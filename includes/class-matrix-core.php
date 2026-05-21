@@ -731,16 +731,16 @@ class Matrix_MLM_Core {
     }
 
     public function daily_cron() {
-        // Check expired e-pins
+        // Expire only pins that have a real expiry date that has passed.
+        // Previously this also unconditionally flipped every 'unused' pin
+        // to 'expired', which silently destroyed valid pins overnight.
         global $wpdb;
-        $wpdb->update(
-            $wpdb->prefix . 'matrix_epins',
-            ['status' => 'expired'],
-            ['status' => 'unused'],
-            ['%s'],
-            ['%s']
+        $wpdb->query(
+            "UPDATE {$wpdb->prefix}matrix_epins
+                SET status = 'expired'
+              WHERE status = 'unused'
+                AND expires_at IS NOT NULL
+                AND expires_at < NOW()"
         );
-        // Only expire pins that have an expiry date set and passed
-        $wpdb->query("UPDATE {$wpdb->prefix}matrix_epins SET status = 'expired' WHERE status = 'unused' AND expires_at IS NOT NULL AND expires_at < NOW()");
     }
 }

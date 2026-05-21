@@ -105,7 +105,16 @@ class Matrix_MLM_Epin {
     }
 
     /**
-     * Redeem an e-pin
+     * Redeem an e-pin.
+     *
+     * Order of operations matters here. Previous versions credited the
+     * wallet first and then tried to mark the pin as used; if the second
+     * step failed silently, the user's balance was credited but the pin
+     * row never recorded `used_by` / `used_at`, so it didn't appear in
+     * the user's Recharge History.
+     *
+     * We now claim the pin atomically with a single conditional UPDATE
+     * and only credit the wallet if exactly one row was claimed.
      */
     public function redeem($user_id, $pin_code) {
         global $wpdb;
@@ -125,21 +134,57 @@ class Matrix_MLM_Epin {
             return ['success' => false, 'message' => __('Pin has expired', 'matrix-mlm')];
         }
 
-        // Credit user wallet with pin amount
-        $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit($user_id, $pin->amount, 'epin_recharge', sprintf(__('E-Pin recharge: %s', 'matrix-mlm'), $pin_code), $pin_code);
+        // Atomic claim. The status='unused' guard prevents double-spend if
+        // two requests race, and lets us detect failures cleanly.
+        $prev_show     = $wpdb->show_errors(false);
+        $prev_suppress = $wpdb->suppress_errors(true);
 
-        // Mark pin as used
-        $wpdb->update($wpdb->prefix . 'matrix_epins', [
-            'status' => 'used',
-            'used_by' => $user_id,
-            'used_at' => current_time('mysql')
-        ], ['id' => $pin->id]);
+        $claimed = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->prefix}matrix_epins
+                SET status = 'used', used_by = %d, used_at = %s
+              WHERE id = %d AND status = 'unused'",
+            $user_id,
+            current_time('mysql'),
+            $pin->id
+        ));
+
+        $db_error = $wpdb->last_error;
+        $wpdb->show_errors($prev_show);
+        $wpdb->suppress_errors($prev_suppress);
+
+        if ($claimed === false) {
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    /* translators: %s: database error */
+                    __('Could not redeem pin. %s', 'matrix-mlm'),
+                    $db_error ? '(' . $db_error . ')' : ''
+                ),
+            ];
+        }
+
+        if ($claimed < 1) {
+            // Another request claimed it between SELECT and UPDATE,
+            // or the row no longer matches status='unused'.
+            return ['success' => false, 'message' => __('Pin was already redeemed', 'matrix-mlm')];
+        }
+
+        // Pin is safely claimed. Credit the wallet using the canonical
+        // pin code from the database so the wallet `reference` column
+        // exactly matches `matrix_epins.pin_code` for joins later.
+        $wallet = new Matrix_MLM_Wallet();
+        $wallet->credit(
+            $user_id,
+            $pin->amount,
+            'epin_recharge',
+            sprintf(__('E-Pin recharge: %s', 'matrix-mlm'), $pin->pin_code),
+            $pin->pin_code
+        );
 
         return [
             'success' => true,
             'message' => sprintf(__('Successfully recharged %s%s', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($pin->amount, 2)),
-            'amount' => $pin->amount
+            'amount'  => $pin->amount,
         ];
     }
 
@@ -199,16 +244,33 @@ class Matrix_MLM_Epin {
     }
 
     /**
-     * Get recharge logs for user
+     * Get recharge logs for user.
+     *
+     * Source of truth is the wallet credit row (transaction_type =
+     * 'epin_recharge'), not matrix_epins. This is intentional: the
+     * wallet row is what actually represents money landing in the
+     * user's balance, so the history stays consistent even if a future
+     * code path forgets to mark the matrix_epins row as 'used'. We
+     * LEFT JOIN matrix_epins via the reference column to enrich the
+     * row with the plan name, but the join is optional.
      */
     public function get_recharge_logs($user_id, $limit = 20, $offset = 0) {
         global $wpdb;
         return $wpdb->get_results($wpdb->prepare(
-            "SELECT e.*, p.name as plan_name 
-             FROM {$wpdb->prefix}matrix_epins e 
-             LEFT JOIN {$wpdb->prefix}matrix_plans p ON e.plan_id = p.id 
-             WHERE e.used_by = %d AND e.status = 'used' 
-             ORDER BY e.used_at DESC LIMIT %d OFFSET %d",
+            "SELECT
+                w.created_at AS used_at,
+                w.amount     AS amount,
+                COALESCE(e.pin_code, w.reference) AS pin_code,
+                COALESCE(p.name, 'Custom')        AS plan_name,
+                w.description AS description
+             FROM {$wpdb->prefix}matrix_wallet w
+             LEFT JOIN {$wpdb->prefix}matrix_epins e ON e.pin_code = w.reference
+             LEFT JOIN {$wpdb->prefix}matrix_plans p ON p.id = e.plan_id
+             WHERE w.user_id = %d
+               AND w.transaction_type = 'epin_recharge'
+               AND w.type = 'credit'
+             ORDER BY w.created_at DESC
+             LIMIT %d OFFSET %d",
             $user_id, $limit, $offset
         ));
     }
