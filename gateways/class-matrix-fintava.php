@@ -73,6 +73,7 @@ class Matrix_MLM_Fintava {
         add_action('wp_ajax_matrix_fintava_create_virtual_wallet', [$this, 'ajax_create_virtual_wallet']);
         add_action('wp_ajax_matrix_fintava_get_virtual_wallet', [$this, 'ajax_get_virtual_wallet']);
         add_action('wp_ajax_matrix_fintava_wallet_balance', [$this, 'ajax_get_virtual_wallet_balance']);
+        add_action('wp_ajax_matrix_fintava_set_my_wallet_id', [$this, 'ajax_set_my_wallet_id']);
 
         // REST API endpoint for webhook callbacks
         add_action('rest_api_init', [$this, 'register_webhook_routes']);
@@ -1329,6 +1330,94 @@ class Matrix_MLM_Fintava {
             'currency'                    => $balance['currency'],
             'available_balance_formatted' => $currency_symbol . number_format($balance['available_balance'], 2),
             'ledger_balance_formatted'    => $currency_symbol . number_format($balance['ledger_balance'], 2),
+        ]);
+    }
+
+    /**
+     * AJAX endpoint that lets a logged-in user fill in their own missing
+     * Fintava Wallet ID directly from the dashboard.
+     *
+     * Security guarantee: the wallet_id is only saved if Fintava confirms it
+     * resolves to the SAME account_number that's already on the user's local
+     * matrix_fintava_wallets row. This prevents anyone from typing a stranger's
+     * wallet_id to peek at their balance.
+     */
+    public function ajax_set_my_wallet_id() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        if (!$this->is_active()) {
+            wp_send_json_error(['message' => __('Fintava is not configured.', 'matrix-mlm')]);
+        }
+
+        $wallet_id = sanitize_text_field($_POST['wallet_id'] ?? '');
+        if (empty($wallet_id)) {
+            wp_send_json_error(['message' => __('Wallet ID is required.', 'matrix-mlm')]);
+        }
+
+        $wallet = $this->get_user_wallet($user_id);
+        if (!$wallet) {
+            wp_send_json_error(['message' => __('You do not have a linked Fintava wallet yet.', 'matrix-mlm')]);
+        }
+
+        if (!empty($wallet->wallet_id)) {
+            wp_send_json_error(['message' => __('Your wallet already has a Wallet ID. Contact an admin if it needs to change.', 'matrix-mlm')]);
+        }
+
+        // Look up the wallet on Fintava's side.
+        $details = $this->get_virtual_wallet_details($wallet_id);
+        if (is_wp_error($details)) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: API error message returned by Fintava */
+                    __('Fintava could not find that Wallet ID: %s', 'matrix-mlm'),
+                    $details->get_error_message()
+                ),
+            ]);
+        }
+
+        // Pull the account number Fintava reports for this wallet (handle both
+        // snake_case and camelCase response shapes).
+        $remote_account_number = $details['account_number']
+            ?? $details['accountNumber']
+            ?? '';
+
+        if (empty($remote_account_number) || empty($wallet->account_number)) {
+            wp_send_json_error(['message' => __('Could not verify the Wallet ID against your account number.', 'matrix-mlm')]);
+        }
+
+        // Strict equality. Both are digit strings; trim just in case.
+        if (trim($remote_account_number) !== trim($wallet->account_number)) {
+            wp_send_json_error([
+                'message' => __('That Wallet ID belongs to a different account number than the one on file. Double-check the Wallet ID in your Fintava dashboard.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Verified. Persist.
+        global $wpdb;
+        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? $wallet->bank_code;
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            [
+                'wallet_id'  => $wallet_id,
+                'bank_code'  => $bank_code,
+                'updated_at' => current_time('mysql'),
+            ],
+            ['id' => $wallet->id],
+            ['%s', '%s', '%s'],
+            ['%d']
+        );
+
+        if ($updated === false) {
+            wp_send_json_error(['message' => __('Could not save Wallet ID. Please try again.', 'matrix-mlm')]);
+        }
+
+        wp_send_json_success([
+            'message' => __('Wallet ID verified and saved. Refreshing balance…', 'matrix-mlm'),
         ]);
     }
 
