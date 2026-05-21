@@ -27,6 +27,10 @@ $referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
                 <input type="email" name="email" required>
             </div>
             <div class="matrix-form-group">
+                <label><?php _e('Phone Number', 'matrix-mlm'); ?></label>
+                <input type="tel" name="phone" required placeholder="+234 xxx xxx xxxx">
+            </div>
+            <div class="matrix-form-group">
                 <label><?php _e('Password', 'matrix-mlm'); ?></label>
                 <input type="password" name="password" required minlength="8">
             </div>
@@ -35,8 +39,9 @@ $referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
                 <input type="password" name="password_confirm" required>
             </div>
             <div class="matrix-form-group">
-                <label><?php _e('Referral Code (Optional)', 'matrix-mlm'); ?></label>
-                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $referral_code ? 'readonly' : ''; ?>>
+                <label><?php _e('Referral Code', 'matrix-mlm'); ?> <span class="matrix-required">*</span></label>
+                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $referral_code ? 'readonly' : ''; ?> required>
+                <small class="matrix-form-hint"><?php _e('Enter the referral code of the person who invited you.', 'matrix-mlm'); ?></small>
             </div>
             <?php if (get_option('matrix_mlm_captcha_enabled')): ?>
             <div class="g-recaptcha" data-sitekey="<?php echo esc_attr(get_option('matrix_mlm_captcha_site_key')); ?>"></div>
