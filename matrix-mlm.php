@@ -64,6 +64,9 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-card.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-billing.php';
 
+// Always loaded — used by the self-healing seed in Matrix_MLM_Core::run().
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways.php';
+
 // Admin
 if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin.php';
@@ -71,7 +74,6 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-users.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-deposits.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-withdrawals.php';
-    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-tickets.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-reports.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-settings.php';

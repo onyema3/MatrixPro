@@ -9,10 +9,104 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Admin_Gateways {
 
+    /**
+     * Default gateway definitions used for seeding.
+     */
+    private static function default_gateways() {
+        return [
+            [
+                'name' => 'Paystack',
+                'slug' => 'paystack',
+                'gateway_parameters' => json_encode([
+                    'public_key' => '',
+                    'secret_key' => '',
+                    'webhook_secret' => ''
+                ]),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
+                'min_amount' => 100.00,
+                'max_amount' => 5000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.50,
+                'status' => 1,
+            ],
+            [
+                'name' => 'Flutterwave',
+                'slug' => 'flutterwave',
+                'gateway_parameters' => json_encode([
+                    'public_key' => '',
+                    'secret_key' => '',
+                    'encryption_key' => '',
+                    'webhook_hash' => ''
+                ]),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
+                'min_amount' => 100.00,
+                'max_amount' => 10000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.40,
+                'status' => 1,
+            ],
+        ];
+    }
+
+    /**
+     * Ensure the gateways table exists and contains the default gateways.
+     * Idempotent: safe to call on every page load.
+     * Returns array with 'inserted' count, 'skipped' count, and any 'errors'.
+     */
+    public static function ensure_default_gateways() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_gateways';
+        $result = ['inserted' => 0, 'skipped' => 0, 'errors' => []];
+
+        // Make sure the table exists; if not, create all plugin tables.
+        $table_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+        if (!$table_exists) {
+            if (class_exists('Matrix_MLM_Database')) {
+                Matrix_MLM_Database::create_tables();
+            }
+            $table_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+            if (!$table_exists) {
+                $result['errors'][] = sprintf(__('Gateways table %s could not be created.', 'matrix-mlm'), $table);
+                return $result;
+            }
+        }
+
+        // Format strings matching the table column types.
+        // name, slug, gateway_parameters, supported_currencies = %s
+        // min/max/fixed/percent = %f
+        // status = %d
+        $format = ['%s', '%s', '%s', '%s', '%f', '%f', '%f', '%f', '%d'];
+
+        foreach (self::default_gateways() as $gw) {
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM $table WHERE slug = %s",
+                $gw['slug']
+            ));
+
+            if ($existing) {
+                $result['skipped']++;
+                continue;
+            }
+
+            $inserted = $wpdb->insert($table, $gw, $format);
+            if ($inserted === false) {
+                $result['errors'][] = sprintf(
+                    __('Failed to insert %s: %s', 'matrix-mlm'),
+                    $gw['name'],
+                    $wpdb->last_error ?: __('unknown error', 'matrix-mlm')
+                );
+            } else {
+                $result['inserted']++;
+            }
+        }
+
+        return $result;
+    }
+
     public function render() {
         global $wpdb;
 
-        // Handle form submissions
+        // Handle form submissions BEFORE seeding so saves take precedence.
         if (isset($_POST['save_gateway']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_save_gateway')) {
             $this->save_gateway();
         }
@@ -21,14 +115,23 @@ class Matrix_MLM_Admin_Gateways {
             $this->save_fintava_settings();
         }
 
-        $seeded = false;
-        if (isset($_POST['matrix_seed_gateways']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_seed_gateways')) {
-            $this->seed_gateways();
-            $seeded = true;
+        // Auto-seed default gateways on every page load. This is idempotent
+        // (skips any slug that already exists) and self-healing — if the table
+        // is empty for any reason, the gateways will be inserted right here
+        // before the page is rendered.
+        $seed_result = self::ensure_default_gateways();
+
+        if ($seed_result['inserted'] > 0) {
+            echo '<div class="notice notice-success"><p>' . sprintf(
+                __('%d default payment gateway(s) created.', 'matrix-mlm'),
+                $seed_result['inserted']
+            ) . '</p></div>';
         }
 
-        if ($seeded || isset($_GET['seeded'])) {
-            echo '<div class="notice notice-success"><p>' . __('Default gateways have been created successfully!', 'matrix-mlm') . '</p></div>';
+        if (!empty($seed_result['errors'])) {
+            foreach ($seed_result['errors'] as $err) {
+                echo '<div class="notice notice-error"><p>' . esc_html($err) . '</p></div>';
+            }
         }
 
         $gateways = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}matrix_gateways ORDER BY name ASC");
@@ -38,27 +141,21 @@ class Matrix_MLM_Admin_Gateways {
 
             <?php if (empty($gateways)): ?>
                 <div class="matrix-admin-card">
-                    <h2><?php _e('No Payment Gateways Found', 'matrix-mlm'); ?></h2>
-                    <p><?php _e('No payment gateways have been configured yet. Click the button below to create the default gateways (Paystack and Flutterwave).', 'matrix-mlm'); ?></p>
-                    <form method="post">
-                        <?php wp_nonce_field('matrix_seed_gateways'); ?>
-                        <p><input type="submit" name="matrix_seed_gateways" class="button button-primary" value="<?php _e('Create Default Gateways', 'matrix-mlm'); ?>"></p>
-                    </form>
+                    <h2><?php _e('No Payment Gateways Available', 'matrix-mlm'); ?></h2>
+                    <p><?php _e('The default gateways could not be created automatically. Check your database permissions and the messages above for details.', 'matrix-mlm'); ?></p>
                 </div>
             <?php endif; ?>
 
-            <?php if (!empty($gateways)): ?>
-
-                <?php foreach ($gateways as $gateway): 
-                    $params = json_decode($gateway->gateway_parameters, true);
-                    if (!is_array($params)) {
-                        $params = [];
-                    }
-                    $currencies = json_decode($gateway->supported_currencies, true);
-                    if (!is_array($currencies)) {
-                        $currencies = [];
-                    }
-                ?>
+            <?php foreach ($gateways as $gateway):
+                $params = json_decode($gateway->gateway_parameters, true);
+                if (!is_array($params)) {
+                    $params = [];
+                }
+                $currencies = json_decode($gateway->supported_currencies, true);
+                if (!is_array($currencies)) {
+                    $currencies = [];
+                }
+            ?>
                 <div class="matrix-admin-card" style="margin-bottom: 20px;">
                     <h2>
                         <?php echo esc_html($gateway->name); ?>
@@ -110,9 +207,7 @@ class Matrix_MLM_Admin_Gateways {
                         <p><input type="submit" name="save_gateway" class="button button-primary" value="<?php _e('Save Settings', 'matrix-mlm'); ?>"></p>
                     </form>
                 </div>
-                <?php endforeach; ?>
-
-            <?php endif; ?>
+            <?php endforeach; ?>
 
             <!-- Fintava Settings (stored in wp_options) -->
             <div class="matrix-admin-card" style="margin-bottom: 20px;">
@@ -226,7 +321,6 @@ class Matrix_MLM_Admin_Gateways {
                 break;
 
             default:
-                // Dynamic rendering for any other gateway - render all stored parameters as editable fields
                 if (!empty($params)) {
                     foreach ($params as $key => $value) {
                         $label = ucwords(str_replace(['_', '-'], ' ', $key));
@@ -259,7 +353,6 @@ class Matrix_MLM_Admin_Gateways {
 
         $id = intval($_POST['gateway_id']);
 
-        // Parse supported currencies from comma-separated string
         $currencies_raw = sanitize_text_field($_POST['supported_currencies'] ?? '');
         $currencies = array_filter(array_map('trim', explode(',', $currencies_raw)));
         $currencies = array_map('strtoupper', $currencies);
@@ -290,58 +383,5 @@ class Matrix_MLM_Admin_Gateways {
         update_option('matrix_mlm_fintava_status', intval($_POST['fintava_status'] ?? 0));
 
         echo '<div class="notice notice-success"><p>' . __('Fintava Pay settings saved successfully!', 'matrix-mlm') . '</p></div>';
-    }
-
-    /**
-     * Seed default gateways into the database
-     */
-    private function seed_gateways() {
-        global $wpdb;
-        $gateways_table = $wpdb->prefix . 'matrix_gateways';
-
-        // Check if paystack already exists (avoid duplicates but allow re-seeding if missing)
-        $has_paystack = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table WHERE slug = 'paystack'");
-        $has_flutterwave = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table WHERE slug = 'flutterwave'");
-
-        if ($has_paystack && $has_flutterwave) {
-            return; // Both already exist
-        }
-
-        if (!$has_paystack) {
-            $wpdb->insert($gateways_table, [
-                'name' => 'Paystack',
-                'slug' => 'paystack',
-                'gateway_parameters' => json_encode([
-                    'public_key' => '',
-                    'secret_key' => '',
-                    'webhook_secret' => ''
-                ]),
-                'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
-                'min_amount' => 100.00,
-                'max_amount' => 5000000.00,
-                'fixed_charge' => 0.00,
-                'percent_charge' => 1.50,
-                'status' => 1
-            ]);
-        }
-
-        if (!$has_flutterwave) {
-            $wpdb->insert($gateways_table, [
-                'name' => 'Flutterwave',
-                'slug' => 'flutterwave',
-                'gateway_parameters' => json_encode([
-                    'public_key' => '',
-                    'secret_key' => '',
-                    'encryption_key' => '',
-                    'webhook_hash' => ''
-                ]),
-                'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
-                'min_amount' => 100.00,
-                'max_amount' => 10000000.00,
-                'fixed_charge' => 0.00,
-                'percent_charge' => 1.40,
-                'status' => 1
-            ]);
-        }
     }
 }
