@@ -1147,14 +1147,44 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Resolve the wallet_id for a local wallet row using the Customer API.
+     * GET /loma-name/enquiry?accountNumber=XXXX — look up wallet details by account number.
      *
-     * Workflow:
-     *  1. If the local row already has a customer_id stored, use it directly.
-     *  2. Otherwise, pull the customer list and match by account_number or email.
-     *  3. Call GET /customers/{customerId} to get the full response with wallet.id.
-     *  4. Verify the wallet's accountNumber matches the local record.
-     *  5. Persist the wallet_id (and customer_id) back to the local row.
+     * This is the primary way to resolve a wallet_id when all we have is the
+     * account number. Returns the full wallet object including its UUID.
+     *
+     * @param string $account_number The 10-digit virtual account number.
+     * @return array|WP_Error Wallet details on success.
+     */
+    public function get_wallet_by_account_number($account_number) {
+        if (empty($account_number)) {
+            return new WP_Error('missing_account_number', __('Account number is required', 'matrix-mlm'));
+        }
+
+        $response = $this->make_request('GET', '/loma-name/enquiry?accountNumber=' . urlencode($account_number));
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        if (isset($response['data']) && is_array($response['data'])) {
+            return $response['data'];
+        }
+
+        // Bare object fallback
+        if (is_array($response) && (isset($response['id']) || isset($response['virtualAcctNo']))) {
+            return $response;
+        }
+
+        return new WP_Error(
+            'fintava_enquiry_error',
+            $response['message'] ?? __('Could not look up wallet by account number', 'matrix-mlm')
+        );
+    }
+
+    /**
+     * Resolve the wallet_id for a local wallet row using the account number enquiry endpoint.
+     *
+     * Calls GET /loma-name/enquiry?accountNumber=XXXX which returns the wallet
+     * details including its UUID (the wallet_id needed for balance lookups).
      *
      * @param object $wallet_row The local matrix_fintava_wallets row.
      * @return string|WP_Error The resolved wallet_id on success.
@@ -1162,108 +1192,51 @@ class Matrix_MLM_Fintava {
     public function resolve_wallet_id_from_customer($wallet_row) {
         global $wpdb;
 
-        $customer_id = '';
-
-        // 1. Check if we already have a customer_id stored
-        if (isset($wallet_row->customer_id) && !empty($wallet_row->customer_id)) {
-            $customer_id = $wallet_row->customer_id;
-        }
-
-        // 2. If no customer_id, search the customer list
-        if (empty($customer_id)) {
-            $customers = $this->get_customer_list();
-            if (is_wp_error($customers)) {
-                return $customers;
-            }
-
-            foreach ($customers as $customer) {
-                // Each item may be the full { userInfo, wallet } shape or just userInfo
-                $user_info = $customer['userInfo'] ?? $customer;
-                $wallet_data = $customer['wallet'] ?? null;
-
-                // Match by account number (most reliable)
-                if ($wallet_data && !empty($wallet_row->account_number)) {
-                    $remote_account = $wallet_data['accountNumber'] ?? $wallet_data['account_number'] ?? '';
-                    if ($remote_account === trim($wallet_row->account_number)) {
-                        $customer_id = $user_info['id'] ?? '';
-                        break;
-                    }
-                }
-
-                // Fallback: match by email
-                if (!empty($wallet_row->customer_email)) {
-                    $remote_email = $user_info['email'] ?? $user_info['emailAddress'] ?? '';
-                    if (strtolower($remote_email) === strtolower($wallet_row->customer_email)) {
-                        $customer_id = $user_info['id'] ?? '';
-                        break;
-                    }
-                }
-
-                // Fallback: match by phone
-                if (!empty($wallet_row->customer_phone)) {
-                    $remote_phone = $user_info['phoneNumber'] ?? $user_info['phone'] ?? '';
-                    if (!empty($remote_phone) && $remote_phone === $wallet_row->customer_phone) {
-                        $customer_id = $user_info['id'] ?? '';
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (empty($customer_id)) {
+        if (empty($wallet_row->account_number)) {
             return new WP_Error(
-                'fintava_customer_not_found',
-                __('Could not find a matching Fintava customer for this wallet.', 'matrix-mlm')
+                'missing_account_number',
+                __('No account number on file to look up.', 'matrix-mlm')
             );
         }
 
-        // 3. Fetch the full customer details (includes wallet.id)
-        $customer_details = $this->get_customer($customer_id);
-        if (is_wp_error($customer_details)) {
-            return $customer_details;
+        // Call the loma-name enquiry endpoint with the account number
+        $details = $this->get_wallet_by_account_number(trim($wallet_row->account_number));
+        if (is_wp_error($details)) {
+            return $details;
         }
 
-        $wallet_obj = $customer_details['wallet'] ?? null;
-        if (!$wallet_obj || empty($wallet_obj['id'])) {
+        // Extract the wallet ID from the response
+        $resolved_wallet_id = self::extract_wallet_id($details);
+        if (empty($resolved_wallet_id)) {
+            // Fallback: use the top-level 'id' field
+            $resolved_wallet_id = $details['id'] ?? '';
+        }
+
+        if (empty($resolved_wallet_id)) {
             return new WP_Error(
-                'fintava_no_wallet_in_customer',
-                __('The customer record does not contain a wallet ID.', 'matrix-mlm')
+                'fintava_no_wallet_id_in_response',
+                __('The enquiry response does not contain a wallet ID.', 'matrix-mlm')
             );
         }
 
-        $resolved_wallet_id = $wallet_obj['id'];
-
-        // 4. Verify account number matches (safety check)
-        $remote_account = $wallet_obj['accountNumber'] ?? $wallet_obj['account_number'] ?? '';
-        if (!empty($wallet_row->account_number) && !empty($remote_account)) {
-            if (trim($remote_account) !== trim($wallet_row->account_number)) {
-                return new WP_Error(
-                    'fintava_account_mismatch',
-                    __('The wallet returned by the customer endpoint has a different account number than expected.', 'matrix-mlm')
-                );
-            }
+        // Verify the account number matches (safety check)
+        $remote_account = self::extract_account_number($details);
+        if (!empty($remote_account) && trim($remote_account) !== trim($wallet_row->account_number)) {
+            return new WP_Error(
+                'fintava_account_mismatch',
+                __('The enquiry returned a different account number than expected.', 'matrix-mlm')
+            );
         }
 
-        // 5. Persist wallet_id and customer_id back to the local row
+        // Persist wallet_id back to the local row
         $update_data = [
-            'wallet_id'   => $resolved_wallet_id,
-            'updated_at'  => current_time('mysql'),
+            'wallet_id'  => $resolved_wallet_id,
+            'updated_at' => current_time('mysql'),
         ];
         $update_formats = ['%s', '%s'];
 
-        // Only include customer_id if the column exists (safe for pre-migration DBs)
-        $col_exists = $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'customer_id'",
-            DB_NAME,
-            $wpdb->prefix . 'matrix_fintava_wallets'
-        ));
-        if ($col_exists && intval($col_exists) > 0) {
-            $update_data['customer_id'] = $customer_id;
-            $update_formats[] = '%s';
-        }
-
-        // Also save bank_code if available
-        $bank_code = $wallet_obj['bank_code'] ?? $wallet_obj['bankCode'] ?? null;
+        // Save bank_code if available
+        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? null;
         if (!empty($bank_code)) {
             $update_data['bank_code'] = $bank_code;
             $update_formats[] = '%s';
