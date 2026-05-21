@@ -152,16 +152,89 @@ class Matrix_MLM_Admin_Settings {
             </tr>
         </table>
 
+        <h2 style="margin-top: 30px;"><?php _e('Default Commission Structure', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom: 15px;">
+            <?php _e('Set the default commission values for new plans. Each plan can override these individually.', 'matrix-mlm'); ?>
+        </p>
+
+        <?php
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $commission_type = get_option('matrix_mlm_default_commission_type', 'fixed');
+        $referral_commission = get_option('matrix_mlm_default_referral_commission', 0);
+        $completion_bonus = get_option('matrix_mlm_default_completion_bonus', 0);
+        $level_commissions = json_decode(get_option('matrix_mlm_default_level_commissions', '{}'), true);
+        if (!is_array($level_commissions)) $level_commissions = [];
+        ?>
+
+        <table class="form-table">
+            <tr>
+                <th><?php _e('Commission Type', 'matrix-mlm'); ?></th>
+                <td>
+                    <select name="matrix_mlm_default_commission_type" id="settings_commission_type">
+                        <option value="fixed" <?php selected($commission_type, 'fixed'); ?>><?php printf(__('Fixed Amount (%s)', 'matrix-mlm'), $currency); ?></option>
+                        <option value="percentage" <?php selected($commission_type, 'percentage'); ?>><?php _e('Percentage of Plan Price (%)', 'matrix-mlm'); ?></option>
+                    </select>
+                    <p class="description"><?php _e('Whether commission values are fixed currency amounts or a percentage of the plan price.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Default Referral Commission', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_default_referral_commission" step="0.01" min="0" value="<?php echo esc_attr($referral_commission); ?>" class="small-text">
+                    <span id="settings-commission-suffix"><?php echo $commission_type === 'percentage' ? '%' : $currency; ?></span>
+                    <p class="description"><?php _e('Paid to the direct sponsor when someone joins under them.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Default Completion Bonus', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_default_completion_bonus" step="0.01" min="0" value="<?php echo esc_attr($completion_bonus); ?>" class="small-text">
+                    <span id="settings-bonus-suffix"><?php echo $commission_type === 'percentage' ? '%' : $currency; ?></span>
+                    <p class="description"><?php _e('Bonus paid when a member completes their full matrix cycle.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Default Level Commissions', 'matrix-mlm'); ?></th>
+                <td>
+                    <div id="settings-level-commissions">
+                        <?php for ($i = 1; $i <= $default_depth; $i++): ?>
+                        <div class="level-commission-row" style="margin-bottom: 5px;">
+                            <label><?php printf(__('Level %d:', 'matrix-mlm'), $i); ?></label>
+                            <input type="number" name="matrix_mlm_default_level_commissions[<?php echo $i; ?>]" step="0.01" min="0" value="<?php echo esc_attr($level_commissions[$i] ?? 0); ?>" style="width: 100px;">
+                            <span class="settings-level-suffix"><?php echo $commission_type === 'percentage' ? '%' : $currency; ?></span>
+                        </div>
+                        <?php endfor; ?>
+                    </div>
+                    <p class="description"><?php _e('Commission paid to upline members at each level when a new member joins. Fields update automatically when you change the depth above.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+        </table>
+
         <script>
         (function() {
             var widthEl = document.getElementById('settings_matrix_width');
             var depthEl = document.getElementById('settings_matrix_depth');
+            var commTypeEl = document.getElementById('settings_commission_type');
+            var levelContainer = document.getElementById('settings-level-commissions');
+            var currency = '<?php echo esc_js($currency); ?>';
 
             function getTypeLabel(width) {
                 if (width == 1) return 'Unilevel';
                 if (width == 2) return 'Binary';
                 if (width == 3) return 'Ternary';
                 return width + '-Wide';
+            }
+
+            function getSuffix() {
+                return commTypeEl.value === 'percentage' ? '%' : currency;
+            }
+
+            function updateAllSuffixes() {
+                var suffix = getSuffix();
+                document.getElementById('settings-commission-suffix').textContent = suffix;
+                document.getElementById('settings-bonus-suffix').textContent = suffix;
+                var spans = levelContainer.querySelectorAll('.settings-level-suffix');
+                spans.forEach(function(s) { s.textContent = suffix; });
             }
 
             function updatePreview() {
@@ -181,8 +254,35 @@ class Matrix_MLM_Admin_Settings {
                 document.getElementById('settings-depth-display').textContent = d;
             }
 
+            function updateLevelCommissions() {
+                var depth = parseInt(depthEl.value) || 3;
+                var suffix = getSuffix();
+                var existingValues = {};
+
+                var inputs = levelContainer.querySelectorAll('input[type="number"]');
+                inputs.forEach(function(input) {
+                    var match = input.name.match(/\[(\d+)\]/);
+                    if (match) existingValues[match[1]] = input.value;
+                });
+
+                var html = '';
+                for (var i = 1; i <= depth; i++) {
+                    var val = existingValues[i] || '0';
+                    html += '<div class="level-commission-row" style="margin-bottom: 5px;">';
+                    html += '<label>Level ' + i + ':</label> ';
+                    html += '<input type="number" name="matrix_mlm_default_level_commissions[' + i + ']" step="0.01" min="0" value="' + val + '" style="width: 100px;"> ';
+                    html += '<span class="settings-level-suffix">' + suffix + '</span>';
+                    html += '</div>';
+                }
+                levelContainer.innerHTML = html;
+            }
+
             widthEl.addEventListener('input', updatePreview);
-            depthEl.addEventListener('input', updatePreview);
+            depthEl.addEventListener('input', function() {
+                updatePreview();
+                updateLevelCommissions();
+            });
+            commTypeEl.addEventListener('change', updateAllSuffixes);
         })();
         </script>
     <?php }
@@ -370,7 +470,12 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_site_title', 'matrix_mlm_currency', 'matrix_mlm_currency_symbol', 'matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled'];
                 break;
             case 'matrix':
-                $settings = ['matrix_mlm_default_width', 'matrix_mlm_default_depth', 'matrix_mlm_spillover_type', 'matrix_mlm_auto_reentry'];
+                $settings = ['matrix_mlm_default_width', 'matrix_mlm_default_depth', 'matrix_mlm_spillover_type', 'matrix_mlm_auto_reentry', 'matrix_mlm_default_commission_type', 'matrix_mlm_default_referral_commission', 'matrix_mlm_default_completion_bonus'];
+                // Handle level commissions as JSON
+                if (isset($_POST['matrix_mlm_default_level_commissions']) && is_array($_POST['matrix_mlm_default_level_commissions'])) {
+                    $level_comms = array_map('floatval', $_POST['matrix_mlm_default_level_commissions']);
+                    update_option('matrix_mlm_default_level_commissions', json_encode($level_comms));
+                }
                 break;
             case 'financial':
                 $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer'];
