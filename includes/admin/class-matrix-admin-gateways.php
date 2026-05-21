@@ -23,6 +23,12 @@ class Matrix_MLM_Admin_Gateways {
 
         if (isset($_POST['matrix_seed_gateways']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_seed_gateways')) {
             $this->seed_gateways();
+            // Redirect to reload the page with fresh data
+            wp_redirect(admin_url('admin.php?page=matrix-mlm-gateways&seeded=1'));
+            exit;
+        }
+
+        if (isset($_GET['seeded'])) {
             echo '<div class="notice notice-success"><p>' . __('Default gateways have been created successfully!', 'matrix-mlm') . '</p></div>';
         }
 
