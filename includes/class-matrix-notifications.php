@@ -107,6 +107,148 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send welcome email after verification
+     */
+    public static function send_welcome_email($user_id) {
+        $user = get_userdata($user_id);
+        if (!$user) return;
+
+        $subject = sprintf(__('[%s] Welcome! Your Account is Active', 'matrix-mlm'), get_bloginfo('name'));
+        $message = self::get_email_template('welcome', [
+            'username' => $user->user_login,
+            'dashboard_url' => home_url('/matrix-dashboard'),
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+    }
+
+    /**
+     * Send password reset email
+     */
+    public static function send_password_reset_email($user_id, $reset_url) {
+        $user = get_userdata($user_id);
+        if (!$user) return;
+
+        $subject = sprintf(__('[%s] Password Reset Request', 'matrix-mlm'), get_bloginfo('name'));
+        $message = self::get_email_template('password-reset', [
+            'username' => $user->user_login,
+            'reset_url' => $reset_url,
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+    }
+
+    /**
+     * Send password changed confirmation
+     */
+    public static function send_password_changed_email($user_id) {
+        $user = get_userdata($user_id);
+        if (!$user) return;
+
+        $subject = sprintf(__('[%s] Your Password Has Been Changed', 'matrix-mlm'), get_bloginfo('name'));
+        $message = self::get_email_template('password-changed', [
+            'username' => $user->user_login,
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+    }
+
+    /**
+     * Hook into WordPress password reset flow
+     * Call this from plugin init to register filters
+     */
+    public static function register_password_reset_hooks() {
+        // Override WordPress default password reset email
+        add_filter('retrieve_password_message', [__CLASS__, 'custom_reset_password_message'], 10, 4);
+        add_filter('retrieve_password_title', [__CLASS__, 'custom_reset_password_title'], 10, 3);
+
+        // Send confirmation when password is actually changed
+        add_action('after_password_reset', [__CLASS__, 'on_password_reset'], 10, 2);
+    }
+
+    /**
+     * Customize password reset email subject
+     */
+    public static function custom_reset_password_title($title, $user_login, $user_data) {
+        return sprintf(__('[%s] Password Reset Request', 'matrix-mlm'), get_bloginfo('name'));
+    }
+
+    /**
+     * Customize password reset email body (return HTML)
+     */
+    public static function custom_reset_password_message($message, $key, $user_login, $user_data) {
+        $reset_url = network_site_url("wp-login.php?action=rp&key={$key}&login=" . rawurlencode($user_login), 'login');
+
+        // Set content type to HTML for this email
+        add_filter('wp_mail_content_type', [__CLASS__, 'set_html_content_type']);
+
+        $html_message = self::get_email_template('password-reset', [
+            'username' => $user_login,
+            'reset_url' => $reset_url,
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        // Remove the filter after use to avoid affecting other emails
+        add_action('wp_mail_succeeded', function() {
+            remove_filter('wp_mail_content_type', [Matrix_MLM_Notifications::class, 'set_html_content_type']);
+        });
+        add_action('wp_mail_failed', function() {
+            remove_filter('wp_mail_content_type', [Matrix_MLM_Notifications::class, 'set_html_content_type']);
+        });
+
+        return $html_message;
+    }
+
+    /**
+     * Set HTML content type for wp_mail
+     */
+    public static function set_html_content_type() {
+        return 'text/html';
+    }
+
+    /**
+     * Send confirmation after password is reset
+     */
+    public static function on_password_reset($user, $new_pass) {
+        self::send_password_changed_email($user->ID);
+    }
+
+    /**
+     * Send transfer received notification
+     */
+    public static function send_transfer_notification($recipient_id, $sender_id, $amount) {
+        $recipient = get_userdata($recipient_id);
+        $sender = get_userdata($sender_id);
+        if (!$recipient || !$sender) return;
+
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+
+        $subject = sprintf(__('[%s] You Received a Transfer!', 'matrix-mlm'), get_bloginfo('name'));
+        $message = self::get_email_template('transfer', [
+            'username' => $recipient->user_login,
+            'sender' => $sender->user_login,
+            'amount' => $currency . number_format($amount, 2),
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        self::send_email($recipient->user_email, $subject, $message);
+
+        // Send SMS if enabled
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone($recipient_id);
+            if ($phone) {
+                self::send_sms($phone, sprintf(
+                    __('You received %s%s from %s. Log in to view your balance.', 'matrix-mlm'),
+                    $currency, number_format($amount, 2), $sender->user_login
+                ));
+            }
+        }
+    }
+
+    /**
      * Send admin notification
      */
     public static function send_admin_notification($type, $message) {
@@ -238,6 +380,27 @@ class Matrix_MLM_Notifications {
             case 'withdrawal':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('Your withdrawal of %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
+                break;
+            case 'transfer':
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(__('You received a transfer of %s from %s.', 'matrix-mlm'), $vars['amount'], $vars['sender']) . '</p>';
+                $content .= '<p>' . __('The funds have been credited to your Matrix wallet.', 'matrix-mlm') . '</p>';
+                break;
+            case 'welcome':
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(__('Welcome to %s! Your email has been verified and your account is now active.', 'matrix-mlm'), $vars['site_name']) . '</p>';
+                $content .= '<p style="text-align: center;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('Go to Dashboard', 'matrix-mlm') . '</a></p>';
+                break;
+            case 'password-reset':
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . __('We received a request to reset your password. Click the button below:', 'matrix-mlm') . '</p>';
+                $content .= '<p style="text-align: center;"><a href="' . esc_url($vars['reset_url']) . '" style="background: #dc2626; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('Reset Password', 'matrix-mlm') . '</a></p>';
+                $content .= '<p style="font-size: 12px; color: #6b7280;">' . __('This link expires in 1 hour. If you did not request this, ignore this email.', 'matrix-mlm') . '</p>';
+                break;
+            case 'password-changed':
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . __('Your password has been successfully changed. You can now log in with your new password.', 'matrix-mlm') . '</p>';
+                $content .= '<p style="font-size: 12px; color: #dc2626;">' . __('If you did not make this change, please reset your password immediately.', 'matrix-mlm') . '</p>';
                 break;
         }
 
