@@ -31,6 +31,9 @@ class Matrix_MLM_Core {
 
         // Initialize Fintava Billing (registers billing AJAX hooks)
         new Matrix_MLM_Fintava_Billing();
+
+        // Register password reset email hooks
+        Matrix_MLM_Notifications::register_password_reset_hooks();
     }
 
     private function define_hooks() {
@@ -59,6 +62,9 @@ class Matrix_MLM_Core {
         // Custom rewrite rules
         add_action('init', [$this, 'add_rewrite_rules']);
         add_filter('query_vars', [$this, 'add_query_vars']);
+
+        // Email verification handler
+        add_action('init', [$this, 'handle_email_verification']);
     }
 
     public function enqueue_public_assets() {
@@ -440,6 +446,9 @@ class Matrix_MLM_Core {
             'status' => 'completed'
         ]);
 
+        // Notify recipient about the incoming transfer
+        Matrix_MLM_Notifications::send_transfer_notification($recipient->ID, $user_id, $amount);
+
         wp_send_json_success(['message' => __('Transfer completed successfully', 'matrix-mlm')]);
     }
 
@@ -582,6 +591,46 @@ class Matrix_MLM_Core {
         }
 
         return new WP_REST_Response(['status' => 'error', 'message' => 'Unsupported gateway'], 400);
+    }
+
+    /**
+     * Handle email verification link
+     */
+    public function handle_email_verification() {
+        if (!isset($_GET['action']) || $_GET['action'] !== 'matrix_verify_email') {
+            return;
+        }
+
+        $token = sanitize_text_field($_GET['token'] ?? '');
+        $user_id = intval($_GET['user'] ?? 0);
+
+        if (empty($token) || !$user_id) {
+            wp_die(__('Invalid verification link.', 'matrix-mlm'));
+        }
+
+        $stored_token = get_user_meta($user_id, 'matrix_email_verify_token', true);
+        $expiry = get_user_meta($user_id, 'matrix_email_verify_expiry', true);
+
+        if ($stored_token !== $token) {
+            wp_die(__('Invalid or expired verification link.', 'matrix-mlm'));
+        }
+
+        if ($expiry && time() > $expiry) {
+            wp_die(__('This verification link has expired. Please request a new one.', 'matrix-mlm'));
+        }
+
+        // Mark email as verified
+        update_user_meta($user_id, 'matrix_email_verified', true);
+        delete_user_meta($user_id, 'matrix_email_verify_token');
+        delete_user_meta($user_id, 'matrix_email_verify_expiry');
+
+        // Send welcome email
+        Matrix_MLM_Notifications::send_welcome_email($user_id);
+
+        // Redirect to login with success message
+        $redirect_url = add_query_arg('verified', '1', home_url('/matrix-login'));
+        wp_redirect($redirect_url);
+        exit;
     }
 
     public function add_rewrite_rules() {
