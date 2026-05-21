@@ -21,6 +21,7 @@ class Matrix_MLM_Admin_Settings {
 
             <nav class="nav-tab-wrapper">
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=general'); ?>" class="nav-tab <?php echo $tab === 'general' ? 'nav-tab-active' : ''; ?>"><?php _e('General', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=matrix'); ?>" class="nav-tab <?php echo $tab === 'matrix' ? 'nav-tab-active' : ''; ?>"><?php _e('Matrix Config', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=financial'); ?>" class="nav-tab <?php echo $tab === 'financial' ? 'nav-tab-active' : ''; ?>"><?php _e('Financial', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=notifications'); ?>" class="nav-tab <?php echo $tab === 'notifications' ? 'nav-tab-active' : ''; ?>"><?php _e('Notifications', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=security'); ?>" class="nav-tab <?php echo $tab === 'security' ? 'nav-tab-active' : ''; ?>"><?php _e('Security', 'matrix-mlm'); ?></a>
@@ -38,6 +39,7 @@ class Matrix_MLM_Admin_Settings {
                 <?php
                 switch ($tab) {
                     case 'general': $this->render_general_tab(); break;
+                    case 'matrix': $this->render_matrix_tab(); break;
                     case 'financial': $this->render_financial_tab(); break;
                     case 'notifications': $this->render_notifications_tab(); break;
                     case 'security': $this->render_security_tab(); break;
@@ -70,6 +72,119 @@ class Matrix_MLM_Admin_Settings {
             <tr><th><?php _e('GDPR Compliance', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_gdpr_enabled" value="1" <?php checked(get_option('matrix_mlm_gdpr_enabled', 1)); ?>> <?php _e('Enable GDPR cookie consent', 'matrix-mlm'); ?></label></td></tr>
         </table>
+    <?php }
+
+    private function render_matrix_tab() {
+        $default_width = get_option('matrix_mlm_default_width', 2);
+        $default_depth = get_option('matrix_mlm_default_depth', 3);
+        $max_members = Matrix_MLM_Plan_Engine::calculate_max_members($default_width, $default_depth);
+        $spillover = get_option('matrix_mlm_spillover_type', 'top_down');
+        $auto_reentry = get_option('matrix_mlm_auto_reentry', 1);
+        ?>
+        <h2><?php _e('Matrix Structure Configuration', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom: 20px;">
+            <?php _e('Configure the default matrix structure for new plans. Each plan can override these settings individually.', 'matrix-mlm'); ?>
+        </p>
+
+        <table class="form-table">
+            <tr>
+                <th><?php _e('Default Matrix Width', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_default_width" id="settings_matrix_width" min="1" max="20" value="<?php echo esc_attr($default_width); ?>" class="small-text">
+                    <p class="description"><?php _e('Number of direct legs per member. Common configurations:', 'matrix-mlm'); ?></p>
+                    <ul style="list-style: disc; margin-left: 20px; margin-top: 5px;">
+                        <li><strong>1</strong> — <?php _e('Unilevel (single leg, unlimited depth)', 'matrix-mlm'); ?></li>
+                        <li><strong>2</strong> — <?php _e('Binary (2 legs per person)', 'matrix-mlm'); ?></li>
+                        <li><strong>3</strong> — <?php _e('Ternary / Trinary (3 legs per person)', 'matrix-mlm'); ?></li>
+                        <li><strong>4-10</strong> — <?php _e('Wide matrix (4+ legs per person)', 'matrix-mlm'); ?></li>
+                    </ul>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Default Matrix Depth', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_default_depth" id="settings_matrix_depth" min="1" max="20" value="<?php echo esc_attr($default_depth); ?>" class="small-text">
+                    <p class="description"><?php _e('Number of levels deep the matrix goes before completing.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Matrix Preview', 'matrix-mlm'); ?></th>
+                <td>
+                    <div id="settings-matrix-preview" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                        <div style="display: flex; gap: 30px; align-items: flex-start;">
+                            <div>
+                                <h4 style="margin: 0 0 10px;" id="settings-matrix-label"><?php echo esc_html(Matrix_MLM_Plan_Engine::get_matrix_label($default_width, $default_depth)); ?></h4>
+                                <table style="border-collapse: collapse; font-size: 13px;" id="settings-matrix-breakdown">
+                                    <thead><tr><th style="padding: 4px 12px; border-bottom: 1px solid #e2e8f0; text-align: left;"><?php _e('Level', 'matrix-mlm'); ?></th><th style="padding: 4px 12px; border-bottom: 1px solid #e2e8f0; text-align: right;"><?php _e('Positions', 'matrix-mlm'); ?></th></tr></thead>
+                                    <tbody>
+                                    <?php for ($i = 1; $i <= $default_depth; $i++): ?>
+                                        <tr><td style="padding: 4px 12px;"><?php printf(__('Level %d', 'matrix-mlm'), $i); ?></td><td style="padding: 4px 12px; text-align: right;"><?php echo number_format(pow($default_width, $i - 1)); ?></td></tr>
+                                    <?php endfor; ?>
+                                    </tbody>
+                                    <tfoot><tr><td style="padding: 4px 12px; border-top: 2px solid #4f46e5; font-weight: bold;"><?php _e('Total', 'matrix-mlm'); ?></td><td style="padding: 4px 12px; border-top: 2px solid #4f46e5; font-weight: bold; text-align: right;" id="settings-matrix-total"><?php echo number_format($max_members); ?></td></tr></tfoot>
+                                </table>
+                            </div>
+                            <div style="flex: 1;">
+                                <p style="margin: 0; color: #64748b; font-size: 13px;">
+                                    <?php _e('This means each member must recruit', 'matrix-mlm'); ?> <strong id="settings-width-display"><?php echo $default_width; ?></strong> <?php _e('people directly, and the matrix completes after', 'matrix-mlm'); ?> <strong id="settings-depth-display"><?php echo $default_depth; ?></strong> <?php _e('levels are filled.', 'matrix-mlm'); ?>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Spillover Placement', 'matrix-mlm'); ?></th>
+                <td>
+                    <select name="matrix_mlm_spillover_type">
+                        <option value="top_down" <?php selected($spillover, 'top_down'); ?>><?php _e('Top-Down (BFS) — Fill left to right, top to bottom', 'matrix-mlm'); ?></option>
+                        <option value="sponsor_first" <?php selected($spillover, 'sponsor_first'); ?>><?php _e('Sponsor-First — Place under sponsor tree first', 'matrix-mlm'); ?></option>
+                    </select>
+                    <p class="description"><?php _e('Determines how new members are placed when their direct sponsor position is full.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Auto Re-Entry', 'matrix-mlm'); ?></th>
+                <td>
+                    <label><input type="checkbox" name="matrix_mlm_auto_reentry" value="1" <?php checked($auto_reentry, 1); ?>> <?php _e('Automatically re-enter members into a new matrix cycle after completion', 'matrix-mlm'); ?></label>
+                    <p class="description"><?php _e('When enabled, members who complete a matrix cycle are automatically placed back at the top of a new cycle.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+        </table>
+
+        <script>
+        (function() {
+            var widthEl = document.getElementById('settings_matrix_width');
+            var depthEl = document.getElementById('settings_matrix_depth');
+
+            function getTypeLabel(width) {
+                if (width == 1) return 'Unilevel';
+                if (width == 2) return 'Binary';
+                if (width == 3) return 'Ternary';
+                return width + '-Wide';
+            }
+
+            function updatePreview() {
+                var w = parseInt(widthEl.value) || 2;
+                var d = parseInt(depthEl.value) || 3;
+                var total = 0;
+                var rows = '';
+                for (var i = 1; i <= d; i++) {
+                    var positions = Math.pow(w, i - 1);
+                    total += positions;
+                    rows += '<tr><td style="padding:4px 12px;">Level ' + i + '</td><td style="padding:4px 12px;text-align:right;">' + positions.toLocaleString() + '</td></tr>';
+                }
+                document.getElementById('settings-matrix-label').textContent = getTypeLabel(w) + ' (' + w + 'x' + d + ')';
+                document.getElementById('settings-matrix-breakdown').querySelector('tbody').innerHTML = rows;
+                document.getElementById('settings-matrix-total').textContent = total.toLocaleString();
+                document.getElementById('settings-width-display').textContent = w;
+                document.getElementById('settings-depth-display').textContent = d;
+            }
+
+            widthEl.addEventListener('input', updatePreview);
+            depthEl.addEventListener('input', updatePreview);
+        })();
+        </script>
     <?php }
 
     private function render_financial_tab() { ?>
@@ -254,6 +369,9 @@ class Matrix_MLM_Admin_Settings {
             case 'general':
                 $settings = ['matrix_mlm_site_title', 'matrix_mlm_currency', 'matrix_mlm_currency_symbol', 'matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled'];
                 break;
+            case 'matrix':
+                $settings = ['matrix_mlm_default_width', 'matrix_mlm_default_depth', 'matrix_mlm_spillover_type', 'matrix_mlm_auto_reentry'];
+                break;
             case 'financial':
                 $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer'];
                 break;
@@ -291,7 +409,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_fintava_enabled'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_fintava_enabled', 'matrix_mlm_auto_reentry'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

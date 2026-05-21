@@ -1,7 +1,7 @@
 <?php
 /**
  * Matrix Plan Engine
- * Handles matrix structures: 2x3, 3x3, 5x5, 4x7, 5x7, 3x9, 2x12
+ * Handles any matrix structure: admin configurable (e.g., 1x2, 2x3, 3x9, 5x10, etc.)
  */
 
 if (!defined('ABSPATH')) {
@@ -11,17 +11,67 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Plan_Engine {
 
     /**
-     * Supported matrix dimensions [width x depth]
+     * Get the default matrix dimensions from admin settings.
+     * Falls back to 2x3 if not configured.
      */
-    const SUPPORTED_PLANS = [
-        '2x3'  => ['width' => 2, 'depth' => 3],
-        '3x3'  => ['width' => 3, 'depth' => 3],
-        '5x5'  => ['width' => 5, 'depth' => 5],
-        '4x7'  => ['width' => 4, 'depth' => 7],
-        '5x7'  => ['width' => 5, 'depth' => 7],
-        '3x9'  => ['width' => 3, 'depth' => 9],
-        '2x12' => ['width' => 2, 'depth' => 12],
-    ];
+    public static function get_default_matrix() {
+        return [
+            'width' => intval(get_option('matrix_mlm_default_width', 2)),
+            'depth' => intval(get_option('matrix_mlm_default_depth', 3)),
+        ];
+    }
+
+    /**
+     * Calculate total positions in a complete matrix
+     */
+    public static function calculate_max_members($width, $depth) {
+        if ($width <= 0 || $depth <= 0) {
+            return 0;
+        }
+        $total = 0;
+        for ($i = 0; $i < $depth; $i++) {
+            $total += pow($width, $i);
+        }
+        return $total;
+    }
+
+    /**
+     * Calculate positions at a specific level
+     */
+    public static function calculate_level_positions($width, $level) {
+        if ($width <= 0 || $level < 1) {
+            return 0;
+        }
+        return pow($width, $level - 1);
+    }
+
+    /**
+     * Validate matrix dimensions
+     */
+    public static function validate_matrix($width, $depth) {
+        $errors = [];
+
+        if ($width < 1) {
+            $errors[] = __('Matrix width must be at least 1.', 'matrix-mlm');
+        }
+        if ($width > 20) {
+            $errors[] = __('Matrix width cannot exceed 20.', 'matrix-mlm');
+        }
+        if ($depth < 1) {
+            $errors[] = __('Matrix depth must be at least 1.', 'matrix-mlm');
+        }
+        if ($depth > 20) {
+            $errors[] = __('Matrix depth cannot exceed 20.', 'matrix-mlm');
+        }
+
+        // Warn about extremely large matrices
+        $max_members = self::calculate_max_members($width, $depth);
+        if ($max_members > 10000000) {
+            $errors[] = sprintf(__('Warning: This matrix configuration would require %s members to complete. Consider using a smaller width or depth.', 'matrix-mlm'), number_format($max_members));
+        }
+
+        return $errors;
+    }
 
     /**
      * Join a matrix plan
@@ -320,10 +370,7 @@ class Matrix_MLM_Plan_Engine {
         global $wpdb;
 
         // Calculate max members for a complete matrix
-        $max_members = 0;
-        for ($i = 0; $i < $depth; $i++) {
-            $max_members += pow($width, $i);
-        }
+        $max_members = self::calculate_max_members($width, $depth);
 
         // Find positions that might be complete (root positions with enough downline)
         $potential_completions = $wpdb->get_results($wpdb->prepare(
@@ -523,10 +570,7 @@ class Matrix_MLM_Plan_Engine {
         ));
 
         // Max members calculation
-        $max_members = 0;
-        for ($i = 0; $i < $plan->depth; $i++) {
-            $max_members += pow($plan->width, $i);
-        }
+        $max_members = self::calculate_max_members($plan->width, $plan->depth);
 
         return [
             'plan' => $plan,
@@ -552,5 +596,22 @@ class Matrix_MLM_Plan_Engine {
             "SELECT * FROM {$wpdb->prefix}matrix_plans WHERE status = %s ORDER BY price ASC",
             $status
         ));
+    }
+
+    /**
+     * Get a human-readable matrix type label
+     */
+    public static function get_matrix_label($width, $depth) {
+        $type = '';
+        if ($width == 1) {
+            $type = __('Unilevel', 'matrix-mlm');
+        } elseif ($width == 2) {
+            $type = __('Binary', 'matrix-mlm');
+        } elseif ($width == 3) {
+            $type = __('Ternary', 'matrix-mlm');
+        } else {
+            $type = sprintf(__('%d-Wide', 'matrix-mlm'), $width);
+        }
+        return sprintf('%s (%dx%d)', $type, $width, $depth);
     }
 }
