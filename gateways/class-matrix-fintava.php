@@ -1165,7 +1165,7 @@ class Matrix_MLM_Fintava {
         $customer_id = '';
 
         // 1. Check if we already have a customer_id stored
-        if (!empty($wallet_row->customer_id)) {
+        if (isset($wallet_row->customer_id) && !empty($wallet_row->customer_id)) {
             $customer_id = $wallet_row->customer_id;
         }
 
@@ -1247,10 +1247,20 @@ class Matrix_MLM_Fintava {
         // 5. Persist wallet_id and customer_id back to the local row
         $update_data = [
             'wallet_id'   => $resolved_wallet_id,
-            'customer_id' => $customer_id,
             'updated_at'  => current_time('mysql'),
         ];
-        $update_formats = ['%s', '%s', '%s'];
+        $update_formats = ['%s', '%s'];
+
+        // Only include customer_id if the column exists (safe for pre-migration DBs)
+        $col_exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'customer_id'",
+            DB_NAME,
+            $wpdb->prefix . 'matrix_fintava_wallets'
+        ));
+        if ($col_exists && intval($col_exists) > 0) {
+            $update_data['customer_id'] = $customer_id;
+            $update_formats[] = '%s';
+        }
 
         // Also save bank_code if available
         $bank_code = $wallet_obj['bank_code'] ?? $wallet_obj['bankCode'] ?? null;
