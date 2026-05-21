@@ -208,7 +208,17 @@ class Matrix_MLM_Admin {
 
             if ($result['success']) {
                 $generated_pins = $result['pins'];
-                echo '<div class="notice notice-success"><p>' . sprintf(__('%d E-Pins generated successfully! Amount: %s per pin.', 'matrix-mlm'), $result['count'], $currency . number_format($result['amount'], 2)) . '</p></div>';
+                if (!empty($result['failed'])) {
+                    echo '<div class="notice notice-warning"><p>' . sprintf(
+                        __('%1$d of %2$d E-Pins generated. %3$d failed to save. %4$s', 'matrix-mlm'),
+                        $result['count'],
+                        $result['count'] + $result['failed'],
+                        $result['failed'],
+                        !empty($result['error']) ? '(' . esc_html($result['error']) . ')' : ''
+                    ) . '</p></div>';
+                } else {
+                    echo '<div class="notice notice-success"><p>' . sprintf(__('%d E-Pins generated successfully! Amount: %s per pin.', 'matrix-mlm'), $result['count'], $currency . number_format($result['amount'], 2)) . '</p></div>';
+                }
             } else {
                 echo '<div class="notice notice-error"><p>' . esc_html($result['message']) . '</p></div>';
             }

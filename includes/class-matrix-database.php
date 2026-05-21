@@ -10,6 +10,35 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Database {
 
     /**
+     * Run schema migrations on every load if the stored DB version is older
+     * than the constant. Safe to call repeatedly — dbDelta is idempotent.
+     */
+    public static function maybe_upgrade() {
+        $installed = get_option('matrix_mlm_db_version');
+        if ($installed === MATRIX_MLM_DB_VERSION) {
+            return;
+        }
+
+        // Re-run the schema (dbDelta is idempotent).
+        self::create_tables();
+
+        // Defensive ALTER for the e-pins plan_id NOT NULL → NULL change.
+        // dbDelta does not always alter NULL constraints reliably across MySQL versions.
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_epins';
+        $col = $wpdb->get_row($wpdb->prepare(
+            "SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'plan_id'",
+            DB_NAME, $table
+        ));
+        if ($col && strtoupper($col->IS_NULLABLE) === 'NO') {
+            $wpdb->query("ALTER TABLE {$table} MODIFY plan_id BIGINT(20) UNSIGNED NULL DEFAULT NULL");
+        }
+
+        update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
+    }
+
+    /**
      * Create all plugin tables
      */
     public static function create_tables() {
@@ -149,7 +178,7 @@ class Matrix_MLM_Database {
         $sql_epins = "CREATE TABLE $table_epins (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             pin_code varchar(50) NOT NULL,
-            plan_id bigint(20) UNSIGNED NOT NULL,
+            plan_id bigint(20) UNSIGNED DEFAULT NULL,
             amount decimal(12,2) NOT NULL,
             created_by bigint(20) UNSIGNED NOT NULL,
             used_by bigint(20) UNSIGNED DEFAULT NULL,
