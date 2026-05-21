@@ -733,14 +733,40 @@ class Matrix_MLM_Core {
         if (version_compare($installed_version, MATRIX_MLM_VERSION, '<')) {
             global $wpdb;
 
-            // Activate any inactive gateways that have no API keys configured yet
-            // This fixes installations where gateways were seeded with status=0
             $gateways_table = $wpdb->prefix . 'matrix_gateways';
             $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$gateways_table'");
 
             if ($table_exists) {
-                // Activate gateways - they should be visible and the admin can deactivate if needed
-                $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
+                $gateway_count = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table");
+
+                if ($gateway_count == 0) {
+                    // Table exists but is empty — seed default gateways as active
+                    $wpdb->insert($gateways_table, [
+                        'name' => 'Paystack',
+                        'slug' => 'paystack',
+                        'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'webhook_secret' => '']),
+                        'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
+                        'min_amount' => 100.00,
+                        'max_amount' => 5000000.00,
+                        'fixed_charge' => 0.00,
+                        'percent_charge' => 1.50,
+                        'status' => 1
+                    ]);
+                    $wpdb->insert($gateways_table, [
+                        'name' => 'Flutterwave',
+                        'slug' => 'flutterwave',
+                        'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'encryption_key' => '', 'webhook_hash' => '']),
+                        'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
+                        'min_amount' => 100.00,
+                        'max_amount' => 10000000.00,
+                        'fixed_charge' => 0.00,
+                        'percent_charge' => 1.40,
+                        'status' => 1
+                    ]);
+                } else {
+                    // Activate any inactive gateways from previous installs
+                    $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
+                }
             }
 
             // Ensure default root user exists for referral system
