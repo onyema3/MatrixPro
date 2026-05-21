@@ -19,7 +19,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin Constants
-define('MATRIX_MLM_VERSION', '1.0.0');
+define('MATRIX_MLM_VERSION', '1.0.1');
 define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
