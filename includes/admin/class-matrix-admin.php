@@ -465,6 +465,9 @@ class Matrix_MLM_Admin {
             case 'update_user_profile':
                 $this->update_user_profile();
                 break;
+            case 'move_user_position':
+                $this->move_user_position();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -603,5 +606,211 @@ class Matrix_MLM_Admin {
         $wpdb->update($wpdb->prefix . 'matrix_user_meta', $meta_data, ['user_id' => $user_id]);
 
         wp_send_json_success(['message' => __('User profile updated successfully', 'matrix-mlm')]);
+    }
+
+    /**
+     * Move a user to a new position in the genealogy tree
+     */
+    private function move_user_position() {
+        global $wpdb;
+
+        $position_id = intval($_POST['position_id'] ?? 0);
+        $new_parent_username = sanitize_text_field($_POST['new_parent_username'] ?? '');
+        $new_sponsor_username = sanitize_text_field($_POST['new_sponsor_username'] ?? '');
+
+        if (!$position_id) {
+            wp_send_json_error(['message' => __('Position ID is required', 'matrix-mlm')]);
+        }
+
+        // Get the position being moved
+        $position = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+            $position_id
+        ));
+
+        if (!$position) {
+            wp_send_json_error(['message' => __('Position not found', 'matrix-mlm')]);
+        }
+
+        $plan_id = $position->plan_id;
+        $plan = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d", $plan_id));
+
+        // Handle parent change (tree position)
+        if (!empty($new_parent_username)) {
+            $new_parent_user = get_user_by('login', $new_parent_username);
+            if (!$new_parent_user) {
+                wp_send_json_error(['message' => __('New parent user not found', 'matrix-mlm')]);
+            }
+
+            // Cannot move under self or own descendant
+            if ($new_parent_user->ID == $position->user_id) {
+                wp_send_json_error(['message' => __('Cannot place a user under themselves', 'matrix-mlm')]);
+            }
+
+            // Get new parent's position in this plan
+            $new_parent_position = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}matrix_positions WHERE user_id = %d AND plan_id = %d AND status = 'active'",
+                $new_parent_user->ID, $plan_id
+            ));
+
+            if (!$new_parent_position) {
+                wp_send_json_error(['message' => __('New parent does not have an active position in this plan', 'matrix-mlm')]);
+            }
+
+            // Check if new parent already has max children (width limit)
+            $child_count = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_positions WHERE parent_id = %d AND plan_id = %d AND id != %d",
+                $new_parent_position->id, $plan_id, $position_id
+            ));
+
+            if ($child_count >= $plan->width) {
+                wp_send_json_error(['message' => sprintf(__('New parent already has %d children (max width: %d). Remove a child first or choose a different parent.', 'matrix-mlm'), $child_count, $plan->width)]);
+            }
+
+            // Check this won't create a circular reference (moving under own descendant)
+            if ($this->is_descendant_of($new_parent_position->id, $position_id, $plan_id)) {
+                wp_send_json_error(['message' => __('Cannot move a user under their own descendant. This would create a circular reference.', 'matrix-mlm')]);
+            }
+
+            // Store old parent for count update
+            $old_parent_id = $position->parent_id;
+
+            // Calculate new level
+            $new_level = $new_parent_position->level + 1;
+
+            // Perform the move
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_positions',
+                [
+                    'parent_id' => $new_parent_position->id,
+                    'position' => $child_count, // Place at next available slot
+                    'level' => $new_level,
+                ],
+                ['id' => $position_id]
+            );
+
+            // Update levels of all descendants recursively
+            $this->recalculate_descendant_levels($position_id, $new_level, $plan_id);
+
+            // Recalculate downline counts for old parent (subtract)
+            if ($old_parent_id) {
+                $this->recalculate_upline_counts($old_parent_id, $plan_id);
+            }
+
+            // Recalculate downline counts for new parent (add)
+            $this->recalculate_upline_counts($new_parent_position->id, $plan_id);
+        }
+
+        // Handle sponsor change
+        if (!empty($new_sponsor_username)) {
+            $new_sponsor_user = get_user_by('login', $new_sponsor_username);
+            if (!$new_sponsor_user) {
+                wp_send_json_error(['message' => __('New sponsor user not found', 'matrix-mlm')]);
+            }
+
+            if ($new_sponsor_user->ID == $position->user_id) {
+                wp_send_json_error(['message' => __('Cannot set user as their own sponsor', 'matrix-mlm')]);
+            }
+
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_positions',
+                ['sponsor_id' => $new_sponsor_user->ID],
+                ['id' => $position_id]
+            );
+
+            // Also update the referred_by in matrix_user_meta
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_user_meta',
+                ['referred_by' => $new_sponsor_user->ID],
+                ['user_id' => $position->user_id]
+            );
+        }
+
+        wp_send_json_success(['message' => __('User position updated successfully in the genealogy tree', 'matrix-mlm')]);
+    }
+
+    /**
+     * Check if a position is a descendant of another position
+     */
+    private function is_descendant_of($check_id, $ancestor_id, $plan_id) {
+        global $wpdb;
+        $current_id = $check_id;
+        $max_depth = 50; // Safety limit
+
+        while ($current_id && $max_depth-- > 0) {
+            $parent = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, parent_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d AND plan_id = %d",
+                $current_id, $plan_id
+            ));
+            if (!$parent) break;
+            if ($parent->parent_id == $ancestor_id) return true;
+            $current_id = $parent->parent_id;
+        }
+        return false;
+    }
+
+    /**
+     * Recursively update levels for all descendants after a move
+     */
+    private function recalculate_descendant_levels($parent_id, $parent_level, $plan_id) {
+        global $wpdb;
+        $children = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}matrix_positions WHERE parent_id = %d AND plan_id = %d",
+            $parent_id, $plan_id
+        ));
+
+        foreach ($children as $child) {
+            $child_level = $parent_level + 1;
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_positions',
+                ['level' => $child_level],
+                ['id' => $child->id]
+            );
+            $this->recalculate_descendant_levels($child->id, $child_level, $plan_id);
+        }
+    }
+
+    /**
+     * Recalculate total_downline for a position and all its ancestors
+     */
+    private function recalculate_upline_counts($position_id, $plan_id) {
+        global $wpdb;
+        $current_id = $position_id;
+        $max_depth = 50;
+
+        while ($current_id && $max_depth-- > 0) {
+            // Count all descendants of this position
+            $count = $this->count_all_descendants($current_id, $plan_id);
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_positions',
+                ['total_downline' => $count],
+                ['id' => $current_id]
+            );
+
+            // Move up to parent
+            $parent_id = $wpdb->get_var($wpdb->prepare(
+                "SELECT parent_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+                $current_id
+            ));
+            $current_id = $parent_id;
+        }
+    }
+
+    /**
+     * Count all descendants of a position recursively
+     */
+    private function count_all_descendants($position_id, $plan_id) {
+        global $wpdb;
+        $count = 0;
+        $children = $wpdb->get_results($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}matrix_positions WHERE parent_id = %d AND plan_id = %d",
+            $position_id, $plan_id
+        ));
+
+        foreach ($children as $child) {
+            $count++;
+            $count += $this->count_all_descendants($child->id, $plan_id);
+        }
+        return $count;
     }
 }
