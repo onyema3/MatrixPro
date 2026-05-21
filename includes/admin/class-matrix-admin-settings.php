@@ -29,6 +29,7 @@ class Matrix_MLM_Admin_Settings {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=sms'); ?>" class="nav-tab <?php echo $tab === 'sms' ? 'nav-tab-active' : ''; ?>"><?php _e('SMS', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=language'); ?>" class="nav-tab <?php echo $tab === 'language' ? 'nav-tab-active' : ''; ?>"><?php _e('Language', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=livechat'); ?>" class="nav-tab <?php echo $tab === 'livechat' ? 'nav-tab-active' : ''; ?>"><?php _e('Livechat', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=subscription'); ?>" class="nav-tab <?php echo $tab === 'subscription' ? 'nav-tab-active' : ''; ?>"><?php _e('Subscription', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=fintava'); ?>" class="nav-tab <?php echo $tab === 'fintava' ? 'nav-tab-active' : ''; ?>"><?php _e('Fintava', 'matrix-mlm'); ?></a>
             </nav>
 
@@ -47,6 +48,7 @@ class Matrix_MLM_Admin_Settings {
                     case 'sms': $this->render_sms_tab(); break;
                     case 'language': $this->render_language_tab(); break;
                     case 'livechat': $this->render_livechat_tab(); break;
+                    case 'subscription': $this->render_subscription_tab(); break;
                     case 'fintava': $this->render_fintava_tab(); break;
                 }
                 ?>
@@ -392,6 +394,61 @@ class Matrix_MLM_Admin_Settings {
         </table>
     <?php }
 
+    private function render_subscription_tab() {
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        ?>
+        <h2><?php _e('Monthly Subscription', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom: 20px;">
+            <?php _e('Configure automatic monthly payments. Users who do not pay within the grace period will be set to inactive.', 'matrix-mlm'); ?>
+        </p>
+
+        <table class="form-table">
+            <tr>
+                <th><?php _e('Enable Monthly Subscription', 'matrix-mlm'); ?></th>
+                <td><label><input type="checkbox" name="matrix_mlm_subscription_enabled" value="1" <?php checked(get_option('matrix_mlm_subscription_enabled', 0)); ?>> <?php _e('Charge users a monthly fee to stay active', 'matrix-mlm'); ?></label></td>
+            </tr>
+            <tr>
+                <th><?php _e('Monthly Amount', 'matrix-mlm'); ?> (<?php echo $currency; ?>)</th>
+                <td>
+                    <input type="number" name="matrix_mlm_subscription_amount" step="0.01" min="0" value="<?php echo esc_attr(get_option('matrix_mlm_subscription_amount', 0)); ?>" class="regular-text">
+                    <p class="description"><?php _e('Amount charged from each user\'s Matrix wallet every month.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Billing Day', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_subscription_billing_day" min="1" max="28" value="<?php echo esc_attr(get_option('matrix_mlm_subscription_billing_day', 1)); ?>" class="small-text">
+                    <p class="description"><?php _e('Day of the month when subscriptions are charged (1-28). Using 28 or lower ensures consistency across all months.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Grace Period (Days)', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_subscription_grace_days" min="0" max="15" value="<?php echo esc_attr(get_option('matrix_mlm_subscription_grace_days', 3)); ?>" class="small-text">
+                    <p class="description"><?php _e('Number of days after billing day before user is deactivated. Set to 0 for immediate deactivation.', 'matrix-mlm'); ?></p>
+                </td>
+            </tr>
+        </table>
+
+        <?php
+        // Show subscription stats
+        global $wpdb;
+        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}matrix_subscriptions'");
+        if ($table_exists):
+            $current_month = date('Y-m');
+            $paid_count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_subscriptions WHERE billing_month = %s AND status = 'paid'", $current_month));
+            $unpaid_count = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_subscriptions WHERE billing_month = %s AND status IN ('unpaid','overdue')", $current_month));
+            $total_collected = $wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(amount), 0) FROM {$wpdb->prefix}matrix_subscriptions WHERE billing_month = %s AND status = 'paid'", $current_month));
+        ?>
+        <h3><?php printf(__('This Month (%s)', 'matrix-mlm'), date('F Y')); ?></h3>
+        <div class="matrix-admin-stats" style="margin-bottom: 20px;">
+            <div class="stat-card stat-success"><h3><?php echo number_format($paid_count); ?></h3><p><?php _e('Paid', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-danger"><h3><?php echo number_format($unpaid_count); ?></h3><p><?php _e('Unpaid/Overdue', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-info"><h3><?php echo $currency . number_format($total_collected, 2); ?></h3><p><?php _e('Collected', 'matrix-mlm'); ?></p></div>
+        </div>
+        <?php endif; ?>
+    <?php }
+
     private function render_fintava_tab() { ?>
         <h2><?php _e('Fintava Pay - Merchant Settings', 'matrix-mlm'); ?></h2>
         <p class="description"><?php _e('Configure Fintava Pay API for bank payouts. Users transfer from their Matrix wallet to their Fintava wallet (or any bank account) via the merchant credit endpoint.', 'matrix-mlm'); ?></p>
@@ -498,6 +555,19 @@ class Matrix_MLM_Admin_Settings {
             case 'livechat':
                 $settings = ['matrix_mlm_livechat_enabled', 'matrix_mlm_livechat_code'];
                 break;
+            case 'subscription':
+                $settings = ['matrix_mlm_subscription_enabled', 'matrix_mlm_subscription_amount', 'matrix_mlm_subscription_billing_day', 'matrix_mlm_subscription_grace_days'];
+                // Create subscriptions table if it doesn't exist
+                Matrix_MLM_Subscription::create_table();
+                // Schedule or unschedule cron based on enabled status
+                if (!empty($_POST['matrix_mlm_subscription_enabled'])) {
+                    if (!wp_next_scheduled('matrix_mlm_monthly_subscription')) {
+                        wp_schedule_event(time(), 'daily', 'matrix_mlm_monthly_subscription');
+                    }
+                } else {
+                    wp_clear_scheduled_hook('matrix_mlm_monthly_subscription');
+                }
+                break;
             case 'fintava':
                 $settings = ['matrix_mlm_fintava_enabled', 'matrix_mlm_fintava_public_key', 'matrix_mlm_fintava_secret_key', 'matrix_mlm_fintava_webhook_secret', 'matrix_mlm_fintava_base_url', 'matrix_mlm_fintava_min_payout', 'matrix_mlm_fintava_max_payout', 'matrix_mlm_fintava_charge_type', 'matrix_mlm_fintava_charge_value'];
                 break;
@@ -514,7 +584,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_fintava_enabled', 'matrix_mlm_auto_reentry'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_fintava_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);
