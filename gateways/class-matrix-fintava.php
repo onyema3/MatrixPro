@@ -16,11 +16,12 @@
  * Fintava ever changes their endpoint.
  *
  * Endpoints used:
- * - GET  /merchant/balance        - Get merchant wallet balance
- * - POST /bank/credit/merchant    - Credit a bank account (payout from merchant)
- * - POST /virtual-wallet/generate - Generate virtual wallet for user
- * - GET  /banks                   - List supported banks
- * - POST /resolve-account         - Verify bank account (name lookup)
+ * - GET  /merchant/balance                    - Get merchant wallet balance
+ * - POST /bank/credit/merchant                - Credit a bank account (payout from merchant)
+ * - POST /virtual-wallet/generate             - Generate virtual wallet for user
+ * - GET  /customer/wallet/balance/{walletId}  - Get virtual wallet balance (fast path)
+ * - GET  /banks                               - List supported banks
+ * - POST /resolve-account                     - Verify bank account (name lookup)
  */
 
 if (!defined('ABSPATH')) {
@@ -1737,38 +1738,103 @@ class Matrix_MLM_Fintava {
             return new WP_Error('missing_wallet_id', __('Wallet ID is required', 'matrix-mlm'));
         }
 
+        // ---- Fast path: dedicated balance endpoint. ----------------------
+        // GET /customer/wallet/balance/{walletId} — single round-trip,
+        // documented on the Fintava dev tier and rolling out to live. We
+        // try it first and only fall back to the heavier details chain
+        // (path-style GET → /loma-name/enquiry → /customers/{id}) if this
+        // endpoint isn't available on the active tier.
+        //
+        // Negative-cached for the rest of the request so a tier that 404s
+        // here doesn't burn a round-trip per refresh — same pattern used
+        // throughout get_virtual_wallet_details().
+        static $balance_endpoint_dead = false;
+
+        if (!$balance_endpoint_dead) {
+            $direct = $this->make_request('GET', '/customer/wallet/balance/' . rawurlencode($wallet_id));
+            if (!is_wp_error($direct)) {
+                $payload = isset($direct['data']) && is_array($direct['data']) ? $direct['data'] : $direct;
+                $normalized = $this->normalize_balance_payload($payload);
+                if ($normalized !== null) {
+                    return $normalized;
+                }
+                // Endpoint replied 200 but with a shape we don't recognise —
+                // fall through to the details chain rather than returning a
+                // half-parsed result.
+            } else {
+                $msg = strtolower(is_array($direct->get_error_message()) ? implode(' ', $direct->get_error_message()) : (string) $direct->get_error_message());
+                if (strpos($msg, 'cannot get') !== false
+                    || strpos($msg, 'not found') !== false
+                    || strpos($msg, 'http 404') !== false
+                    || strpos($msg, '(http 404)') !== false) {
+                    // Tier doesn't expose this endpoint — stop probing it
+                    // for the rest of the request and let the details
+                    // fallback take over.
+                    $balance_endpoint_dead = true;
+                } else {
+                    // Real failure (auth, rate-limit, network). Surface it
+                    // immediately rather than masking it behind a fallback.
+                    return $direct;
+                }
+            }
+        }
+
+        // ---- Fallback: derive balance from the wallet details object. ----
         $details = $this->get_virtual_wallet_details($wallet_id, $account_number, $customer_id);
         if (is_wp_error($details)) {
             return $details;
         }
 
+        $normalized = $this->normalize_balance_payload($details);
+        if ($normalized === null) {
+            return new WP_Error(
+                'fintava_balance_unavailable',
+                __('Fintava did not return a balance for this wallet.', 'matrix-mlm')
+            );
+        }
+        return $normalized;
+    }
+
+    /**
+     * Pull available_balance / ledger_balance / currency out of any of the
+     * field-name variations Fintava uses across endpoints (snake_case vs
+     * camelCase, balance vs available_balance vs wallet_balance vs
+     * current_balance, etc.). Returns null when neither an available nor a
+     * ledger balance can be located so the caller can fall through to the
+     * next strategy.
+     *
+     * @param array $payload Decoded wallet/balance object.
+     * @return array{available_balance: float, ledger_balance: float, currency: string}|null
+     */
+    private function normalize_balance_payload($payload) {
+        if (!is_array($payload)) {
+            return null;
+        }
+
         $available = null;
         foreach (['available_balance', 'availableBalance', 'wallet_balance', 'walletBalance', 'balance', 'current_balance', 'currentBalance'] as $key) {
-            if (isset($details[$key]) && $details[$key] !== '') {
-                $available = floatval($details[$key]);
+            if (isset($payload[$key]) && $payload[$key] !== '') {
+                $available = floatval($payload[$key]);
                 break;
             }
         }
 
         $ledger = null;
         foreach (['ledger_balance', 'ledgerBalance', 'book_balance', 'bookBalance'] as $key) {
-            if (isset($details[$key]) && $details[$key] !== '') {
-                $ledger = floatval($details[$key]);
+            if (isset($payload[$key]) && $payload[$key] !== '') {
+                $ledger = floatval($payload[$key]);
                 break;
             }
         }
 
         if ($available === null && $ledger === null) {
-            return new WP_Error(
-                'fintava_balance_unavailable',
-                __('Fintava did not return a balance for this wallet.', 'matrix-mlm')
-            );
+            return null;
         }
 
         return [
             'available_balance' => $available !== null ? $available : $ledger,
             'ledger_balance'    => $ledger !== null ? $ledger : $available,
-            'currency'          => $details['currency'] ?? 'NGN',
+            'currency'          => $payload['currency'] ?? 'NGN',
         ];
     }
 
