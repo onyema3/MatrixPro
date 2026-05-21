@@ -485,6 +485,9 @@ class Matrix_MLM_Admin {
             case 'fintava_lookup_wallet':
                 $this->fintava_lookup_wallet();
                 break;
+            case 'fintava_backfill_wallet_ids':
+                $this->fintava_backfill_wallet_ids();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -874,6 +877,45 @@ class Matrix_MLM_Admin {
                 'customer_email' => $details['email'] ?? $details['customer_email'] ?? '',
                 'customer_phone' => $details['phone'] ?? $details['customer_phone'] ?? '',
             ],
+        ]);
+    }
+
+    /**
+     * Backfill missing wallet_id values across all linked Fintava accounts.
+     *
+     * Delegates to the gateway's backfill_missing_wallet_ids() orchestrator
+     * (primary: list endpoint, fallback: webhook log scan; both verified via
+     * GET /virtual-wallet/{id} before persisting). Returns a structured
+     * report so the migration page can render counts and a per-row table.
+     */
+    private function fintava_backfill_wallet_ids() {
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->is_active()) {
+            wp_send_json_error(['message' => __('Fintava is not configured. Add the live API key on the Gateways page first.', 'matrix-mlm')]);
+        }
+
+        // Give long Fintava list pagination a chance to finish without tripping
+        // the default 30s PHP timeout in shared hosting environments.
+        @set_time_limit(180);
+
+        $report = $fintava->backfill_missing_wallet_ids();
+        if (is_wp_error($report)) {
+            wp_send_json_error(['message' => $report->get_error_message()]);
+        }
+
+        // Build a friendly summary line for the toast.
+        $summary = sprintf(
+            __('Backfill complete: %d via list API, %d via webhook logs, %d mismatched, %d still missing (started with %d).', 'matrix-mlm'),
+            $report['backfilled_via_list_api'],
+            $report['backfilled_via_webhook'],
+            $report['mismatched'],
+            $report['still_missing'],
+            $report['total_missing_before']
+        );
+
+        wp_send_json_success([
+            'message' => $summary,
+            'report'  => $report,
         ]);
     }
 

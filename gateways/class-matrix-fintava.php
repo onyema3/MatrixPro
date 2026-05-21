@@ -1134,6 +1134,355 @@ class Matrix_MLM_Fintava {
         ];
     }
 
+    /**
+     * GET /virtual-wallet — list virtual wallets owned by this merchant.
+     *
+     * Some Fintava live tiers expose a paginated list endpoint; not every
+     * account has it enabled, so this method must fail gracefully. Returns
+     * a normalized array on success or WP_Error on failure.
+     *
+     * @param int $page  1-indexed page number.
+     * @param int $limit Max records per page (capped to 100).
+     * @return array|WP_Error {
+     *     @type array $wallets    List of wallet records (raw API objects).
+     *     @type int   $page       Page that was requested.
+     *     @type int   $total      Total available across all pages, if reported.
+     *     @type bool  $has_more   Whether another page is likely available.
+     * }
+     */
+    public function list_virtual_wallets($page = 1, $limit = 100) {
+        $page  = max(1, intval($page));
+        $limit = max(1, min(100, intval($limit)));
+
+        $endpoint = sprintf('/virtual-wallet?page=%d&limit=%d', $page, $limit);
+        $response = $this->make_request('GET', $endpoint);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        // Tolerate both "wrapped" ({status, data:[...]}) and "bare" array shapes.
+        $wallets = [];
+        if (isset($response['data']) && is_array($response['data'])) {
+            // Some APIs return data as a list; others wrap it in data.items / data.results.
+            if (isset($response['data'][0]) || empty($response['data'])) {
+                $wallets = $response['data'];
+            } elseif (isset($response['data']['items']) && is_array($response['data']['items'])) {
+                $wallets = $response['data']['items'];
+            } elseif (isset($response['data']['results']) && is_array($response['data']['results'])) {
+                $wallets = $response['data']['results'];
+            } elseif (isset($response['data']['wallets']) && is_array($response['data']['wallets'])) {
+                $wallets = $response['data']['wallets'];
+            }
+        } elseif (is_array($response) && isset($response[0])) {
+            $wallets = $response;
+        }
+
+        $total = isset($response['total']) ? intval($response['total'])
+            : (isset($response['data']['total']) ? intval($response['data']['total']) : count($wallets));
+
+        $has_more = count($wallets) >= $limit;
+
+        return [
+            'wallets'  => $wallets,
+            'page'     => $page,
+            'total'    => $total,
+            'has_more' => $has_more,
+        ];
+    }
+
+    /**
+     * Backfill missing wallet_id values on local matrix_fintava_wallets rows by:
+     *
+     *   1. Listing all wallets via Fintava's list endpoint and matching on
+     *      account_number (primary path).
+     *   2. Falling back to scanning recent account_funded webhook log payloads
+     *      for any rows the list endpoint couldn't satisfy (e.g. when the list
+     *      endpoint isn't available on this account tier).
+     *
+     * Every candidate wallet_id is verified by calling GET /virtual-wallet/{id}
+     * and checking that the returned account_number matches the local row.
+     * Mismatches are NEVER persisted — same safety contract as ajax_set_my_wallet_id.
+     *
+     * @return array Diagnostic report with counts and per-row outcomes.
+     */
+    public function backfill_missing_wallet_ids() {
+        global $wpdb;
+
+        if (!$this->is_active()) {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava is not active. Configure the live API key first.', 'matrix-mlm')
+            );
+        }
+
+        self::ensure_tables_exist();
+        $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
+        $logs_table    = $wpdb->prefix . 'matrix_fintava_webhook_logs';
+
+        // 1. Find local rows missing a wallet_id.
+        $missing_rows = $wpdb->get_results(
+            "SELECT id, user_id, account_number, account_name
+               FROM {$wallets_table}
+              WHERE (wallet_id IS NULL OR wallet_id = '')
+                AND account_number IS NOT NULL
+                AND account_number <> ''"
+        );
+
+        $report = [
+            'total_missing_before'      => count($missing_rows),
+            'backfilled_via_list_api'   => 0,
+            'backfilled_via_webhook'    => 0,
+            'mismatched'                => 0,
+            'still_missing'             => 0,
+            'list_api_available'        => null,  // true | false
+            'list_api_error'            => null,
+            'pages_fetched'             => 0,
+            'details'                   => [],
+        ];
+
+        if (empty($missing_rows)) {
+            return $report;
+        }
+
+        // Index missing rows by account number for O(1) lookup.
+        $missing_by_account = [];
+        foreach ($missing_rows as $row) {
+            $missing_by_account[trim($row->account_number)] = $row;
+        }
+
+        // ---------------------------------------------------------------
+        // PRIMARY PATH: list endpoint
+        // ---------------------------------------------------------------
+        $page         = 1;
+        $max_pages    = 50;          // safety cap (50 * 100 = 5000 wallets)
+        $list_failed  = false;
+
+        while ($page <= $max_pages && !empty($missing_by_account)) {
+            $listing = $this->list_virtual_wallets($page, 100);
+            if (is_wp_error($listing)) {
+                if ($page === 1) {
+                    // Endpoint not available — fall through to webhook fallback.
+                    $report['list_api_available'] = false;
+                    $report['list_api_error']     = $listing->get_error_message();
+                    $list_failed = true;
+                } else {
+                    // Mid-pagination failure — log and bail out of the loop.
+                    $report['list_api_error'] = sprintf(
+                        'Stopped at page %d: %s',
+                        $page,
+                        $listing->get_error_message()
+                    );
+                }
+                break;
+            }
+
+            if ($report['list_api_available'] === null) {
+                $report['list_api_available'] = true;
+            }
+            $report['pages_fetched']++;
+
+            $wallets = isset($listing['wallets']) && is_array($listing['wallets']) ? $listing['wallets'] : [];
+
+            foreach ($wallets as $remote) {
+                if (empty($missing_by_account)) {
+                    break;
+                }
+
+                $remote_account = trim((string) (
+                    $remote['account_number']
+                    ?? $remote['accountNumber']
+                    ?? ''
+                ));
+                if ($remote_account === '' || !isset($missing_by_account[$remote_account])) {
+                    continue;
+                }
+
+                $remote_wallet_id = (string) (
+                    $remote['wallet_id']
+                    ?? $remote['walletId']
+                    ?? $remote['id']
+                    ?? ''
+                );
+                if ($remote_wallet_id === '') {
+                    continue;
+                }
+
+                $local_row = $missing_by_account[$remote_account];
+                $outcome   = $this->verify_and_persist_wallet_id($local_row, $remote_wallet_id);
+
+                if ($outcome['status'] === 'backfilled') {
+                    $report['backfilled_via_list_api']++;
+                    unset($missing_by_account[$remote_account]);
+                } elseif ($outcome['status'] === 'mismatched') {
+                    $report['mismatched']++;
+                    unset($missing_by_account[$remote_account]); // don't keep retrying with bad data
+                }
+                $outcome['source']         = 'list_api';
+                $outcome['user_id']        = (int) $local_row->user_id;
+                $outcome['account_number'] = $remote_account;
+                $report['details'][]       = $outcome;
+            }
+
+            if (!$listing['has_more']) {
+                break;
+            }
+            $page++;
+            usleep(150000); // 150ms — be polite to Fintava's rate limiter
+        }
+
+        // ---------------------------------------------------------------
+        // FALLBACK PATH: scan recent account_funded webhook logs
+        // ---------------------------------------------------------------
+        if (!empty($missing_by_account)) {
+            $log_rows = $wpdb->get_results(
+                "SELECT payload
+                   FROM {$logs_table}
+                  WHERE event_type = 'account_funded'
+                  ORDER BY id DESC
+                  LIMIT 500"
+            );
+
+            foreach ($log_rows as $log_row) {
+                if (empty($missing_by_account)) {
+                    break;
+                }
+                $payload = json_decode($log_row->payload, true);
+                if (!is_array($payload)) {
+                    continue;
+                }
+
+                // The interesting fields might live at the root or under a 'data' key.
+                $candidates = [$payload];
+                if (isset($payload['data']) && is_array($payload['data'])) {
+                    $candidates[] = $payload['data'];
+                }
+
+                foreach ($candidates as $candidate) {
+                    $remote_account = trim((string) (
+                        $candidate['account_number']
+                        ?? $candidate['accountNumber']
+                        ?? $candidate['virtual_account_number']
+                        ?? ''
+                    ));
+                    if ($remote_account === '' || !isset($missing_by_account[$remote_account])) {
+                        continue;
+                    }
+
+                    $remote_wallet_id = (string) (
+                        $candidate['wallet_id']
+                        ?? $candidate['walletId']
+                        ?? $candidate['virtual_wallet_id']
+                        ?? $candidate['id']
+                        ?? ''
+                    );
+                    if ($remote_wallet_id === '') {
+                        continue;
+                    }
+
+                    $local_row = $missing_by_account[$remote_account];
+                    $outcome   = $this->verify_and_persist_wallet_id($local_row, $remote_wallet_id);
+
+                    if ($outcome['status'] === 'backfilled') {
+                        $report['backfilled_via_webhook']++;
+                        unset($missing_by_account[$remote_account]);
+                    } elseif ($outcome['status'] === 'mismatched') {
+                        $report['mismatched']++;
+                        unset($missing_by_account[$remote_account]);
+                    }
+                    $outcome['source']         = 'webhook_log';
+                    $outcome['user_id']        = (int) $local_row->user_id;
+                    $outcome['account_number'] = $remote_account;
+                    $report['details'][]       = $outcome;
+
+                    break; // matched on this log row, move to next
+                }
+            }
+        }
+
+        // Anything left in $missing_by_account couldn't be resolved.
+        $report['still_missing'] = count($missing_by_account);
+        foreach ($missing_by_account as $acct => $row) {
+            $report['details'][] = [
+                'source'         => 'unresolved',
+                'status'         => 'still_missing',
+                'user_id'        => (int) $row->user_id,
+                'account_number' => $acct,
+                'reason'         => $list_failed
+                    ? __('List endpoint unavailable and no matching webhook payload found.', 'matrix-mlm')
+                    : __('No matching record returned by Fintava and no matching webhook payload found.', 'matrix-mlm'),
+            ];
+        }
+
+        return $report;
+    }
+
+    /**
+     * Verify a candidate wallet_id against a local wallet row and persist it
+     * if the account_number reported by Fintava matches what we have on file.
+     *
+     * Returns one of:
+     *   ['status' => 'backfilled', 'wallet_id' => '...']
+     *   ['status' => 'mismatched', 'reason' => 'Account number mismatch']
+     *   ['status' => 'lookup_failed', 'reason' => 'API error message']
+     *   ['status' => 'persist_failed', 'reason' => 'DB error']
+     *
+     * @param object $local_row        Row from matrix_fintava_wallets (id, account_number, ...).
+     * @param string $candidate_wallet The wallet_id we're trying to validate.
+     */
+    private function verify_and_persist_wallet_id($local_row, $candidate_wallet) {
+        $details = $this->get_virtual_wallet_details($candidate_wallet);
+        if (is_wp_error($details)) {
+            return [
+                'status' => 'lookup_failed',
+                'reason' => $details->get_error_message(),
+            ];
+        }
+
+        $remote_account = trim((string) (
+            $details['account_number']
+            ?? $details['accountNumber']
+            ?? ''
+        ));
+        if ($remote_account === '' || $remote_account !== trim((string) $local_row->account_number)) {
+            return [
+                'status' => 'mismatched',
+                'reason' => __('Fintava returned a different account number for that wallet ID.', 'matrix-mlm'),
+            ];
+        }
+
+        global $wpdb;
+        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? null;
+        $update    = [
+            'wallet_id'  => $candidate_wallet,
+            'updated_at' => current_time('mysql'),
+        ];
+        $formats   = ['%s', '%s'];
+        if (!empty($bank_code)) {
+            $update['bank_code'] = $bank_code;
+            $formats[]           = '%s';
+        }
+
+        $result = $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            $update,
+            ['id' => $local_row->id],
+            $formats,
+            ['%d']
+        );
+
+        if ($result === false) {
+            return [
+                'status' => 'persist_failed',
+                'reason' => $wpdb->last_error ?: __('Could not write to the wallets table.', 'matrix-mlm'),
+            ];
+        }
+
+        return [
+            'status'    => 'backfilled',
+            'wallet_id' => $candidate_wallet,
+        ];
+    }
+
     public function get_user_wallet($user_id) {
         global $wpdb;
         return $wpdb->get_row($wpdb->prepare(
