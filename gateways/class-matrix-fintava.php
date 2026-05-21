@@ -30,13 +30,27 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Fintava {
 
     /**
-     * Default Fintava Pay LIVE API base URL.
+     * Default Fintava Pay API base URL (DEV environment).
      * Override by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php.
      */
-    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/live';
+    const DEFAULT_BASE_URL = 'https://dev.fintavapay.com/api/dev';
+
+    /**
+     * Default Merchant ID for Fintava Pay.
+     * Override by defining MATRIX_FINTAVA_MERCHANT_ID in wp-config.php.
+     */
+    const DEFAULT_MERCHANT_ID = '438555ab-b45c-467d-b0ce-50dee25241b4';
+
+    /**
+     * Default Webhook/Callback URL for Fintava Pay.
+     * Override by defining MATRIX_FINTAVA_CALLBACK_URL in wp-config.php.
+     */
+    const DEFAULT_CALLBACK_URL = 'https://libertymatrix.ng/webhook/fintava';
 
     private $secret_key;
     private $base_url;
+    private $merchant_id;
+    private $callback_url;
 
     public function __construct() {
         $this->load_credentials();
@@ -56,6 +70,20 @@ class Matrix_MLM_Fintava {
             $this->base_url = rtrim(MATRIX_FINTAVA_API_BASE_URL, '/');
         } else {
             $this->base_url = self::DEFAULT_BASE_URL;
+        }
+
+        // Merchant ID — stored in wp_options, overridable via wp-config.php.
+        if (defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID) {
+            $this->merchant_id = MATRIX_FINTAVA_MERCHANT_ID;
+        } else {
+            $this->merchant_id = trim(get_option('matrix_mlm_fintava_merchant_id', self::DEFAULT_MERCHANT_ID));
+        }
+
+        // Callback URL — stored in wp_options, overridable via wp-config.php.
+        if (defined('MATRIX_FINTAVA_CALLBACK_URL') && MATRIX_FINTAVA_CALLBACK_URL) {
+            $this->callback_url = MATRIX_FINTAVA_CALLBACK_URL;
+        } else {
+            $this->callback_url = trim(get_option('matrix_mlm_fintava_callback_url', self::DEFAULT_CALLBACK_URL));
         }
     }
 
@@ -294,7 +322,7 @@ class Matrix_MLM_Fintava {
             'narration' => sanitize_text_field($transfer_data['narration']),
             'currency' => $transfer_data['currency'] ?? 'NGN',
             'reference' => $transfer_data['reference'] ?? $this->generate_reference(),
-            'callback_url' => rest_url('matrix-mlm/v1/fintava/webhook'),
+            'callback_url' => $this->callback_url,
         ];
 
         if (!empty($transfer_data['account_name'])) {
@@ -2136,6 +2164,7 @@ class Matrix_MLM_Fintava {
                 'Authorization' => 'Bearer ' . $this->secret_key,
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json',
+                'Merchant-Id' => $this->merchant_id,
             ],
             'timeout' => 30,
         ];

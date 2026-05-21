@@ -394,7 +394,7 @@ class Matrix_MLM_Fintava_Billing {
     }
 
     private function make_request($method, $endpoint, $body = null) {
-        // Use the same base URL source as Matrix_MLM_Fintava (live by default,
+        // Use the same base URL source as Matrix_MLM_Fintava (dev by default,
         // overridable via MATRIX_FINTAVA_API_BASE_URL constant).
         $base_url = defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL
             ? rtrim(MATRIX_FINTAVA_API_BASE_URL, '/')
@@ -409,12 +409,18 @@ class Matrix_MLM_Fintava_Billing {
             );
         }
 
+        // Merchant ID — same resolution logic as the main Fintava class.
+        $merchant_id = defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID
+            ? MATRIX_FINTAVA_MERCHANT_ID
+            : trim(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID));
+
         $args = [
             'method' => $method,
             'headers' => [
                 'Authorization' => 'Bearer ' . $secret_key,
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json',
+                'Merchant-Id' => $merchant_id,
             ],
             'timeout' => 30,
         ];

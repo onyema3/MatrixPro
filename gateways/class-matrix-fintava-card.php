@@ -483,7 +483,7 @@ class Matrix_MLM_Fintava_Card {
     }
 
     /**
-     * Make API request (uses the same Live API endpoint as Matrix_MLM_Fintava)
+     * Make API request (uses the same API endpoint as Matrix_MLM_Fintava)
      */
     private function make_request($method, $endpoint, $body = null) {
         $base_url = defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL
@@ -500,12 +500,18 @@ class Matrix_MLM_Fintava_Card {
             );
         }
 
+        // Merchant ID — same resolution logic as the main Fintava class.
+        $merchant_id = defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID
+            ? MATRIX_FINTAVA_MERCHANT_ID
+            : trim(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID));
+
         $args = [
             'method' => $method,
             'headers' => [
                 'Authorization' => 'Bearer ' . $secret_key,
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json',
+                'Merchant-Id' => $merchant_id,
             ],
             'timeout' => 30,
         ];
