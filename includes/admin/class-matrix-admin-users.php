@@ -346,7 +346,7 @@ class Matrix_MLM_Admin_Users {
         if ($balance_max !== '') { $where .= " AND um.balance <= %f"; $params[] = floatval($balance_max); }
         if ($plan_filter) { $where .= " AND um.user_id IN (SELECT user_id FROM {$wpdb->prefix}matrix_positions WHERE plan_id = %d AND status = 'active')"; $params[] = $plan_filter; }
 
-        $query = "SELECT u.user_login as username, u.user_email as email, um.phone, um.balance, um.referral_code, um.referred_by, um.status, um.country, um.state, um.city, u.user_registered as joined FROM {$wpdb->prefix}matrix_user_meta um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID $where ORDER BY um.created_at DESC";
+        $query = "SELECT u.user_login as username, COALESCE(wum1.meta_value, '') as first_name, COALESCE(wum2.meta_value, '') as last_name, u.user_email as email, um.phone, um.balance, um.referral_code, um.referred_by, um.status, um.country, um.state, um.city, u.user_registered as joined FROM {$wpdb->prefix}matrix_user_meta um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID LEFT JOIN {$wpdb->usermeta} wum1 ON um.user_id = wum1.user_id AND wum1.meta_key = 'first_name' LEFT JOIN {$wpdb->usermeta} wum2 ON um.user_id = wum2.user_id AND wum2.meta_key = 'last_name' $where ORDER BY um.created_at DESC";
 
         return !empty($params) ? $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A) : $wpdb->get_results($query, ARRAY_A);
     }
