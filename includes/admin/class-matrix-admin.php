@@ -325,12 +325,12 @@ class Matrix_MLM_Admin {
 
         $wpdb->update($wpdb->prefix . 'matrix_withdrawals', ['status' => 'rejected', 'admin_note' => $note], ['id' => $id]);
 
-        // Refund the user
+        // Refund full amount + charge back to Matrix wallet
         $wallet = new Matrix_MLM_Wallet();
         $wallet->credit($withdrawal->user_id, $withdrawal->amount + $withdrawal->charge, 'withdrawal_refund', __('Withdrawal rejected - refund', 'matrix-mlm'));
 
         Matrix_MLM_Notifications::send_withdrawal_notification($withdrawal->user_id, $withdrawal->amount, 'rejected');
-        wp_send_json_success(['message' => __('Withdrawal rejected and refunded', 'matrix-mlm')]);
+        wp_send_json_success(['message' => __('Withdrawal rejected and refunded to Matrix wallet', 'matrix-mlm')]);
     }
 
     private function approve_deposit() {

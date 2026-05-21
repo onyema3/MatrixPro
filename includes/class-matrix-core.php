@@ -363,16 +363,24 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => sprintf(__('Amount must be between %s and %s', 'matrix-mlm'), $min, $max)]);
         }
 
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
+        // User must have a Fintava wallet — funds move from Matrix wallet to Fintava wallet
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->user_has_wallet($user_id)) {
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to withdraw. Please create one from the Virtual Wallet tab first.', 'matrix-mlm')]);
+        }
 
+        // Calculate charge
         $charge_type = get_option('matrix_mlm_withdraw_charge_type', 'percent');
         $charge_value = get_option('matrix_mlm_withdraw_charge', 5);
         $charge = $charge_type === 'percent' ? ($amount * $charge_value / 100) : $charge_value;
         $total = $amount + $charge;
 
+        // Check Matrix wallet has enough for amount + charge (full debit from Matrix wallet)
+        $wallet = new Matrix_MLM_Wallet();
+        $balance = $wallet->get_balance($user_id);
+
         if ($balance < $total) {
-            wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
+            wp_send_json_error(['message' => __('Insufficient Matrix wallet balance', 'matrix-mlm')]);
         }
 
         global $wpdb;
@@ -387,10 +395,10 @@ class Matrix_MLM_Core {
             'status' => 'pending'
         ]);
 
-        // Debit wallet
-        $wallet->debit($user_id, $total, 'withdrawal', __('Withdrawal request', 'matrix-mlm'));
+        // Debit full amount + charge from Matrix wallet (funds move to Fintava wallet on approval)
+        $wallet->debit($user_id, $total, 'withdrawal', sprintf(__('Withdrawal request: %s%s to Fintava wallet', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount, 2)));
 
-        wp_send_json_success(['message' => __('Withdrawal request submitted successfully', 'matrix-mlm')]);
+        wp_send_json_success(['message' => __('Withdrawal request submitted successfully. Funds have been held from your Matrix wallet and will be credited to your Fintava wallet upon admin approval.', 'matrix-mlm')]);
     }
 
     private function process_transfer() {
