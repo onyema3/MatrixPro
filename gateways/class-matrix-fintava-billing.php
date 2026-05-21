@@ -436,7 +436,14 @@ class Matrix_MLM_Fintava_Billing {
         $body = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($status_code >= 400) {
-            return new WP_Error('fintava_billing_error', $body['message'] ?? sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code));
+            $error_message = $body['message'] ?? null;
+            if (is_array($error_message)) {
+                $error_message = implode('. ', $error_message);
+            }
+            if (empty($error_message)) {
+                $error_message = sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code);
+            }
+            return new WP_Error('fintava_billing_error', $error_message);
         }
 
         return $body;

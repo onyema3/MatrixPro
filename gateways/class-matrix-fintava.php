@@ -278,7 +278,7 @@ class Matrix_MLM_Fintava {
             return $response['data'];
         }
 
-        return new WP_Error('fintava_error', $response['message'] ?? __('Failed to retrieve bank list', 'matrix-mlm'));
+        return new WP_Error('fintava_error', self::safe_message($response['message'] ?? null, __('Failed to retrieve bank list', 'matrix-mlm')));
     }
 
     /**
@@ -300,7 +300,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_resolve_error',
-            $response['message'] ?? __('Could not resolve account details', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not resolve account details', 'matrix-mlm'))
         );
     }
 
@@ -343,13 +343,13 @@ class Matrix_MLM_Fintava {
                 'transfer_id' => $response['data']['id'] ?? null,
                 'reference' => $response['data']['reference'] ?? $payload['reference'],
                 'status' => $response['data']['status'] ?? 'pending',
-                'message' => $response['message'] ?? __('Transfer initiated successfully', 'matrix-mlm'),
+                'message' => self::safe_message($response['message'] ?? null, __('Transfer initiated successfully', 'matrix-mlm')),
             ];
         }
 
         return new WP_Error(
             'fintava_transfer_error',
-            $response['message'] ?? __('Transfer failed', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Transfer failed', 'matrix-mlm'))
         );
     }
 
@@ -368,7 +368,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_status_error',
-            $response['message'] ?? __('Could not fetch transfer status', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not fetch transfer status', 'matrix-mlm'))
         );
     }
 
@@ -397,7 +397,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_balance_error',
-            $response['message'] ?? __('Could not retrieve merchant balance', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not retrieve merchant balance', 'matrix-mlm'))
         );
     }
 
@@ -435,13 +435,13 @@ class Matrix_MLM_Fintava {
                 'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
                 'reference' => $response['data']['reference'] ?? ($transfer_data['reference'] ?? ''),
                 'status' => $response['data']['status'] ?? 'pending',
-                'message' => $response['message'] ?? __('Merchant transfer initiated successfully', 'matrix-mlm'),
+                'message' => self::safe_message($response['message'] ?? null, __('Merchant transfer initiated successfully', 'matrix-mlm')),
             ];
         }
 
         return new WP_Error(
             'fintava_merchant_transfer_error',
-            $response['message'] ?? __('Merchant transfer failed', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Merchant transfer failed', 'matrix-mlm'))
         );
     }
 
@@ -810,6 +810,9 @@ class Matrix_MLM_Fintava {
         global $wpdb;
         $reference = $data['reference'] ?? '';
         $reason = $data['reason'] ?? $data['message'] ?? __('Transfer failed', 'matrix-mlm');
+        if (is_array($reason)) {
+            $reason = implode('. ', $reason);
+        }
 
         if (empty($reference)) {
             return;
@@ -1114,7 +1117,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_customer_list_error',
-            $response['message'] ?? __('Could not retrieve customer list', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not retrieve customer list', 'matrix-mlm'))
         );
     }
 
@@ -1170,7 +1173,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_customer_error',
-            $response['message'] ?? __('Could not retrieve customer details', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not retrieve customer details', 'matrix-mlm'))
         );
     }
 
@@ -1204,7 +1207,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_enquiry_error',
-            $response['message'] ?? __('Could not look up wallet by account number', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not look up wallet by account number', 'matrix-mlm'))
         );
     }
 
@@ -1347,7 +1350,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_wallet_error',
-            $response['message'] ?? __('Failed to generate virtual wallet', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Failed to generate virtual wallet', 'matrix-mlm'))
         );
     }
 
@@ -1372,7 +1375,7 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_wallet_error',
-            $response['message'] ?? __('Could not retrieve wallet details', 'matrix-mlm')
+            self::safe_message($response['message'] ?? null, __('Could not retrieve wallet details', 'matrix-mlm'))
         );
     }
 
@@ -2183,8 +2186,13 @@ class Matrix_MLM_Fintava {
         $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($status_code >= 400) {
-            $error_message = $body_decoded['message']
-                ?? sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            $error_message = $body_decoded['message'] ?? null;
+            if (is_array($error_message)) {
+                $error_message = implode('. ', $error_message);
+            }
+            if (empty($error_message)) {
+                $error_message = sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            }
             return new WP_Error('fintava_api_error', $error_message);
         }
 
@@ -2193,6 +2201,21 @@ class Matrix_MLM_Fintava {
 
     private function generate_reference() {
         return 'MTX-FTV-' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 12)) . '-' . time();
+    }
+
+    /**
+     * Safely extract a string message from an API response.
+     * Fintava sometimes returns message as an array of strings.
+     *
+     * @param mixed $message The raw message value from the API response.
+     * @param string $fallback Fallback text if message is empty/null.
+     * @return string
+     */
+    private static function safe_message($message, $fallback = '') {
+        if (is_array($message)) {
+            return implode('. ', array_filter(array_map('strval', $message))) ?: $fallback;
+        }
+        return (string) ($message ?? $fallback);
     }
 
     /**

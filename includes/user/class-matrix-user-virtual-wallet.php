@@ -133,7 +133,8 @@ class Matrix_MLM_User_Virtual_Wallet {
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
             if (is_wp_error($balance_result)) {
-                $fintava_balance_error  = $balance_result->get_error_message();
+                $err_msg = $balance_result->get_error_message();
+                $fintava_balance_error  = is_array($err_msg) ? implode('. ', $err_msg) : $err_msg;
                 $fintava_balance_reason = 'api_error';
             } else {
                 $fintava_balance_value    = $balance_result['available_balance'];
