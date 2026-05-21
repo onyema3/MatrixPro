@@ -156,6 +156,7 @@ class Matrix_MLM_Fintava {
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id bigint(20) UNSIGNED NOT NULL,
             wallet_id varchar(100) DEFAULT NULL,
+            customer_id varchar(100) DEFAULT NULL,
             account_number varchar(20) NOT NULL,
             account_name varchar(255) NOT NULL,
             bank_name varchar(100) NOT NULL DEFAULT 'Fintava',
@@ -171,6 +172,7 @@ class Matrix_MLM_Fintava {
             PRIMARY KEY (id),
             UNIQUE KEY user_id (user_id),
             KEY account_number (account_number),
+            KEY customer_id (customer_id),
             KEY status (status)
         ) $charset_collate";
 
@@ -199,6 +201,18 @@ class Matrix_MLM_Fintava {
             if ($wpdb->last_error) {
                 $errors[] = sprintf('%s: %s', $name, $wpdb->last_error);
             }
+        }
+
+        // Self-healing: add customer_id column to wallets table if missing
+        // (for installations created before this column was added).
+        $col_exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'customer_id'",
+            DB_NAME,
+            $wallets_table
+        ));
+        if ($col_exists !== null && intval($col_exists) === 0) {
+            $wpdb->query("ALTER TABLE `$wallets_table` ADD COLUMN `customer_id` varchar(100) DEFAULT NULL AFTER `wallet_id`");
+            $wpdb->query("ALTER TABLE `$wallets_table` ADD KEY `customer_id` (`customer_id`)");
         }
 
         return ['errors' => $errors];
@@ -1021,6 +1035,200 @@ class Matrix_MLM_Fintava {
     }
 
     // =========================================================================
+    // CUSTOMER API
+    // =========================================================================
+
+    /**
+     * GET /customers — list all customers under this merchant.
+     *
+     * Returns an array of customer objects. Each customer's `userInfo.id` is
+     * the customerId needed for the single-customer endpoint.
+     *
+     * @return array|WP_Error Array of customer records on success.
+     */
+    public function get_customer_list() {
+        $response = $this->make_request('GET', '/customers');
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        // Fintava wraps the list in { data: [...], status: 200, message: "successful" }
+        if (isset($response['data']) && is_array($response['data'])) {
+            return $response['data'];
+        }
+
+        // Bare array fallback
+        if (is_array($response) && isset($response[0])) {
+            return $response;
+        }
+
+        return new WP_Error(
+            'fintava_customer_list_error',
+            $response['message'] ?? __('Could not retrieve customer list', 'matrix-mlm')
+        );
+    }
+
+    /**
+     * GET /customers/{customerId} — fetch a single customer's full details.
+     *
+     * The customerId is the `userInfo.id` UUID returned in the customer list.
+     * The response includes a `wallet` object with `wallet.id` (the wallet UUID
+     * needed for balance lookups) and `wallet.accountNumber`.
+     *
+     * @param string $customer_id The Fintava customer UUID.
+     * @return array|WP_Error Customer data on success.
+     */
+    public function get_customer($customer_id) {
+        if (empty($customer_id)) {
+            return new WP_Error('missing_customer_id', __('Customer ID is required', 'matrix-mlm'));
+        }
+
+        $response = $this->make_request('GET', '/customers/' . $customer_id);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        // Standard Fintava envelope: { data: { userInfo: {...}, wallet: {...} }, status: 200 }
+        if (isset($response['data']) && is_array($response['data'])) {
+            return $response['data'];
+        }
+
+        // Bare object fallback (if they return the customer object directly)
+        if (is_array($response) && (isset($response['userInfo']) || isset($response['wallet']))) {
+            return $response;
+        }
+
+        return new WP_Error(
+            'fintava_customer_error',
+            $response['message'] ?? __('Could not retrieve customer details', 'matrix-mlm')
+        );
+    }
+
+    /**
+     * Resolve the wallet_id for a local wallet row using the Customer API.
+     *
+     * Workflow:
+     *  1. If the local row already has a customer_id stored, use it directly.
+     *  2. Otherwise, pull the customer list and match by account_number or email.
+     *  3. Call GET /customers/{customerId} to get the full response with wallet.id.
+     *  4. Verify the wallet's accountNumber matches the local record.
+     *  5. Persist the wallet_id (and customer_id) back to the local row.
+     *
+     * @param object $wallet_row The local matrix_fintava_wallets row.
+     * @return string|WP_Error The resolved wallet_id on success.
+     */
+    public function resolve_wallet_id_from_customer($wallet_row) {
+        global $wpdb;
+
+        $customer_id = '';
+
+        // 1. Check if we already have a customer_id stored
+        if (!empty($wallet_row->customer_id)) {
+            $customer_id = $wallet_row->customer_id;
+        }
+
+        // 2. If no customer_id, search the customer list
+        if (empty($customer_id)) {
+            $customers = $this->get_customer_list();
+            if (is_wp_error($customers)) {
+                return $customers;
+            }
+
+            foreach ($customers as $customer) {
+                // Each item may be the full { userInfo, wallet } shape or just userInfo
+                $user_info = $customer['userInfo'] ?? $customer;
+                $wallet_data = $customer['wallet'] ?? null;
+
+                // Match by account number (most reliable)
+                if ($wallet_data && !empty($wallet_row->account_number)) {
+                    $remote_account = $wallet_data['accountNumber'] ?? $wallet_data['account_number'] ?? '';
+                    if ($remote_account === trim($wallet_row->account_number)) {
+                        $customer_id = $user_info['id'] ?? '';
+                        break;
+                    }
+                }
+
+                // Fallback: match by email
+                if (!empty($wallet_row->customer_email)) {
+                    $remote_email = $user_info['email'] ?? $user_info['emailAddress'] ?? '';
+                    if (strtolower($remote_email) === strtolower($wallet_row->customer_email)) {
+                        $customer_id = $user_info['id'] ?? '';
+                        break;
+                    }
+                }
+
+                // Fallback: match by phone
+                if (!empty($wallet_row->customer_phone)) {
+                    $remote_phone = $user_info['phoneNumber'] ?? $user_info['phone'] ?? '';
+                    if (!empty($remote_phone) && $remote_phone === $wallet_row->customer_phone) {
+                        $customer_id = $user_info['id'] ?? '';
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (empty($customer_id)) {
+            return new WP_Error(
+                'fintava_customer_not_found',
+                __('Could not find a matching Fintava customer for this wallet.', 'matrix-mlm')
+            );
+        }
+
+        // 3. Fetch the full customer details (includes wallet.id)
+        $customer_details = $this->get_customer($customer_id);
+        if (is_wp_error($customer_details)) {
+            return $customer_details;
+        }
+
+        $wallet_obj = $customer_details['wallet'] ?? null;
+        if (!$wallet_obj || empty($wallet_obj['id'])) {
+            return new WP_Error(
+                'fintava_no_wallet_in_customer',
+                __('The customer record does not contain a wallet ID.', 'matrix-mlm')
+            );
+        }
+
+        $resolved_wallet_id = $wallet_obj['id'];
+
+        // 4. Verify account number matches (safety check)
+        $remote_account = $wallet_obj['accountNumber'] ?? $wallet_obj['account_number'] ?? '';
+        if (!empty($wallet_row->account_number) && !empty($remote_account)) {
+            if (trim($remote_account) !== trim($wallet_row->account_number)) {
+                return new WP_Error(
+                    'fintava_account_mismatch',
+                    __('The wallet returned by the customer endpoint has a different account number than expected.', 'matrix-mlm')
+                );
+            }
+        }
+
+        // 5. Persist wallet_id and customer_id back to the local row
+        $update_data = [
+            'wallet_id'   => $resolved_wallet_id,
+            'customer_id' => $customer_id,
+            'updated_at'  => current_time('mysql'),
+        ];
+        $update_formats = ['%s', '%s', '%s'];
+
+        // Also save bank_code if available
+        $bank_code = $wallet_obj['bank_code'] ?? $wallet_obj['bankCode'] ?? null;
+        if (!empty($bank_code)) {
+            $update_data['bank_code'] = $bank_code;
+            $update_formats[] = '%s';
+        }
+
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            $update_data,
+            ['id' => $wallet_row->id],
+            $update_formats,
+            ['%d']
+        );
+
+        return $resolved_wallet_id;
+    }
+
+    // =========================================================================
     // VIRTUAL WALLET API
     // =========================================================================
 
@@ -1059,9 +1267,22 @@ class Matrix_MLM_Fintava {
         if (isset($response['data']) && is_array($response['data'])) {
             $data = $response['data'];
             $extracted_name = self::extract_account_name($data);
+
+            // Extract customer_id from the response — Fintava may return it as
+            // userInfo.id, customerId, or customer_id depending on the endpoint.
+            $customer_id = '';
+            if (isset($data['userInfo']['id'])) {
+                $customer_id = $data['userInfo']['id'];
+            } elseif (isset($data['customerId'])) {
+                $customer_id = $data['customerId'];
+            } elseif (isset($data['customer_id'])) {
+                $customer_id = $data['customer_id'];
+            }
+
             return [
                 'success' => true,
                 'wallet_id' => self::extract_wallet_id($data) ?: ($data['id'] ?? null),
+                'customer_id' => $customer_id,
                 'account_number' => self::extract_account_number($data),
                 'account_name' => $extracted_name !== '' ? $extracted_name : ($customer_data['first_name'] . ' ' . $customer_data['last_name']),
                 'bank_name' => self::extract_bank_name($data) ?: 'Fintava',
@@ -1611,6 +1832,7 @@ class Matrix_MLM_Fintava {
             [
                 'user_id' => $user_id,
                 'wallet_id' => $result['wallet_id'],
+                'customer_id' => $result['customer_id'] ?? null,
                 'account_number' => $result['account_number'],
                 'account_name' => $result['account_name'],
                 'bank_name' => $result['bank_name'],
@@ -1628,7 +1850,7 @@ class Matrix_MLM_Fintava {
                     'reference' => $reference,
                 ]),
             ],
-            ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
+            ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
         );
 
         Matrix_MLM_Notifications::send_admin_notification(
@@ -1693,6 +1915,7 @@ class Matrix_MLM_Fintava {
     /**
      * AJAX endpoint for the dashboard "Refresh balance" button.
      * Fetches the current balance from Fintava for the logged-in user's wallet.
+     * If wallet_id is missing, attempts to auto-resolve it via the Customer API.
      */
     public function ajax_get_virtual_wallet_balance() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -1703,10 +1926,26 @@ class Matrix_MLM_Fintava {
         }
 
         $wallet = $this->get_user_wallet($user_id);
-        if (!$wallet || empty($wallet->wallet_id)) {
+        if (!$wallet) {
             wp_send_json_error([
-                'message' => __('No virtual wallet linked, or this wallet has no Fintava wallet ID on file.', 'matrix-mlm'),
+                'message' => __('No virtual wallet linked to your account.', 'matrix-mlm'),
             ]);
+        }
+
+        // If wallet_id is missing, try to auto-resolve it via the Customer API
+        if (empty($wallet->wallet_id)) {
+            $resolved = $this->resolve_wallet_id_from_customer($wallet);
+            if (is_wp_error($resolved)) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        __('Wallet ID is missing and could not be resolved automatically: %s', 'matrix-mlm'),
+                        $resolved->get_error_message()
+                    ),
+                    'needs_wallet_id' => true,
+                ]);
+            }
+            // Refresh the wallet row after resolution
+            $wallet = $this->get_user_wallet($user_id);
         }
 
         $balance = $this->get_virtual_wallet_balance($wallet->wallet_id);
