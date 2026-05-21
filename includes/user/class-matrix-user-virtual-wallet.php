@@ -81,6 +81,9 @@ class Matrix_MLM_User_Virtual_Wallet {
         .matrix-wallet-status.active { background: rgba(16, 185, 129, 0.3); color: #34d399; }
         .matrix-wallet-copy-btn { background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); color: #fff; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 11px; margin-left: 10px; }
         .matrix-wallet-copy-btn:hover { background: rgba(255,255,255,0.25); }
+        .matrix-fintava-balance-row { margin: 4px 0 18px; padding: 12px 0 14px; border-top: 1px solid rgba(255,255,255,0.15); border-bottom: 1px solid rgba(255,255,255,0.15); position: relative; z-index: 1; }
+        .matrix-fintava-balance-value { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 22px; font-weight: 700; letter-spacing: 0.5px; margin-top: 2px; }
+        #matrix-fintava-refresh-balance { font-size: 11px; padding: 4px 10px; }
         .matrix-transfer-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; margin-top: 24px; }
         .matrix-transfer-section h3 { margin-top: 0; color: #1f2937; }
         .matrix-transfer-note { background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #92400e; }
@@ -108,6 +111,24 @@ class Matrix_MLM_User_Virtual_Wallet {
         // Get transfer history to this wallet
         $fintava = new Matrix_MLM_Fintava();
         $payouts = $fintava->get_user_payouts($user_id, 10);
+
+        // Pull the live Fintava balance for this wallet. If Fintava is unreachable
+        // or the response is malformed, fall through gracefully with a placeholder
+        // and a tooltip explaining what happened — never break the page.
+        $fintava_balance_value = null;
+        $fintava_balance_currency = $wallet->currency ?? 'NGN';
+        $fintava_balance_error = '';
+        if (!empty($wallet->wallet_id)) {
+            $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
+            if (is_wp_error($balance_result)) {
+                $fintava_balance_error = $balance_result->get_error_message();
+            } else {
+                $fintava_balance_value = $balance_result['available_balance'];
+                $fintava_balance_currency = $balance_result['currency'];
+            }
+        } else {
+            $fintava_balance_error = __('No Fintava wallet ID on file — cannot query balance.', 'matrix-mlm');
+        }
         ?>
 
         <!-- Visual: Matrix Wallet → Fintava Wallet -->
@@ -135,6 +156,28 @@ class Matrix_MLM_User_Virtual_Wallet {
                 <button class="matrix-wallet-copy-btn" onclick="navigator.clipboard.writeText('<?php echo esc_js($wallet->account_number); ?>'); this.textContent='Copied!';">
                     <?php _e('Copy', 'matrix-mlm'); ?>
                 </button>
+            </div>
+            <div class="matrix-fintava-balance-row">
+                <div class="matrix-wallet-label"><?php _e('Account Balance', 'matrix-mlm'); ?></div>
+                <div class="matrix-fintava-balance-value">
+                    <span id="matrix-fintava-balance-amount">
+                        <?php
+                        if ($fintava_balance_value !== null) {
+                            echo esc_html(($fintava_balance_currency === 'NGN' ? '₦' : ($fintava_balance_currency . ' ')) . number_format($fintava_balance_value, 2));
+                        } else {
+                            echo '<span title="' . esc_attr($fintava_balance_error) . '">&mdash;</span>';
+                        }
+                        ?>
+                    </span>
+                    <button type="button" class="matrix-wallet-copy-btn" id="matrix-fintava-refresh-balance" title="<?php esc_attr_e('Refresh from Fintava', 'matrix-mlm'); ?>">
+                        <?php _e('Refresh', 'matrix-mlm'); ?>
+                    </button>
+                    <?php if ($fintava_balance_error): ?>
+                        <small style="display:block;margin-top:4px;color:#fecaca;">
+                            <?php echo esc_html($fintava_balance_error); ?>
+                        </small>
+                    <?php endif; ?>
+                </div>
             </div>
             <div class="matrix-wallet-details-row">
                 <div class="matrix-wallet-detail">
@@ -217,6 +260,36 @@ class Matrix_MLM_User_Virtual_Wallet {
         <script>
         (function($) {
             'use strict';
+
+            // Live-refresh the Fintava wallet balance from the server without reloading.
+            $('#matrix-fintava-refresh-balance').on('click', function() {
+                var btn = $(this);
+                var amountEl = $('#matrix-fintava-balance-amount');
+                var originalLabel = btn.text();
+                btn.prop('disabled', true).text('<?php echo esc_js(__('…', 'matrix-mlm')); ?>');
+
+                $.ajax({
+                    url: matrixMLM.ajaxUrl,
+                    type: 'POST',
+                    data: {
+                        action: 'matrix_fintava_wallet_balance',
+                        nonce: matrixMLM.nonce
+                    },
+                    success: function(res) {
+                        btn.prop('disabled', false).text(originalLabel);
+                        if (res && res.success && res.data && res.data.available_balance_formatted) {
+                            amountEl.text(res.data.available_balance_formatted);
+                        } else {
+                            var msg = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Could not refresh balance.', 'matrix-mlm')); ?>';
+                            alert(msg);
+                        }
+                    },
+                    error: function() {
+                        btn.prop('disabled', false).text(originalLabel);
+                        alert('<?php echo esc_js(__('Network error refreshing balance.', 'matrix-mlm')); ?>');
+                    }
+                });
+            });
 
             const currency = '<?php echo esc_js($currency); ?>';
             const chargeType = '<?php echo esc_js($charge_type); ?>';

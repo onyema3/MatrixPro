@@ -72,6 +72,7 @@ class Matrix_MLM_Fintava {
         // Virtual Wallet AJAX handlers
         add_action('wp_ajax_matrix_fintava_create_virtual_wallet', [$this, 'ajax_create_virtual_wallet']);
         add_action('wp_ajax_matrix_fintava_get_virtual_wallet', [$this, 'ajax_get_virtual_wallet']);
+        add_action('wp_ajax_matrix_fintava_wallet_balance', [$this, 'ajax_get_virtual_wallet_balance']);
 
         // REST API endpoint for webhook callbacks
         add_action('rest_api_init', [$this, 'register_webhook_routes']);
@@ -1083,6 +1084,55 @@ class Matrix_MLM_Fintava {
         );
     }
 
+    /**
+     * Fetch the current balance of a user's Fintava virtual wallet.
+     *
+     * Returns ['available_balance' => float, 'ledger_balance' => float, 'currency' => string]
+     * on success, or WP_Error on failure. Defensively handles the common
+     * variations Fintava (and similar gateways) use for the balance field name
+     * across endpoint versions: balance / available_balance / availableBalance /
+     * wallet_balance / walletBalance / current_balance / currentBalance.
+     */
+    public function get_virtual_wallet_balance($wallet_id) {
+        if (empty($wallet_id)) {
+            return new WP_Error('missing_wallet_id', __('Wallet ID is required', 'matrix-mlm'));
+        }
+
+        $details = $this->get_virtual_wallet_details($wallet_id);
+        if (is_wp_error($details)) {
+            return $details;
+        }
+
+        $available = null;
+        foreach (['available_balance', 'availableBalance', 'wallet_balance', 'walletBalance', 'balance', 'current_balance', 'currentBalance'] as $key) {
+            if (isset($details[$key]) && $details[$key] !== '') {
+                $available = floatval($details[$key]);
+                break;
+            }
+        }
+
+        $ledger = null;
+        foreach (['ledger_balance', 'ledgerBalance', 'book_balance', 'bookBalance'] as $key) {
+            if (isset($details[$key]) && $details[$key] !== '') {
+                $ledger = floatval($details[$key]);
+                break;
+            }
+        }
+
+        if ($available === null && $ledger === null) {
+            return new WP_Error(
+                'fintava_balance_unavailable',
+                __('Fintava did not return a balance for this wallet.', 'matrix-mlm')
+            );
+        }
+
+        return [
+            'available_balance' => $available !== null ? $available : $ledger,
+            'ledger_balance'    => $ledger !== null ? $ledger : $available,
+            'currency'          => $details['currency'] ?? 'NGN',
+        ];
+    }
+
     public function get_user_wallet($user_id) {
         global $wpdb;
         return $wpdb->get_row($wpdb->prepare(
@@ -1245,6 +1295,40 @@ class Matrix_MLM_Fintava {
                 'status' => $wallet->status,
                 'created_at' => $wallet->created_at,
             ],
+        ]);
+    }
+
+    /**
+     * AJAX endpoint for the dashboard "Refresh balance" button.
+     * Fetches the current balance from Fintava for the logged-in user's wallet.
+     */
+    public function ajax_get_virtual_wallet_balance() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        $wallet = $this->get_user_wallet($user_id);
+        if (!$wallet || empty($wallet->wallet_id)) {
+            wp_send_json_error([
+                'message' => __('No virtual wallet linked, or this wallet has no Fintava wallet ID on file.', 'matrix-mlm'),
+            ]);
+        }
+
+        $balance = $this->get_virtual_wallet_balance($wallet->wallet_id);
+        if (is_wp_error($balance)) {
+            wp_send_json_error(['message' => $balance->get_error_message()]);
+        }
+
+        $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
+        wp_send_json_success([
+            'available_balance'           => $balance['available_balance'],
+            'ledger_balance'              => $balance['ledger_balance'],
+            'currency'                    => $balance['currency'],
+            'available_balance_formatted' => $currency_symbol . number_format($balance['available_balance'], 2),
+            'ledger_balance_formatted'    => $currency_symbol . number_format($balance['ledger_balance'], 2),
         ]);
     }
 
