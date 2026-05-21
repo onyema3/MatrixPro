@@ -126,14 +126,9 @@ class Matrix_MLM_User_Virtual_Wallet {
         $fintava_balance_error    = '';
         $fintava_balance_reason   = ''; // 'missing_wallet_id' | 'api_error' | ''
 
-        // Auto-resolve: if wallet_id is missing but we have an account number,
-        // call the /loma-name/enquiry endpoint which returns walletId + customerAccountNo.
-        if (empty($wallet->wallet_id) && !empty($wallet->account_number)) {
-            $resolved = $fintava->resolve_wallet_id_from_customer($wallet);
-            if (!is_wp_error($resolved)) {
-                $wallet->wallet_id = $resolved;
-            }
-        }
+        // Auto-resolve is disabled: the /loma-name/enquiry endpoint is not
+        // available on all Fintava tiers. Users can enter their wallet ID
+        // manually via the "Verify & Save" input below.
 
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
