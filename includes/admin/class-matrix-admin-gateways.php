@@ -23,6 +23,12 @@ class Matrix_MLM_Admin_Gateways {
 
         if (isset($_POST['matrix_seed_gateways']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_seed_gateways')) {
             $this->seed_gateways();
+            // Redirect to reload the page with fresh data
+            wp_redirect(admin_url('admin.php?page=matrix-mlm-gateways&seeded=1'));
+            exit;
+        }
+
+        if (isset($_GET['seeded'])) {
             echo '<div class="notice notice-success"><p>' . __('Default gateways have been created successfully!', 'matrix-mlm') . '</p></div>';
         }
 
@@ -34,13 +40,15 @@ class Matrix_MLM_Admin_Gateways {
             <?php if (empty($gateways)): ?>
                 <div class="matrix-admin-card">
                     <h2><?php _e('No Payment Gateways Found', 'matrix-mlm'); ?></h2>
-                    <p><?php _e('No payment gateways have been configured yet. Click the button below to create the default gateways (Paystack, Flutterwave, and Fintava).', 'matrix-mlm'); ?></p>
+                    <p><?php _e('No payment gateways have been configured yet. Click the button below to create the default gateways (Paystack and Flutterwave).', 'matrix-mlm'); ?></p>
                     <form method="post">
                         <?php wp_nonce_field('matrix_seed_gateways'); ?>
                         <p><input type="submit" name="matrix_seed_gateways" class="button button-primary" value="<?php _e('Create Default Gateways', 'matrix-mlm'); ?>"></p>
                     </form>
                 </div>
-            <?php else: ?>
+            <?php endif; ?>
+
+            <?php if (!empty($gateways)): ?>
 
                 <?php foreach ($gateways as $gateway): 
                     $params = json_decode($gateway->gateway_parameters, true);
@@ -292,42 +300,49 @@ class Matrix_MLM_Admin_Gateways {
         global $wpdb;
         $gateways_table = $wpdb->prefix . 'matrix_gateways';
 
-        $existing = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table");
-        if ($existing > 0) {
-            return; // Already has gateways, don't duplicate
+        // Check if paystack already exists (avoid duplicates but allow re-seeding if missing)
+        $has_paystack = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table WHERE slug = 'paystack'");
+        $has_flutterwave = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table WHERE slug = 'flutterwave'");
+
+        if ($has_paystack && $has_flutterwave) {
+            return; // Both already exist
         }
 
-        $wpdb->insert($gateways_table, [
-            'name' => 'Paystack',
-            'slug' => 'paystack',
-            'gateway_parameters' => json_encode([
-                'public_key' => '',
-                'secret_key' => '',
-                'webhook_secret' => ''
-            ]),
-            'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
-            'min_amount' => 100.00,
-            'max_amount' => 5000000.00,
-            'fixed_charge' => 0.00,
-            'percent_charge' => 1.50,
-            'status' => 0
-        ]);
+        if (!$has_paystack) {
+            $wpdb->insert($gateways_table, [
+                'name' => 'Paystack',
+                'slug' => 'paystack',
+                'gateway_parameters' => json_encode([
+                    'public_key' => '',
+                    'secret_key' => '',
+                    'webhook_secret' => ''
+                ]),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
+                'min_amount' => 100.00,
+                'max_amount' => 5000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.50,
+                'status' => 0
+            ]);
+        }
 
-        $wpdb->insert($gateways_table, [
-            'name' => 'Flutterwave',
-            'slug' => 'flutterwave',
-            'gateway_parameters' => json_encode([
-                'public_key' => '',
-                'secret_key' => '',
-                'encryption_key' => '',
-                'webhook_hash' => ''
-            ]),
-            'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
-            'min_amount' => 100.00,
-            'max_amount' => 10000000.00,
-            'fixed_charge' => 0.00,
-            'percent_charge' => 1.40,
-            'status' => 0
-        ]);
+        if (!$has_flutterwave) {
+            $wpdb->insert($gateways_table, [
+                'name' => 'Flutterwave',
+                'slug' => 'flutterwave',
+                'gateway_parameters' => json_encode([
+                    'public_key' => '',
+                    'secret_key' => '',
+                    'encryption_key' => '',
+                    'webhook_hash' => ''
+                ]),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
+                'min_amount' => 100.00,
+                'max_amount' => 10000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.40,
+                'status' => 0
+            ]);
+        }
     }
 }
