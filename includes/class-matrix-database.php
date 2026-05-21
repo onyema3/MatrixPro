@@ -352,6 +352,8 @@ class Matrix_MLM_Database {
                 'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
                 'min_amount' => 100.00,
                 'max_amount' => 5000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.50,
                 'status' => 0
             ]);
 
@@ -367,8 +369,26 @@ class Matrix_MLM_Database {
                 'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
                 'min_amount' => 100.00,
                 'max_amount' => 10000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.40,
                 'status' => 0
             ]);
+        }
+
+        // Seed Fintava Pay default settings (stored in wp_options)
+        $fintava_defaults = [
+            'matrix_mlm_fintava_environment' => 'sandbox',
+            'matrix_mlm_fintava_public_key' => '',
+            'matrix_mlm_fintava_secret_key' => '',
+            'matrix_mlm_fintava_base_url' => '',
+            'matrix_mlm_fintava_webhook_secret' => '',
+            'matrix_mlm_fintava_status' => 0,
+        ];
+
+        foreach ($fintava_defaults as $key => $value) {
+            if (get_option($key) === false) {
+                add_option($key, $value);
+            }
         }
 
         // Insert default plans
