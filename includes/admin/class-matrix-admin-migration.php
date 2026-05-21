@@ -365,6 +365,19 @@ class Matrix_MLM_Admin_Migration {
                     html += '</div>';
                 }
 
+                // If nothing landed at all, give actionable next steps.
+                if (report.backfilled_via_list_api === 0
+                    && report.backfilled_via_webhook === 0
+                    && report.still_missing > 0) {
+                    html += '<div class="notice notice-info inline" style="padding:12px 16px;margin:10px 0;">';
+                    html += '<p style="margin:0 0 8px;"><strong><?php echo esc_js(__('Nothing could be backfilled automatically. To recover these wallet IDs:', 'matrix-mlm')); ?></strong></p>';
+                    html += '<ol style="margin:0 0 0 20px;font-size:13px;">';
+                    html += '<li><?php echo esc_js(__('Send a small test deposit (e.g. ₦50) to each affected virtual account. Fintava fires an account_funded webhook on receipt; the wallet_id is recorded in the log and the next backfill run picks it up.', 'matrix-mlm')); ?></li>';
+                    html += '<li><?php echo esc_js(__('Or paste the wallet_id directly via the user\'s on-dashboard "Verify & Save" form, or via Migration → Link Single User → Verify & Auto-Fill from Fintava.', 'matrix-mlm')); ?></li>';
+                    html += '<li><?php echo esc_js(__('Or contact Fintava support with the account number — they can read the wallet_id off their internal panel.', 'matrix-mlm')); ?></li>';
+                    html += '</ol></div>';
+                }
+
                 if (report.details && report.details.length) {
                     html += '<h3 style="margin-top:18px;"><?php echo esc_js(__('Per-wallet outcomes', 'matrix-mlm')); ?></h3>';
                     html += '<table class="wp-list-table widefat striped"><thead><tr>';

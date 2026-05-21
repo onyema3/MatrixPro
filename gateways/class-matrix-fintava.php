@@ -1154,10 +1154,47 @@ class Matrix_MLM_Fintava {
         $page  = max(1, intval($page));
         $limit = max(1, min(100, intval($limit)));
 
-        $endpoint = sprintf('/virtual-wallet?page=%d&limit=%d', $page, $limit);
-        $response = $this->make_request('GET', $endpoint);
-        if (is_wp_error($response)) {
-            return $response;
+        // Different Fintava merchant tiers expose this list under slightly
+        // different paths. Try the most common spellings in order and accept
+        // the first one that doesn't 404. The remembered winner is cached
+        // for the rest of the request to avoid retrying dead paths during
+        // pagination.
+        static $resolved_path = null;
+
+        $candidate_paths = $resolved_path !== null
+            ? [$resolved_path]
+            : ['/virtual-wallet', '/virtual-wallets', '/wallet', '/wallets', '/merchant/virtual-wallet', '/merchant/virtual-wallets'];
+
+        $response   = null;
+        $last_error = null;
+        foreach ($candidate_paths as $path) {
+            $endpoint = sprintf('%s?page=%d&limit=%d', $path, $page, $limit);
+            $attempt  = $this->make_request('GET', $endpoint);
+
+            if (!is_wp_error($attempt)) {
+                $response      = $attempt;
+                $resolved_path = $path;
+                break;
+            }
+
+            $last_error = $attempt;
+            $msg        = strtolower($attempt->get_error_message());
+            // Only keep trying alternates on "not found" / "cannot get" style
+            // 404s. For real failures (auth, rate-limit, network) bail out
+            // immediately so callers see the actual cause.
+            if (strpos($msg, 'cannot get') === false
+                && strpos($msg, 'not found') === false
+                && strpos($msg, 'http 404') === false
+                && strpos($msg, '(http 404)') === false) {
+                return $attempt;
+            }
+        }
+
+        if ($response === null) {
+            return $last_error ?: new WP_Error(
+                'fintava_list_unavailable',
+                __('Fintava list endpoint is not available on this merchant tier.', 'matrix-mlm')
+            );
         }
 
         // Tolerate both "wrapped" ({status, data:[...]}) and "bare" array shapes.
@@ -1331,15 +1368,20 @@ class Matrix_MLM_Fintava {
         }
 
         // ---------------------------------------------------------------
-        // FALLBACK PATH: scan recent account_funded webhook logs
+        // FALLBACK PATH: scan recent webhook logs
+        //
+        // We deliberately scan ALL event types, not just account_funded:
+        // wallet_to_wallet_transfer_v2 and other Fintava events also embed
+        // wallet identifiers. We extract any (account_number, wallet_id)
+        // pair we can find and let verify_and_persist_wallet_id() decide
+        // whether it's safe to save.
         // ---------------------------------------------------------------
         if (!empty($missing_by_account)) {
             $log_rows = $wpdb->get_results(
                 "SELECT payload
                    FROM {$logs_table}
-                  WHERE event_type = 'account_funded'
                   ORDER BY id DESC
-                  LIMIT 500"
+                  LIMIT 1000"
             );
 
             foreach ($log_rows as $log_row) {
@@ -1351,10 +1393,17 @@ class Matrix_MLM_Fintava {
                     continue;
                 }
 
-                // The interesting fields might live at the root or under a 'data' key.
+                // The interesting fields might live at the root, under 'data',
+                // or in a nested 'wallet' / 'recipient' / 'destination' object
+                // (varies by event type).
                 $candidates = [$payload];
-                if (isset($payload['data']) && is_array($payload['data'])) {
-                    $candidates[] = $payload['data'];
+                foreach (['data', 'wallet', 'virtual_wallet', 'virtualWallet', 'recipient', 'destination', 'beneficiary'] as $key) {
+                    if (isset($payload[$key]) && is_array($payload[$key])) {
+                        $candidates[] = $payload[$key];
+                    }
+                    if (isset($payload['data']) && is_array($payload['data']) && isset($payload['data'][$key]) && is_array($payload['data'][$key])) {
+                        $candidates[] = $payload['data'][$key];
+                    }
                 }
 
                 foreach ($candidates as $candidate) {
@@ -1362,6 +1411,8 @@ class Matrix_MLM_Fintava {
                         $candidate['account_number']
                         ?? $candidate['accountNumber']
                         ?? $candidate['virtual_account_number']
+                        ?? $candidate['recipient_account_number']
+                        ?? $candidate['destination_account_number']
                         ?? ''
                     ));
                     if ($remote_account === '' || !isset($missing_by_account[$remote_account])) {
@@ -1372,6 +1423,9 @@ class Matrix_MLM_Fintava {
                         $candidate['wallet_id']
                         ?? $candidate['walletId']
                         ?? $candidate['virtual_wallet_id']
+                        ?? $candidate['virtualWalletId']
+                        ?? $candidate['recipient_wallet_id']
+                        ?? $candidate['destination_wallet_id']
                         ?? $candidate['id']
                         ?? ''
                     );
