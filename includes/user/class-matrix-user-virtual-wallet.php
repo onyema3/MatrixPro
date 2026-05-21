@@ -133,8 +133,15 @@ class Matrix_MLM_User_Virtual_Wallet {
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
             if (is_wp_error($balance_result)) {
-                $err_msg = $balance_result->get_error_message();
-                $fintava_balance_error  = is_array($err_msg) ? implode(' ', $err_msg) : (string) $err_msg;
+                // Defense-in-depth: although Matrix_MLM_Fintava already normalizes
+                // API messages to strings before storing them in WP_Error, a
+                // third-party plugin or filter could still inject an array here.
+                // Run the message through the same normalizer so we never hand an
+                // array to esc_attr() / sprintf() downstream.
+                $fintava_balance_error  = Matrix_MLM_Fintava::normalize_api_message(
+                    $balance_result->get_error_message(),
+                    __('Balance is unavailable.', 'matrix-mlm')
+                );
                 $fintava_balance_reason = 'api_error';
             } else {
                 $fintava_balance_value    = $balance_result['available_balance'];

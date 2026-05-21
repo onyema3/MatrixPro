@@ -278,7 +278,10 @@ class Matrix_MLM_Fintava {
             return $response['data'];
         }
 
-        return new WP_Error('fintava_error', $response['message'] ?? __('Failed to retrieve bank list', 'matrix-mlm'));
+        return new WP_Error('fintava_error', self::normalize_api_message(
+            $response['message'] ?? null,
+            __('Failed to retrieve bank list', 'matrix-mlm')
+        ));
     }
 
     /**
@@ -300,7 +303,10 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_resolve_error',
-            $response['message'] ?? __('Could not resolve account details', 'matrix-mlm')
+            self::normalize_api_message(
+                $response['message'] ?? null,
+                __('Could not resolve account details', 'matrix-mlm')
+            )
         );
     }
 
@@ -343,13 +349,19 @@ class Matrix_MLM_Fintava {
                 'transfer_id' => $response['data']['id'] ?? null,
                 'reference' => $response['data']['reference'] ?? $payload['reference'],
                 'status' => $response['data']['status'] ?? 'pending',
-                'message' => $response['message'] ?? __('Transfer initiated successfully', 'matrix-mlm'),
+                'message' => self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Transfer initiated successfully', 'matrix-mlm')
+                ),
             ];
         }
 
         return new WP_Error(
             'fintava_transfer_error',
-            $response['message'] ?? __('Transfer failed', 'matrix-mlm')
+            self::normalize_api_message(
+                $response['message'] ?? null,
+                __('Transfer failed', 'matrix-mlm')
+            )
         );
     }
 
@@ -368,7 +380,10 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_status_error',
-            $response['message'] ?? __('Could not fetch transfer status', 'matrix-mlm')
+            self::normalize_api_message(
+                $response['message'] ?? null,
+                __('Could not fetch transfer status', 'matrix-mlm')
+            )
         );
     }
 
@@ -2183,12 +2198,50 @@ class Matrix_MLM_Fintava {
         $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($status_code >= 400) {
-            $error_message = $body_decoded['message']
-                ?? sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            $error_message = self::normalize_api_message(
+                $body_decoded['message'] ?? null,
+                sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint)
+            );
             return new WP_Error('fintava_api_error', $error_message);
         }
 
         return $body_decoded;
+    }
+
+    /**
+     * Coerce a Fintava API "message" field into a single string suitable for
+     * storing in a WP_Error. Fintava (and other providers) sometimes return
+     * the message as an array of validation errors, or as a nested object
+     * keyed by field name. Letting any of those reach WP_Error causes
+     * "Array to string conversion" warnings the moment the message hits
+     * sprintf(), esc_attr(), or string concatenation downstream.
+     *
+     * Accepts string, scalar, array (flat or nested), or null. Anything that
+     * can't be flattened to a useful string falls back to $default.
+     *
+     * @param mixed  $raw     The "message" value from a decoded API response.
+     * @param string $default Fallback message when $raw yields nothing useful.
+     * @return string
+     */
+    public static function normalize_api_message($raw, $default = '') {
+        if (is_string($raw)) {
+            return $raw;
+        }
+        if (is_scalar($raw)) {
+            return (string) $raw;
+        }
+        if (is_array($raw)) {
+            $flat = [];
+            array_walk_recursive($raw, function ($leaf) use (&$flat) {
+                if (is_scalar($leaf) && $leaf !== '') {
+                    $flat[] = (string) $leaf;
+                }
+            });
+            if (!empty($flat)) {
+                return implode(' ', $flat);
+            }
+        }
+        return (string) $default;
     }
 
     private function generate_reference() {
