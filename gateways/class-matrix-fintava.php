@@ -30,10 +30,26 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Fintava {
 
     /**
-     * Default Fintava Pay API base URL (DEV environment).
-     * Override by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php.
+     * Fintava Pay API base URLs, one per environment. The active environment
+     * is selected by the `matrix_mlm_fintava_environment` option (`live` |
+     * `dev`) which the admin sets on the Gateways page. Both URLs can be
+     * overridden in one shot via the MATRIX_FINTAVA_API_BASE_URL constant.
      */
-    const DEFAULT_BASE_URL = 'https://dev.fintavapay.com/api/dev';
+    const LIVE_BASE_URL = 'https://live.fintavapay.com/api/live';
+    const DEV_BASE_URL  = 'https://dev.fintavapay.com/api/dev';
+
+    /**
+     * Default base URL when no environment option is set yet. Intentionally
+     * Live so the field labelled "API Key" on the admin page resolves against
+     * the same environment most production installs are using.
+     *
+     * Kept as a public class constant for backward compatibility — the billing
+     * and card sub-gateways referenced it directly before get_base_url() was
+     * introduced. Mirrors LIVE_BASE_URL and is intentionally inlined as a
+     * literal rather than a self::LIVE_BASE_URL reference, since older PHP
+     * versions reject constant-to-constant references at parse time.
+     */
+    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/live';
 
     /**
      * Default Merchant ID for Fintava Pay.
@@ -58,19 +74,52 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * Resolve the active Fintava API base URL.
+     *
+     * Resolution order (first match wins):
+     *   1. MATRIX_FINTAVA_API_BASE_URL constant — full pinned override.
+     *   2. matrix_mlm_fintava_environment option ('live' or 'dev').
+     *   3. LIVE_BASE_URL — production default; matches the admin field label.
+     *
+     * Static so the billing and card sub-gateways can call it without
+     * instantiating the main class (their make_request() runs early enough
+     * that booting the full gateway just for a URL is wasteful).
+     *
+     * @return string Base URL with no trailing slash.
+     */
+    public static function get_base_url() {
+        if (defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL) {
+            return rtrim(MATRIX_FINTAVA_API_BASE_URL, '/');
+        }
+
+        $env = strtolower(trim((string) get_option('matrix_mlm_fintava_environment', 'live')));
+        if ($env === 'dev') {
+            return self::DEV_BASE_URL;
+        }
+        return self::LIVE_BASE_URL;
+    }
+
+    /**
+     * Resolve the active environment label, useful for the admin UI badge
+     * and for downstream code paths that need to short-circuit certain
+     * features in dev mode.
+     *
+     * @return string 'live' | 'dev' | 'custom' (when the constant override is set).
+     */
+    public static function get_environment() {
+        if (defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL) {
+            return 'custom';
+        }
+        $env = strtolower(trim((string) get_option('matrix_mlm_fintava_environment', 'live')));
+        return $env === 'dev' ? 'dev' : 'live';
+    }
+
+    /**
      * Load API credentials from settings.
-     * Only the live secret (API) key is needed.
      */
     private function load_credentials() {
         $this->secret_key = trim(get_option('matrix_mlm_fintava_secret_key', ''));
-
-        // Allow wp-config.php override for the base URL (escape hatch in case
-        // Fintava changes their endpoint structure).
-        if (defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL) {
-            $this->base_url = rtrim(MATRIX_FINTAVA_API_BASE_URL, '/');
-        } else {
-            $this->base_url = self::DEFAULT_BASE_URL;
-        }
+        $this->base_url   = self::get_base_url();
 
         // Merchant ID — stored in wp_options, overridable via wp-config.php.
         if (defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID) {

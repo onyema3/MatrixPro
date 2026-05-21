@@ -244,18 +244,64 @@ class Matrix_MLM_Admin_Gateways {
                     <span class="matrix-badge matrix-badge-<?php echo get_option('matrix_mlm_fintava_status', 0) ? 'active' : 'inactive'; ?>" style="font-size: 12px;">
                         <?php echo get_option('matrix_mlm_fintava_status', 0) ? __('Active', 'matrix-mlm') : __('Inactive', 'matrix-mlm'); ?>
                     </span>
+                    <?php
+                    // Surface the active environment next to the status badge so
+                    // admins can spot a Dev/Live mismatch at a glance.
+                    $fintava_env = Matrix_MLM_Fintava::get_environment();
+                    $env_label   = $fintava_env === 'dev'    ? __('DEV', 'matrix-mlm')
+                                 : ($fintava_env === 'custom' ? __('CUSTOM', 'matrix-mlm')
+                                 : __('LIVE', 'matrix-mlm'));
+                    $env_class   = $fintava_env === 'live' ? 'active' : 'inactive';
+                    ?>
+                    <span class="matrix-badge matrix-badge-<?php echo esc_attr($env_class); ?>" style="font-size: 12px;" title="<?php esc_attr_e('Currently selected Fintava API environment', 'matrix-mlm'); ?>">
+                        <?php echo esc_html($env_label); ?>
+                    </span>
                 </h2>
                 <p class="description" style="margin-bottom: 15px;">
-                    <?php _e('Fintava Pay powers bank payouts and virtual wallet generation. Paste your Live API Key from your Fintava dashboard below.', 'matrix-mlm'); ?>
+                    <?php _e('Fintava Pay powers bank payouts and virtual wallet generation. Paste your API Key from your Fintava dashboard below and pick the matching environment.', 'matrix-mlm'); ?>
                 </p>
                 <form method="post">
                     <?php wp_nonce_field('matrix_save_fintava_gateway'); ?>
                     <table class="form-table">
                         <tr>
-                            <th><?php _e('Live API Key', 'matrix-mlm'); ?></th>
+                            <th><?php _e('Environment', 'matrix-mlm'); ?></th>
+                            <td>
+                                <?php
+                                $current_env = strtolower(trim((string) get_option('matrix_mlm_fintava_environment', 'live')));
+                                if ($current_env !== 'dev') {
+                                    $current_env = 'live';
+                                }
+                                $is_overridden = defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL;
+                                ?>
+                                <select name="fintava_environment" <?php disabled($is_overridden); ?>>
+                                    <option value="live" <?php selected($current_env, 'live'); ?>>
+                                        <?php _e('Live (production)', 'matrix-mlm'); ?> &mdash; <?php echo esc_html(Matrix_MLM_Fintava::LIVE_BASE_URL); ?>
+                                    </option>
+                                    <option value="dev" <?php selected($current_env, 'dev'); ?>>
+                                        <?php _e('Dev (sandbox)', 'matrix-mlm'); ?> &mdash; <?php echo esc_html(Matrix_MLM_Fintava::DEV_BASE_URL); ?>
+                                    </option>
+                                </select>
+                                <p class="description">
+                                    <?php if ($is_overridden): ?>
+                                        <strong><?php _e('Override active:', 'matrix-mlm'); ?></strong>
+                                        <?php
+                                        printf(
+                                            /* translators: %s: full URL pinned via the wp-config.php constant. */
+                                            esc_html__('this dropdown is ignored because MATRIX_FINTAVA_API_BASE_URL is set to %s in wp-config.php. Remove that constant to manage the environment from this page.', 'matrix-mlm'),
+                                            '<code>' . esc_html(MATRIX_FINTAVA_API_BASE_URL) . '</code>'
+                                        );
+                                        ?>
+                                    <?php else: ?>
+                                        <?php _e('Pick the environment that matches the API Key below. Live keys do not work on the Dev URL and vice versa &mdash; that mismatch is the most common source of "Invalid API Key" errors.', 'matrix-mlm'); ?>
+                                    <?php endif; ?>
+                                </p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('API Key', 'matrix-mlm'); ?></th>
                             <td>
                                 <input type="password" name="fintava_secret_key" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_secret_key', '')); ?>" autocomplete="off">
-                                <p class="description"><?php _e('Bearer token used for all Fintava API calls. Find it under Settings &rarr; API Keys &amp; Webhooks in your Fintava dashboard.', 'matrix-mlm'); ?></p>
+                                <p class="description"><?php _e('Bearer token used for all Fintava API calls. Find it under Settings &rarr; API Keys &amp; Webhooks in your Fintava dashboard. Use the key that matches the environment selected above.', 'matrix-mlm'); ?></p>
                             </td>
                         </tr>
                         <tr>
@@ -401,7 +447,8 @@ class Matrix_MLM_Admin_Gateways {
 
     /**
      * Save Fintava Pay settings (stored in wp_options).
-     * Fields: Live API Key, Merchant ID, Callback URL, Webhook Secret, Status toggle.
+     * Fields: API Key, Environment (live/dev), Merchant ID, Callback URL,
+     * Webhook Secret, Status toggle.
      */
     private function save_fintava_settings() {
         update_option('matrix_mlm_fintava_secret_key', sanitize_text_field($_POST['fintava_secret_key'] ?? ''));
@@ -409,6 +456,13 @@ class Matrix_MLM_Admin_Gateways {
         update_option('matrix_mlm_fintava_callback_url', esc_url_raw($_POST['fintava_callback_url'] ?? ''));
         update_option('matrix_mlm_fintava_webhook_secret', sanitize_text_field($_POST['fintava_webhook_secret'] ?? ''));
         update_option('matrix_mlm_fintava_status', intval($_POST['fintava_status'] ?? 0));
+
+        // Environment selector — restrict to the two values we render in the
+        // dropdown so a hand-crafted POST can't push a garbage value into the
+        // option and confuse get_base_url() downstream.
+        $submitted_env = strtolower(trim((string) ($_POST['fintava_environment'] ?? 'live')));
+        $environment   = in_array($submitted_env, ['live', 'dev'], true) ? $submitted_env : 'live';
+        update_option('matrix_mlm_fintava_environment', $environment);
 
         // Keep the legacy "_enabled" option in sync so any older code paths
         // that still read it stay aligned with the toggle on this page.
