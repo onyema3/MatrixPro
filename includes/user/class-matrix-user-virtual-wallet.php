@@ -114,21 +114,31 @@ class Matrix_MLM_User_Virtual_Wallet {
 
         // Pull the live Fintava balance for this wallet. If Fintava is unreachable
         // or the response is malformed, fall through gracefully with a placeholder
-        // and a tooltip explaining what happened — never break the page.
-        $fintava_balance_value = null;
+        // and a hint explaining how to fix it — never break the page.
+        //
+        // Two distinct failure modes:
+        //   - missing_wallet_id: the local row never recorded the Fintava wallet ID
+        //     (typical when the wallet was linked manually with only the account
+        //     number filled in). Only an admin can fix this via Migration → Link.
+        //   - api_error: wallet_id is on file but Fintava returned an error.
+        $fintava_balance_value    = null;
         $fintava_balance_currency = $wallet->currency ?? 'NGN';
-        $fintava_balance_error = '';
+        $fintava_balance_error    = '';
+        $fintava_balance_reason   = ''; // 'missing_wallet_id' | 'api_error' | ''
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
             if (is_wp_error($balance_result)) {
-                $fintava_balance_error = $balance_result->get_error_message();
+                $fintava_balance_error  = $balance_result->get_error_message();
+                $fintava_balance_reason = 'api_error';
             } else {
-                $fintava_balance_value = $balance_result['available_balance'];
+                $fintava_balance_value    = $balance_result['available_balance'];
                 $fintava_balance_currency = $balance_result['currency'];
             }
         } else {
-            $fintava_balance_error = __('No Fintava wallet ID on file — cannot query balance.', 'matrix-mlm');
+            $fintava_balance_error  = __('Balance is unavailable.', 'matrix-mlm');
+            $fintava_balance_reason = 'missing_wallet_id';
         }
+        $is_admin_viewing = current_user_can('manage_matrix_mlm');
         ?>
 
         <!-- Visual: Matrix Wallet → Fintava Wallet -->
@@ -173,9 +183,22 @@ class Matrix_MLM_User_Virtual_Wallet {
                         <?php _e('Refresh', 'matrix-mlm'); ?>
                     </button>
                     <?php if ($fintava_balance_error): ?>
-                        <small style="display:block;margin-top:4px;color:#fecaca;">
-                            <?php echo esc_html($fintava_balance_error); ?>
-                        </small>
+                        <?php if ($fintava_balance_reason === 'missing_wallet_id'): ?>
+                            <small style="display:block;margin-top:6px;color:#fde68a;">
+                                <?php _e('Balance lookup needs your Fintava Wallet ID. Add it below — we\'ll verify it against the live API and only save it if the account number matches yours.', 'matrix-mlm'); ?>
+                            </small>
+                            <div class="matrix-set-wallet-id-form" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                                <input type="text" id="matrix-fintava-wallet-id-input" placeholder="<?php esc_attr_e('Fintava Wallet ID', 'matrix-mlm'); ?>" style="flex:1;min-width:220px;padding:6px 10px;border:1px solid rgba(255,255,255,0.4);background:rgba(255,255,255,0.1);color:#fff;border-radius:6px;font-size:13px;">
+                                <button type="button" class="matrix-wallet-copy-btn" id="matrix-fintava-set-wallet-id-btn" style="font-size:12px;padding:6px 12px;">
+                                    <?php _e('Verify & Save', 'matrix-mlm'); ?>
+                                </button>
+                                <span id="matrix-fintava-set-wallet-id-status" style="display:block;width:100%;font-size:12px;margin-top:4px;"></span>
+                            </div>
+                        <?php else: ?>
+                            <small style="display:block;margin-top:4px;color:#fecaca;">
+                                <?php echo esc_html($fintava_balance_error); ?>
+                            </small>
+                        <?php endif; ?>
                     <?php endif; ?>
                 </div>
             </div>
@@ -287,6 +310,49 @@ class Matrix_MLM_User_Virtual_Wallet {
                     error: function() {
                         btn.prop('disabled', false).text(originalLabel);
                         alert('<?php echo esc_js(__('Network error refreshing balance.', 'matrix-mlm')); ?>');
+                    }
+                });
+            });
+
+            // Verify & save a missing Fintava Wallet ID inline. The server will only
+            // accept the wallet_id if Fintava confirms it belongs to the same
+            // account_number that's already stored on the local row.
+            $('#matrix-fintava-set-wallet-id-btn').on('click', function() {
+                var btn = $(this);
+                var input = $('#matrix-fintava-wallet-id-input');
+                var statusEl = $('#matrix-fintava-set-wallet-id-status');
+                var walletId = (input.val() || '').trim();
+                if (!walletId) {
+                    statusEl.css('color', '#fecaca').text('<?php echo esc_js(__('Enter your Fintava Wallet ID first.', 'matrix-mlm')); ?>');
+                    return;
+                }
+
+                var originalLabel = btn.text();
+                btn.prop('disabled', true).text('<?php echo esc_js(__('Verifying…', 'matrix-mlm')); ?>');
+                statusEl.css('color', '#a7f3d0').text('<?php echo esc_js(__('Calling Fintava…', 'matrix-mlm')); ?>');
+
+                $.ajax({
+                    url: matrixMLM.ajaxUrl,
+                    type: 'POST',
+                    data: {
+                        action: 'matrix_fintava_set_my_wallet_id',
+                        nonce: matrixMLM.nonce,
+                        wallet_id: walletId
+                    },
+                    success: function(res) {
+                        btn.prop('disabled', false).text(originalLabel);
+                        if (res && res.success) {
+                            statusEl.css('color', '#a7f3d0').text(res.data && res.data.message ? res.data.message : '<?php echo esc_js(__('Saved.', 'matrix-mlm')); ?>');
+                            // Reload so the server-side balance fetch runs with the new wallet_id.
+                            setTimeout(function() { location.reload(); }, 600);
+                        } else {
+                            var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Could not save Wallet ID.', 'matrix-mlm')); ?>';
+                            statusEl.css('color', '#fecaca').text('✗ ' + err);
+                        }
+                    },
+                    error: function() {
+                        btn.prop('disabled', false).text(originalLabel);
+                        statusEl.css('color', '#fecaca').text('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>');
                     }
                 });
             });
