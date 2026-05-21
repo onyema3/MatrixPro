@@ -231,9 +231,31 @@ class Matrix_MLM_Core {
         $email = sanitize_email($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
         $referral_code = sanitize_text_field($_POST['referral_code'] ?? '');
+        $phone = sanitize_text_field($_POST['phone'] ?? '');
+        $first_name = sanitize_text_field($_POST['first_name'] ?? '');
+        $last_name = sanitize_text_field($_POST['last_name'] ?? '');
 
         if (empty($username) || empty($email) || empty($password)) {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
+        }
+
+        if (empty($phone)) {
+            wp_send_json_error(['message' => __('Phone number is required', 'matrix-mlm')]);
+        }
+
+        if (empty($referral_code)) {
+            wp_send_json_error(['message' => __('Referral code is required. Please ask the person who invited you for their code.', 'matrix-mlm')]);
+        }
+
+        // Validate referral code exists
+        global $wpdb;
+        $referrer = $wpdb->get_row($wpdb->prepare(
+            "SELECT user_id FROM {$wpdb->prefix}matrix_user_meta WHERE referral_code = %s",
+            $referral_code
+        ));
+
+        if (!$referrer) {
+            wp_send_json_error(['message' => __('Invalid referral code. Please check and try again.', 'matrix-mlm')]);
         }
 
         if (username_exists($username) || email_exists($email)) {
@@ -245,25 +267,21 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => $user_id->get_error_message()]);
         }
 
-        // Create matrix user meta
-        global $wpdb;
-        $ref_code = strtoupper(substr(md5($user_id . time()), 0, 8));
-        $referred_by = null;
+        // Save first name, last name to WP user
+        wp_update_user([
+            'ID' => $user_id,
+            'first_name' => $first_name,
+            'last_name' => $last_name,
+        ]);
 
-        if (!empty($referral_code)) {
-            $referrer = $wpdb->get_row($wpdb->prepare(
-                "SELECT user_id FROM {$wpdb->prefix}matrix_user_meta WHERE referral_code = %s",
-                $referral_code
-            ));
-            if ($referrer) {
-                $referred_by = $referrer->user_id;
-            }
-        }
+        // Create matrix user meta
+        $ref_code = strtoupper(substr(md5($user_id . time()), 0, 8));
 
         $wpdb->insert($wpdb->prefix . 'matrix_user_meta', [
             'user_id' => $user_id,
             'referral_code' => $ref_code,
-            'referred_by' => $referred_by,
+            'referred_by' => $referrer->user_id,
+            'phone' => $phone,
             'balance' => 0.00,
             'status' => 'active'
         ]);

@@ -69,8 +69,11 @@
         matrixAjax({
             action: 'matrix_mlm_action',
             matrix_action: 'register',
+            first_name: form.find('[name="first_name"]').val(),
+            last_name: form.find('[name="last_name"]').val(),
             username: form.find('[name="username"]').val(),
             email: form.find('[name="email"]').val(),
+            phone: form.find('[name="phone"]').val(),
             password: form.find('[name="password"]').val(),
             referral_code: form.find('[name="referral_code"]').val()
         }, function(data) {
