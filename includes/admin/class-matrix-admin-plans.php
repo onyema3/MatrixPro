@@ -110,15 +110,24 @@ class Matrix_MLM_Admin_Plans {
                     <tr>
                         <th><?php _e('Matrix Width', 'matrix-mlm'); ?></th>
                         <td>
-                            <input type="number" name="width" min="2" max="10" value="<?php echo esc_attr($plan->width ?? 2); ?>" required>
-                            <p class="description"><?php _e('Number of direct legs per member (e.g., 2 for binary, 3 for ternary)', 'matrix-mlm'); ?></p>
+                            <input type="number" name="width" id="matrix_width" min="1" max="20" value="<?php echo esc_attr($plan->width ?? get_option('matrix_mlm_default_width', 2)); ?>" required>
+                            <p class="description"><?php _e('Number of direct legs per member (1 = Unilevel, 2 = Binary, 3 = Ternary, etc.)', 'matrix-mlm'); ?></p>
                         </td>
                     </tr>
                     <tr>
                         <th><?php _e('Matrix Depth', 'matrix-mlm'); ?></th>
                         <td>
-                            <input type="number" name="depth" min="2" max="15" value="<?php echo esc_attr($plan->depth ?? 3); ?>" required>
+                            <input type="number" name="depth" id="matrix_depth" min="1" max="20" value="<?php echo esc_attr($plan->depth ?? get_option('matrix_mlm_default_depth', 3)); ?>" required>
                             <p class="description"><?php _e('Number of levels deep the matrix goes', 'matrix-mlm'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Matrix Summary', 'matrix-mlm'); ?></th>
+                        <td>
+                            <div id="matrix-summary" style="background: #f0f6ff; border: 1px solid #b3d4fc; border-radius: 6px; padding: 12px 16px;">
+                                <strong id="matrix-type-label"></strong><br>
+                                <span id="matrix-capacity-info"></span>
+                            </div>
                         </td>
                     </tr>
                     <tr>
@@ -175,6 +184,85 @@ class Matrix_MLM_Admin_Plans {
                     <a href="<?php echo admin_url('admin.php?page=matrix-mlm-plans'); ?>" class="button"><?php _e('Cancel', 'matrix-mlm'); ?></a>
                 </p>
             </form>
+
+            <script>
+            (function() {
+                var widthInput = document.getElementById('matrix_width');
+                var depthInput = document.getElementById('matrix_depth');
+                var typeLabel = document.getElementById('matrix-type-label');
+                var capacityInfo = document.getElementById('matrix-capacity-info');
+                var levelContainer = document.getElementById('level-commissions');
+
+                function calculateMaxMembers(width, depth) {
+                    var total = 0;
+                    for (var i = 0; i < depth; i++) {
+                        total += Math.pow(width, i);
+                    }
+                    return total;
+                }
+
+                function getMatrixTypeLabel(width) {
+                    if (width == 1) return '<?php _e('Unilevel', 'matrix-mlm'); ?>';
+                    if (width == 2) return '<?php _e('Binary', 'matrix-mlm'); ?>';
+                    if (width == 3) return '<?php _e('Ternary', 'matrix-mlm'); ?>';
+                    return width + '-<?php _e('Wide', 'matrix-mlm'); ?>';
+                }
+
+                function updateMatrixSummary() {
+                    var width = parseInt(widthInput.value) || 2;
+                    var depth = parseInt(depthInput.value) || 3;
+                    var maxMembers = calculateMaxMembers(width, depth);
+                    var label = getMatrixTypeLabel(width) + ' (' + width + 'x' + depth + ')';
+
+                    typeLabel.textContent = label;
+                    capacityInfo.innerHTML = '<?php _e('Total positions to fill:', 'matrix-mlm'); ?> <strong>' + maxMembers.toLocaleString() + ' <?php _e('members', 'matrix-mlm'); ?></strong>';
+
+                    if (maxMembers > 10000000) {
+                        capacityInfo.innerHTML += '<br><span style="color: #dc2626;"><?php _e('⚠ Very large matrix — may be impractical to complete.', 'matrix-mlm'); ?></span>';
+                    }
+                }
+
+                function updateLevelCommissions() {
+                    var depth = parseInt(depthInput.value) || 3;
+                    var existingValues = {};
+
+                    // Preserve existing values
+                    var inputs = levelContainer.querySelectorAll('input[type="number"]');
+                    inputs.forEach(function(input) {
+                        var match = input.name.match(/level_commission\[(\d+)\]/);
+                        if (match) {
+                            existingValues[match[1]] = input.value;
+                        }
+                    });
+
+                    // Rebuild level commission fields
+                    var html = '';
+                    for (var i = 1; i <= depth; i++) {
+                        var val = existingValues[i] || '0';
+                        html += '<div class="level-commission-row" style="margin-bottom: 5px;">';
+                        html += '<label><?php _e('Level', 'matrix-mlm'); ?> ' + i + ': </label>';
+                        html += '<input type="number" name="level_commission[' + i + ']" step="0.01" min="0" value="' + val + '" style="width: 120px;">';
+                        html += ' <?php echo esc_js(get_option('matrix_mlm_currency_symbol', '₦')); ?>';
+                        html += '</div>';
+                    }
+                    levelContainer.innerHTML = html;
+                }
+
+                widthInput.addEventListener('change', updateMatrixSummary);
+                widthInput.addEventListener('input', updateMatrixSummary);
+                depthInput.addEventListener('change', function() {
+                    updateMatrixSummary();
+                    updateLevelCommissions();
+                });
+                depthInput.addEventListener('input', function() {
+                    updateMatrixSummary();
+                    updateLevelCommissions();
+                });
+
+                // Initial calculation
+                updateMatrixSummary();
+            })();
+            </script>
         </div>
         <?php
     }
