@@ -1152,7 +1152,10 @@ class Matrix_MLM_Fintava {
      * This is the primary way to resolve a wallet_id when all we have is the
      * account number. Returns the full wallet object including its UUID.
      *
-     * @param string $account_number The 10-digit virtual account number.
+     * Response format:
+     * { "status": "success", "data": { "walletId": "...", "customerAccountNo": "...", "balance": ..., ... } }
+     *
+     * @param string $account_number The virtual account number.
      * @return array|WP_Error Wallet details on success.
      */
     public function get_wallet_by_account_number($account_number) {
@@ -1170,7 +1173,7 @@ class Matrix_MLM_Fintava {
         }
 
         // Bare object fallback
-        if (is_array($response) && (isset($response['id']) || isset($response['virtualAcctNo']))) {
+        if (is_array($response) && (isset($response['walletId']) || isset($response['customerAccountNo']) || isset($response['id']) || isset($response['virtualAcctNo']))) {
             return $response;
         }
 
@@ -1184,7 +1187,7 @@ class Matrix_MLM_Fintava {
      * Resolve the wallet_id for a local wallet row using the account number enquiry endpoint.
      *
      * Calls GET /loma-name/enquiry?accountNumber=XXXX which returns the wallet
-     * details including its UUID (the wallet_id needed for balance lookups).
+     * details including its walletId (the wallet_id needed for balance lookups).
      *
      * @param object $wallet_row The local matrix_fintava_wallets row.
      * @return string|WP_Error The resolved wallet_id on success.
@@ -1205,11 +1208,21 @@ class Matrix_MLM_Fintava {
             return $details;
         }
 
-        // Extract the wallet ID from the response
-        $resolved_wallet_id = self::extract_wallet_id($details);
+        // Extract the wallet ID from the response.
+        // Fintava returns: { "walletId": "309485721", "customerAccountNo": "9930485721", ... }
+        $resolved_wallet_id = '';
+        if (!empty($details['walletId'])) {
+            $resolved_wallet_id = (string) $details['walletId'];
+        } elseif (!empty($details['wallet_id'])) {
+            $resolved_wallet_id = (string) $details['wallet_id'];
+        } elseif (!empty($details['id']) && !isset($details['merchant'])) {
+            // Use 'id' only if it's not a merchant object
+            $resolved_wallet_id = (string) $details['id'];
+        }
+
+        // Also try our generic extractor as fallback
         if (empty($resolved_wallet_id)) {
-            // Fallback: use the top-level 'id' field
-            $resolved_wallet_id = $details['id'] ?? '';
+            $resolved_wallet_id = self::extract_wallet_id($details);
         }
 
         if (empty($resolved_wallet_id)) {
@@ -1220,7 +1233,7 @@ class Matrix_MLM_Fintava {
         }
 
         // Verify the account number matches (safety check)
-        $remote_account = self::extract_account_number($details);
+        $remote_account = $details['customerAccountNo'] ?? $details['customer_account_no'] ?? self::extract_account_number($details);
         if (!empty($remote_account) && trim($remote_account) !== trim($wallet_row->account_number)) {
             return new WP_Error(
                 'fintava_account_mismatch',
@@ -2183,7 +2196,7 @@ class Matrix_MLM_Fintava {
         if (!is_array($obj)) {
             return '';
         }
-        foreach (['virtualAcctNo', 'virtual_acct_no', 'virtual_account_number', 'virtualAccountNumber', 'account_number', 'accountNumber', 'recipient_account_number', 'destination_account_number'] as $key) {
+        foreach (['virtualAcctNo', 'virtual_acct_no', 'virtual_account_number', 'virtualAccountNumber', 'customerAccountNo', 'customer_account_no', 'account_number', 'accountNumber', 'recipient_account_number', 'destination_account_number'] as $key) {
             if (isset($obj[$key]) && $obj[$key] !== '') {
                 return trim((string) $obj[$key]);
             }
