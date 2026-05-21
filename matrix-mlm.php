@@ -55,6 +55,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-two-factor.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-gdpr.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-language.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-seo.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-subscription.php';
 
 // Payment Gateways
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-paystack.php';

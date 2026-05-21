@@ -32,6 +32,9 @@ class Matrix_MLM_Core {
         // Initialize Fintava Billing (registers billing AJAX hooks)
         new Matrix_MLM_Fintava_Billing();
 
+        // Initialize monthly subscription
+        new Matrix_MLM_Subscription();
+
         // Register password reset email hooks
         Matrix_MLM_Notifications::register_password_reset_hooks();
     }
@@ -193,6 +196,9 @@ class Matrix_MLM_Core {
                 break;
             case 'enable_2fa':
                 $this->process_enable_2fa();
+                break;
+            case 'pay_subscription':
+                $this->process_pay_subscription();
                 break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
@@ -524,6 +530,18 @@ class Matrix_MLM_Core {
         $two_factor = new Matrix_MLM_Two_Factor();
         $result = $two_factor->enable($user_id);
         wp_send_json_success($result);
+    }
+
+    private function process_pay_subscription() {
+        $user_id = get_current_user_id();
+        $subscription = new Matrix_MLM_Subscription();
+        $result = $subscription->manual_pay($user_id);
+
+        if ($result['success']) {
+            wp_send_json_success($result);
+        } else {
+            wp_send_json_error($result);
+        }
     }
 
     private function process_subscribe() {

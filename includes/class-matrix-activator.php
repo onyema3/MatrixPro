@@ -22,6 +22,9 @@ class Matrix_MLM_Activator {
         // Create billing transactions table
         Matrix_MLM_Fintava_Billing::create_table();
 
+        // Create subscriptions table
+        Matrix_MLM_Subscription::create_table();
+
         // Seed default data
         Matrix_MLM_Database::seed_defaults();
 
