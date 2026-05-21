@@ -126,23 +126,9 @@ class Matrix_MLM_User_Virtual_Wallet {
         $fintava_balance_error    = '';
         $fintava_balance_reason   = ''; // 'missing_wallet_id' | 'api_error' | ''
 
-        // Auto-resolve wallet_id via Customer API if missing.
-        // Wrapped in try/catch to prevent page crashes if the customer_id
-        // column hasn't been added yet or the API is unreachable.
-        if (empty($wallet->wallet_id)) {
-            try {
-                $resolved = $fintava->resolve_wallet_id_from_customer($wallet);
-                if (!is_wp_error($resolved)) {
-                    // Refresh the wallet object with the newly-saved wallet_id
-                    $wallet = $fintava->get_user_wallet($user_id);
-                }
-            } catch (\Exception $e) {
-                // Silently fail — the manual Wallet ID input form below
-                // will still be shown as a fallback.
-            } catch (\Error $e) {
-                // Catch fatal errors (e.g. missing column) gracefully.
-            }
-        }
+        // Note: Auto-resolve via Fintava API is not available on this account.
+        // The manual "Verify & Save" input below allows users/admins to enter
+        // their wallet ID once Fintava provides it.
 
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
