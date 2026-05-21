@@ -482,6 +482,9 @@ class Matrix_MLM_Admin {
             case 'link_fintava_account':
                 $this->link_fintava_account();
                 break;
+            case 'fintava_lookup_wallet':
+                $this->fintava_lookup_wallet();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -826,6 +829,52 @@ class Matrix_MLM_Admin {
             $count += $this->count_all_descendants($child->id, $plan_id);
         }
         return $count;
+    }
+
+    /**
+     * Look up a virtual wallet on Fintava by wallet_id and return the
+     * authoritative account details so the admin Link form can auto-fill
+     * itself instead of relying on hand-typed values.
+     */
+    private function fintava_lookup_wallet() {
+        $wallet_id = sanitize_text_field($_POST['wallet_id'] ?? '');
+        if (empty($wallet_id)) {
+            wp_send_json_error(['message' => __('Enter a Wallet ID first, then click Verify.', 'matrix-mlm')]);
+        }
+
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->is_active()) {
+            wp_send_json_error(['message' => __('Fintava is not configured. Add the live API key on the Gateways page first.', 'matrix-mlm')]);
+        }
+
+        $details = $fintava->get_virtual_wallet_details($wallet_id);
+        if (is_wp_error($details)) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: API error message returned by Fintava */
+                    __('Fintava could not find that wallet: %s', 'matrix-mlm'),
+                    $details->get_error_message()
+                ),
+            ]);
+        }
+
+        // Normalize the API response into a stable shape regardless of which
+        // field names Fintava chose to return (account_number vs accountNumber,
+        // bank_name vs bank, email vs customer_email, etc.).
+        wp_send_json_success([
+            'message' => __('Wallet verified — account details auto-filled.', 'matrix-mlm'),
+            'wallet'  => [
+                'wallet_id'      => $details['wallet_id'] ?? $details['id'] ?? $wallet_id,
+                'account_number' => $details['account_number'] ?? $details['accountNumber'] ?? '',
+                'account_name'   => $details['account_name'] ?? $details['accountName'] ?? '',
+                'bank_name'      => $details['bank_name'] ?? $details['bank'] ?? $details['bankName'] ?? 'Fintava',
+                'bank_code'      => $details['bank_code'] ?? $details['bankCode'] ?? '',
+                'currency'       => $details['currency'] ?? 'NGN',
+                'status'         => $details['status'] ?? 'active',
+                'customer_email' => $details['email'] ?? $details['customer_email'] ?? '',
+                'customer_phone' => $details['phone'] ?? $details['customer_phone'] ?? '',
+            ],
+        ]);
     }
 
     /**
