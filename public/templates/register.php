@@ -40,7 +40,7 @@ $referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
             </div>
             <div class="matrix-form-group">
                 <label><?php _e('Referral Code', 'matrix-mlm'); ?> <span class="matrix-required">*</span></label>
-                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $referral_code ? 'readonly' : ''; ?> required>
+                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $referral_code ? 'readonly' : ''; ?> required placeholder="<?php echo esc_attr(get_option('matrix_mlm_default_referral_code', '')); ?>">
                 <small class="matrix-form-hint"><?php _e('Enter the referral code of the person who invited you.', 'matrix-mlm'); ?></small>
             </div>
             <?php if (get_option('matrix_mlm_captcha_enabled')): ?>
