@@ -145,7 +145,12 @@ class Matrix_MLM_Admin_Migration {
                 <tr><td colspan="2"><hr><h3 style="margin:0;"><?php _e('Wallet Details', 'matrix-mlm'); ?></h3></td></tr>
                 <tr>
                     <th><?php _e('Wallet ID', 'matrix-mlm'); ?></th>
-                    <td><input type="text" id="link_wallet_id" class="regular-text" placeholder="<?php _e('Fintava wallet ID', 'matrix-mlm'); ?>"></td>
+                    <td>
+                        <input type="text" id="link_wallet_id" class="regular-text" placeholder="<?php _e('Fintava wallet ID', 'matrix-mlm'); ?>">
+                        <button type="button" class="button" id="btn_verify_wallet" style="margin-left:6px;"><?php _e('Verify & Auto-Fill from Fintava', 'matrix-mlm'); ?></button>
+                        <p class="description"><?php _e('Optional. If you provide a Wallet ID and click Verify, the plugin will call Fintava\'s live API (<code>GET /virtual-wallet/{wallet_id}</code>) and fill in the Account Number, Account Name, and Bank Name below from the verified response.', 'matrix-mlm'); ?></p>
+                        <div id="verify_wallet_status" style="margin-top:8px;font-size:13px;"></div>
+                    </td>
                 </tr>
                 <tr>
                     <th><?php _e('Account Number', 'matrix-mlm'); ?></th>
@@ -205,6 +210,61 @@ class Matrix_MLM_Admin_Migration {
                 alert(res.success ? res.data.message : (res.data.message || 'Error'));
             });
         }
+
+        (function() {
+            var btn        = document.getElementById('btn_verify_wallet');
+            var statusEl   = document.getElementById('verify_wallet_status');
+            var walletInp  = document.getElementById('link_wallet_id');
+            var acctNumEl  = document.getElementById('link_account_number');
+            var acctNameEl = document.getElementById('link_account_name');
+            var bankEl     = document.getElementById('link_bank_name');
+            if (!btn) return;
+
+            function setStatus(msg, color) {
+                statusEl.textContent = msg;
+                statusEl.style.color = color || '#1f2937';
+            }
+
+            btn.addEventListener('click', function() {
+                var walletId = walletInp.value.trim();
+                if (!walletId) {
+                    setStatus('<?php echo esc_js(__('Enter a Wallet ID above first.', 'matrix-mlm')); ?>', '#b91c1c');
+                    return;
+                }
+
+                btn.disabled = true;
+                var originalLabel = btn.textContent;
+                btn.textContent = '<?php echo esc_js(__('Verifying…', 'matrix-mlm')); ?>';
+                setStatus('<?php echo esc_js(__('Calling Fintava…', 'matrix-mlm')); ?>', '#6b7280');
+
+                jQuery.post(matrixMLMAdmin.ajaxUrl, {
+                    action: 'matrix_admin_action',
+                    nonce: matrixMLMAdmin.nonce,
+                    matrix_action: 'fintava_lookup_wallet',
+                    wallet_id: walletId
+                }, function(res) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+
+                    if (!res || !res.success) {
+                        var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Verification failed.', 'matrix-mlm')); ?>';
+                        setStatus('✗ ' + err, '#b91c1c');
+                        return;
+                    }
+
+                    var w = res.data.wallet || {};
+                    if (w.account_number) acctNumEl.value = w.account_number;
+                    if (w.account_name)   acctNameEl.value = w.account_name;
+                    if (w.bank_name)      bankEl.value     = w.bank_name;
+
+                    setStatus('✓ ' + res.data.message + (w.status ? ' (' + w.status + ')' : ''), '#059669');
+                }).fail(function() {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    setStatus('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>', '#b91c1c');
+                });
+            });
+        })();
         </script>
         <?php
     }
