@@ -1416,9 +1416,57 @@ class Matrix_MLM_Fintava {
     }
 
     public function get_virtual_wallet_details($wallet_id) {
-        $response = $this->make_request('GET', '/virtual-wallet/' . $wallet_id);
-        if (is_wp_error($response)) {
-            return $response;
+        if (empty($wallet_id)) {
+            return new WP_Error('missing_wallet_id', __('Wallet ID is required', 'matrix-mlm'));
+        }
+
+        // Different Fintava merchant tiers expose the single-wallet GET under
+        // slightly different paths (the Live tier in particular does NOT
+        // expose /virtual-wallet/{id}, which returns Express's default
+        // "Cannot GET ..." 404). Try the most common spellings in order and
+        // accept the first one that doesn't 404. The remembered winner is
+        // cached on the class for the lifetime of the request so subsequent
+        // calls (balance lookups, backfill verification, migration page,
+        // etc.) skip straight to the working path.
+        //
+        // Mirrors the resolver used by list_virtual_wallets() / get_customer().
+        static $resolved_prefix = null;
+
+        $prefixes = $resolved_prefix !== null
+            ? [$resolved_prefix]
+            : ['/virtual-wallet', '/virtual-wallets', '/wallet', '/wallets', '/merchant/virtual-wallet', '/merchant/virtual-wallets'];
+
+        $response   = null;
+        $last_error = null;
+
+        foreach ($prefixes as $prefix) {
+            $attempt = $this->make_request('GET', $prefix . '/' . $wallet_id);
+
+            if (!is_wp_error($attempt)) {
+                $response        = $attempt;
+                $resolved_prefix = $prefix;
+                break;
+            }
+
+            $last_error = $attempt;
+            $msg        = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
+            // Only keep trying alternates on "not found" / "cannot get" style
+            // 404s. For real failures (auth, rate-limit, network, or
+            // Fintava's own JSON-formatted "wallet not found") bail out
+            // immediately so callers see the actual cause.
+            if (strpos($msg, 'cannot get') === false
+                && strpos($msg, 'not found') === false
+                && strpos($msg, 'http 404') === false
+                && strpos($msg, '(http 404)') === false) {
+                return $attempt;
+            }
+        }
+
+        if ($response === null) {
+            return $last_error ?: new WP_Error(
+                'fintava_wallet_error',
+                __('Could not retrieve wallet details', 'matrix-mlm')
+            );
         }
 
         // Fintava actually returns {"data": {...}, "status": 200, "message": "successful"}
