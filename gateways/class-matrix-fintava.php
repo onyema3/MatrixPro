@@ -1169,8 +1169,8 @@ class Matrix_MLM_Fintava {
             return $response['data'];
         }
 
-        // Bare object fallback
-        if (is_array($response) && (isset($response['id']) || isset($response['virtualAcctNo']))) {
+        // Bare object fallback — accept any shape that has a wallet identifier or account number
+        if (is_array($response) && (isset($response['id']) || isset($response['walletId']) || isset($response['virtualAcctNo']) || isset($response['customerAccountNo']))) {
             return $response;
         }
 
@@ -2183,7 +2183,7 @@ class Matrix_MLM_Fintava {
         if (!is_array($obj)) {
             return '';
         }
-        foreach (['virtualAcctNo', 'virtual_acct_no', 'virtual_account_number', 'virtualAccountNumber', 'account_number', 'accountNumber', 'recipient_account_number', 'destination_account_number'] as $key) {
+        foreach (['virtualAcctNo', 'customerAccountNo', 'virtual_acct_no', 'virtual_account_number', 'virtualAccountNumber', 'account_number', 'accountNumber', 'recipient_account_number', 'destination_account_number'] as $key) {
             if (isset($obj[$key]) && $obj[$key] !== '') {
                 return trim((string) $obj[$key]);
             }
