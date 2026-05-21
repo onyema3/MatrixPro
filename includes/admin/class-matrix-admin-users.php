@@ -9,6 +9,10 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Admin_Users {
 
+    public function __construct() {
+        add_action('admin_init', [$this, 'handle_user_export']);
+    }
+
     public function render() {
         global $wpdb;
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
@@ -20,6 +24,12 @@ class Matrix_MLM_Admin_Users {
 
         $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
         $status_filter = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
+        $date_from = isset($_GET['date_from']) ? sanitize_text_field($_GET['date_from']) : '';
+        $date_to = isset($_GET['date_to']) ? sanitize_text_field($_GET['date_to']) : '';
+        $balance_min = isset($_GET['balance_min']) ? sanitize_text_field($_GET['balance_min']) : '';
+        $balance_max = isset($_GET['balance_max']) ? sanitize_text_field($_GET['balance_max']) : '';
+        $plan_filter = isset($_GET['plan_id']) ? intval($_GET['plan_id']) : 0;
+        $has_referrals = isset($_GET['has_referrals']) ? sanitize_text_field($_GET['has_referrals']) : '';
         $page_num = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
         $per_page = 20;
         $offset = ($page_num - 1) * $per_page;
@@ -28,44 +38,123 @@ class Matrix_MLM_Admin_Users {
         $params = [];
 
         if ($search) {
-            $where .= " AND (u.user_login LIKE %s OR u.user_email LIKE %s)";
+            $where .= " AND (u.user_login LIKE %s OR u.user_email LIKE %s OR um.phone LIKE %s OR um.referral_code LIKE %s)";
+            $params[] = '%' . $search . '%';
+            $params[] = '%' . $search . '%';
             $params[] = '%' . $search . '%';
             $params[] = '%' . $search . '%';
         }
-
         if ($status_filter) {
             $where .= " AND um.status = %s";
             $params[] = $status_filter;
         }
+        if ($date_from) {
+            $where .= " AND DATE(u.user_registered) >= %s";
+            $params[] = $date_from;
+        }
+        if ($date_to) {
+            $where .= " AND DATE(u.user_registered) <= %s";
+            $params[] = $date_to;
+        }
+        if ($balance_min !== '') {
+            $where .= " AND um.balance >= %f";
+            $params[] = floatval($balance_min);
+        }
+        if ($balance_max !== '') {
+            $where .= " AND um.balance <= %f";
+            $params[] = floatval($balance_max);
+        }
+        if ($plan_filter) {
+            $where .= " AND um.user_id IN (SELECT user_id FROM {$wpdb->prefix}matrix_positions WHERE plan_id = %d AND status = 'active')";
+            $params[] = $plan_filter;
+        }
 
+        $count_params = $params;
         $params[] = $per_page;
         $params[] = $offset;
 
-        $users = $wpdb->get_results($wpdb->prepare(
-            "SELECT um.*, u.user_login, u.user_email, u.user_registered 
-             FROM {$wpdb->prefix}matrix_user_meta um 
-             LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID 
-             $where ORDER BY um.created_at DESC LIMIT %d OFFSET %d",
-            $params
-        ));
+        $query = "SELECT um.*, u.user_login, u.user_email, u.user_registered FROM {$wpdb->prefix}matrix_user_meta um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID $where ORDER BY um.created_at DESC LIMIT %d OFFSET %d";
+        $users = !empty($params) ? $wpdb->get_results($wpdb->prepare($query, $params)) : $wpdb->get_results($query);
 
-        $total = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_user_meta");
+        $count_query = "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_user_meta um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID $where";
+        $total = !empty($count_params) ? $wpdb->get_var($wpdb->prepare($count_query, $count_params)) : $wpdb->get_var($count_query);
+
+        // Get plans for filter dropdown
+        $plans = $wpdb->get_results("SELECT id, name FROM {$wpdb->prefix}matrix_plans ORDER BY name ASC");
+
+        // Build export URL params
+        $export_params = array_filter([
+            'page' => 'matrix-mlm-users',
+            's' => $search,
+            'status' => $status_filter,
+            'date_from' => $date_from,
+            'date_to' => $date_to,
+            'balance_min' => $balance_min,
+            'balance_max' => $balance_max,
+            'plan_id' => $plan_filter,
+            'has_referrals' => $has_referrals,
+        ]);
         ?>
         <div class="wrap matrix-admin-wrap">
-            <h1><?php _e('Manage Users', 'matrix-mlm'); ?></h1>
+            <h1><?php _e('Manage Users', 'matrix-mlm'); ?> <span style="font-size:14px;color:#666;font-weight:normal;">(<?php echo number_format($total); ?> <?php _e('total', 'matrix-mlm'); ?>)</span></h1>
 
-            <div class="matrix-admin-filters">
-                <form method="get">
+            <!-- Filters -->
+            <div class="matrix-admin-card" style="margin-bottom:20px;padding:16px 20px;">
+                <form method="get" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
                     <input type="hidden" name="page" value="matrix-mlm-users">
-                    <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="<?php _e('Search users...', 'matrix-mlm'); ?>">
-                    <select name="status">
-                        <option value=""><?php _e('All Status', 'matrix-mlm'); ?></option>
-                        <option value="active" <?php selected($status_filter, 'active'); ?>><?php _e('Active', 'matrix-mlm'); ?></option>
-                        <option value="banned" <?php selected($status_filter, 'banned'); ?>><?php _e('Banned', 'matrix-mlm'); ?></option>
-                        <option value="pending" <?php selected($status_filter, 'pending'); ?>><?php _e('Pending', 'matrix-mlm'); ?></option>
-                    </select>
-                    <input type="submit" class="button" value="<?php _e('Filter', 'matrix-mlm'); ?>">
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Search', 'matrix-mlm'); ?></label>
+                        <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="<?php _e('Name, email, phone, code...', 'matrix-mlm'); ?>" style="width:180px;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Status', 'matrix-mlm'); ?></label>
+                        <select name="status">
+                            <option value=""><?php _e('All', 'matrix-mlm'); ?></option>
+                            <option value="active" <?php selected($status_filter, 'active'); ?>><?php _e('Active', 'matrix-mlm'); ?></option>
+                            <option value="banned" <?php selected($status_filter, 'banned'); ?>><?php _e('Banned', 'matrix-mlm'); ?></option>
+                            <option value="pending" <?php selected($status_filter, 'pending'); ?>><?php _e('Pending', 'matrix-mlm'); ?></option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Joined From', 'matrix-mlm'); ?></label>
+                        <input type="date" name="date_from" value="<?php echo esc_attr($date_from); ?>" style="width:130px;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Joined To', 'matrix-mlm'); ?></label>
+                        <input type="date" name="date_to" value="<?php echo esc_attr($date_to); ?>" style="width:130px;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Min Balance', 'matrix-mlm'); ?></label>
+                        <input type="number" name="balance_min" value="<?php echo esc_attr($balance_min); ?>" step="0.01" style="width:90px;" placeholder="0">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Max Balance', 'matrix-mlm'); ?></label>
+                        <input type="number" name="balance_max" value="<?php echo esc_attr($balance_max); ?>" step="0.01" style="width:90px;" placeholder="∞">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:11px;margin-bottom:2px;"><?php _e('Plan', 'matrix-mlm'); ?></label>
+                        <select name="plan_id">
+                            <option value=""><?php _e('All Plans', 'matrix-mlm'); ?></option>
+                            <?php foreach ($plans as $p): ?>
+                            <option value="<?php echo $p->id; ?>" <?php selected($plan_filter, $p->id); ?>><?php echo esc_html($p->name); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div>
+                        <input type="submit" class="button button-primary" value="<?php _e('Filter', 'matrix-mlm'); ?>">
+                        <a href="<?php echo admin_url('admin.php?page=matrix-mlm-users'); ?>" class="button"><?php _e('Reset', 'matrix-mlm'); ?></a>
+                    </div>
                 </form>
+            </div>
+
+            <!-- Export Buttons -->
+            <div style="margin-bottom:15px;display:flex;gap:8px;align-items:center;">
+                <strong><?php _e('Export:', 'matrix-mlm'); ?></strong>
+                <a href="<?php echo wp_nonce_url(add_query_arg(array_merge($export_params, ['export_users' => 'csv']), admin_url('admin.php')), 'matrix_export_users'); ?>" class="button"><span class="dashicons dashicons-media-spreadsheet" style="margin-top:4px;"></span> CSV</a>
+                <a href="<?php echo wp_nonce_url(add_query_arg(array_merge($export_params, ['export_users' => 'excel']), admin_url('admin.php')), 'matrix_export_users'); ?>" class="button"><span class="dashicons dashicons-media-document" style="margin-top:4px;"></span> Excel</a>
+                <a href="<?php echo wp_nonce_url(add_query_arg(array_merge($export_params, ['export_users' => 'pdf']), admin_url('admin.php')), 'matrix_export_users'); ?>" class="button"><span class="dashicons dashicons-pdf" style="margin-top:4px;"></span> PDF</a>
+                <a href="<?php echo wp_nonce_url(add_query_arg(array_merge($export_params, ['export_users' => 'json']), admin_url('admin.php')), 'matrix_export_users'); ?>" class="button"><span class="dashicons dashicons-editor-code" style="margin-top:4px;"></span> JSON</a>
+                <span style="margin-left:10px;color:#666;font-size:12px;"><?php printf(__('(%d users match current filters)', 'matrix-mlm'), $total); ?></span>
             </div>
 
             <table class="wp-list-table widefat fixed striped">
@@ -73,6 +162,7 @@ class Matrix_MLM_Admin_Users {
                     <tr>
                         <th><?php _e('Username', 'matrix-mlm'); ?></th>
                         <th><?php _e('Email', 'matrix-mlm'); ?></th>
+                        <th><?php _e('Phone', 'matrix-mlm'); ?></th>
                         <th><?php _e('Balance', 'matrix-mlm'); ?></th>
                         <th><?php _e('Referral Code', 'matrix-mlm'); ?></th>
                         <th><?php _e('Referrals', 'matrix-mlm'); ?></th>
@@ -88,6 +178,7 @@ class Matrix_MLM_Admin_Users {
                     <tr>
                         <td><strong><?php echo esc_html($user->user_login); ?></strong></td>
                         <td><?php echo esc_html($user->user_email); ?></td>
+                        <td><?php echo esc_html($user->phone ?? '-'); ?></td>
                         <td><?php echo $currency . number_format($user->balance, 2); ?></td>
                         <td><code><?php echo esc_html($user->referral_code); ?></code></td>
                         <td><?php echo $referral_count; ?></td>
@@ -198,5 +289,119 @@ class Matrix_MLM_Admin_Users {
             </div>
         </div>
         <?php
+    }
+
+    /**
+     * Handle user export
+     */
+    public function handle_user_export() {
+        if (!isset($_GET['export_users']) || !isset($_GET['page']) || $_GET['page'] !== 'matrix-mlm-users') {
+            return;
+        }
+        if (!wp_verify_nonce($_GET['_wpnonce'], 'matrix_export_users')) {
+            return;
+        }
+        if (!current_user_can('manage_matrix_users')) {
+            return;
+        }
+
+        $format = sanitize_text_field($_GET['export_users']);
+        $data = $this->get_filtered_users_for_export();
+        $filename = 'matrix-users-' . date('Y-m-d');
+
+        switch ($format) {
+            case 'csv': $this->export_users_csv($data, $filename); break;
+            case 'excel': $this->export_users_excel($data, $filename); break;
+            case 'pdf': $this->export_users_pdf($data, $filename); break;
+            case 'json': $this->export_users_json($data, $filename); break;
+        }
+        exit;
+    }
+
+    private function get_filtered_users_for_export() {
+        global $wpdb;
+
+        $where = "WHERE 1=1";
+        $params = [];
+
+        $search = sanitize_text_field($_GET['s'] ?? '');
+        $status_filter = sanitize_text_field($_GET['status'] ?? '');
+        $date_from = sanitize_text_field($_GET['date_from'] ?? '');
+        $date_to = sanitize_text_field($_GET['date_to'] ?? '');
+        $balance_min = $_GET['balance_min'] ?? '';
+        $balance_max = $_GET['balance_max'] ?? '';
+        $plan_filter = intval($_GET['plan_id'] ?? 0);
+
+        if ($search) {
+            $where .= " AND (u.user_login LIKE %s OR u.user_email LIKE %s OR um.phone LIKE %s OR um.referral_code LIKE %s)";
+            $params[] = '%' . $search . '%';
+            $params[] = '%' . $search . '%';
+            $params[] = '%' . $search . '%';
+            $params[] = '%' . $search . '%';
+        }
+        if ($status_filter) { $where .= " AND um.status = %s"; $params[] = $status_filter; }
+        if ($date_from) { $where .= " AND DATE(u.user_registered) >= %s"; $params[] = $date_from; }
+        if ($date_to) { $where .= " AND DATE(u.user_registered) <= %s"; $params[] = $date_to; }
+        if ($balance_min !== '') { $where .= " AND um.balance >= %f"; $params[] = floatval($balance_min); }
+        if ($balance_max !== '') { $where .= " AND um.balance <= %f"; $params[] = floatval($balance_max); }
+        if ($plan_filter) { $where .= " AND um.user_id IN (SELECT user_id FROM {$wpdb->prefix}matrix_positions WHERE plan_id = %d AND status = 'active')"; $params[] = $plan_filter; }
+
+        $query = "SELECT u.user_login as username, u.user_email as email, um.phone, um.balance, um.referral_code, um.referred_by, um.status, um.country, um.state, um.city, u.user_registered as joined FROM {$wpdb->prefix}matrix_user_meta um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID $where ORDER BY um.created_at DESC";
+
+        return !empty($params) ? $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A) : $wpdb->get_results($query, ARRAY_A);
+    }
+
+    private function export_users_csv($data, $filename) {
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '.csv"');
+        $output = fopen('php://output', 'w');
+        fprintf($output, chr(0xEF) . chr(0xBB) . chr(0xBF));
+        if (!empty($data)) {
+            fputcsv($output, array_keys($data[0]));
+            foreach ($data as $row) { fputcsv($output, $row); }
+        }
+        fclose($output);
+    }
+
+    private function export_users_excel($data, $filename) {
+        header('Content-Type: application/vnd.ms-excel');
+        header('Content-Disposition: attachment; filename="' . $filename . '.xls"');
+        echo '<html><head><meta charset="UTF-8"></head><body><table border="1">';
+        if (!empty($data)) {
+            echo '<tr>';
+            foreach (array_keys($data[0]) as $h) { echo '<th style="background:#4f46e5;color:#fff;padding:8px;">' . esc_html(ucwords(str_replace('_', ' ', $h))) . '</th>'; }
+            echo '</tr>';
+            foreach ($data as $row) {
+                echo '<tr>';
+                foreach ($row as $cell) { echo '<td style="padding:6px;">' . esc_html($cell) . '</td>'; }
+                echo '</tr>';
+            }
+        }
+        echo '</table></body></html>';
+    }
+
+    private function export_users_pdf($data, $filename) {
+        header('Content-Type: text/html; charset=utf-8');
+        $title = get_option('matrix_mlm_site_title', 'Matrix MLM Pro') . ' - Users Report';
+        echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . esc_html($title) . '</title>';
+        echo '<style>body{font-family:Arial,sans-serif;margin:20px;font-size:12px;}h1{font-size:18px;color:#4f46e5;}table{width:100%;border-collapse:collapse;margin-top:15px;}th{background:#4f46e5;color:#fff;padding:6px 8px;text-align:left;font-size:11px;}td{padding:5px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;}tr:nth-child(even){background:#f9fafb;}.no-print{margin-bottom:15px;}@media print{.no-print{display:none;}}</style>';
+        echo '</head><body>';
+        echo '<div class="no-print"><button onclick="window.print()" style="padding:8px 16px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;">Print / Save as PDF</button></div>';
+        echo '<h1>' . esc_html($title) . '</h1>';
+        echo '<p style="color:#666;font-size:11px;">Generated: ' . date('F d, Y H:i:s') . ' | Records: ' . count($data) . '</p>';
+        if (!empty($data)) {
+            echo '<table><thead><tr>';
+            foreach (array_keys($data[0]) as $h) { echo '<th>' . esc_html(ucwords(str_replace('_', ' ', $h))) . '</th>'; }
+            echo '</tr></thead><tbody>';
+            foreach ($data as $row) { echo '<tr>'; foreach ($row as $cell) { echo '<td>' . esc_html($cell) . '</td>'; } echo '</tr>'; }
+            echo '</tbody></table>';
+        }
+        echo '</body></html>';
+    }
+
+    private function export_users_json($data, $filename) {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '.json"');
+        echo json_encode(['report' => 'users', 'generated_at' => current_time('mysql'), 'total_records' => count($data), 'filters' => array_filter(['status' => $_GET['status'] ?? '', 'date_from' => $_GET['date_from'] ?? '', 'date_to' => $_GET['date_to'] ?? '', 'search' => $_GET['s'] ?? '']), 'data' => $data], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
     }
 }
