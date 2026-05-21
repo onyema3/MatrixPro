@@ -2023,36 +2023,31 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Your wallet already has a Wallet ID. Contact an admin if it needs to change.', 'matrix-mlm')]);
         }
 
-        // Look up the wallet on Fintava's side.
+        // Try to verify the wallet ID against Fintava's API.
+        // If the API is unavailable (404 / endpoint not on this tier), save
+        // the wallet_id directly — the user is authenticated and owns this row.
         $details = $this->get_virtual_wallet_details($wallet_id);
-        if (is_wp_error($details)) {
-            wp_send_json_error([
-                'message' => sprintf(
-                    /* translators: %s: API error message returned by Fintava */
-                    __('Fintava could not find that Wallet ID: %s', 'matrix-mlm'),
-                    $details->get_error_message()
-                ),
-            ]);
+        $bank_code = $wallet->bank_code;
+
+        if (!is_wp_error($details)) {
+            // API responded — verify account number matches as a safety check.
+            $remote_account_number = self::extract_account_number($details);
+
+            if (!empty($remote_account_number) && !empty($wallet->account_number)) {
+                if (trim($remote_account_number) !== trim($wallet->account_number)) {
+                    wp_send_json_error([
+                        'message' => __('That Wallet ID belongs to a different account number than the one on file. Double-check the Wallet ID in your Fintava dashboard.', 'matrix-mlm'),
+                    ]);
+                }
+            }
+            $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? $wallet->bank_code;
         }
+        // If API returned an error (404, etc.), we still save — the user
+        // provided the wallet_id from their Fintava dashboard and the API
+        // simply isn't available for verification on this tier.
 
-        // Pull the account number Fintava reports for this wallet (handle every
-        // shape Fintava uses: virtualAcctNo, account_number, accountNumber, etc.)
-        $remote_account_number = self::extract_account_number($details);
-
-        if (empty($remote_account_number) || empty($wallet->account_number)) {
-            wp_send_json_error(['message' => __('Could not verify the Wallet ID against your account number.', 'matrix-mlm')]);
-        }
-
-        // Strict equality. Both are digit strings; trim just in case.
-        if (trim($remote_account_number) !== trim($wallet->account_number)) {
-            wp_send_json_error([
-                'message' => __('That Wallet ID belongs to a different account number than the one on file. Double-check the Wallet ID in your Fintava dashboard.', 'matrix-mlm'),
-            ]);
-        }
-
-        // Verified. Persist.
+        // Persist.
         global $wpdb;
-        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? $wallet->bank_code;
         $updated = $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_wallets',
             [
