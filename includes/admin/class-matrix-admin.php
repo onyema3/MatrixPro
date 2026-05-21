@@ -840,7 +840,8 @@ class Matrix_MLM_Admin {
      * itself instead of relying on hand-typed values.
      */
     private function fintava_lookup_wallet() {
-        $wallet_id = sanitize_text_field($_POST['wallet_id'] ?? '');
+        $wallet_id      = sanitize_text_field($_POST['wallet_id'] ?? '');
+        $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         if (empty($wallet_id)) {
             wp_send_json_error(['message' => __('Enter a Wallet ID first, then click Verify.', 'matrix-mlm')]);
         }
@@ -850,7 +851,11 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('Fintava is not configured. Add the live API key on the Gateways page first.', 'matrix-mlm')]);
         }
 
-        $details = $fintava->get_virtual_wallet_details($wallet_id);
+        // Pass the typed account_number through as a hint — on Live tiers
+        // where /virtual-wallet/{id} 404s, get_virtual_wallet_details() will
+        // fall back to /loma-name/enquiry?accountNumber=... and verify the
+        // returned wallet matches the requested wallet_id.
+        $details = $fintava->get_virtual_wallet_details($wallet_id, $account_number ?: null);
         if (is_wp_error($details)) {
             wp_send_json_error([
                 'message' => sprintf(

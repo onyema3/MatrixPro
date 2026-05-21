@@ -1415,52 +1415,132 @@ class Matrix_MLM_Fintava {
         );
     }
 
-    public function get_virtual_wallet_details($wallet_id) {
+    /**
+     * Fetch a single virtual wallet's details by its Fintava UUID.
+     *
+     * Resolution chain (each step is gated on the previous one 404-ing):
+     *
+     *   1. Path-style GET against /virtual-wallet/{id} and several known
+     *      siblings (/virtual-wallets/{id}, /merchant/virtual-wallet/{id},
+     *      etc.). The first prefix that responds is cached on the class for
+     *      the rest of the request — see list_virtual_wallets() for the same
+     *      pattern. Accordingly we also negative-cache "every prefix 404'd"
+     *      so subsequent calls skip the dead probes.
+     *
+     *   2. If $account_number is supplied, fall back to
+     *      GET /loma-name/enquiry?accountNumber=... — the canonical Live
+     *      lookup endpoint that returns the full wallet object keyed by
+     *      account number rather than UUID. Some tiers expose this but not
+     *      the path-style GET, and vice versa, so we try whichever the caller
+     *      can support.
+     *
+     * Whatever the source, the result is sanity-checked: the wallet object
+     * we hand back must agree with the requested $wallet_id (either via its
+     * own `id`/`walletId` field, or — when the response doesn't echo that —
+     * via the account number the caller already vouched for).
+     *
+     * @param string      $wallet_id      The Fintava wallet UUID.
+     * @param string|null $account_number Optional account number for the same
+     *                                    wallet. When supplied, enables the
+     *                                    /loma-name/enquiry fallback for tiers
+     *                                    where the path-style GET is missing.
+     * @return array|WP_Error Wallet details on success.
+     */
+    public function get_virtual_wallet_details($wallet_id, $account_number = null) {
         if (empty($wallet_id)) {
             return new WP_Error('missing_wallet_id', __('Wallet ID is required', 'matrix-mlm'));
         }
 
-        // Different Fintava merchant tiers expose the single-wallet GET under
-        // slightly different paths (the Live tier in particular does NOT
-        // expose /virtual-wallet/{id}, which returns Express's default
-        // "Cannot GET ..." 404). Try the most common spellings in order and
-        // accept the first one that doesn't 404. The remembered winner is
-        // cached on the class for the lifetime of the request so subsequent
-        // calls (balance lookups, backfill verification, migration page,
-        // etc.) skip straight to the working path.
-        //
-        // Mirrors the resolver used by list_virtual_wallets() / get_customer().
+        // Per-request memoization. $resolved_prefix remembers the winning
+        // path-style prefix once we find one; $path_style_dead is the
+        // negative cache for tiers (Live, currently) where every path
+        // variant 404s — without it, every balance refresh would burn six
+        // round-trips before reaching the loma-name fallback.
         static $resolved_prefix = null;
-
-        $prefixes = $resolved_prefix !== null
-            ? [$resolved_prefix]
-            : ['/virtual-wallet', '/virtual-wallets', '/wallet', '/wallets', '/merchant/virtual-wallet', '/merchant/virtual-wallets'];
+        static $path_style_dead = false;
 
         $response   = null;
         $last_error = null;
 
-        foreach ($prefixes as $prefix) {
-            $attempt = $this->make_request('GET', $prefix . '/' . $wallet_id);
+        if (!$path_style_dead) {
+            $prefixes = $resolved_prefix !== null
+                ? [$resolved_prefix]
+                : ['/virtual-wallet', '/virtual-wallets', '/wallet', '/wallets', '/merchant/virtual-wallet', '/merchant/virtual-wallets'];
 
-            if (!is_wp_error($attempt)) {
-                $response        = $attempt;
-                $resolved_prefix = $prefix;
-                break;
+            foreach ($prefixes as $prefix) {
+                $attempt = $this->make_request('GET', $prefix . '/' . $wallet_id);
+
+                if (!is_wp_error($attempt)) {
+                    $response        = $attempt;
+                    $resolved_prefix = $prefix;
+                    break;
+                }
+
+                $last_error = $attempt;
+                $msg        = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
+                // Only keep trying alternates on "not found" / "cannot get"
+                // style 404s. For real failures (auth, rate-limit, network,
+                // or Fintava's own JSON-formatted "wallet not found") bail
+                // out immediately so callers see the actual cause.
+                if (strpos($msg, 'cannot get') === false
+                    && strpos($msg, 'not found') === false
+                    && strpos($msg, 'http 404') === false
+                    && strpos($msg, '(http 404)') === false) {
+                    return $attempt;
+                }
             }
 
-            $last_error = $attempt;
-            $msg        = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
-            // Only keep trying alternates on "not found" / "cannot get" style
-            // 404s. For real failures (auth, rate-limit, network, or
-            // Fintava's own JSON-formatted "wallet not found") bail out
-            // immediately so callers see the actual cause.
-            if (strpos($msg, 'cannot get') === false
-                && strpos($msg, 'not found') === false
-                && strpos($msg, 'http 404') === false
-                && strpos($msg, '(http 404)') === false) {
-                return $attempt;
+            // If the loop exhausted every prefix without success, this tier
+            // simply doesn't expose a path-style single-wallet GET.
+            // Remember that so we don't keep probing on follow-up calls.
+            if ($response === null && $resolved_prefix === null) {
+                $path_style_dead = true;
             }
         }
+
+        // ---- Fallback: account-number enquiry. ----------------------------
+        // Some Live merchant tiers (the one in production right now) expose
+        // GET /loma-name/enquiry?accountNumber=... but no equivalent
+        // path-style singleton. If the caller has the account number on hand
+        // — and most do, since the local matrix_fintava_wallets row carries
+        // it — try that endpoint and verify the returned wallet matches.
+        if ($response === null && !empty($account_number)) {
+            $enquiry = $this->get_wallet_by_account_number($account_number);
+            if (!is_wp_error($enquiry)) {
+                $returned_id = self::extract_wallet_id($enquiry);
+                if ($returned_id === '' && isset($enquiry['id'])) {
+                    $returned_id = (string) $enquiry['id'];
+                }
+
+                $matches = false;
+                if ($returned_id !== '' && trim($returned_id) === trim((string) $wallet_id)) {
+                    $matches = true;
+                } elseif ($returned_id === '') {
+                    // Some response shapes don't echo the wallet UUID at all.
+                    // In that case fall back to confirming the account number
+                    // the caller passed in is the one Fintava returned —
+                    // since the caller had to vouch for that pairing anyway,
+                    // matching it isn't a privilege escalation.
+                    $returned_account = self::extract_account_number($enquiry);
+                    if ($returned_account !== '' && trim($returned_account) === trim((string) $account_number)) {
+                        $matches = true;
+                    }
+                }
+
+                if ($matches) {
+                    return $enquiry;
+                }
+
+                $last_error = new WP_Error(
+                    'fintava_wallet_id_mismatch',
+                    __('The Fintava enquiry response refers to a different wallet than expected.', 'matrix-mlm')
+                );
+            }
+            // If the enquiry call itself errored we deliberately keep the
+            // earlier path-style $last_error — it's the more informative
+            // signal ("endpoint unavailable on this tier") for callers.
+        }
+        // ------------------------------------------------------------------
 
         if ($response === null) {
             return $last_error ?: new WP_Error(
@@ -1497,12 +1577,12 @@ class Matrix_MLM_Fintava {
      * across endpoint versions: balance / available_balance / availableBalance /
      * wallet_balance / walletBalance / current_balance / currentBalance.
      */
-    public function get_virtual_wallet_balance($wallet_id) {
+    public function get_virtual_wallet_balance($wallet_id, $account_number = null) {
         if (empty($wallet_id)) {
             return new WP_Error('missing_wallet_id', __('Wallet ID is required', 'matrix-mlm'));
         }
 
-        $details = $this->get_virtual_wallet_details($wallet_id);
+        $details = $this->get_virtual_wallet_details($wallet_id, $account_number);
         if (is_wp_error($details)) {
             return $details;
         }
@@ -1862,7 +1942,10 @@ class Matrix_MLM_Fintava {
      * @param string $candidate_wallet The wallet_id we're trying to validate.
      */
     private function verify_and_persist_wallet_id($local_row, $candidate_wallet) {
-        $details = $this->get_virtual_wallet_details($candidate_wallet);
+        $details = $this->get_virtual_wallet_details(
+            $candidate_wallet,
+            isset($local_row->account_number) ? $local_row->account_number : null
+        );
         if (is_wp_error($details)) {
             return [
                 'status' => 'lookup_failed',
@@ -2048,7 +2131,7 @@ class Matrix_MLM_Fintava {
         }
 
         if (!empty($wallet->wallet_id)) {
-            $api_details = $this->get_virtual_wallet_details($wallet->wallet_id);
+            $api_details = $this->get_virtual_wallet_details($wallet->wallet_id, $wallet->account_number);
             if (!is_wp_error($api_details) && isset($api_details['status'])) {
                 if ($api_details['status'] !== $wallet->status) {
                     global $wpdb;
@@ -2113,7 +2196,7 @@ class Matrix_MLM_Fintava {
             $wallet = $this->get_user_wallet($user_id);
         }
 
-        $balance = $this->get_virtual_wallet_balance($wallet->wallet_id);
+        $balance = $this->get_virtual_wallet_balance($wallet->wallet_id, $wallet->account_number);
         if (is_wp_error($balance)) {
             wp_send_json_error(['message' => $balance->get_error_message()]);
         }
@@ -2166,7 +2249,7 @@ class Matrix_MLM_Fintava {
         // Try to verify the wallet ID against Fintava's API.
         // If the API is unavailable (404 / endpoint not on this tier), save
         // the wallet_id directly — the user is authenticated and owns this row.
-        $details = $this->get_virtual_wallet_details($wallet_id);
+        $details = $this->get_virtual_wallet_details($wallet_id, $wallet->account_number);
         $bank_code = $wallet->bank_code;
 
         if (!is_wp_error($details)) {
