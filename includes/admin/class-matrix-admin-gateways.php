@@ -259,12 +259,26 @@ class Matrix_MLM_Admin_Gateways {
                             </td>
                         </tr>
                         <tr>
+                            <th><?php _e('Merchant ID', 'matrix-mlm'); ?></th>
+                            <td>
+                                <input type="text" name="fintava_merchant_id" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID)); ?>">
+                                <p class="description"><?php _e('Your Fintava Merchant ID (UUID). Sent as the Merchant-Id header with every API request.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Callback / Webhook URL', 'matrix-mlm'); ?></th>
+                            <td>
+                                <input type="url" name="fintava_callback_url" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_callback_url', Matrix_MLM_Fintava::DEFAULT_CALLBACK_URL)); ?>">
+                                <p class="description"><?php _e('The URL Fintava will POST webhook events to. Set this same URL in your Fintava dashboard under Webhooks.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
                             <th><?php _e('Webhook Secret', 'matrix-mlm'); ?></th>
                             <td>
                                 <input type="text" name="fintava_webhook_secret" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_webhook_secret', '')); ?>">
                                 <p class="description">
                                     <?php _e('Optional but recommended &mdash; used to verify webhook signatures.', 'matrix-mlm'); ?><br>
-                                    <?php _e('Webhook URL:', 'matrix-mlm'); ?> <code><?php echo esc_html(rest_url('matrix-mlm/v1/fintava/webhook')); ?></code>
+                                    <?php _e('Webhook URL:', 'matrix-mlm'); ?> <code><?php echo esc_html(get_option('matrix_mlm_fintava_callback_url', Matrix_MLM_Fintava::DEFAULT_CALLBACK_URL)); ?></code>
                                 </p>
                             </td>
                         </tr>
@@ -387,10 +401,12 @@ class Matrix_MLM_Admin_Gateways {
 
     /**
      * Save Fintava Pay settings (stored in wp_options).
-     * Simplified to: Live API Key + optional Webhook Secret + Status toggle.
+     * Fields: Live API Key, Merchant ID, Callback URL, Webhook Secret, Status toggle.
      */
     private function save_fintava_settings() {
         update_option('matrix_mlm_fintava_secret_key', sanitize_text_field($_POST['fintava_secret_key'] ?? ''));
+        update_option('matrix_mlm_fintava_merchant_id', sanitize_text_field($_POST['fintava_merchant_id'] ?? ''));
+        update_option('matrix_mlm_fintava_callback_url', esc_url_raw($_POST['fintava_callback_url'] ?? ''));
         update_option('matrix_mlm_fintava_webhook_secret', sanitize_text_field($_POST['fintava_webhook_secret'] ?? ''));
         update_option('matrix_mlm_fintava_status', intval($_POST['fintava_status'] ?? 0));
 
