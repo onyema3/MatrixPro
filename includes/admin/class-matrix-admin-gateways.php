@@ -58,15 +58,43 @@ class Matrix_MLM_Admin_Gateways {
         $table = $wpdb->prefix . 'matrix_gateways';
         $result = ['inserted' => 0, 'skipped' => 0, 'errors' => []];
 
-        // Make sure the table exists; if not, create all plugin tables.
+        // Make sure the table exists; if not, create it directly with a clean
+        // CREATE TABLE IF NOT EXISTS. We bypass dbDelta because the original
+        // schema has inline UNIQUE constraints that dbDelta cannot handle.
         $table_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
         if (!$table_exists) {
-            if (class_exists('Matrix_MLM_Database')) {
-                Matrix_MLM_Database::create_tables();
+            $charset_collate = $wpdb->get_charset_collate();
+            $create_sql = "CREATE TABLE IF NOT EXISTS `$table` (
+                id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                name varchar(100) NOT NULL,
+                slug varchar(50) NOT NULL,
+                gateway_parameters text,
+                supported_currencies text,
+                min_amount decimal(12,2) NOT NULL DEFAULT 0.00,
+                max_amount decimal(12,2) NOT NULL DEFAULT 999999.99,
+                fixed_charge decimal(12,2) NOT NULL DEFAULT 0.00,
+                percent_charge decimal(5,2) NOT NULL DEFAULT 0.00,
+                status tinyint(1) NOT NULL DEFAULT 1,
+                created_at datetime DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY slug (slug)
+            ) $charset_collate";
+
+            // Suppress wpdb's error display for this query so we can capture it.
+            $previous_show_errors = $wpdb->show_errors;
+            $wpdb->hide_errors();
+            $wpdb->query($create_sql);
+            if ($previous_show_errors) {
+                $wpdb->show_errors();
             }
+
             $table_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
             if (!$table_exists) {
-                $result['errors'][] = sprintf(__('Gateways table %s could not be created.', 'matrix-mlm'), $table);
+                $result['errors'][] = sprintf(
+                    __('Gateways table %s could not be created. SQL error: %s', 'matrix-mlm'),
+                    $table,
+                    $wpdb->last_error ?: __('unknown error (check database user CREATE permissions)', 'matrix-mlm')
+                );
                 return $result;
             }
         }

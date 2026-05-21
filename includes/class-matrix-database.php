@@ -148,7 +148,7 @@ class Matrix_MLM_Database {
         $table_epins = $wpdb->prefix . 'matrix_epins';
         $sql_epins = "CREATE TABLE $table_epins (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            pin_code varchar(50) NOT NULL UNIQUE,
+            pin_code varchar(50) NOT NULL,
             plan_id bigint(20) UNSIGNED NOT NULL,
             amount decimal(12,2) NOT NULL,
             created_by bigint(20) UNSIGNED NOT NULL,
@@ -201,7 +201,7 @@ class Matrix_MLM_Database {
         $sql_gateways = "CREATE TABLE $table_gateways (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             name varchar(100) NOT NULL,
-            slug varchar(50) NOT NULL UNIQUE,
+            slug varchar(50) NOT NULL,
             gateway_parameters text,
             supported_currencies text,
             min_amount decimal(12,2) NOT NULL DEFAULT 0.00,
@@ -264,7 +264,7 @@ class Matrix_MLM_Database {
         $table_subscribers = $wpdb->prefix . 'matrix_subscribers';
         $sql_subscribers = "CREATE TABLE $table_subscribers (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            email varchar(255) NOT NULL UNIQUE,
+            email varchar(255) NOT NULL,
             status tinyint(1) NOT NULL DEFAULT 1,
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
