@@ -20,6 +20,7 @@
  * - POST /bank/credit/merchant                - Credit a bank account (payout from merchant)
  * - POST /virtual-wallet/generate             - Generate virtual wallet for user
  * - GET  /customer/wallet/balance/{walletId}  - Get virtual wallet balance (fast path)
+ * - GET  /customers                           - List customers (wallet lookup fallback)
  * - GET  /banks                               - List supported banks
  * - POST /resolve-account                     - Verify bank account (name lookup)
  */
@@ -1441,6 +1442,11 @@ class Matrix_MLM_Fintava {
      *      path-style singleton nor the loma-name enquiry is exposed but
      *      the customer endpoint is.
      *
+     *   4. As a final fallback (when an account_number is on hand), pull
+     *      the full /customers list and match by embedded account_number.
+     *      Picks up tiers that expose only the list endpoint, and resolves
+     *      pre-existing wallets that lack a customer_id locally.
+     *
      * Whatever the source, the result is sanity-checked: the wallet object
      * we hand back must agree with the requested $wallet_id (either via its
      * own `id`/`walletId` field, or — when the response doesn't echo that —
@@ -1481,9 +1487,11 @@ class Matrix_MLM_Fintava {
         $path_style_error     = null; // last error from step 1
         $loma_name_error      = null; // error or null from step 2
         $customer_error       = null; // error or null from step 3
+        $customer_list_error  = null; // error or null from step 4
         $tried_path_style     = false;
         $tried_loma_name      = false;
         $tried_customer       = false;
+        $tried_customer_list  = false;
 
         // ---- Step 1: path-style GET. -------------------------------------
         if (!$path_style_dead) {
@@ -1593,6 +1601,66 @@ class Matrix_MLM_Fintava {
             }
         }
 
+        // ---- Step 4: customer list fallback. -----------------------------
+        // Final fallback for tiers that expose neither path-style GETs,
+        // /loma-name/enquiry, nor /customers/{id} (or where customer_id
+        // isn't on file): pull the full customer list from /customers and
+        // match by embedded account_number. The list response carries each
+        // customer's wallet object inline, so a hit lets us return wallet
+        // details without a follow-up /customers/{id} round-trip.
+        //
+        // Only runs when we have an account_number to match against; without
+        // one, there's nothing to key the search on.
+        static $customer_list_dead = false;
+        if ($response === null && !empty($account_number) && !$customer_list_dead) {
+            $tried_customer_list = true;
+            $list = $this->get_customer_list();
+            if (!is_wp_error($list) && is_array($list)) {
+                $found = false;
+                foreach ($list as $cust) {
+                    if (!is_array($cust)) {
+                        continue;
+                    }
+                    // The list response can carry the wallet either nested
+                    // under 'wallet' (preferred) or at the root of the
+                    // customer object on simpler tiers.
+                    $cust_wallet = isset($cust['wallet']) && is_array($cust['wallet']) ? $cust['wallet'] : $cust;
+                    $cust_account = self::extract_account_number($cust_wallet);
+                    if ($cust_account === '' || trim($cust_account) !== trim((string) $account_number)) {
+                        continue;
+                    }
+                    $found = true;
+                    if ($this->wallet_response_matches($cust_wallet, $wallet_id, $account_number)) {
+                        return $cust_wallet;
+                    }
+                    $customer_list_error = new WP_Error(
+                        'fintava_wallet_id_mismatch',
+                        __('A customer in the Fintava list matches the account number, but its wallet ID does not match the requested wallet.', 'matrix-mlm')
+                    );
+                    break;
+                }
+                if (!$found && $customer_list_error === null) {
+                    $customer_list_error = new WP_Error(
+                        'fintava_customer_not_in_list',
+                        __('No customer in the Fintava customer list matches the account number on file.', 'matrix-mlm')
+                    );
+                }
+            } else {
+                $customer_list_error = $list instanceof WP_Error ? $list : new WP_Error(
+                    'fintava_customer_list_error',
+                    __('Customer list endpoint returned an unexpected shape.', 'matrix-mlm')
+                );
+                // Negative-cache the list endpoint only on 404-style errors.
+                $msg = strtolower(is_array($customer_list_error->get_error_message()) ? implode(' ', $customer_list_error->get_error_message()) : (string) $customer_list_error->get_error_message());
+                if (strpos($msg, 'cannot get') !== false
+                    || strpos($msg, 'not found') !== false
+                    || strpos($msg, 'http 404') !== false
+                    || strpos($msg, '(http 404)') !== false) {
+                    $customer_list_dead = true;
+                }
+            }
+        }
+
         // ---- Build a diagnostic error if nothing worked. -----------------
         if ($response === null) {
             return $this->build_wallet_lookup_error(
@@ -1602,6 +1670,8 @@ class Matrix_MLM_Fintava {
                 $loma_name_error,
                 $tried_customer,
                 $customer_error,
+                $tried_customer_list,
+                $customer_list_error,
                 !empty($account_number),
                 !empty($customer_id)
             );
@@ -1671,6 +1741,8 @@ class Matrix_MLM_Fintava {
         $loma_name_error,
         $tried_customer,
         $customer_error,
+        $tried_customer_list,
+        $customer_list_error,
         $had_account_number,
         $had_customer_id
     ) {
@@ -1714,6 +1786,20 @@ class Matrix_MLM_Fintava {
             $parts[] = __('/customers/{id} not tried (no customer_id on file)', 'matrix-mlm');
         }
 
+        if ($tried_customer_list && $customer_list_error instanceof WP_Error) {
+            $parts[] = sprintf(
+                /* translators: %s: error returned by Fintava customer list endpoint */
+                __('/customers (list) failed (%s)', 'matrix-mlm'),
+                $customer_list_error->get_error_message()
+            );
+        } elseif ($tried_customer_list) {
+            $parts[] = __('/customers (list) failed', 'matrix-mlm');
+        } elseif (!$had_account_number) {
+            $parts[] = __('/customers (list) not tried (no account_number on file)', 'matrix-mlm');
+        } else {
+            $parts[] = __('/customers (list) skipped (negative-cached as unavailable)', 'matrix-mlm');
+        }
+
         return new WP_Error(
             'fintava_wallet_error',
             sprintf(
@@ -1742,13 +1828,17 @@ class Matrix_MLM_Fintava {
         // GET /customer/wallet/balance/{walletId} — single round-trip,
         // documented on the Fintava dev tier and rolling out to live. We
         // try it first and only fall back to the heavier details chain
-        // (path-style GET → /loma-name/enquiry → /customers/{id}) if this
-        // endpoint isn't available on the active tier.
+        // (path-style GET → /loma-name/enquiry → /customers/{id} →
+        // /customers list) if this endpoint isn't available on the active
+        // tier.
         //
         // Negative-cached for the rest of the request so a tier that 404s
         // here doesn't burn a round-trip per refresh — same pattern used
-        // throughout get_virtual_wallet_details().
+        // throughout get_virtual_wallet_details(). $balance_endpoint_error
+        // captures the 404 so we can surface it in the diagnostic when the
+        // details fallback also fails.
         static $balance_endpoint_dead = false;
+        $balance_endpoint_error = null;
 
         if (!$balance_endpoint_dead) {
             $direct = $this->make_request('GET', '/customer/wallet/balance/' . rawurlencode($wallet_id));
@@ -1769,8 +1859,10 @@ class Matrix_MLM_Fintava {
                     || strpos($msg, '(http 404)') !== false) {
                     // Tier doesn't expose this endpoint — stop probing it
                     // for the rest of the request and let the details
-                    // fallback take over.
+                    // fallback take over. Keep the error around so we can
+                    // include it in the final diagnostic if everything fails.
                     $balance_endpoint_dead = true;
+                    $balance_endpoint_error = $direct;
                 } else {
                     // Real failure (auth, rate-limit, network). Surface it
                     // immediately rather than masking it behind a fallback.
@@ -1782,6 +1874,22 @@ class Matrix_MLM_Fintava {
         // ---- Fallback: derive balance from the wallet details object. ----
         $details = $this->get_virtual_wallet_details($wallet_id, $account_number, $customer_id);
         if (is_wp_error($details)) {
+            // Decorate the diagnostic so the user sees we ALSO tried the
+            // dedicated balance endpoint and exactly how it failed —
+            // otherwise the error message lists only the details-chain
+            // attempts and the operator can't tell whether the new endpoint
+            // is live yet on this tier.
+            if ($balance_endpoint_error instanceof WP_Error) {
+                return new WP_Error(
+                    $details->get_error_code(),
+                    sprintf(
+                        /* translators: %1$s: details-chain diagnostic, %2$s: balance endpoint failure */
+                        __('%1$s | /customer/wallet/balance/{walletId} failed (%2$s)', 'matrix-mlm'),
+                        $details->get_error_message(),
+                        $balance_endpoint_error->get_error_message()
+                    )
+                );
+            }
             return $details;
         }
 
