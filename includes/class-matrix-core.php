@@ -194,6 +194,9 @@ class Matrix_MLM_Core {
             case 'update_profile':
                 $this->process_profile_update();
                 break;
+            case 'upload_avatar':
+                $this->process_upload_avatar();
+                break;
             case 'enable_2fa':
                 $this->process_enable_2fa();
                 break;
@@ -522,7 +525,51 @@ class Matrix_MLM_Core {
         if ($first_name) update_user_meta($user_id, 'first_name', $first_name);
         if ($last_name) update_user_meta($user_id, 'last_name', $last_name);
 
+        // Update extended profile fields
+        $date_of_birth = sanitize_text_field($_POST['date_of_birth'] ?? '');
+        $gender = sanitize_text_field($_POST['gender'] ?? '');
+        $bio = sanitize_textarea_field($_POST['bio'] ?? '');
+        $bank_name = sanitize_text_field($_POST['bank_name'] ?? '');
+        $bank_account = sanitize_text_field($_POST['bank_account'] ?? '');
+        $bank_account_name = sanitize_text_field($_POST['bank_account_name'] ?? '');
+
+        update_user_meta($user_id, 'matrix_date_of_birth', $date_of_birth);
+        update_user_meta($user_id, 'matrix_gender', $gender);
+        update_user_meta($user_id, 'matrix_bio', $bio);
+        update_user_meta($user_id, 'matrix_bank_name', $bank_name);
+        update_user_meta($user_id, 'matrix_bank_account', $bank_account);
+        update_user_meta($user_id, 'matrix_bank_account_name', $bank_account_name);
+
         wp_send_json_success(['message' => __('Profile updated successfully', 'matrix-mlm')]);
+    }
+
+    private function process_upload_avatar() {
+        $user_id = get_current_user_id();
+
+        if (empty($_FILES['avatar'])) {
+            wp_send_json_error(['message' => __('No file uploaded', 'matrix-mlm')]);
+        }
+
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+
+        $file = $_FILES['avatar'];
+        $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (!in_array($file['type'], $allowed)) {
+            wp_send_json_error(['message' => __('Invalid file type. Allowed: JPG, PNG, GIF, WebP', 'matrix-mlm')]);
+        }
+        if ($file['size'] > 2 * 1024 * 1024) {
+            wp_send_json_error(['message' => __('File too large. Maximum 2MB', 'matrix-mlm')]);
+        }
+
+        $upload = wp_handle_upload($file, ['test_form' => false]);
+        if (isset($upload['error'])) {
+            wp_send_json_error(['message' => $upload['error']]);
+        }
+
+        update_user_meta($user_id, 'matrix_avatar_url', $upload['url']);
+        wp_send_json_success(['message' => __('Avatar updated', 'matrix-mlm'), 'url' => $upload['url']]);
     }
 
     private function process_enable_2fa() {

@@ -462,6 +462,9 @@ class Matrix_MLM_Admin {
             case 'subtract_balance':
                 $this->subtract_user_balance();
                 break;
+            case 'update_user_profile':
+                $this->update_user_profile();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -551,5 +554,54 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
         }
         wp_send_json_success(['message' => __('Balance subtracted', 'matrix-mlm')]);
+    }
+
+    private function update_user_profile() {
+        $user_id = intval($_POST['user_id'] ?? 0);
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+
+        $user = get_userdata($user_id);
+        if (!$user) {
+            wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+
+        // Update WordPress user fields
+        $first_name = sanitize_text_field($_POST['first_name'] ?? '');
+        $last_name = sanitize_text_field($_POST['last_name'] ?? '');
+        $email = sanitize_email($_POST['email'] ?? '');
+
+        if ($first_name) update_user_meta($user_id, 'first_name', $first_name);
+        if ($last_name) update_user_meta($user_id, 'last_name', $last_name);
+
+        // Update email if changed
+        if ($email && $email !== $user->user_email) {
+            if (email_exists($email) && email_exists($email) !== $user_id) {
+                wp_send_json_error(['message' => __('Email already in use by another user', 'matrix-mlm')]);
+            }
+            wp_update_user(['ID' => $user_id, 'user_email' => $email]);
+        }
+
+        // Update matrix_user_meta fields
+        global $wpdb;
+        $meta_data = [
+            'phone' => sanitize_text_field($_POST['phone'] ?? ''),
+            'address' => sanitize_textarea_field($_POST['address'] ?? ''),
+            'city' => sanitize_text_field($_POST['city'] ?? ''),
+            'state' => sanitize_text_field($_POST['state'] ?? ''),
+            'country' => sanitize_text_field($_POST['country'] ?? ''),
+            'zip_code' => sanitize_text_field($_POST['zip_code'] ?? ''),
+        ];
+
+        // Update status if provided
+        $status = sanitize_text_field($_POST['status'] ?? '');
+        if ($status && in_array($status, ['active', 'inactive', 'banned'])) {
+            $meta_data['status'] = $status;
+        }
+
+        $wpdb->update($wpdb->prefix . 'matrix_user_meta', $meta_data, ['user_id' => $user_id]);
+
+        wp_send_json_success(['message' => __('User profile updated successfully', 'matrix-mlm')]);
     }
 }

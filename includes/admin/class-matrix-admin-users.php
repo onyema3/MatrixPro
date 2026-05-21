@@ -251,10 +251,7 @@ class Matrix_MLM_Admin_Users {
             <div class="matrix-admin-card">
                 <h2><?php _e('User Details', 'matrix-mlm'); ?></h2>
                 <table class="form-table">
-                    <tr><th><?php _e('Email', 'matrix-mlm'); ?></th><td><?php echo esc_html($user->user_email); ?></td></tr>
-                    <tr><th><?php _e('Phone', 'matrix-mlm'); ?></th><td><?php echo esc_html($meta->phone ?? 'N/A'); ?></td></tr>
                     <tr><th><?php _e('Referral Code', 'matrix-mlm'); ?></th><td><code><?php echo esc_html($meta->referral_code); ?></code></td></tr>
-                    <tr><th><?php _e('Status', 'matrix-mlm'); ?></th><td><span class="matrix-badge matrix-badge-<?php echo $meta->status; ?>"><?php echo ucfirst($meta->status); ?></span></td></tr>
                     <tr><th><?php _e('2FA', 'matrix-mlm'); ?></th><td><?php echo $meta->two_factor_enabled ? __('Enabled', 'matrix-mlm') : __('Disabled', 'matrix-mlm'); ?></td></tr>
                     <tr><th><?php _e('Email Verified', 'matrix-mlm'); ?></th><td><?php echo $meta->email_verified ? __('Yes', 'matrix-mlm') : __('No', 'matrix-mlm'); ?></td></tr>
                     <tr><th><?php _e('Registered', 'matrix-mlm'); ?></th><td><?php echo date('M d, Y H:i', strtotime($user->user_registered)); ?></td></tr>
@@ -271,6 +268,87 @@ class Matrix_MLM_Admin_Users {
                     <button class="button" onclick="matrixSubtractBalance(<?php echo $user_id; ?>)"><?php _e('Subtract Balance', 'matrix-mlm'); ?></button>
                 </div>
             </div>
+
+            <!-- Admin Edit Profile -->
+            <div class="matrix-admin-card">
+                <h2><?php _e('Edit Profile', 'matrix-mlm'); ?></h2>
+                <p class="description"><?php _e('Update this user\'s profile information.', 'matrix-mlm'); ?></p>
+                <table class="form-table" id="matrix-admin-edit-profile">
+                    <tr>
+                        <th><?php _e('First Name', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_first_name" class="regular-text" value="<?php echo esc_attr(get_user_meta($user_id, 'first_name', true)); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Last Name', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_last_name" class="regular-text" value="<?php echo esc_attr(get_user_meta($user_id, 'last_name', true)); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Email', 'matrix-mlm'); ?></th>
+                        <td><input type="email" id="admin_edit_email" class="regular-text" value="<?php echo esc_attr($user->user_email); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Phone', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_phone" class="regular-text" value="<?php echo esc_attr($meta->phone ?? ''); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Status', 'matrix-mlm'); ?></th>
+                        <td>
+                            <select id="admin_edit_status">
+                                <option value="active" <?php selected($meta->status, 'active'); ?>><?php _e('Active', 'matrix-mlm'); ?></option>
+                                <option value="inactive" <?php selected($meta->status, 'inactive'); ?>><?php _e('Inactive', 'matrix-mlm'); ?></option>
+                                <option value="banned" <?php selected($meta->status, 'banned'); ?>><?php _e('Banned', 'matrix-mlm'); ?></option>
+                            </select>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Address', 'matrix-mlm'); ?></th>
+                        <td><textarea id="admin_edit_address" class="large-text" rows="2"><?php echo esc_textarea($meta->address ?? ''); ?></textarea></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('City', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_city" class="regular-text" value="<?php echo esc_attr($meta->city ?? ''); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('State', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_state" class="regular-text" value="<?php echo esc_attr($meta->state ?? ''); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Country', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_country" class="regular-text" value="<?php echo esc_attr($meta->country ?? ''); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Zip Code', 'matrix-mlm'); ?></th>
+                        <td><input type="text" id="admin_edit_zip_code" class="small-text" value="<?php echo esc_attr($meta->zip_code ?? ''); ?>"></td>
+                    </tr>
+                </table>
+                <p>
+                    <button class="button button-primary" onclick="matrixAdminUpdateProfile(<?php echo $user_id; ?>)"><?php _e('Save Profile Changes', 'matrix-mlm'); ?></button>
+                </p>
+            </div>
+            <script>
+            function matrixAdminUpdateProfile(userId) {
+                var data = {
+                    action: 'matrix_admin_action',
+                    nonce: matrixMLMAdmin.nonce,
+                    matrix_action: 'update_user_profile',
+                    user_id: userId,
+                    first_name: document.getElementById('admin_edit_first_name').value,
+                    last_name: document.getElementById('admin_edit_last_name').value,
+                    email: document.getElementById('admin_edit_email').value,
+                    phone: document.getElementById('admin_edit_phone').value,
+                    status: document.getElementById('admin_edit_status').value,
+                    address: document.getElementById('admin_edit_address').value,
+                    city: document.getElementById('admin_edit_city').value,
+                    state: document.getElementById('admin_edit_state').value,
+                    country: document.getElementById('admin_edit_country').value,
+                    zip_code: document.getElementById('admin_edit_zip_code').value
+                };
+                jQuery.post(matrixMLMAdmin.ajaxUrl, data, function(res) {
+                    alert(res.success ? res.data.message : (res.data.message || 'Error'));
+                    if (res.success) location.reload();
+                });
+            }
+            </script>
 
             <div class="matrix-admin-card">
                 <h2><?php _e('Active Plans', 'matrix-mlm'); ?></h2>
