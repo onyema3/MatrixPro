@@ -1,0 +1,211 @@
+/* Matrix MLM Pro - Dashboard Styles */
+
+.matrix-dashboard {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    min-height: 80vh;
+    background: var(--matrix-light);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--matrix-shadow);
+    margin: 20px 0;
+}
+
+/* Sidebar */
+.matrix-dashboard-sidebar {
+    background: var(--matrix-dark);
+    padding: 24px 0;
+    overflow-y: auto;
+}
+
+.matrix-user-info {
+    text-align: center;
+    padding: 0 20px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    margin-bottom: 16px;
+}
+
+.matrix-user-info .matrix-avatar img {
+    border-radius: 50%;
+    border: 3px solid var(--matrix-primary);
+}
+
+.matrix-user-info h4 {
+    color: #fff;
+    margin: 10px 0 4px;
+    font-size: 16px;
+}
+
+.matrix-user-info .matrix-balance {
+    color: var(--matrix-success);
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0;
+}
+
+.matrix-dashboard-nav {
+    display: flex;
+    flex-direction: column;
+}
+
+.matrix-dashboard-nav a {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 24px;
+    color: #d1d5db;
+    text-decoration: none;
+    font-size: 13px;
+    transition: all 0.2s;
+    border-left: 3px solid transparent;
+}
+
+.matrix-dashboard-nav a:hover {
+    background: rgba(255,255,255,0.05);
+    color: #fff;
+}
+
+.matrix-dashboard-nav a.active {
+    background: rgba(79, 70, 229, 0.2);
+    color: #fff;
+    border-left-color: var(--matrix-primary);
+}
+
+.matrix-dashboard-nav a .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+}
+
+.matrix-nav-logout {
+    margin-top: 16px;
+    border-top: 1px solid rgba(255,255,255,0.1);
+    padding-top: 16px !important;
+}
+
+/* Dashboard Content */
+.matrix-dashboard-content {
+    padding: 30px;
+    overflow-y: auto;
+}
+
+.matrix-dashboard-content h2 {
+    font-size: 22px;
+    color: var(--matrix-dark);
+    margin: 0 0 20px;
+}
+
+.matrix-dashboard-content h3 {
+    font-size: 16px;
+    color: var(--matrix-dark);
+    margin: 24px 0 12px;
+}
+
+/* Stats Grid */
+.matrix-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.matrix-stat-card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 20px;
+    border: 1px solid var(--matrix-border);
+    transition: transform 0.2s;
+}
+
+.matrix-stat-card:hover {
+    transform: translateY(-2px);
+}
+
+.matrix-stat-card .stat-value {
+    font-size: 24px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.matrix-stat-card .stat-label {
+    font-size: 13px;
+    color: #6b7280;
+}
+
+.matrix-stat-card.primary .stat-value { color: var(--matrix-primary); }
+.matrix-stat-card.success .stat-value { color: var(--matrix-success); }
+.matrix-stat-card.warning .stat-value { color: var(--matrix-warning); }
+.matrix-stat-card.danger .stat-value { color: var(--matrix-danger); }
+.matrix-stat-card.info .stat-value { color: var(--matrix-info); }
+.matrix-stat-card.purple .stat-value { color: var(--matrix-secondary); }
+
+/* Security Section */
+.matrix-security-section {
+    background: #fff;
+    border: 1px solid var(--matrix-border);
+    border-radius: 8px;
+    padding: 24px;
+}
+
+.matrix-2fa-status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 16px 0;
+}
+
+/* Plans in dashboard */
+.matrix-plan-card.active {
+    border-color: var(--matrix-success);
+    border-width: 2px;
+}
+
+.matrix-plan-card .plan-matrix {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--matrix-primary);
+    margin: 8px 0;
+}
+
+.matrix-plan-card .plan-details p {
+    margin: 4px 0;
+    font-size: 13px;
+    color: #6b7280;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+    .matrix-dashboard {
+        grid-template-columns: 1fr;
+    }
+    .matrix-dashboard-sidebar {
+        padding: 16px;
+    }
+    .matrix-dashboard-nav {
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 4px;
+    }
+    .matrix-dashboard-nav a {
+        padding: 8px 12px;
+        font-size: 12px;
+        border-left: none;
+        border-radius: 6px;
+    }
+    .matrix-dashboard-nav a.active {
+        background: var(--matrix-primary);
+        border-left-color: transparent;
+    }
+    .matrix-dashboard-content {
+        padding: 20px;
+    }
+    .matrix-stats-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+@media (max-width: 480px) {
+    .matrix-stats-grid {
+        grid-template-columns: 1fr;
+    }
+}

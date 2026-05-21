@@ -1,0 +1,208 @@
+/* Matrix MLM Pro - Admin Styles */
+
+.matrix-admin-wrap {
+    max-width: 1400px;
+}
+
+.matrix-admin-title {
+    font-size: 28px;
+    margin-bottom: 24px;
+}
+
+/* Admin Stats */
+.matrix-admin-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.stat-card {
+    background: #fff;
+    border-radius: 8px;
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    border-left: 4px solid #e5e7eb;
+}
+
+.stat-card .stat-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f3f4f6;
+}
+
+.stat-card .stat-icon .dashicons {
+    font-size: 24px;
+    width: 24px;
+    height: 24px;
+}
+
+.stat-card .stat-content h3 {
+    margin: 0;
+    font-size: 20px;
+}
+
+.stat-card .stat-content p {
+    margin: 2px 0 0;
+    color: #6b7280;
+    font-size: 13px;
+}
+
+.stat-primary { border-left-color: #4f46e5; }
+.stat-primary .stat-icon { background: #eef2ff; color: #4f46e5; }
+.stat-success { border-left-color: #10b981; }
+.stat-success .stat-icon { background: #ecfdf5; color: #10b981; }
+.stat-warning { border-left-color: #f59e0b; }
+.stat-warning .stat-icon { background: #fffbeb; color: #f59e0b; }
+.stat-info { border-left-color: #3b82f6; }
+.stat-info .stat-icon { background: #eff6ff; color: #3b82f6; }
+.stat-danger { border-left-color: #ef4444; }
+.stat-danger .stat-icon { background: #fef2f2; color: #ef4444; }
+.stat-purple { border-left-color: #7c3aed; }
+.stat-purple .stat-icon { background: #f5f3ff; color: #7c3aed; }
+
+/* Admin Card */
+.matrix-admin-card {
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    margin-bottom: 24px;
+}
+
+.matrix-admin-card h2 {
+    margin-top: 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+/* Admin Tables */
+.matrix-admin-tables {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+}
+
+.matrix-table-section {
+    background: #fff;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+
+.matrix-table-section h2 {
+    margin-top: 0;
+    font-size: 16px;
+}
+
+/* Badges */
+.matrix-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.matrix-badge-active, .matrix-badge-completed, .matrix-badge-approved { background: #ecfdf5; color: #065f46; }
+.matrix-badge-pending, .matrix-badge-medium { background: #fffbeb; color: #92400e; }
+.matrix-badge-inactive, .matrix-badge-rejected, .matrix-badge-banned { background: #fef2f2; color: #991b1b; }
+.matrix-badge-open, .matrix-badge-info, .matrix-badge-low { background: #eff6ff; color: #1e40af; }
+.matrix-badge-high, .matrix-badge-urgent, .matrix-badge-customer_reply { background: #fff1f2; color: #9f1239; }
+.matrix-badge-answered { background: #ecfdf5; color: #065f46; }
+.matrix-badge-closed, .matrix-badge-unused { background: #f3f4f6; color: #6b7280; }
+.matrix-badge-used { background: #ecfdf5; color: #065f46; }
+.matrix-badge-expired { background: #f3f4f6; color: #6b7280; }
+
+/* Filters */
+.matrix-admin-filters {
+    margin-bottom: 16px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.matrix-admin-filters form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+/* Admin Actions */
+.matrix-admin-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+
+/* Ticket Meta */
+.matrix-ticket-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+
+.matrix-ticket-meta span {
+    font-size: 14px;
+}
+
+/* Ticket Messages */
+.matrix-ticket-messages {
+    margin: 20px 0;
+}
+
+.matrix-message {
+    padding: 16px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+
+.matrix-message.admin-message {
+    background: #eff6ff;
+    border-left: 3px solid #3b82f6;
+}
+
+.matrix-message.user-message {
+    background: #f9fafb;
+    border-left: 3px solid #d1d5db;
+}
+
+.message-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.message-time {
+    font-size: 12px;
+    color: #9ca3af;
+    margin-left: auto;
+}
+
+.message-body {
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+/* Responsive */
+@media (max-width: 1200px) {
+    .matrix-admin-tables {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 768px) {
+    .matrix-admin-stats {
+        grid-template-columns: 1fr 1fr;
+    }
+}

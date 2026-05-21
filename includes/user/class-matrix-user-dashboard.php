@@ -1,0 +1,320 @@
+<?php
+/**
+ * User Dashboard
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Matrix_MLM_User_Dashboard {
+
+    public function render_dashboard($atts) {
+        if (!is_user_logged_in()) {
+            return '<script>window.location.href="' . home_url('/matrix-login') . '";</script>';
+        }
+
+        $user_id = get_current_user_id();
+        if (!Matrix_MLM_User::is_active($user_id)) {
+            return '<div class="matrix-alert matrix-alert-danger">' . __('Your account has been suspended. Please contact support.', 'matrix-mlm') . '</div>';
+        }
+
+        $tab = get_query_var('matrix_tab', isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'overview');
+
+        ob_start();
+        ?>
+        <div class="matrix-dashboard">
+            <div class="matrix-dashboard-sidebar">
+                <div class="matrix-user-info">
+                    <div class="matrix-avatar"><?php echo get_avatar($user_id, 60); ?></div>
+                    <h4><?php echo esc_html(wp_get_current_user()->display_name); ?></h4>
+                    <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
+                </div>
+                <nav class="matrix-dashboard-nav">
+                    <a href="<?php echo home_url('/matrix-dashboard/'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw'); ?>" class="<?php echo $tab === 'withdraw' ? 'active' : ''; ?>"><span class="dashicons dashicons-upload"></span> <?php _e('Withdraw', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw-history'); ?>" class="<?php echo $tab === 'withdraw-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-media-spreadsheet"></span> <?php _e('Withdraw History', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transactions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=epin'); ?>" class="<?php echo $tab === 'epin' ? 'active' : ''; ?>"><span class="dashicons dashicons-tickets-alt"></span> <?php _e('E-Pin Recharge', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=transfer'); ?>" class="<?php echo $tab === 'transfer' ? 'active' : ''; ?>"><span class="dashicons dashicons-randomize"></span> <?php _e('Balance Transfer', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=bank-payout'); ?>" class="<?php echo $tab === 'bank-payout' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Bank Payout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=virtual-wallet'); ?>" class="<?php echo $tab === 'virtual-wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-id-alt"></span> <?php _e('Virtual Wallet', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=card'); ?>" class="<?php echo $tab === 'card' ? 'active' : ''; ?>"><span class="dashicons dashicons-credit-card"></span> <?php _e('Verve Card', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=billing'); ?>" class="<?php echo $tab === 'billing' ? 'active' : ''; ?>"><span class="dashicons dashicons-smartphone"></span> <?php _e('Bill Payments', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=profile'); ?>" class="<?php echo $tab === 'profile' ? 'active' : ''; ?>"><span class="dashicons dashicons-admin-users"></span> <?php _e('Profile', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=security'); ?>" class="<?php echo $tab === 'security' ? 'active' : ''; ?>"><span class="dashicons dashicons-shield"></span> <?php _e('2FA Security', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo wp_logout_url(home_url()); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
+                </nav>
+            </div>
+            <div class="matrix-dashboard-content">
+                <?php $this->render_tab($tab, $user_id); ?>
+            </div>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+
+    private function render_tab($tab, $user_id) {
+        switch ($tab) {
+            case 'overview':
+                $this->render_overview($user_id);
+                break;
+            case 'deposits':
+                $deposits_handler = new Matrix_MLM_User_Deposits();
+                // Check if returning from payment gateway
+                $verify_result = $deposits_handler->maybe_verify_payment();
+                if ($verify_result) {
+                    $alert_class = $verify_result['status'] === 'success' ? 'success' : ($verify_result['status'] === 'error' ? 'danger' : 'info');
+                    echo '<div class="matrix-alert matrix-alert-' . $alert_class . '">' . esc_html($verify_result['message']) . '</div>';
+                }
+                $deposits_handler->render_deposit_form($user_id);
+                break;
+            case 'deposit-history':
+                (new Matrix_MLM_User_Deposits())->render_history($user_id);
+                break;
+            case 'withdraw':
+                (new Matrix_MLM_User_Withdrawals())->render_form($user_id);
+                break;
+            case 'withdraw-history':
+                (new Matrix_MLM_User_Withdrawals())->render_history($user_id);
+                break;
+            case 'transactions':
+                $this->render_transactions($user_id);
+                break;
+            case 'referrals':
+                (new Matrix_MLM_User_Referrals())->render($user_id);
+                break;
+            case 'commissions':
+                $this->render_commissions($user_id);
+                break;
+            case 'plans':
+                $this->render_plans($user_id);
+                break;
+            case 'epin':
+                (new Matrix_MLM_User_Epin())->render($user_id);
+                break;
+            case 'transfer':
+                (new Matrix_MLM_User_Transfer())->render($user_id);
+                break;
+            case 'bank-payout':
+                (new Matrix_MLM_User_Bank_Payout())->render($user_id);
+                break;
+            case 'virtual-wallet':
+                (new Matrix_MLM_User_Virtual_Wallet())->render($user_id);
+                break;
+            case 'card':
+                (new Matrix_MLM_User_Card())->render($user_id);
+                break;
+            case 'billing':
+                (new Matrix_MLM_User_Billing())->render($user_id);
+                break;
+            case 'tickets':
+                (new Matrix_MLM_User_Tickets())->render($user_id);
+                break;
+            case 'profile':
+                (new Matrix_MLM_User_Profile())->render($user_id);
+                break;
+            case 'security':
+                $this->render_security($user_id);
+                break;
+            default:
+                $this->render_overview($user_id);
+        }
+    }
+
+    private function render_overview($user_id) {
+        $wallet = new Matrix_MLM_Wallet();
+        $balance = $wallet->get_balance($user_id);
+        $total_earnings = $wallet->get_total_earnings($user_id);
+        $total_withdrawals = $wallet->get_total_withdrawals($user_id);
+        $commissions = Matrix_MLM_Commission::get_summary($user_id);
+        $referral_count = Matrix_MLM_User::get_referral_count($user_id);
+        $referral_link = Matrix_MLM_User::get_referral_link($user_id);
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $recent_transactions = $wallet->get_transactions($user_id, 5);
+        ?>
+        <div class="matrix-overview">
+            <h2><?php _e('Dashboard Overview', 'matrix-mlm'); ?></h2>
+
+            <div class="matrix-stats-grid">
+                <div class="matrix-stat-card primary">
+                    <div class="stat-value"><?php echo $currency . number_format($balance, 2); ?></div>
+                    <div class="stat-label"><?php _e('Current Balance', 'matrix-mlm'); ?></div>
+                </div>
+                <div class="matrix-stat-card success">
+                    <div class="stat-value"><?php echo $currency . number_format($total_earnings, 2); ?></div>
+                    <div class="stat-label"><?php _e('Total Earnings', 'matrix-mlm'); ?></div>
+                </div>
+                <div class="matrix-stat-card warning">
+                    <div class="stat-value"><?php echo $currency . number_format($total_withdrawals, 2); ?></div>
+                    <div class="stat-label"><?php _e('Total Withdrawn', 'matrix-mlm'); ?></div>
+                </div>
+                <div class="matrix-stat-card info">
+                    <div class="stat-value"><?php echo $referral_count; ?></div>
+                    <div class="stat-label"><?php _e('Total Referrals', 'matrix-mlm'); ?></div>
+                </div>
+                <div class="matrix-stat-card purple">
+                    <div class="stat-value"><?php echo $currency . number_format($commissions['referral'], 2); ?></div>
+                    <div class="stat-label"><?php _e('Referral Commission', 'matrix-mlm'); ?></div>
+                </div>
+                <div class="matrix-stat-card danger">
+                    <div class="stat-value"><?php echo $currency . number_format($commissions['level'], 2); ?></div>
+                    <div class="stat-label"><?php _e('Level Commission', 'matrix-mlm'); ?></div>
+                </div>
+            </div>
+
+            <div class="matrix-referral-box">
+                <h3><?php _e('Your Referral Link', 'matrix-mlm'); ?></h3>
+                <div class="matrix-referral-link">
+                    <input type="text" id="referral-link" value="<?php echo esc_url($referral_link); ?>" readonly>
+                    <button onclick="navigator.clipboard.writeText(document.getElementById('referral-link').value); this.textContent='Copied!';" class="matrix-btn matrix-btn-primary"><?php _e('Copy', 'matrix-mlm'); ?></button>
+                </div>
+            </div>
+
+            <div class="matrix-recent-transactions">
+                <h3><?php _e('Recent Transactions', 'matrix-mlm'); ?></h3>
+                <table class="matrix-table">
+                    <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Description', 'matrix-mlm'); ?></th></tr></thead>
+                    <tbody>
+                        <?php foreach ($recent_transactions as $tx): ?>
+                        <tr>
+                            <td><?php echo date('M d, Y', strtotime($tx->created_at)); ?></td>
+                            <td><span class="matrix-badge matrix-badge-<?php echo $tx->type; ?>"><?php echo ucfirst($tx->type); ?></span></td>
+                            <td class="<?php echo $tx->type === 'credit' ? 'text-success' : 'text-danger'; ?>"><?php echo ($tx->type === 'credit' ? '+' : '-') . $currency . number_format($tx->amount, 2); ?></td>
+                            <td><?php echo esc_html($tx->description); ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <?php
+    }
+
+    private function render_transactions($user_id) {
+        $wallet = new Matrix_MLM_Wallet();
+        $transactions = $wallet->get_transactions($user_id, 50);
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        ?>
+        <h2><?php _e('Transaction Logs', 'matrix-mlm'); ?></h2>
+        <table class="matrix-table">
+            <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Post Balance', 'matrix-mlm'); ?></th><th><?php _e('Description', 'matrix-mlm'); ?></th></tr></thead>
+            <tbody>
+                <?php foreach ($transactions as $tx): ?>
+                <tr>
+                    <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
+                    <td><span class="matrix-badge matrix-badge-<?php echo $tx->type; ?>"><?php echo ucfirst($tx->type); ?></span></td>
+                    <td class="<?php echo $tx->type === 'credit' ? 'text-success' : 'text-danger'; ?>"><?php echo ($tx->type === 'credit' ? '+' : '-') . $currency . number_format($tx->amount, 2); ?></td>
+                    <td><?php echo $currency . number_format($tx->post_balance, 2); ?></td>
+                    <td><?php echo esc_html($tx->description); ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php
+    }
+
+    private function render_commissions($user_id) {
+        $commissions = Matrix_MLM_Commission::get_user_commissions($user_id, null, 50);
+        $summary = Matrix_MLM_Commission::get_summary($user_id);
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        ?>
+        <h2><?php _e('Commission History', 'matrix-mlm'); ?></h2>
+        <div class="matrix-stats-grid">
+            <div class="matrix-stat-card success"><div class="stat-value"><?php echo $currency . number_format($summary['total'], 2); ?></div><div class="stat-label"><?php _e('Total', 'matrix-mlm'); ?></div></div>
+            <div class="matrix-stat-card info"><div class="stat-value"><?php echo $currency . number_format($summary['referral'], 2); ?></div><div class="stat-label"><?php _e('Referral', 'matrix-mlm'); ?></div></div>
+            <div class="matrix-stat-card warning"><div class="stat-value"><?php echo $currency . number_format($summary['level'], 2); ?></div><div class="stat-label"><?php _e('Level', 'matrix-mlm'); ?></div></div>
+            <div class="matrix-stat-card purple"><div class="stat-value"><?php echo $currency . number_format($summary['matrix_completion'], 2); ?></div><div class="stat-label"><?php _e('Completion Bonus', 'matrix-mlm'); ?></div></div>
+        </div>
+        <table class="matrix-table">
+            <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('From', 'matrix-mlm'); ?></th><th><?php _e('Plan', 'matrix-mlm'); ?></th><th><?php _e('Level', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th></tr></thead>
+            <tbody>
+                <?php foreach ($commissions as $c): ?>
+                <tr>
+                    <td><?php echo date('M d, Y', strtotime($c->created_at)); ?></td>
+                    <td><span class="matrix-badge"><?php echo ucfirst(str_replace('_', ' ', $c->type)); ?></span></td>
+                    <td><?php echo esc_html($c->from_username ?? '-'); ?></td>
+                    <td><?php echo esc_html($c->plan_name ?? '-'); ?></td>
+                    <td><?php echo $c->level ?: '-'; ?></td>
+                    <td class="text-success">+<?php echo $currency . number_format($c->amount, 2); ?></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php
+    }
+
+    private function render_plans($user_id) {
+        $active_plans = Matrix_MLM_User::get_active_plans($user_id);
+        $plan_engine = new Matrix_MLM_Plan_Engine();
+        $all_plans = $plan_engine->get_plans('active');
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        ?>
+        <h2><?php _e('My Active Plans', 'matrix-mlm'); ?></h2>
+        <?php if (empty($active_plans)): ?>
+        <div class="matrix-alert matrix-alert-info"><?php _e('You have not joined any plan yet.', 'matrix-mlm'); ?></div>
+        <?php else: ?>
+        <div class="matrix-plans-grid">
+            <?php foreach ($active_plans as $plan): ?>
+            <div class="matrix-plan-card active">
+                <h3><?php echo esc_html($plan->name); ?></h3>
+                <div class="plan-matrix"><?php echo $plan->width . ' x ' . $plan->depth; ?></div>
+                <div class="plan-details">
+                    <p><?php _e('Downline:', 'matrix-mlm'); ?> <strong><?php echo $plan->total_downline; ?></strong></p>
+                    <p><?php _e('Joined:', 'matrix-mlm'); ?> <?php echo date('M d, Y', strtotime($plan->joined_at)); ?></p>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <h2><?php _e('Available Plans', 'matrix-mlm'); ?></h2>
+        <div class="matrix-plans-grid">
+            <?php foreach ($all_plans as $plan): ?>
+            <div class="matrix-plan-card">
+                <h3><?php echo esc_html($plan->name); ?></h3>
+                <div class="plan-price"><?php echo $currency . number_format($plan->price, 2); ?></div>
+                <div class="plan-matrix"><?php echo $plan->width . ' x ' . $plan->depth; ?> Matrix</div>
+                <ul class="plan-features">
+                    <li><?php echo sprintf(__('Referral: %s', 'matrix-mlm'), $currency . number_format($plan->referral_commission, 2)); ?></li>
+                    <li><?php echo sprintf(__('Completion Bonus: %s', 'matrix-mlm'), $currency . number_format($plan->matrix_completion_bonus, 2)); ?></li>
+                </ul>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixJoinPlan(<?php echo $plan->id; ?>)"><?php _e('Join Plan', 'matrix-mlm'); ?></button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php
+    }
+
+    private function render_security($user_id) {
+        $two_factor = new Matrix_MLM_Two_Factor();
+        $is_enabled = $two_factor->is_enabled($user_id);
+        ?>
+        <h2><?php _e('Two-Factor Authentication', 'matrix-mlm'); ?></h2>
+        <div class="matrix-security-section">
+            <p><?php _e('Two-factor authentication adds an extra layer of security to your account.', 'matrix-mlm'); ?></p>
+            <div class="matrix-2fa-status">
+                <strong><?php _e('Status:', 'matrix-mlm'); ?></strong>
+                <?php if ($is_enabled): ?>
+                <span class="matrix-badge matrix-badge-active"><?php _e('Enabled', 'matrix-mlm'); ?></span>
+                <button class="matrix-btn matrix-btn-danger" onclick="matrixDisable2FA()"><?php _e('Disable 2FA', 'matrix-mlm'); ?></button>
+                <?php else: ?>
+                <span class="matrix-badge matrix-badge-inactive"><?php _e('Disabled', 'matrix-mlm'); ?></span>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixEnable2FA()"><?php _e('Enable 2FA', 'matrix-mlm'); ?></button>
+                <?php endif; ?>
+            </div>
+            <div id="matrix-2fa-setup" style="display: none;">
+                <p><?php _e('Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.):', 'matrix-mlm'); ?></p>
+                <img id="matrix-2fa-qr" src="" alt="QR Code">
+                <p><?php _e('Secret Key:', 'matrix-mlm'); ?> <code id="matrix-2fa-secret"></code></p>
+            </div>
+        </div>
+        <?php
+    }
+}
