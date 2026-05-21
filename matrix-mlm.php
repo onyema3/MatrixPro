@@ -82,6 +82,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-dashboard.
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-deposits.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-withdrawals.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-referrals.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-genealogy.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-profile.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-epin.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-transfer.php';

@@ -37,6 +37,7 @@ class Matrix_MLM_User_Dashboard {
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw'); ?>" class="<?php echo $tab === 'withdraw' ? 'active' : ''; ?>"><span class="dashicons dashicons-upload"></span> <?php _e('Withdraw', 'matrix-mlm'); ?></a>
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw-history'); ?>" class="<?php echo $tab === 'withdraw-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-media-spreadsheet"></span> <?php _e('Withdraw History', 'matrix-mlm'); ?></a>
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transactions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo home_url('/matrix-dashboard/?tab=genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
                     <a href="<?php echo home_url('/matrix-dashboard/?tab=plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
@@ -89,6 +90,9 @@ class Matrix_MLM_User_Dashboard {
                 break;
             case 'referrals':
                 (new Matrix_MLM_User_Referrals())->render($user_id);
+                break;
+            case 'genealogy':
+                (new Matrix_MLM_User_Genealogy())->render($user_id);
                 break;
             case 'commissions':
                 $this->render_commissions($user_id);
