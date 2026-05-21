@@ -17,12 +17,17 @@ class Matrix_MLM_Core {
     }
 
     public function run() {
-        // Run any needed upgrades
-        $this->maybe_upgrade();
+        // Self-healing seed: ensure default gateways exist on every load.
+        // The admin gateways page also calls this when rendering, so it works
+        // regardless of which page the user visits first.
+        if (class_exists('Matrix_MLM_Admin_Gateways')) {
+            Matrix_MLM_Admin_Gateways::ensure_default_gateways();
+        }
 
-        // Always ensure gateways exist (covers cases where version-based
-        // upgrade has already run but the table is still empty)
-        $this->ensure_gateways_exist();
+        // Ensure default root user exists for the referral system
+        if (class_exists('Matrix_MLM_Database')) {
+            Matrix_MLM_Database::create_default_user();
+        }
 
         // Initialize components
         if (is_admin()) {
@@ -726,108 +731,5 @@ class Matrix_MLM_Core {
         );
         // Only expire pins that have an expiry date set and passed
         $wpdb->query("UPDATE {$wpdb->prefix}matrix_epins SET status = 'expired' WHERE status = 'unused' AND expires_at IS NOT NULL AND expires_at < NOW()");
-    }
-
-    /**
-     * Run upgrade routines when plugin version changes
-     */
-    private function maybe_upgrade() {
-        $installed_version = get_option('matrix_mlm_plugin_version', '0');
-
-        if (version_compare($installed_version, MATRIX_MLM_VERSION, '<')) {
-            global $wpdb;
-
-            $gateways_table = $wpdb->prefix . 'matrix_gateways';
-            $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$gateways_table'");
-
-            if ($table_exists) {
-                $gateway_count = $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table");
-
-                if ($gateway_count == 0) {
-                    // Table exists but is empty — seed default gateways as active
-                    $wpdb->insert($gateways_table, [
-                        'name' => 'Paystack',
-                        'slug' => 'paystack',
-                        'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'webhook_secret' => '']),
-                        'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
-                        'min_amount' => 100.00,
-                        'max_amount' => 5000000.00,
-                        'fixed_charge' => 0.00,
-                        'percent_charge' => 1.50,
-                        'status' => 1
-                    ]);
-                    $wpdb->insert($gateways_table, [
-                        'name' => 'Flutterwave',
-                        'slug' => 'flutterwave',
-                        'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'encryption_key' => '', 'webhook_hash' => '']),
-                        'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
-                        'min_amount' => 100.00,
-                        'max_amount' => 10000000.00,
-                        'fixed_charge' => 0.00,
-                        'percent_charge' => 1.40,
-                        'status' => 1
-                    ]);
-                } else {
-                    // Activate any inactive gateways from previous installs
-                    $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
-                }
-            }
-
-            // Ensure default root user exists for referral system
-            Matrix_MLM_Database::create_default_user();
-
-            update_option('matrix_mlm_plugin_version', MATRIX_MLM_VERSION);
-        }
-    }
-
-    /**
-     * Ensure the matrix_gateways table is populated.
-     * Runs on every load but uses a transient to avoid repeated DB queries.
-     */
-    private function ensure_gateways_exist() {
-        // Cache check result for 1 hour to avoid hitting DB on every page load
-        if (get_transient('matrix_mlm_gateways_seeded')) {
-            return;
-        }
-
-        global $wpdb;
-        $gateways_table = $wpdb->prefix . 'matrix_gateways';
-
-        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$gateways_table'");
-        if (!$table_exists) {
-            return;
-        }
-
-        $count = (int) $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table");
-
-        if ($count === 0) {
-            $wpdb->insert($gateways_table, [
-                'name' => 'Paystack',
-                'slug' => 'paystack',
-                'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'webhook_secret' => '']),
-                'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
-                'min_amount' => 100.00,
-                'max_amount' => 5000000.00,
-                'fixed_charge' => 0.00,
-                'percent_charge' => 1.50,
-                'status' => 1
-            ]);
-            $wpdb->insert($gateways_table, [
-                'name' => 'Flutterwave',
-                'slug' => 'flutterwave',
-                'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'encryption_key' => '', 'webhook_hash' => '']),
-                'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
-                'min_amount' => 100.00,
-                'max_amount' => 10000000.00,
-                'fixed_charge' => 0.00,
-                'percent_charge' => 1.40,
-                'status' => 1
-            ]);
-        } else {
-            // Activate any inactive gateways from old installs
-            $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
-        }
-
-        set_transient('matrix_mlm_gateways_seeded', 1, HOUR_IN_SECONDS);
     }
 }
