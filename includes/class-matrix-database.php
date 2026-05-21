@@ -406,9 +406,13 @@ class Matrix_MLM_Database {
 
         // Seed Fintava Pay default settings (stored in wp_options)
         $fintava_defaults = [
-            'matrix_mlm_fintava_secret_key' => '',
+            'matrix_mlm_fintava_secret_key'   => '',
             'matrix_mlm_fintava_webhook_secret' => '',
-            'matrix_mlm_fintava_status' => 0,
+            'matrix_mlm_fintava_status'       => 0,
+            // Default to Live so the API Key field on the admin Gateways page
+            // matches a real production endpoint without forcing the admin to
+            // edit wp-config.php. Switchable via the Environment dropdown.
+            'matrix_mlm_fintava_environment'  => 'live',
         ];
 
         foreach ($fintava_defaults as $key => $value) {
