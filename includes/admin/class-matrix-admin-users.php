@@ -365,6 +365,96 @@ class Matrix_MLM_Admin_Users {
                     </tbody>
                 </table>
             </div>
+
+            <?php if (!empty($active_plans)): ?>
+            <!-- Move User in Genealogy -->
+            <div class="matrix-admin-card">
+                <h2><?php _e('Move in Genealogy', 'matrix-mlm'); ?></h2>
+                <p class="description"><?php _e('Reassign this user\'s position in the matrix tree. You can change their tree parent (who they sit under) and/or their sponsor (who referred them).', 'matrix-mlm'); ?></p>
+
+                <?php
+                // Get positions with parent info
+                $user_positions = $wpdb->get_results($wpdb->prepare(
+                    "SELECT p.*, pl.name as plan_name, pl.width, pl.depth,
+                            parent_u.user_login as parent_username,
+                            sponsor_u.user_login as sponsor_username
+                     FROM {$wpdb->prefix}matrix_positions p
+                     JOIN {$wpdb->prefix}matrix_plans pl ON p.plan_id = pl.id
+                     LEFT JOIN {$wpdb->prefix}matrix_positions pp ON p.parent_id = pp.id
+                     LEFT JOIN {$wpdb->users} parent_u ON pp.user_id = parent_u.ID
+                     LEFT JOIN {$wpdb->users} sponsor_u ON p.sponsor_id = sponsor_u.ID
+                     WHERE p.user_id = %d AND p.status = 'active'
+                     ORDER BY p.joined_at DESC",
+                    $user_id
+                ));
+                ?>
+
+                <?php foreach ($user_positions as $pos): ?>
+                <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px 20px;margin-bottom:16px;">
+                    <h4 style="margin:0 0 12px;"><?php echo esc_html($pos->plan_name); ?> (<?php echo $pos->width . 'x' . $pos->depth; ?>)</h4>
+                    <table class="form-table" style="margin:0;">
+                        <tr>
+                            <th style="width:140px;padding:8px 0;"><?php _e('Current Parent', 'matrix-mlm'); ?></th>
+                            <td style="padding:8px 0;">
+                                <strong><?php echo esc_html($pos->parent_username ?? __('Root (No Parent)', 'matrix-mlm')); ?></strong>
+                                <span style="color:#6b7280;font-size:12px;"> &mdash; <?php printf(__('Level %d', 'matrix-mlm'), $pos->level); ?></span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th style="padding:8px 0;"><?php _e('Current Sponsor', 'matrix-mlm'); ?></th>
+                            <td style="padding:8px 0;">
+                                <strong><?php echo esc_html($pos->sponsor_username ?? __('None', 'matrix-mlm')); ?></strong>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th style="padding:8px 0;"><?php _e('New Parent', 'matrix-mlm'); ?></th>
+                            <td style="padding:8px 0;">
+                                <input type="text" id="move_parent_<?php echo $pos->id; ?>" class="regular-text" placeholder="<?php _e('Username of new parent (leave empty to keep)', 'matrix-mlm'); ?>">
+                                <p class="description" style="margin:4px 0 0;"><?php _e('The user this member will be placed directly under in the tree.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th style="padding:8px 0;"><?php _e('New Sponsor', 'matrix-mlm'); ?></th>
+                            <td style="padding:8px 0;">
+                                <input type="text" id="move_sponsor_<?php echo $pos->id; ?>" class="regular-text" placeholder="<?php _e('Username of new sponsor (leave empty to keep)', 'matrix-mlm'); ?>">
+                                <p class="description" style="margin:4px 0 0;"><?php _e('The user who referred/recruited this member.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                    </table>
+                    <p style="margin:12px 0 0;">
+                        <button class="button button-primary" onclick="matrixMoveUserPosition(<?php echo $pos->id; ?>)"><?php _e('Move Position', 'matrix-mlm'); ?></button>
+                    </p>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            <script>
+            function matrixMoveUserPosition(positionId) {
+                var newParent = document.getElementById('move_parent_' + positionId).value.trim();
+                var newSponsor = document.getElementById('move_sponsor_' + positionId).value.trim();
+
+                if (!newParent && !newSponsor) {
+                    alert('<?php _e('Please enter a new parent or sponsor username.', 'matrix-mlm'); ?>');
+                    return;
+                }
+
+                if (!confirm('<?php _e('Are you sure you want to move this user in the genealogy? This will restructure the tree and recalculate all downline counts.', 'matrix-mlm'); ?>')) {
+                    return;
+                }
+
+                jQuery.post(matrixMLMAdmin.ajaxUrl, {
+                    action: 'matrix_admin_action',
+                    nonce: matrixMLMAdmin.nonce,
+                    matrix_action: 'move_user_position',
+                    position_id: positionId,
+                    new_parent_username: newParent,
+                    new_sponsor_username: newSponsor
+                }, function(res) {
+                    alert(res.success ? res.data.message : (res.data.message || 'Error'));
+                    if (res.success) location.reload();
+                });
+            }
+            </script>
+            <?php endif; ?>
         </div>
         <?php
     }
