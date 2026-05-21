@@ -21,14 +21,13 @@ class Matrix_MLM_Admin_Gateways {
             $this->save_fintava_settings();
         }
 
+        $seeded = false;
         if (isset($_POST['matrix_seed_gateways']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_seed_gateways')) {
             $this->seed_gateways();
-            // Redirect to reload the page with fresh data
-            wp_redirect(admin_url('admin.php?page=matrix-mlm-gateways&seeded=1'));
-            exit;
+            $seeded = true;
         }
 
-        if (isset($_GET['seeded'])) {
+        if ($seeded || isset($_GET['seeded'])) {
             echo '<div class="notice notice-success"><p>' . __('Default gateways have been created successfully!', 'matrix-mlm') . '</p></div>';
         }
 
