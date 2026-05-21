@@ -11,7 +11,7 @@
  * - Webhook Secret (optional but recommended)
  * - Active toggle
  *
- * The API base URL defaults to https://live.fintavapay.com/api/live and can
+ * The API base URL defaults to https://live.fintavapay.com/api/v1 and can
  * be overridden by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php if
  * Fintava ever changes their endpoint.
  *
@@ -21,8 +21,9 @@
  * - POST /virtual-wallet/generate             - Generate virtual wallet for user
  * - GET  /customer/wallet/balance/{walletId}  - Get virtual wallet balance (fast path)
  * - GET  /customers                           - List customers (wallet lookup fallback)
+ * - GET  /wallet/details?accountNumber=...    - Internal: look up our virtual wallet by account number
+ * - GET  /name/enquiry?accountNumber=...&sortCode=... - External name enquiry (3rd-party banks)
  * - GET  /banks                               - List supported banks
- * - POST /resolve-account                     - Verify bank account (name lookup)
  */
 
 if (!defined('ABSPATH')) {
@@ -37,7 +38,7 @@ class Matrix_MLM_Fintava {
      * `dev`) which the admin sets on the Gateways page. Both URLs can be
      * overridden in one shot via the MATRIX_FINTAVA_API_BASE_URL constant.
      */
-    const LIVE_BASE_URL = 'https://live.fintavapay.com/api/live';
+    const LIVE_BASE_URL = 'https://live.fintavapay.com/api/v1';
     const DEV_BASE_URL  = 'https://dev.fintavapay.com/api/dev';
 
     /**
@@ -51,7 +52,7 @@ class Matrix_MLM_Fintava {
      * literal rather than a self::LIVE_BASE_URL reference, since older PHP
      * versions reject constant-to-constant references at parse time.
      */
-    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/live';
+    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/v1';
 
     /**
      * Default Merchant ID for Fintava Pay.
@@ -336,13 +337,18 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * POST /resolve-account — verify bank account (name lookup).
+     * GET /name/enquiry?accountNumber=...&sortCode=... — verify bank account (external name lookup).
+     *
+     * @param string $account_number 10-digit NUBAN.
+     * @param string $bank_code      Bank sort code (passed as `sortCode` query param).
      */
     public function resolve_account($account_number, $bank_code) {
-        $response = $this->make_request('POST', '/resolve-account', [
-            'account_number' => $account_number,
-            'bank_code' => $bank_code,
+        $query = http_build_query([
+            'accountNumber' => $account_number,
+            'sortCode'      => $bank_code,
         ]);
+
+        $response = $this->make_request('GET', '/name/enquiry?' . $query);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1241,7 +1247,7 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * GET /loma-name/enquiry?accountNumber=XXXX — look up wallet details by account number.
+     * GET /wallet/details?accountNumber=XXXX — look up wallet details by account number.
      *
      * This is the primary way to resolve a wallet_id when all we have is the
      * account number. Returns the full wallet object including its UUID.
@@ -1254,7 +1260,7 @@ class Matrix_MLM_Fintava {
             return new WP_Error('missing_account_number', __('Account number is required', 'matrix-mlm'));
         }
 
-        $response = $this->make_request('GET', '/loma-name/enquiry?accountNumber=' . urlencode($account_number));
+        $response = $this->make_request('GET', '/wallet/details?accountNumber=' . urlencode($account_number));
         if (is_wp_error($response)) {
             return $response;
         }
@@ -1277,7 +1283,7 @@ class Matrix_MLM_Fintava {
     /**
      * Resolve the wallet_id for a local wallet row using the account number enquiry endpoint.
      *
-     * Calls GET /loma-name/enquiry?accountNumber=XXXX which returns the wallet
+     * Calls GET /wallet/details?accountNumber=XXXX which returns the wallet
      * details including its UUID (the wallet_id needed for balance lookups).
      *
      * @param object $wallet_row The local matrix_fintava_wallets row.
@@ -1293,7 +1299,7 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        // Call the loma-name enquiry endpoint with the account number
+        // Call the wallet details enquiry endpoint with the account number
         $details = $this->get_wallet_by_account_number(trim($wallet_row->account_number));
         if (is_wp_error($details)) {
             return $details;
@@ -1430,17 +1436,17 @@ class Matrix_MLM_Fintava {
      *      so subsequent calls skip the dead probes.
      *
      *   2. If $account_number is supplied, fall back to
-     *      GET /loma-name/enquiry?accountNumber=... — the canonical Live
-     *      lookup endpoint that returns the full wallet object keyed by
-     *      account number rather than UUID. Some tiers expose this but not
-     *      the path-style GET, and vice versa, so we try whichever the caller
+     *      GET /wallet/details?accountNumber=... — the canonical lookup
+     *      endpoint that returns the full wallet object keyed by account
+     *      number rather than UUID. Some tiers expose this but not the
+     *      path-style GET, and vice versa, so we try whichever the caller
      *      can support.
      *
      *   3. If $customer_id is supplied, fall back to
      *      GET /customers/{customer_id} and pull the wallet object out of
      *      the embedded `wallet` field. Useful on tiers where neither the
-     *      path-style singleton nor the loma-name enquiry is exposed but
-     *      the customer endpoint is.
+     *      path-style singleton nor the wallet details enquiry is exposed
+     *      but the customer endpoint is.
      *
      *   4. As a final fallback (when an account_number is on hand), pull
      *      the full /customers list and match by embedded account_number.
@@ -1460,13 +1466,13 @@ class Matrix_MLM_Fintava {
      * @param string      $wallet_id      The Fintava wallet UUID.
      * @param string|null $account_number Optional account number for the same
      *                                    wallet. When supplied, enables the
-     *                                    /loma-name/enquiry fallback for tiers
+     *                                    /wallet/details fallback for tiers
      *                                    where the path-style GET is missing.
      * @param string|null $customer_id    Optional Fintava customer UUID. When
      *                                    supplied, enables the
      *                                    /customers/{id} fallback for tiers
      *                                    where neither path-style nor
-     *                                    loma-name enquiry is exposed.
+     *                                    /wallet/details enquiry is exposed.
      * @return array|WP_Error Wallet details on success.
      */
     public function get_virtual_wallet_details($wallet_id, $account_number = null, $customer_id = null) {
@@ -1478,7 +1484,7 @@ class Matrix_MLM_Fintava {
         // path-style prefix once we find one; $path_style_dead is the
         // negative cache for tiers (Live, currently) where every path
         // variant 404s — without it, every balance refresh would burn six
-        // round-trips before reaching the loma-name fallback.
+        // round-trips before reaching the /wallet/details fallback.
         static $resolved_prefix = null;
         static $path_style_dead = false;
         static $loma_name_dead  = false;
@@ -1532,7 +1538,7 @@ class Matrix_MLM_Fintava {
         }
 
         // ---- Step 2: account-number enquiry. -----------------------------
-        // Some Live merchant tiers expose GET /loma-name/enquiry?accountNumber=...
+        // Some Live merchant tiers expose GET /wallet/details?accountNumber=...
         // but no equivalent path-style singleton. If the caller has the
         // account number on hand — and most do, since the local
         // matrix_fintava_wallets row carries it — try that endpoint and
@@ -1567,7 +1573,7 @@ class Matrix_MLM_Fintava {
         // If $customer_id is on hand, try GET /customers/{customer_id} and
         // pull the wallet from the embedded `wallet` object. This is the
         // fallback of last resort for tiers where neither path-style nor
-        // loma-name enquiry is exposed.
+        // /wallet/details enquiry is exposed.
         if ($response === null && !empty($customer_id)) {
             $tried_customer = true;
             $customer = $this->get_customer($customer_id);
@@ -1603,7 +1609,7 @@ class Matrix_MLM_Fintava {
 
         // ---- Step 4: customer list fallback. -----------------------------
         // Final fallback for tiers that expose neither path-style GETs,
-        // /loma-name/enquiry, nor /customers/{id} (or where customer_id
+        // /wallet/details, nor /customers/{id} (or where customer_id
         // isn't on file): pull the full customer list from /customers and
         // match by embedded account_number. The list response carries each
         // customer's wallet object inline, so a hit lets us return wallet
@@ -1730,7 +1736,7 @@ class Matrix_MLM_Fintava {
      * Build a single, self-describing WP_Error that names every fallback we
      * tried and what each one returned. Lets callers (and the operator
      * staring at the dashboard) tell at a glance whether a given Fintava
-     * tier exposes the path-style endpoint, the loma-name enquiry, the
+     * tier exposes the path-style endpoint, the /wallet/details enquiry, the
      * customer endpoint, all three, or none — without having to grep server
      * logs.
      */
@@ -1763,15 +1769,15 @@ class Matrix_MLM_Fintava {
         if ($tried_loma_name && $loma_name_error instanceof WP_Error) {
             $parts[] = sprintf(
                 /* translators: %s: error returned by Fintava enquiry endpoint */
-                __('/loma-name/enquiry failed (%s)', 'matrix-mlm'),
+                __('/wallet/details failed (%s)', 'matrix-mlm'),
                 $loma_name_error->get_error_message()
             );
         } elseif ($tried_loma_name) {
-            $parts[] = __('/loma-name/enquiry failed', 'matrix-mlm');
+            $parts[] = __('/wallet/details failed', 'matrix-mlm');
         } elseif (!$had_account_number) {
-            $parts[] = __('/loma-name/enquiry not tried (no account_number on file)', 'matrix-mlm');
+            $parts[] = __('/wallet/details not tried (no account_number on file)', 'matrix-mlm');
         } else {
-            $parts[] = __('/loma-name/enquiry skipped (negative-cached as unavailable)', 'matrix-mlm');
+            $parts[] = __('/wallet/details skipped (negative-cached as unavailable)', 'matrix-mlm');
         }
 
         if ($tried_customer && $customer_error instanceof WP_Error) {
@@ -1828,7 +1834,7 @@ class Matrix_MLM_Fintava {
         // GET /customer/wallet/balance/{walletId} — single round-trip,
         // documented on the Fintava dev tier and rolling out to live. We
         // try it first and only fall back to the heavier details chain
-        // (path-style GET → /loma-name/enquiry → /customers/{id} →
+        // (path-style GET → /wallet/details → /customers/{id} →
         // /customers list) if this endpoint isn't available on the active
         // tier.
         //

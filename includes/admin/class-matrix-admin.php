@@ -853,7 +853,7 @@ class Matrix_MLM_Admin {
 
         // Pass the typed account_number through as a hint — on Live tiers
         // where /virtual-wallet/{id} 404s, get_virtual_wallet_details() will
-        // fall back to /loma-name/enquiry?accountNumber=... and verify the
+        // fall back to /wallet/details?accountNumber=... and verify the
         // returned wallet matches the requested wallet_id.
         $details = $fintava->get_virtual_wallet_details($wallet_id, $account_number ?: null);
         if (is_wp_error($details)) {
