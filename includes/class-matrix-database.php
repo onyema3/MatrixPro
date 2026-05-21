@@ -354,7 +354,7 @@ class Matrix_MLM_Database {
                 'max_amount' => 5000000.00,
                 'fixed_charge' => 0.00,
                 'percent_charge' => 1.50,
-                'status' => 0
+                'status' => 1
             ]);
 
             $wpdb->insert($gateways_table, [
@@ -371,7 +371,7 @@ class Matrix_MLM_Database {
                 'max_amount' => 10000000.00,
                 'fixed_charge' => 0.00,
                 'percent_charge' => 1.40,
-                'status' => 0
+                'status' => 1
             ]);
         }
 
