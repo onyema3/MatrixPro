@@ -246,7 +246,7 @@ class Matrix_MLM_Admin_Migration {
                     wallet_id: walletId,
                     // Forward the typed account number too — used as a hint on
                     // Live tiers where the path-style single-wallet GET 404s
-                    // and we need to fall back to /loma-name/enquiry.
+                    // and we need to fall back to /wallet/details.
                     account_number: (acctNumEl && acctNumEl.value || '').trim()
                 }, function(res) {
                     btn.disabled = false;

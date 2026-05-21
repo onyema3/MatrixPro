@@ -126,7 +126,7 @@ class Matrix_MLM_User_Virtual_Wallet {
         $fintava_balance_error    = '';
         $fintava_balance_reason   = ''; // 'missing_wallet_id' | 'api_error' | ''
 
-        // Auto-resolve is disabled: the /loma-name/enquiry endpoint is not
+        // Auto-resolve is disabled: the /wallet/details endpoint is not
         // available on all Fintava tiers. Users can enter their wallet ID
         // manually via the "Verify & Save" input below.
 
