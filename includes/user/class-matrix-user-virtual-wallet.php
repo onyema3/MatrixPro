@@ -131,7 +131,7 @@ class Matrix_MLM_User_Virtual_Wallet {
         // manually via the "Verify & Save" input below.
 
         if (!empty($wallet->wallet_id)) {
-            $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
+            $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id, $wallet->account_number);
             if (is_wp_error($balance_result)) {
                 // Defense-in-depth: although Matrix_MLM_Fintava already normalizes
                 // API messages to strings before storing them in WP_Error, a

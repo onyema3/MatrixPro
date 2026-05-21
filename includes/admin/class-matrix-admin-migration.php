@@ -150,7 +150,7 @@ class Matrix_MLM_Admin_Migration {
                     <td>
                         <input type="text" id="link_wallet_id" class="regular-text" placeholder="<?php _e('Fintava wallet ID', 'matrix-mlm'); ?>">
                         <button type="button" class="button" id="btn_verify_wallet" style="margin-left:6px;"><?php _e('Verify & Auto-Fill from Fintava', 'matrix-mlm'); ?></button>
-                        <p class="description"><?php _e('Optional. If you provide a Wallet ID and click Verify, the plugin will call Fintava\'s live API (<code>GET /virtual-wallet/{wallet_id}</code>) and fill in the Account Number, Account Name, and Bank Name below from the verified response.', 'matrix-mlm'); ?></p>
+                        <p class="description"><?php _e('Optional. Type the Account Number below first, then click Verify and the plugin will look up the wallet on Fintava\'s live API and fill in the Account Name and Bank Name from the verified response.', 'matrix-mlm'); ?></p>
                         <div id="verify_wallet_status" style="margin-top:8px;font-size:13px;"></div>
                     </td>
                 </tr>
@@ -243,7 +243,11 @@ class Matrix_MLM_Admin_Migration {
                     action: 'matrix_admin_action',
                     nonce: matrixMLMAdmin.nonce,
                     matrix_action: 'fintava_lookup_wallet',
-                    wallet_id: walletId
+                    wallet_id: walletId,
+                    // Forward the typed account number too — used as a hint on
+                    // Live tiers where the path-style single-wallet GET 404s
+                    // and we need to fall back to /loma-name/enquiry.
+                    account_number: (acctNumEl && acctNumEl.value || '').trim()
                 }, function(res) {
                     btn.disabled = false;
                     btn.textContent = originalLabel;
