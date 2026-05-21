@@ -17,6 +17,12 @@ class Matrix_MLM_Core {
     }
 
     public function run() {
+        // Self-healing schema upgrade: run any pending migrations on load
+        // so admins don't have to deactivate/reactivate after a plugin update.
+        if (class_exists('Matrix_MLM_Database')) {
+            Matrix_MLM_Database::maybe_upgrade();
+        }
+
         // Self-healing seed: ensure default gateways exist on every load.
         // The admin gateways page also calls this when rendering, so it works
         // regardless of which page the user visits first.

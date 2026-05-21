@@ -43,24 +43,65 @@ class Matrix_MLM_Epin {
         }
 
         $pins = [];
+        $failed = 0;
+        $last_error = '';
         for ($i = 0; $i < $quantity; $i++) {
             $pin_code = strtoupper('EP-' . substr(md5(uniqid(mt_rand(), true)), 0, 12));
 
-            $wpdb->insert($wpdb->prefix . 'matrix_epins', [
-                'pin_code' => $pin_code,
-                'plan_id' => $plan_id ?: null,
-                'amount' => $amount,
+            // Suppress wpdb's automatic error printing so we can handle failures cleanly.
+            $prev_show = $wpdb->show_errors(false);
+            $prev_suppress = $wpdb->suppress_errors(true);
+
+            $inserted = $wpdb->insert($wpdb->prefix . 'matrix_epins', [
+                'pin_code'   => $pin_code,
+                'plan_id'    => $plan_id ?: null,
+                'amount'     => $amount,
                 'created_by' => $created_by,
-                'expires_at' => $expires_at
-            ]);
+                'expires_at' => $expires_at,
+            ], ['%s', '%d', '%f', '%d', '%s']);
+
+            $wpdb->show_errors($prev_show);
+            $wpdb->suppress_errors($prev_suppress);
+
+            if (!$inserted) {
+                $failed++;
+                if ($wpdb->last_error) {
+                    $last_error = $wpdb->last_error;
+                }
+                // If the very first insert fails, there is no point continuing —
+                // it's almost certainly a schema/permissions issue that will
+                // affect every row in the batch.
+                if ($i === 0) {
+                    break;
+                }
+                continue;
+            }
 
             $pins[] = [
                 'pin_code' => $pin_code,
-                'amount' => $amount,
+                'amount'   => $amount,
             ];
         }
 
-        return ['success' => true, 'pins' => $pins, 'count' => count($pins), 'amount' => $amount];
+        if (empty($pins)) {
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    /* translators: %s: database error */
+                    __('Failed to save E-Pins to database. %s', 'matrix-mlm'),
+                    $last_error ? '(' . $last_error . ')' : ''
+                ),
+            ];
+        }
+
+        return [
+            'success' => true,
+            'pins'    => $pins,
+            'count'   => count($pins),
+            'amount'  => $amount,
+            'failed'  => $failed,
+            'error'   => $failed ? $last_error : '',
+        ];
     }
 
     /**
