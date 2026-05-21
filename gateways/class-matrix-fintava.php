@@ -1165,13 +1165,29 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
+        // Log the raw response shape for debugging wallet_id resolution issues.
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('[Matrix Fintava] /loma-name/enquiry raw response keys: ' . (is_array($response) ? implode(', ', array_keys($response)) : gettype($response)));
+        }
+
+        // Standard envelope: { data: {...}, status: 200 }
         if (isset($response['data']) && is_array($response['data'])) {
-            return $response['data'];
+            $data = $response['data'];
+            // data might itself be a list of one: [ {walletId: ..., customerAccountNo: ...} ]
+            if (isset($data[0]) && is_array($data[0])) {
+                return $data[0];
+            }
+            return $data;
         }
 
         // Bare object fallback — accept any shape that has a wallet identifier or account number
         if (is_array($response) && (isset($response['id']) || isset($response['walletId']) || isset($response['virtualAcctNo']) || isset($response['customerAccountNo']))) {
             return $response;
+        }
+
+        // Response might be a bare indexed array: [ {walletId: ..., customerAccountNo: ...} ]
+        if (is_array($response) && isset($response[0]) && is_array($response[0])) {
+            return $response[0];
         }
 
         return new WP_Error(

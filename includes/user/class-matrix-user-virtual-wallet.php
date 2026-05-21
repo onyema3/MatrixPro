@@ -131,7 +131,13 @@ class Matrix_MLM_User_Virtual_Wallet {
         if (empty($wallet->wallet_id) && !empty($wallet->account_number)) {
             $resolved = $fintava->resolve_wallet_id_from_customer($wallet);
             if (!is_wp_error($resolved)) {
-                $wallet->wallet_id = $resolved;
+                // Successfully resolved — refresh the wallet object from DB
+                $wallet = $fintava->get_user_wallet($user_id);
+            } else {
+                // Log the resolution failure for debugging
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log('[Matrix Fintava] Auto-resolve wallet_id failed for user ' . $user_id . ': ' . $resolved->get_error_message());
+                }
             }
         }
 
