@@ -419,6 +419,9 @@ class Matrix_MLM_Database {
             }
         }
 
+        // Create default root user for referral system
+        self::create_default_user();
+
         // Default settings
         $defaults = [
             'matrix_mlm_site_title' => 'Matrix MLM Pro',
@@ -452,5 +455,68 @@ class Matrix_MLM_Database {
                 add_option($key, $value);
             }
         }
+    }
+
+    /**
+     * Create a default root user for the referral system.
+     * Since referral codes are mandatory for registration, this user serves
+     * as the top of the referral tree so the first real users can sign up.
+     */
+    public static function create_default_user() {
+        global $wpdb;
+
+        // Check if a default root user already exists
+        $default_ref_code = 'MATRIX01';
+        $existing = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_user_meta WHERE referral_code = %s",
+            $default_ref_code
+        ));
+
+        if ($existing) {
+            return; // Already created
+        }
+
+        // Use the current WordPress admin (the user activating the plugin) as the root user
+        $admin_id = get_current_user_id();
+
+        // If no user is logged in (unlikely during activation), get the first admin
+        if (!$admin_id) {
+            $admins = get_users(['role' => 'administrator', 'number' => 1, 'orderby' => 'ID', 'order' => 'ASC']);
+            if (!empty($admins)) {
+                $admin_id = $admins[0]->ID;
+            }
+        }
+
+        // If still no admin found, create a dedicated root user
+        if (!$admin_id) {
+            $admin_email = get_option('admin_email', 'admin@' . parse_url(home_url(), PHP_URL_HOST));
+            $admin_id = wp_create_user('matrix_admin', wp_generate_password(16, true), $admin_email);
+            if (is_wp_error($admin_id)) {
+                return; // Cannot create user, skip
+            }
+            $user = new WP_User($admin_id);
+            $user->set_role('administrator');
+        }
+
+        // Check if this user already has a matrix_user_meta entry
+        $has_meta = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
+            $admin_id
+        ));
+
+        if (!$has_meta) {
+            $wpdb->insert($wpdb->prefix . 'matrix_user_meta', [
+                'user_id' => $admin_id,
+                'referral_code' => $default_ref_code,
+                'referred_by' => null,
+                'phone' => '',
+                'balance' => 0.00,
+                'status' => 'active',
+                'email_verified' => 1,
+            ]);
+        }
+
+        // Store the default referral code in options for easy display/reference
+        update_option('matrix_mlm_default_referral_code', $default_ref_code);
     }
 }

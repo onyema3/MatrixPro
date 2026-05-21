@@ -69,6 +69,11 @@ class Matrix_MLM_Admin_Settings {
                 <td><input type="text" name="matrix_mlm_currency" class="small-text" value="<?php echo esc_attr(get_option('matrix_mlm_currency', 'NGN')); ?>"></td></tr>
             <tr><th><?php _e('Currency Symbol', 'matrix-mlm'); ?></th>
                 <td><input type="text" name="matrix_mlm_currency_symbol" class="small-text" value="<?php echo esc_attr(get_option('matrix_mlm_currency_symbol', '₦')); ?>"></td></tr>
+            <tr><th><?php _e('Default Referral Code', 'matrix-mlm'); ?></th>
+                <td>
+                    <code style="font-size: 14px; padding: 4px 10px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 4px;"><?php echo esc_html(get_option('matrix_mlm_default_referral_code', 'MATRIX01')); ?></code>
+                    <p class="description"><?php _e('Share this referral code with your first users so they can register. This belongs to the root admin account.', 'matrix-mlm'); ?></p>
+                </td></tr>
             <tr><th><?php _e('Registration', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_registration_enabled" value="1" <?php checked(get_option('matrix_mlm_registration_enabled', 1)); ?>> <?php _e('Allow new user registration', 'matrix-mlm'); ?></label></td></tr>
             <tr><th><?php _e('GDPR Compliance', 'matrix-mlm'); ?></th>
