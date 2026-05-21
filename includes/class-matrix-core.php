@@ -17,6 +17,9 @@ class Matrix_MLM_Core {
     }
 
     public function run() {
+        // Run any needed upgrades
+        $this->maybe_upgrade();
+
         // Initialize components
         if (is_admin()) {
             $this->admin = new Matrix_MLM_Admin();
@@ -719,5 +722,31 @@ class Matrix_MLM_Core {
         );
         // Only expire pins that have an expiry date set and passed
         $wpdb->query("UPDATE {$wpdb->prefix}matrix_epins SET status = 'expired' WHERE status = 'unused' AND expires_at IS NOT NULL AND expires_at < NOW()");
+    }
+
+    /**
+     * Run upgrade routines when plugin version changes
+     */
+    private function maybe_upgrade() {
+        $installed_version = get_option('matrix_mlm_plugin_version', '0');
+
+        if (version_compare($installed_version, MATRIX_MLM_VERSION, '<')) {
+            global $wpdb;
+
+            // Activate any inactive gateways that have no API keys configured yet
+            // This fixes installations where gateways were seeded with status=0
+            $gateways_table = $wpdb->prefix . 'matrix_gateways';
+            $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$gateways_table'");
+
+            if ($table_exists) {
+                // Activate gateways - they should be visible and the admin can deactivate if needed
+                $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
+            }
+
+            // Ensure default root user exists for referral system
+            Matrix_MLM_Database::create_default_user();
+
+            update_option('matrix_mlm_plugin_version', MATRIX_MLM_VERSION);
+        }
     }
 }

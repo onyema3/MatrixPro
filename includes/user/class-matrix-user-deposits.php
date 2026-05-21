@@ -118,6 +118,11 @@ class Matrix_MLM_User_Deposits {
         $max = get_option('matrix_mlm_max_deposit', 5000000);
         ?>
         <h2><?php _e('Make a Deposit', 'matrix-mlm'); ?></h2>
+        <?php if (empty($gateways)): ?>
+        <div class="matrix-alert matrix-alert-info">
+            <?php _e('No payment gateways are currently available. Please contact the administrator.', 'matrix-mlm'); ?>
+        </div>
+        <?php else: ?>
         <div class="matrix-form-card">
             <form id="matrix-deposit-form" class="matrix-form">
                 <div class="matrix-form-group">
@@ -141,6 +146,7 @@ class Matrix_MLM_User_Deposits {
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Proceed to Payment', 'matrix-mlm'); ?></button>
             </form>
         </div>
+        <?php endif; ?>
         <?php
     }
 
