@@ -20,6 +20,10 @@ class Matrix_MLM_Core {
         // Run any needed upgrades
         $this->maybe_upgrade();
 
+        // Always ensure gateways exist (covers cases where version-based
+        // upgrade has already run but the table is still empty)
+        $this->ensure_gateways_exist();
+
         // Initialize components
         if (is_admin()) {
             $this->admin = new Matrix_MLM_Admin();
@@ -774,5 +778,56 @@ class Matrix_MLM_Core {
 
             update_option('matrix_mlm_plugin_version', MATRIX_MLM_VERSION);
         }
+    }
+
+    /**
+     * Ensure the matrix_gateways table is populated.
+     * Runs on every load but uses a transient to avoid repeated DB queries.
+     */
+    private function ensure_gateways_exist() {
+        // Cache check result for 1 hour to avoid hitting DB on every page load
+        if (get_transient('matrix_mlm_gateways_seeded')) {
+            return;
+        }
+
+        global $wpdb;
+        $gateways_table = $wpdb->prefix . 'matrix_gateways';
+
+        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$gateways_table'");
+        if (!$table_exists) {
+            return;
+        }
+
+        $count = (int) $wpdb->get_var("SELECT COUNT(*) FROM $gateways_table");
+
+        if ($count === 0) {
+            $wpdb->insert($gateways_table, [
+                'name' => 'Paystack',
+                'slug' => 'paystack',
+                'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'webhook_secret' => '']),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'ZAR', 'USD']),
+                'min_amount' => 100.00,
+                'max_amount' => 5000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.50,
+                'status' => 1
+            ]);
+            $wpdb->insert($gateways_table, [
+                'name' => 'Flutterwave',
+                'slug' => 'flutterwave',
+                'gateway_parameters' => json_encode(['public_key' => '', 'secret_key' => '', 'encryption_key' => '', 'webhook_hash' => '']),
+                'supported_currencies' => json_encode(['NGN', 'GHS', 'KES', 'ZAR', 'USD', 'GBP', 'EUR']),
+                'min_amount' => 100.00,
+                'max_amount' => 10000000.00,
+                'fixed_charge' => 0.00,
+                'percent_charge' => 1.40,
+                'status' => 1
+            ]);
+        } else {
+            // Activate any inactive gateways from old installs
+            $wpdb->query("UPDATE $gateways_table SET status = 1 WHERE status = 0");
+        }
+
+        set_transient('matrix_mlm_gateways_seeded', 1, HOUR_IN_SECONDS);
     }
 }
