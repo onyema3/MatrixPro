@@ -818,7 +818,11 @@ class Matrix_MLM_Fintava {
 
         $reference = $data['reference'] ?? $data['transaction_reference'] ?? '';
         $amount = floatval($data['amount'] ?? 0);
-        $recipient_account = $data['recipient_account_number'] ?? $data['recipient_wallet'] ?? $data['account_number'] ?? '';
+        $recipient_account = self::extract_account_number($data);
+        if ($recipient_account === '') {
+            // Some payloads use recipient_wallet as a free-form holder.
+            $recipient_account = trim((string) ($data['recipient_wallet'] ?? ''));
+        }
         $sender_name = $data['sender_name'] ?? $data['sender'] ?? __('External Wallet', 'matrix-mlm');
         $narration = $data['narration'] ?? $data['description'] ?? '';
         $currency = $data['currency'] ?? 'NGN';
@@ -905,7 +909,7 @@ class Matrix_MLM_Fintava {
 
         $reference = $data['reference'] ?? $data['transaction_reference'] ?? $data['session_id'] ?? '';
         $amount = floatval($data['amount'] ?? 0);
-        $account_number = $data['account_number'] ?? $data['virtual_account_number'] ?? '';
+        $account_number = self::extract_account_number($data);
         $sender_name = $data['sender_name'] ?? $data['payer_name'] ?? $data['originator_name'] ?? __('Bank Transfer', 'matrix-mlm');
         $sender_bank = $data['sender_bank'] ?? $data['payer_bank'] ?? $data['originator_bank'] ?? '';
         $narration = $data['narration'] ?? $data['description'] ?? $data['remark'] ?? '';
@@ -1050,16 +1054,20 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        // Same envelope tolerance as get_virtual_wallet_details() — Fintava
+        // returns numeric status: 200, message: "successful", data: {...}.
+        if (isset($response['data']) && is_array($response['data'])) {
+            $data = $response['data'];
+            $extracted_name = self::extract_account_name($data);
             return [
                 'success' => true,
-                'wallet_id' => $response['data']['wallet_id'] ?? $response['data']['id'] ?? null,
-                'account_number' => $response['data']['account_number'] ?? '',
-                'account_name' => $response['data']['account_name'] ?? ($customer_data['first_name'] . ' ' . $customer_data['last_name']),
-                'bank_name' => $response['data']['bank_name'] ?? $response['data']['bank'] ?? 'Fintava',
-                'bank_code' => $response['data']['bank_code'] ?? null,
-                'currency' => $response['data']['currency'] ?? 'NGN',
-                'status' => $response['data']['status'] ?? 'active',
+                'wallet_id' => self::extract_wallet_id($data) ?: ($data['id'] ?? null),
+                'account_number' => self::extract_account_number($data),
+                'account_name' => $extracted_name !== '' ? $extracted_name : ($customer_data['first_name'] . ' ' . $customer_data['last_name']),
+                'bank_name' => self::extract_bank_name($data) ?: 'Fintava',
+                'bank_code' => $data['bank_code'] ?? $data['bankCode'] ?? null,
+                'currency' => $data['currency'] ?? 'NGN',
+                'status' => $data['status'] ?? 'active',
             ];
         }
 
@@ -1075,8 +1083,17 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        // Fintava actually returns {"data": {...}, "status": 200, "message": "successful"}
+        // — status is a numeric HTTP code, not boolean true. Accept any envelope
+        // that carries a non-empty `data` object; rely on make_request() having
+        // already converted real HTTP errors into WP_Error.
+        if (isset($response['data']) && is_array($response['data'])) {
             return $response['data'];
+        }
+
+        // Fallback: some shapes return the wallet object at the root.
+        if (is_array($response) && (isset($response['id']) || isset($response['virtualAcctNo']) || isset($response['account_number']))) {
+            return $response;
         }
 
         return new WP_Error(
@@ -1325,21 +1342,12 @@ class Matrix_MLM_Fintava {
                     break;
                 }
 
-                $remote_account = trim((string) (
-                    $remote['account_number']
-                    ?? $remote['accountNumber']
-                    ?? ''
-                ));
+                $remote_account = self::extract_account_number($remote);
                 if ($remote_account === '' || !isset($missing_by_account[$remote_account])) {
                     continue;
                 }
 
-                $remote_wallet_id = (string) (
-                    $remote['wallet_id']
-                    ?? $remote['walletId']
-                    ?? $remote['id']
-                    ?? ''
-                );
+                $remote_wallet_id = self::extract_wallet_id($remote);
                 if ($remote_wallet_id === '') {
                     continue;
                 }
@@ -1407,28 +1415,12 @@ class Matrix_MLM_Fintava {
                 }
 
                 foreach ($candidates as $candidate) {
-                    $remote_account = trim((string) (
-                        $candidate['account_number']
-                        ?? $candidate['accountNumber']
-                        ?? $candidate['virtual_account_number']
-                        ?? $candidate['recipient_account_number']
-                        ?? $candidate['destination_account_number']
-                        ?? ''
-                    ));
+                    $remote_account = self::extract_account_number($candidate);
                     if ($remote_account === '' || !isset($missing_by_account[$remote_account])) {
                         continue;
                     }
 
-                    $remote_wallet_id = (string) (
-                        $candidate['wallet_id']
-                        ?? $candidate['walletId']
-                        ?? $candidate['virtual_wallet_id']
-                        ?? $candidate['virtualWalletId']
-                        ?? $candidate['recipient_wallet_id']
-                        ?? $candidate['destination_wallet_id']
-                        ?? $candidate['id']
-                        ?? ''
-                    );
+                    $remote_wallet_id = self::extract_wallet_id($candidate);
                     if ($remote_wallet_id === '') {
                         continue;
                     }
@@ -1492,11 +1484,7 @@ class Matrix_MLM_Fintava {
             ];
         }
 
-        $remote_account = trim((string) (
-            $details['account_number']
-            ?? $details['accountNumber']
-            ?? ''
-        ));
+        $remote_account = self::extract_account_number($details);
         if ($remote_account === '' || $remote_account !== trim((string) $local_row->account_number)) {
             return [
                 'status' => 'mismatched',
@@ -1783,11 +1771,9 @@ class Matrix_MLM_Fintava {
             ]);
         }
 
-        // Pull the account number Fintava reports for this wallet (handle both
-        // snake_case and camelCase response shapes).
-        $remote_account_number = $details['account_number']
-            ?? $details['accountNumber']
-            ?? '';
+        // Pull the account number Fintava reports for this wallet (handle every
+        // shape Fintava uses: virtualAcctNo, account_number, accountNumber, etc.)
+        $remote_account_number = self::extract_account_number($details);
 
         if (empty($remote_account_number) || empty($wallet->account_number)) {
             wp_send_json_error(['message' => __('Could not verify the Wallet ID against your account number.', 'matrix-mlm')]);
@@ -1919,5 +1905,80 @@ class Matrix_MLM_Fintava {
 
     private function generate_reference() {
         return 'MTX-FTV-' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 12)) . '-' . time();
+    }
+
+    /**
+     * Extract the canonical 10-digit virtual-account number from a Fintava
+     * payload, regardless of which field name they used. Returns '' if none
+     * of the known shapes are present.
+     *
+     * Per Fintava's documented response (Dec 2023), the live field is
+     * `virtualAcctNo`; older snake_case variants are kept for compatibility.
+     */
+    public static function extract_account_number($obj) {
+        if (!is_array($obj)) {
+            return '';
+        }
+        foreach (['virtualAcctNo', 'virtual_acct_no', 'virtual_account_number', 'virtualAccountNumber', 'account_number', 'accountNumber', 'recipient_account_number', 'destination_account_number'] as $key) {
+            if (isset($obj[$key]) && $obj[$key] !== '') {
+                return trim((string) $obj[$key]);
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Extract the wallet's account holder name from a Fintava payload.
+     */
+    public static function extract_account_name($obj) {
+        if (!is_array($obj)) {
+            return '';
+        }
+        foreach (['virtualAcctName', 'virtual_acct_name', 'account_name', 'accountName', 'customerName', 'customer_name'] as $key) {
+            if (isset($obj[$key]) && $obj[$key] !== '') {
+                return (string) $obj[$key];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Extract the bank name from a Fintava payload (Fintava uses `bank` as a
+     * plain string in their virtual wallet response).
+     */
+    public static function extract_bank_name($obj) {
+        if (!is_array($obj)) {
+            return '';
+        }
+        foreach (['bank', 'bank_name', 'bankName'] as $key) {
+            if (isset($obj[$key]) && $obj[$key] !== '') {
+                return (string) $obj[$key];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Extract the wallet's own UUID from a Fintava payload, taking care to
+     * prefer the top-level `id` (the wallet) over nested `merchant.id`,
+     * `jobId`, etc.
+     */
+    public static function extract_wallet_id($obj) {
+        if (!is_array($obj)) {
+            return '';
+        }
+        foreach (['wallet_id', 'walletId', 'virtual_wallet_id', 'virtualWalletId', 'recipient_wallet_id', 'destination_wallet_id'] as $key) {
+            if (isset($obj[$key]) && $obj[$key] !== '') {
+                return (string) $obj[$key];
+            }
+        }
+        // Top-level `id` is the wallet's own UUID per Fintava docs. We only
+        // accept it as a wallet_id candidate when there's also an account
+        // number on the same level — otherwise we might pick up `merchant.id`
+        // or `jobId` from a nested object.
+        if (isset($obj['id']) && $obj['id'] !== '' && self::extract_account_number($obj) !== '') {
+            return (string) $obj['id'];
+        }
+        return '';
     }
 }

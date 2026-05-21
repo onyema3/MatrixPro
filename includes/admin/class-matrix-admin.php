@@ -862,15 +862,15 @@ class Matrix_MLM_Admin {
         }
 
         // Normalize the API response into a stable shape regardless of which
-        // field names Fintava chose to return (account_number vs accountNumber,
-        // bank_name vs bank, email vs customer_email, etc.).
+        // field names Fintava chose to return (virtualAcctNo vs account_number,
+        // bank vs bank_name, etc.).
         wp_send_json_success([
             'message' => __('Wallet verified — account details auto-filled.', 'matrix-mlm'),
             'wallet'  => [
-                'wallet_id'      => $details['wallet_id'] ?? $details['id'] ?? $wallet_id,
-                'account_number' => $details['account_number'] ?? $details['accountNumber'] ?? '',
-                'account_name'   => $details['account_name'] ?? $details['accountName'] ?? '',
-                'bank_name'      => $details['bank_name'] ?? $details['bank'] ?? $details['bankName'] ?? 'Fintava',
+                'wallet_id'      => Matrix_MLM_Fintava::extract_wallet_id($details) ?: $wallet_id,
+                'account_number' => Matrix_MLM_Fintava::extract_account_number($details),
+                'account_name'   => Matrix_MLM_Fintava::extract_account_name($details),
+                'bank_name'      => Matrix_MLM_Fintava::extract_bank_name($details) ?: 'Fintava',
                 'bank_code'      => $details['bank_code'] ?? $details['bankCode'] ?? '',
                 'currency'       => $details['currency'] ?? 'NGN',
                 'status'         => $details['status'] ?? 'active',
