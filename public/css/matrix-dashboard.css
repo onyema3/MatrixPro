@@ -209,3 +209,234 @@
         grid-template-columns: 1fr;
     }
 }
+
+
+/* Genealogy Tree Styles */
+.matrix-genealogy-plan-selector {
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.matrix-genealogy-plan-selector label {
+    font-weight: 600;
+    color: var(--matrix-dark);
+}
+
+.matrix-genealogy-plan-selector select {
+    padding: 8px 12px;
+    border: 1px solid var(--matrix-border);
+    border-radius: 6px;
+    font-size: 14px;
+}
+
+.matrix-genealogy-wrapper {
+    overflow-x: auto;
+    padding: 20px 0;
+    margin-bottom: 20px;
+}
+
+.matrix-genealogy-tree {
+    display: flex;
+    justify-content: center;
+    min-width: fit-content;
+}
+
+/* Tree Item */
+.matrix-tree-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+}
+
+/* Tree Node */
+.matrix-tree-node {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #fff;
+    border: 2px solid var(--matrix-border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    min-width: 160px;
+    transition: all 0.2s;
+    cursor: default;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+}
+
+.matrix-tree-node:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.matrix-tree-node-you {
+    border-color: var(--matrix-primary);
+    background: linear-gradient(135deg, #eef2ff, #e0e7ff);
+}
+
+.matrix-tree-node-active {
+    border-color: var(--matrix-success);
+    background: #f0fdf4;
+}
+
+.matrix-tree-node-empty {
+    border-color: #e5e7eb;
+    border-style: dashed;
+    background: #f9fafb;
+    opacity: 0.7;
+}
+
+.tree-node-avatar img {
+    border-radius: 50%;
+    width: 36px;
+    height: 36px;
+}
+
+.tree-node-empty-avatar {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f3f4f6;
+    border-radius: 50%;
+    color: #9ca3af;
+}
+
+.tree-node-empty-avatar .dashicons {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+}
+
+.tree-node-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.tree-node-info strong {
+    font-size: 13px;
+    color: var(--matrix-dark);
+    line-height: 1.3;
+}
+
+.tree-node-info small {
+    font-size: 11px;
+    color: #6b7280;
+}
+
+/* Tree Children / Lines */
+.matrix-tree-children {
+    display: flex;
+    gap: 12px;
+    padding-top: 24px;
+    position: relative;
+}
+
+.matrix-tree-children::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 2px;
+    height: 12px;
+    background: var(--matrix-border);
+    transform: translateX(-50%);
+}
+
+.matrix-tree-children::after {
+    content: '';
+    position: absolute;
+    top: 12px;
+    left: 24px;
+    right: 24px;
+    height: 2px;
+    background: var(--matrix-border);
+}
+
+.matrix-tree-children > .matrix-tree-item {
+    position: relative;
+    padding-top: 12px;
+}
+
+.matrix-tree-children > .matrix-tree-item::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 2px;
+    height: 12px;
+    background: var(--matrix-border);
+    transform: translateX(-50%);
+}
+
+/* Single child - straight line */
+.matrix-tree-children:has(> .matrix-tree-item:only-child)::after {
+    display: none;
+}
+
+/* Legend */
+.matrix-genealogy-legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    padding: 16px;
+    background: #f8fafc;
+    border-radius: 8px;
+    border: 1px solid var(--matrix-border);
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #4b5563;
+}
+
+.legend-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.legend-you {
+    background: var(--matrix-primary);
+}
+
+.legend-active {
+    background: var(--matrix-success);
+}
+
+.legend-empty {
+    background: #e5e7eb;
+    border: 1px dashed #9ca3af;
+}
+
+/* Responsive tree */
+@media (max-width: 768px) {
+    .matrix-tree-node {
+        min-width: 130px;
+        padding: 8px 10px;
+    }
+
+    .matrix-tree-children {
+        gap: 8px;
+    }
+
+    .tree-node-info strong {
+        font-size: 11px;
+    }
+
+    .tree-node-info small {
+        font-size: 10px;
+    }
+
+    .matrix-genealogy-legend {
+        flex-wrap: wrap;
+        gap: 12px;
+    }
+}
