@@ -1,11 +1,20 @@
 <?php
 /**
  * Fintava Pay Gateway - Merchant Bank Credit & Virtual Wallet
- * 
- * Integrates with the Fintava Pay API (https://dev.fintavapay.com/api/dev/)
- * to allow users to transfer funds from their Matrix wallet to their bank accounts
- * via the merchant credit endpoint.
- * 
+ *
+ * Integrates with the Fintava Pay LIVE API to allow users to transfer funds
+ * from their Matrix wallet to their bank accounts via the merchant credit
+ * endpoint, and to generate virtual wallets for receiving deposits.
+ *
+ * Configuration is intentionally minimal:
+ * - Live API Key (required)
+ * - Webhook Secret (optional but recommended)
+ * - Active toggle
+ *
+ * The API base URL defaults to https://live.fintavapay.com/api/live and can
+ * be overridden by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php if
+ * Fintava ever changes their endpoint.
+ *
  * Endpoints used:
  * - GET  /merchant/balance        - Get merchant wallet balance
  * - POST /bank/credit/merchant    - Credit a bank account (payout from merchant)
@@ -20,10 +29,14 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Fintava {
 
+    /**
+     * Default Fintava Pay LIVE API base URL.
+     * Override by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php.
+     */
+    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/live';
+
     private $secret_key;
-    private $public_key;
     private $base_url;
-    private $environment;
 
     public function __construct() {
         $this->load_credentials();
@@ -31,25 +44,23 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Load API credentials from settings
+     * Load API credentials from settings.
+     * Only the live secret (API) key is needed.
      */
     private function load_credentials() {
-        $this->environment = get_option('matrix_mlm_fintava_environment', 'sandbox');
-        $this->secret_key = get_option('matrix_mlm_fintava_secret_key', '');
-        $this->public_key = get_option('matrix_mlm_fintava_public_key', '');
+        $this->secret_key = trim(get_option('matrix_mlm_fintava_secret_key', ''));
 
-        // Default base URL: Fintava Pay API
-        $this->base_url = 'https://dev.fintavapay.com/api/dev';
-
-        // Allow override via settings
-        $custom_url = get_option('matrix_mlm_fintava_base_url', '');
-        if (!empty($custom_url)) {
-            $this->base_url = rtrim($custom_url, '/');
+        // Allow wp-config.php override for the base URL (escape hatch in case
+        // Fintava changes their endpoint structure).
+        if (defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL) {
+            $this->base_url = rtrim(MATRIX_FINTAVA_API_BASE_URL, '/');
+        } else {
+            $this->base_url = self::DEFAULT_BASE_URL;
         }
     }
 
     /**
-     * Register WordPress hooks
+     * Register WordPress hooks.
      */
     private function register_hooks() {
         add_action('wp_ajax_matrix_fintava_get_banks', [$this, 'ajax_get_banks']);
@@ -66,9 +77,6 @@ class Matrix_MLM_Fintava {
         add_action('rest_api_init', [$this, 'register_webhook_routes']);
     }
 
-    /**
-     * Register webhook route for transfer status updates
-     */
     public function register_webhook_routes() {
         register_rest_route('matrix-mlm/v1', '/fintava/webhook', [
             'methods' => 'POST',
@@ -77,12 +85,135 @@ class Matrix_MLM_Fintava {
         ]);
     }
 
+    /**
+     * Check if Fintava is configured and active.
+     *
+     * Reads matrix_mlm_fintava_status (the option saved by the admin Gateways
+     * page). Falls back to the legacy matrix_mlm_fintava_enabled option for
+     * existing installs that were configured before the rework.
+     */
+    public function is_active() {
+        if (empty($this->secret_key)) {
+            return false;
+        }
+        $status = get_option('matrix_mlm_fintava_status', null);
+        if ($status === null) {
+            // Legacy fallback
+            return (bool) get_option('matrix_mlm_fintava_enabled', 0);
+        }
+        return (bool) $status;
+    }
+
+    // =========================================================================
+    // SCHEMA / SELF-HEALING
+    // =========================================================================
+
+    /**
+     * Ensure the Fintava database tables exist.
+     * Idempotent and self-healing — safe to call on every page load.
+     * Bypasses dbDelta (which silently fails on inline UNIQUE constraints) and
+     * uses direct CREATE TABLE IF NOT EXISTS instead.
+     *
+     * @return array{errors: string[]}
+     */
+    public static function ensure_tables_exist() {
+        global $wpdb;
+        $charset_collate = $wpdb->get_charset_collate();
+        $errors = [];
+
+        $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
+        $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
+        $logs_table = $wpdb->prefix . 'matrix_fintava_webhook_logs';
+
+        $payouts_sql = "CREATE TABLE IF NOT EXISTS `$payouts_table` (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            reference varchar(100) NOT NULL,
+            transfer_id varchar(100) DEFAULT NULL,
+            amount decimal(12,2) NOT NULL,
+            charge decimal(12,2) NOT NULL DEFAULT 0.00,
+            total_debit decimal(12,2) NOT NULL,
+            bank_code varchar(20) NOT NULL,
+            bank_name varchar(100) NOT NULL,
+            account_number varchar(20) NOT NULL,
+            account_name varchar(255) NOT NULL,
+            narration varchar(255) DEFAULT NULL,
+            currency varchar(5) NOT NULL DEFAULT 'NGN',
+            status varchar(20) NOT NULL DEFAULT 'pending',
+            failure_reason text,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            completed_at datetime DEFAULT NULL,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY reference (reference),
+            KEY user_id (user_id),
+            KEY status (status)
+        ) $charset_collate";
+
+        $wallets_sql = "CREATE TABLE IF NOT EXISTS `$wallets_table` (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            wallet_id varchar(100) DEFAULT NULL,
+            account_number varchar(20) NOT NULL,
+            account_name varchar(255) NOT NULL,
+            bank_name varchar(100) NOT NULL DEFAULT 'Fintava',
+            bank_code varchar(20) DEFAULT NULL,
+            currency varchar(5) NOT NULL DEFAULT 'NGN',
+            customer_email varchar(255) DEFAULT NULL,
+            customer_phone varchar(20) DEFAULT NULL,
+            bvn varchar(20) DEFAULT NULL,
+            status varchar(20) NOT NULL DEFAULT 'active',
+            metadata text,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY user_id (user_id),
+            KEY account_number (account_number),
+            KEY status (status)
+        ) $charset_collate";
+
+        $logs_sql = "CREATE TABLE IF NOT EXISTS `$logs_table` (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            event_type varchar(100) NOT NULL,
+            reference varchar(255) DEFAULT NULL,
+            payload longtext,
+            signature varchar(255) DEFAULT NULL,
+            ip_address varchar(45) DEFAULT NULL,
+            status varchar(20) NOT NULL DEFAULT 'received',
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY event_type (event_type),
+            KEY reference (reference),
+            KEY created_at (created_at)
+        ) $charset_collate";
+
+        foreach (['payouts' => $payouts_sql, 'wallets' => $wallets_sql, 'logs' => $logs_sql] as $name => $sql) {
+            $previous = $wpdb->show_errors;
+            $wpdb->hide_errors();
+            $wpdb->query($sql);
+            if ($previous) {
+                $wpdb->show_errors();
+            }
+            if ($wpdb->last_error) {
+                $errors[] = sprintf('%s: %s', $name, $wpdb->last_error);
+            }
+        }
+
+        return ['errors' => $errors];
+    }
+
+    /**
+     * Backward-compatible alias kept because the activator calls it.
+     */
+    public static function create_table() {
+        self::ensure_tables_exist();
+    }
+
     // =========================================================================
     // API METHODS
     // =========================================================================
 
     /**
-     * Get list of supported banks
      * GET /banks
      */
     public function get_banks() {
@@ -94,13 +225,11 @@ class Matrix_MLM_Fintava {
         }
 
         $response = $this->make_request('GET', '/banks');
-
         if (is_wp_error($response)) {
             return $response;
         }
 
         if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
-            // Cache bank list for 24 hours
             set_transient($cache_key, $response['data'], DAY_IN_SECONDS);
             return $response['data'];
         }
@@ -109,12 +238,7 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Resolve/verify bank account details (name lookup)
-     * POST /resolve-account
-     * 
-     * @param string $account_number The bank account number
-     * @param string $bank_code The bank code
-     * @return array|WP_Error Account details or error
+     * POST /resolve-account — verify bank account (name lookup).
      */
     public function resolve_account($account_number, $bank_code) {
         $response = $this->make_request('POST', '/resolve-account', [
@@ -137,11 +261,7 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Initiate a bank transfer/payout
-     * POST /transfer
-     * 
-     * @param array $transfer_data Transfer parameters
-     * @return array|WP_Error Transfer result or error
+     * POST /transfer — initiate a transfer.
      */
     public function initiate_transfer($transfer_data) {
         $required_fields = ['amount', 'account_number', 'bank_code', 'narration'];
@@ -161,7 +281,6 @@ class Matrix_MLM_Fintava {
             'callback_url' => rest_url('matrix-mlm/v1/fintava/webhook'),
         ];
 
-        // Optional fields
         if (!empty($transfer_data['account_name'])) {
             $payload['account_name'] = sanitize_text_field($transfer_data['account_name']);
         }
@@ -170,7 +289,6 @@ class Matrix_MLM_Fintava {
         }
 
         $response = $this->make_request('POST', '/transfer', $payload);
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -192,15 +310,10 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Check transfer status
-     * GET /transfer/:id
-     * 
-     * @param string $transfer_id The transfer ID or reference
-     * @return array|WP_Error
+     * GET /transfer/:id — check status.
      */
     public function check_transfer_status($transfer_id) {
         $response = $this->make_request('GET', '/transfer/' . $transfer_id);
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -216,17 +329,10 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Get merchant wallet balance
-     * GET /merchant/balance
-     * 
-     * Returns the current balance of the merchant's Fintava wallet.
-     * This is the pool from which user payouts are funded.
-     * 
-     * @return array|WP_Error Balance data or error
+     * GET /merchant/balance — current merchant wallet balance.
      */
     public function get_merchant_balance() {
         $response = $this->make_request('GET', '/merchant/balance');
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -235,7 +341,7 @@ class Matrix_MLM_Fintava {
             return $response['data'];
         }
 
-        // Some API responses return balance directly
+        // Some response shapes return balance fields directly at the root.
         if (isset($response['balance'])) {
             return [
                 'balance' => floatval($response['balance']),
@@ -252,14 +358,7 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Merchant transfer - Credit a bank account from merchant wallet
-     * POST /bank/credit/merchant
-     * 
-     * This is the actual payout endpoint that debits the merchant's Fintava wallet
-     * and credits the recipient's bank account.
-     * 
-     * @param array $transfer_data Transfer parameters
-     * @return array|WP_Error Transfer result or error
+     * POST /bank/credit/merchant — payout from merchant wallet to bank account.
      */
     public function merchant_bank_credit($transfer_data) {
         $required_fields = ['amount', 'account_number', 'bank_code'];
@@ -275,25 +374,13 @@ class Matrix_MLM_Fintava {
             'bank_code' => sanitize_text_field($transfer_data['bank_code']),
         ];
 
-        // Optional fields commonly accepted by the API
-        if (!empty($transfer_data['narration'])) {
-            $payload['narration'] = sanitize_text_field($transfer_data['narration']);
-        }
-        if (!empty($transfer_data['reference'])) {
-            $payload['reference'] = sanitize_text_field($transfer_data['reference']);
-        }
-        if (!empty($transfer_data['account_name'])) {
-            $payload['account_name'] = sanitize_text_field($transfer_data['account_name']);
-        }
-        if (!empty($transfer_data['bank_name'])) {
-            $payload['bank_name'] = sanitize_text_field($transfer_data['bank_name']);
-        }
-        if (!empty($transfer_data['currency'])) {
-            $payload['currency'] = sanitize_text_field($transfer_data['currency']);
+        foreach (['narration', 'reference', 'account_name', 'bank_name', 'currency'] as $optional_field) {
+            if (!empty($transfer_data[$optional_field])) {
+                $payload[$optional_field] = sanitize_text_field($transfer_data[$optional_field]);
+            }
         }
 
         $response = $this->make_request('POST', '/bank/credit/merchant', $payload);
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -318,9 +405,6 @@ class Matrix_MLM_Fintava {
     // AJAX HANDLERS
     // =========================================================================
 
-    /**
-     * AJAX: Get bank list
-     */
     public function ajax_get_banks() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
@@ -329,7 +413,6 @@ class Matrix_MLM_Fintava {
         }
 
         $banks = $this->get_banks();
-
         if (is_wp_error($banks)) {
             wp_send_json_error(['message' => $banks->get_error_message()]);
         }
@@ -337,9 +420,6 @@ class Matrix_MLM_Fintava {
         wp_send_json_success(['banks' => $banks]);
     }
 
-    /**
-     * AJAX: Resolve bank account
-     */
     public function ajax_resolve_account() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
@@ -359,7 +439,6 @@ class Matrix_MLM_Fintava {
         }
 
         $result = $this->resolve_account($account_number, $bank_code);
-
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
@@ -371,23 +450,23 @@ class Matrix_MLM_Fintava {
         ]);
     }
 
-    /**
-     * AJAX: Initiate bank transfer from wallet
-     */
     public function ajax_initiate_transfer() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
+        self::ensure_tables_exist();
 
         $user_id = get_current_user_id();
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        // Check if user is active
         if (!Matrix_MLM_User::is_active($user_id)) {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
         }
 
-        // Validate inputs
+        if (!$this->is_active()) {
+            wp_send_json_error(['message' => __('Bank payouts are not available at the moment.', 'matrix-mlm')]);
+        }
+
         $amount = floatval($_POST['amount'] ?? 0);
         $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         $bank_code = sanitize_text_field($_POST['bank_code'] ?? '');
@@ -399,51 +478,43 @@ class Matrix_MLM_Fintava {
             $narration = sprintf('Matrix Payout - %s', wp_get_current_user()->user_login);
         }
 
-        // Validate amount limits
+        $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
         $min_payout = floatval(get_option('matrix_mlm_fintava_min_payout', 1000));
         $max_payout = floatval(get_option('matrix_mlm_fintava_max_payout', 5000000));
 
         if ($amount < $min_payout) {
-            wp_send_json_error(['message' => sprintf(__('Minimum payout amount is %s%s', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($min_payout, 2))]);
+            wp_send_json_error(['message' => sprintf(__('Minimum payout amount is %s%s', 'matrix-mlm'), $currency_symbol, number_format($min_payout, 2))]);
         }
 
         if ($amount > $max_payout) {
-            wp_send_json_error(['message' => sprintf(__('Maximum payout amount is %s%s', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($max_payout, 2))]);
+            wp_send_json_error(['message' => sprintf(__('Maximum payout amount is %s%s', 'matrix-mlm'), $currency_symbol, number_format($max_payout, 2))]);
         }
 
         if (empty($account_number) || empty($bank_code)) {
             wp_send_json_error(['message' => __('Bank account details are required', 'matrix-mlm')]);
         }
 
-        // Calculate charges
         $charge_type = get_option('matrix_mlm_fintava_charge_type', 'fixed');
         $charge_value = floatval(get_option('matrix_mlm_fintava_charge_value', 50));
-
-        if ($charge_type === 'percent') {
-            $charge = round($amount * $charge_value / 100, 2);
-        } else {
-            $charge = $charge_value;
-        }
-
+        $charge = $charge_type === 'percent'
+            ? round($amount * $charge_value / 100, 2)
+            : $charge_value;
         $total_debit = $amount + $charge;
 
-        // Check wallet balance
         $wallet = new Matrix_MLM_Wallet();
         $balance = $wallet->get_balance($user_id);
 
         if ($balance < $total_debit) {
             wp_send_json_error(['message' => sprintf(
                 __('Insufficient balance. You need %s%s (Amount: %s%s + Charge: %s%s)', 'matrix-mlm'),
-                get_option('matrix_mlm_currency_symbol', '₦'), number_format($total_debit, 2),
-                get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount, 2),
-                get_option('matrix_mlm_currency_symbol', '₦'), number_format($charge, 2)
+                $currency_symbol, number_format($total_debit, 2),
+                $currency_symbol, number_format($amount, 2),
+                $currency_symbol, number_format($charge, 2)
             )]);
         }
 
-        // Generate reference
         $reference = $this->generate_reference();
 
-        // Debit wallet first (hold funds)
         $wallet->debit(
             $user_id,
             $total_debit,
@@ -452,27 +523,29 @@ class Matrix_MLM_Fintava {
             $reference
         );
 
-        // Record the payout in database
         global $wpdb;
-        $wpdb->insert($wpdb->prefix . 'matrix_fintava_payouts', [
-            'user_id' => $user_id,
-            'reference' => $reference,
-            'amount' => $amount,
-            'charge' => $charge,
-            'total_debit' => $total_debit,
-            'bank_code' => $bank_code,
-            'bank_name' => $bank_name,
-            'account_number' => $account_number,
-            'account_name' => $account_name,
-            'narration' => $narration,
-            'currency' => 'NGN',
-            'status' => 'pending',
-            'created_at' => current_time('mysql'),
-        ]);
-
+        $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
+        $wpdb->insert(
+            $payouts_table,
+            [
+                'user_id' => $user_id,
+                'reference' => $reference,
+                'amount' => $amount,
+                'charge' => $charge,
+                'total_debit' => $total_debit,
+                'bank_code' => $bank_code,
+                'bank_name' => $bank_name,
+                'account_number' => $account_number,
+                'account_name' => $account_name,
+                'narration' => $narration,
+                'currency' => 'NGN',
+                'status' => 'pending',
+                'created_at' => current_time('mysql'),
+            ],
+            ['%d', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
         $payout_id = $wpdb->insert_id;
 
-        // Initiate transfer via Fintava API (merchant bank credit)
         $result = $this->merchant_bank_credit([
             'amount' => $amount,
             'account_number' => $account_number,
@@ -485,7 +558,6 @@ class Matrix_MLM_Fintava {
         ]);
 
         if (is_wp_error($result)) {
-            // Transfer failed - refund the user
             $wallet->credit(
                 $user_id,
                 $total_debit,
@@ -494,47 +566,48 @@ class Matrix_MLM_Fintava {
                 $reference
             );
 
-            // Update payout status
-            $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-                'status' => 'failed',
-                'failure_reason' => $result->get_error_message(),
-                'updated_at' => current_time('mysql'),
-            ], ['id' => $payout_id]);
+            $wpdb->update(
+                $payouts_table,
+                ['status' => 'failed', 'failure_reason' => $result->get_error_message(), 'updated_at' => current_time('mysql')],
+                ['id' => $payout_id],
+                ['%s', '%s', '%s'],
+                ['%d']
+            );
 
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        // Update payout with transfer details
-        $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-            'transfer_id' => $result['transfer_id'] ?? '',
-            'status' => $result['status'] ?? 'processing',
-            'updated_at' => current_time('mysql'),
-        ], ['id' => $payout_id]);
+        $wpdb->update(
+            $payouts_table,
+            [
+                'transfer_id' => $result['transfer_id'] ?? '',
+                'status' => $result['status'] ?? 'processing',
+                'updated_at' => current_time('mysql'),
+            ],
+            ['id' => $payout_id],
+            ['%s', '%s', '%s'],
+            ['%d']
+        );
 
-        // Send notification
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
         Matrix_MLM_Notifications::send_admin_notification(
             'fintava_payout',
             sprintf(
                 __('Bank payout initiated: %s%s to %s (%s - %s). Ref: %s', 'matrix-mlm'),
-                $currency, number_format($amount, 2), $account_name, $bank_name, $account_number, $reference
+                $currency_symbol, number_format($amount, 2), $account_name, $bank_name, $account_number, $reference
             )
         );
 
         wp_send_json_success([
             'message' => sprintf(
                 __('Transfer of %s%s initiated to %s (%s). It will be processed shortly.', 'matrix-mlm'),
-                $currency, number_format($amount, 2), $account_name, $bank_name
+                $currency_symbol, number_format($amount, 2), $account_name, $bank_name
             ),
             'reference' => $reference,
             'status' => $result['status'] ?? 'processing',
         ]);
     }
 
-    /**
-     * AJAX: Check transfer status
-     */
     public function ajax_check_transfer_status() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
@@ -557,16 +630,18 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Payout not found', 'matrix-mlm')]);
         }
 
-        // If we have a transfer_id, check with Fintava
-        if (!empty($payout->transfer_id) && in_array($payout->status, ['pending', 'processing'])) {
+        if (!empty($payout->transfer_id) && in_array($payout->status, ['pending', 'processing'], true)) {
             $status = $this->check_transfer_status($payout->transfer_id);
             if (!is_wp_error($status)) {
                 $new_status = $status['status'] ?? $payout->status;
                 if ($new_status !== $payout->status) {
-                    $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-                        'status' => $new_status,
-                        'updated_at' => current_time('mysql'),
-                    ], ['id' => $payout->id]);
+                    $wpdb->update(
+                        $wpdb->prefix . 'matrix_fintava_payouts',
+                        ['status' => $new_status, 'updated_at' => current_time('mysql')],
+                        ['id' => $payout->id],
+                        ['%s', '%s'],
+                        ['%d']
+                    );
                     $payout->status = $new_status;
                 }
             }
@@ -583,9 +658,6 @@ class Matrix_MLM_Fintava {
         ]);
     }
 
-    /**
-     * AJAX: Get merchant wallet balance (admin only)
-     */
     public function ajax_get_merchant_balance() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
@@ -594,7 +666,6 @@ class Matrix_MLM_Fintava {
         }
 
         $balance = $this->get_merchant_balance();
-
         if (is_wp_error($balance)) {
             wp_send_json_error(['message' => $balance->get_error_message()]);
         }
@@ -606,14 +677,12 @@ class Matrix_MLM_Fintava {
     // WEBHOOK HANDLER
     // =========================================================================
 
-    /**
-     * Handle Fintava webhook notifications for transfer status updates
-     */
     public function handle_webhook($request) {
+        self::ensure_tables_exist();
+
         $payload = $request->get_body();
         $signature = $request->get_header('x-fintava-signature');
 
-        // Verify webhook signature
         $webhook_secret = get_option('matrix_mlm_fintava_webhook_secret', '');
         if (!empty($webhook_secret)) {
             $computed_signature = hash_hmac('sha512', $payload, $webhook_secret);
@@ -627,11 +696,9 @@ class Matrix_MLM_Fintava {
             return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid payload'], 400);
         }
 
-        // Support both 'event' and 'type' keys for event identification
         $event_type = $event['event'] ?? $event['type'] ?? '';
         $data = $event['data'] ?? [];
 
-        // Log webhook event for debugging/auditing
         $this->log_webhook_event($event_type, $data, $signature);
 
         switch ($event_type) {
@@ -650,7 +717,6 @@ class Matrix_MLM_Fintava {
                 $this->handle_account_funded($data);
                 break;
             default:
-                // Unknown event type - log and acknowledge
                 error_log(sprintf('[Matrix Fintava Webhook] Unhandled event type: %s', $event_type));
                 break;
         }
@@ -658,13 +724,9 @@ class Matrix_MLM_Fintava {
         return new WP_REST_Response(['status' => 'success'], 200);
     }
 
-    /**
-     * Handle successful transfer webhook
-     */
     private function handle_transfer_success($data) {
         global $wpdb;
         $reference = $data['reference'] ?? '';
-
         if (empty($reference)) {
             return;
         }
@@ -678,14 +740,18 @@ class Matrix_MLM_Fintava {
             return;
         }
 
-        $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-            'status' => 'completed',
-            'completed_at' => current_time('mysql'),
-            'updated_at' => current_time('mysql'),
-        ], ['id' => $payout->id]);
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_payouts',
+            [
+                'status' => 'completed',
+                'completed_at' => current_time('mysql'),
+                'updated_at' => current_time('mysql'),
+            ],
+            ['id' => $payout->id],
+            ['%s', '%s', '%s'],
+            ['%d']
+        );
 
-        // Send success notification to user
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $user = get_userdata($payout->user_id);
         if ($user) {
             Matrix_MLM_Notifications::send_deposit_notification(
@@ -696,9 +762,6 @@ class Matrix_MLM_Fintava {
         }
     }
 
-    /**
-     * Handle failed/reversed transfer webhook
-     */
     private function handle_transfer_failure($data) {
         global $wpdb;
         $reference = $data['reference'] ?? '';
@@ -713,18 +776,18 @@ class Matrix_MLM_Fintava {
             $reference
         ));
 
-        if (!$payout || in_array($payout->status, ['failed', 'refunded'])) {
+        if (!$payout || in_array($payout->status, ['failed', 'refunded'], true)) {
             return;
         }
 
-        // Update status
-        $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-            'status' => 'failed',
-            'failure_reason' => $reason,
-            'updated_at' => current_time('mysql'),
-        ], ['id' => $payout->id]);
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_payouts',
+            ['status' => 'failed', 'failure_reason' => $reason, 'updated_at' => current_time('mysql')],
+            ['id' => $payout->id],
+            ['%s', '%s', '%s'],
+            ['%d']
+        );
 
-        // Refund the user
         $wallet = new Matrix_MLM_Wallet();
         $wallet->credit(
             $payout->user_id,
@@ -734,29 +797,20 @@ class Matrix_MLM_Fintava {
             $reference
         );
 
-        // Update to refunded
-        $wpdb->update($wpdb->prefix . 'matrix_fintava_payouts', [
-            'status' => 'refunded',
-            'updated_at' => current_time('mysql'),
-        ], ['id' => $payout->id]);
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_payouts',
+            ['status' => 'refunded', 'updated_at' => current_time('mysql')],
+            ['id' => $payout->id],
+            ['%s', '%s'],
+            ['%d']
+        );
 
-        // Notify user
         Matrix_MLM_Notifications::send_admin_notification(
             'fintava_payout_failed',
             sprintf(__('Bank payout FAILED and refunded. Ref: %s, Reason: %s', 'matrix-mlm'), $reference, $reason)
         );
     }
 
-    // =========================================================================
-    // INCOMING PAYMENT WEBHOOK HANDLERS
-    // =========================================================================
-
-    /**
-     * Handle wallet-to-wallet transfer webhook (wallet_to_wallet_transfer_v2)
-     * 
-     * Triggered when a user receives funds via wallet-to-wallet transfer on Fintava.
-     * Maps the recipient virtual wallet to a Matrix user and credits their balance.
-     */
     private function handle_wallet_to_wallet_transfer($data) {
         global $wpdb;
 
@@ -768,60 +822,54 @@ class Matrix_MLM_Fintava {
         $currency = $data['currency'] ?? 'NGN';
 
         if (empty($reference) || $amount <= 0 || empty($recipient_account)) {
-            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: Missing required data - ref: ' . $reference . ', amount: ' . $amount . ', account: ' . $recipient_account);
+            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: Missing required data');
             return;
         }
 
-        // Check for duplicate processing
         $existing = $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM {$wpdb->prefix}matrix_deposits WHERE transaction_id = %s AND status = 'completed'",
             $reference
         ));
-
         if ($existing) {
-            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: Duplicate reference - ' . $reference);
             return;
         }
 
-        // Find the user by their virtual wallet account number
         $wallet_record = $wpdb->get_row($wpdb->prepare(
             "SELECT * FROM {$wpdb->prefix}matrix_fintava_wallets WHERE account_number = %s AND status = 'active'",
             $recipient_account
         ));
-
         if (!$wallet_record) {
-            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: No user found for account ' . $recipient_account . ' (ref: ' . $reference . ')');
+            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: No user found for account ' . $recipient_account);
             return;
         }
 
         $user_id = $wallet_record->user_id;
-
-        // Verify user is active
         if (!Matrix_MLM_User::is_active($user_id)) {
-            error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: User ' . $user_id . ' is not active (ref: ' . $reference . ')');
             return;
         }
 
-        // Record the deposit
-        $wpdb->insert($wpdb->prefix . 'matrix_deposits', [
-            'user_id' => $user_id,
-            'amount' => $amount,
-            'charge' => 0.00,
-            'net_amount' => $amount,
-            'gateway' => 'fintava_wallet_transfer',
-            'currency' => $currency,
-            'transaction_id' => $reference,
-            'gateway_response' => json_encode([
-                'type' => 'wallet_to_wallet_transfer_v2',
-                'sender_name' => $sender_name,
-                'narration' => $narration,
-                'recipient_account' => $recipient_account,
-            ]),
-            'status' => 'completed',
-            'created_at' => current_time('mysql'),
-        ]);
+        $wpdb->insert(
+            $wpdb->prefix . 'matrix_deposits',
+            [
+                'user_id' => $user_id,
+                'amount' => $amount,
+                'charge' => 0.00,
+                'net_amount' => $amount,
+                'gateway' => 'fintava_wallet_transfer',
+                'currency' => $currency,
+                'transaction_id' => $reference,
+                'gateway_response' => json_encode([
+                    'type' => 'wallet_to_wallet_transfer_v2',
+                    'sender_name' => $sender_name,
+                    'narration' => $narration,
+                    'recipient_account' => $recipient_account,
+                ]),
+                'status' => 'completed',
+                'created_at' => current_time('mysql'),
+            ],
+            ['%d', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
 
-        // Credit the user's Matrix wallet
         $wallet = new Matrix_MLM_Wallet();
         $description = sprintf(
             __('Wallet transfer received from %s%s', 'matrix-mlm'),
@@ -830,10 +878,8 @@ class Matrix_MLM_Fintava {
         );
         $wallet->credit($user_id, $amount, 'fintava_wallet_transfer', $description, $reference);
 
-        // Send notification to user
         Matrix_MLM_Notifications::send_deposit_notification($user_id, $amount, 'completed');
 
-        // Notify admin
         $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
         $user = get_userdata($user_id);
         Matrix_MLM_Notifications::send_admin_notification(
@@ -852,12 +898,6 @@ class Matrix_MLM_Fintava {
         do_action('matrix_fintava_wallet_transfer_received', $user_id, $amount, $data);
     }
 
-    /**
-     * Handle account funded webhook (account_funded)
-     * 
-     * Triggered when a user's virtual account receives a bank transfer/deposit.
-     * Maps the funded virtual account to a Matrix user and credits their balance.
-     */
     private function handle_account_funded($data) {
         global $wpdb;
 
@@ -870,61 +910,55 @@ class Matrix_MLM_Fintava {
         $currency = $data['currency'] ?? 'NGN';
 
         if (empty($reference) || $amount <= 0 || empty($account_number)) {
-            error_log('[Matrix Fintava Webhook] account_funded: Missing required data - ref: ' . $reference . ', amount: ' . $amount . ', account: ' . $account_number);
+            error_log('[Matrix Fintava Webhook] account_funded: Missing required data');
             return;
         }
 
-        // Check for duplicate processing
         $existing = $wpdb->get_var($wpdb->prepare(
             "SELECT id FROM {$wpdb->prefix}matrix_deposits WHERE transaction_id = %s AND status = 'completed'",
             $reference
         ));
-
         if ($existing) {
-            error_log('[Matrix Fintava Webhook] account_funded: Duplicate reference - ' . $reference);
             return;
         }
 
-        // Find the user by their virtual wallet account number
         $wallet_record = $wpdb->get_row($wpdb->prepare(
             "SELECT * FROM {$wpdb->prefix}matrix_fintava_wallets WHERE account_number = %s AND status = 'active'",
             $account_number
         ));
-
         if (!$wallet_record) {
-            error_log('[Matrix Fintava Webhook] account_funded: No user found for account ' . $account_number . ' (ref: ' . $reference . ')');
+            error_log('[Matrix Fintava Webhook] account_funded: No user found for account ' . $account_number);
             return;
         }
 
         $user_id = $wallet_record->user_id;
-
-        // Verify user is active
         if (!Matrix_MLM_User::is_active($user_id)) {
-            error_log('[Matrix Fintava Webhook] account_funded: User ' . $user_id . ' is not active (ref: ' . $reference . ')');
             return;
         }
 
-        // Record the deposit
-        $wpdb->insert($wpdb->prefix . 'matrix_deposits', [
-            'user_id' => $user_id,
-            'amount' => $amount,
-            'charge' => 0.00,
-            'net_amount' => $amount,
-            'gateway' => 'fintava_account_funded',
-            'currency' => $currency,
-            'transaction_id' => $reference,
-            'gateway_response' => json_encode([
-                'type' => 'account_funded',
-                'sender_name' => $sender_name,
-                'sender_bank' => $sender_bank,
-                'narration' => $narration,
-                'account_number' => $account_number,
-            ]),
-            'status' => 'completed',
-            'created_at' => current_time('mysql'),
-        ]);
+        $wpdb->insert(
+            $wpdb->prefix . 'matrix_deposits',
+            [
+                'user_id' => $user_id,
+                'amount' => $amount,
+                'charge' => 0.00,
+                'net_amount' => $amount,
+                'gateway' => 'fintava_account_funded',
+                'currency' => $currency,
+                'transaction_id' => $reference,
+                'gateway_response' => json_encode([
+                    'type' => 'account_funded',
+                    'sender_name' => $sender_name,
+                    'sender_bank' => $sender_bank,
+                    'narration' => $narration,
+                    'account_number' => $account_number,
+                ]),
+                'status' => 'completed',
+                'created_at' => current_time('mysql'),
+            ],
+            ['%d', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
 
-        // Credit the user's Matrix wallet
         $wallet = new Matrix_MLM_Wallet();
         $description = sprintf(
             __('Account funded by %s%s%s', 'matrix-mlm'),
@@ -934,10 +968,8 @@ class Matrix_MLM_Fintava {
         );
         $wallet->credit($user_id, $amount, 'fintava_account_funded', $description, $reference);
 
-        // Send notification to user
         Matrix_MLM_Notifications::send_deposit_notification($user_id, $amount, 'completed');
 
-        // Notify admin
         $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
         $user = get_userdata($user_id);
         Matrix_MLM_Notifications::send_admin_notification(
@@ -957,148 +989,37 @@ class Matrix_MLM_Fintava {
         do_action('matrix_fintava_account_funded', $user_id, $amount, $data);
     }
 
-    // =========================================================================
-    // WEBHOOK LOGGING
-    // =========================================================================
-
     /**
-     * Log webhook events for debugging and auditing
-     * 
-     * Stores webhook events in the database for troubleshooting and audit trail.
+     * Log webhook events for debugging and auditing.
+     * Self-heals by ensuring the logs table exists before inserting.
      */
     private function log_webhook_event($event_type, $data, $signature) {
         global $wpdb;
+        self::ensure_tables_exist();
 
         $table = $wpdb->prefix . 'matrix_fintava_webhook_logs';
 
-        // Check if logging table exists (graceful fallback)
-        if ($wpdb->get_var("SHOW TABLES LIKE '$table'") !== $table) {
-            // Fallback to error_log if table doesn't exist
-            error_log(sprintf(
-                '[Matrix Fintava Webhook] Event: %s | Reference: %s | Data: %s',
-                $event_type,
-                $data['reference'] ?? $data['transaction_reference'] ?? 'N/A',
-                json_encode($data)
-            ));
-            return;
-        }
-
-        $wpdb->insert($table, [
-            'event_type' => $event_type,
-            'reference' => $data['reference'] ?? $data['transaction_reference'] ?? '',
-            'payload' => json_encode($data),
-            'signature' => $signature ?? '',
-            'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
-            'status' => 'received',
-            'created_at' => current_time('mysql'),
-        ]);
-    }
-
-    // =========================================================================
-    // UTILITY METHODS
-    // =========================================================================
-
-    /**
-     * Make HTTP request to Fintava API
-     */
-    private function make_request($method, $endpoint, $body = null) {
-        $url = $this->base_url . $endpoint;
-
-        $args = [
-            'method' => $method,
-            'headers' => [
-                'Authorization' => 'Bearer ' . $this->secret_key,
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
+        $wpdb->insert(
+            $table,
+            [
+                'event_type' => $event_type,
+                'reference' => $data['reference'] ?? $data['transaction_reference'] ?? '',
+                'payload' => json_encode($data),
+                'signature' => $signature ?? '',
+                'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
+                'status' => 'received',
+                'created_at' => current_time('mysql'),
             ],
-            'timeout' => 30,
-        ];
-
-        if ($body && in_array($method, ['POST', 'PUT', 'PATCH'])) {
-            $args['body'] = json_encode($body);
-        }
-
-        $response = wp_remote_request($url, $args);
-
-        if (is_wp_error($response)) {
-            return $response;
-        }
-
-        $status_code = wp_remote_retrieve_response_code($response);
-        $body = json_decode(wp_remote_retrieve_body($response), true);
-
-        if ($status_code >= 400) {
-            $error_message = $body['message'] ?? sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code);
-            return new WP_Error('fintava_api_error', $error_message);
-        }
-
-        return $body;
-    }
-
-    /**
-     * Generate unique transfer reference
-     */
-    private function generate_reference() {
-        return 'MTX-FTV-' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 12)) . '-' . time();
-    }
-
-    /**
-     * Check if Fintava is configured and active
-     */
-    public function is_active() {
-        return !empty($this->secret_key) && get_option('matrix_mlm_fintava_enabled', 0);
-    }
-
-    /**
-     * Get payout history for a user
-     */
-    public function get_user_payouts($user_id, $limit = 20, $offset = 0) {
-        global $wpdb;
-        return $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_fintava_payouts 
-             WHERE user_id = %d 
-             ORDER BY created_at DESC 
-             LIMIT %d OFFSET %d",
-            $user_id, $limit, $offset
-        ));
-    }
-
-    /**
-     * Get all payouts (admin)
-     */
-    public function get_all_payouts($status = null, $limit = 50, $offset = 0) {
-        global $wpdb;
-
-        $where = "WHERE 1=1";
-        $params = [];
-
-        if ($status) {
-            $where .= " AND p.status = %s";
-            $params[] = $status;
-        }
-
-        $params[] = $limit;
-        $params[] = $offset;
-
-        return $wpdb->get_results($wpdb->prepare(
-            "SELECT p.*, u.user_login, u.user_email 
-             FROM {$wpdb->prefix}matrix_fintava_payouts p 
-             LEFT JOIN {$wpdb->users} u ON p.user_id = u.ID 
-             $where ORDER BY p.created_at DESC LIMIT %d OFFSET %d",
-            $params
-        ));
+            ['%s', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
     }
 
     // =========================================================================
-    // VIRTUAL WALLET API METHODS
+    // VIRTUAL WALLET API
     // =========================================================================
 
     /**
-     * Generate a virtual wallet/account for a user
      * POST /virtual-wallet/generate
-     * 
-     * @param array $customer_data Customer details for wallet creation
-     * @return array|WP_Error Wallet details or error
      */
     public function generate_virtual_wallet($customer_data) {
         $required_fields = ['first_name', 'last_name', 'email', 'phone'];
@@ -1116,28 +1037,13 @@ class Matrix_MLM_Fintava {
             'currency' => $customer_data['currency'] ?? 'NGN',
         ];
 
-        // Optional fields
-        if (!empty($customer_data['bvn'])) {
-            $payload['bvn'] = sanitize_text_field($customer_data['bvn']);
-        }
-        if (!empty($customer_data['nin'])) {
-            $payload['nin'] = sanitize_text_field($customer_data['nin']);
-        }
-        if (!empty($customer_data['date_of_birth'])) {
-            $payload['date_of_birth'] = sanitize_text_field($customer_data['date_of_birth']);
-        }
-        if (!empty($customer_data['gender'])) {
-            $payload['gender'] = sanitize_text_field($customer_data['gender']);
-        }
-        if (!empty($customer_data['address'])) {
-            $payload['address'] = sanitize_text_field($customer_data['address']);
-        }
-        if (!empty($customer_data['reference'])) {
-            $payload['reference'] = sanitize_text_field($customer_data['reference']);
+        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address', 'reference'] as $optional) {
+            if (!empty($customer_data[$optional])) {
+                $payload[$optional] = sanitize_text_field($customer_data[$optional]);
+            }
         }
 
         $response = $this->make_request('POST', '/virtual-wallet/generate', $payload);
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -1161,16 +1067,8 @@ class Matrix_MLM_Fintava {
         );
     }
 
-    /**
-     * Get virtual wallet details
-     * GET /virtual-wallet/:wallet_id
-     * 
-     * @param string $wallet_id The wallet ID
-     * @return array|WP_Error Wallet details or error
-     */
     public function get_virtual_wallet_details($wallet_id) {
         $response = $this->make_request('GET', '/virtual-wallet/' . $wallet_id);
-
         if (is_wp_error($response)) {
             return $response;
         }
@@ -1185,9 +1083,6 @@ class Matrix_MLM_Fintava {
         );
     }
 
-    /**
-     * Get user's virtual wallet from local database
-     */
     public function get_user_wallet($user_id) {
         global $wpdb;
         return $wpdb->get_row($wpdb->prepare(
@@ -1196,9 +1091,6 @@ class Matrix_MLM_Fintava {
         ));
     }
 
-    /**
-     * Check if user already has a virtual wallet
-     */
     public function user_has_wallet($user_id) {
         global $wpdb;
         return (bool) $wpdb->get_var($wpdb->prepare(
@@ -1207,15 +1099,9 @@ class Matrix_MLM_Fintava {
         ));
     }
 
-    // =========================================================================
-    // VIRTUAL WALLET AJAX HANDLERS
-    // =========================================================================
-
-    /**
-     * AJAX: Create virtual wallet for the current user
-     */
     public function ajax_create_virtual_wallet() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
+        self::ensure_tables_exist();
 
         $user_id = get_current_user_id();
         if (!$user_id) {
@@ -1226,12 +1112,14 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
         }
 
-        // Check if user already has a wallet
+        if (!$this->is_active()) {
+            wp_send_json_error(['message' => __('Virtual wallet creation is not available at the moment.', 'matrix-mlm')]);
+        }
+
         if ($this->user_has_wallet($user_id)) {
             wp_send_json_error(['message' => __('You already have a virtual wallet. Only one wallet per user is allowed.', 'matrix-mlm')]);
         }
 
-        // Validate required inputs
         $first_name = sanitize_text_field($_POST['first_name'] ?? '');
         $last_name = sanitize_text_field($_POST['last_name'] ?? '');
         $email = sanitize_email($_POST['email'] ?? '');
@@ -1252,15 +1140,12 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Phone number is required', 'matrix-mlm')]);
         }
 
-        // BVN validation (11 digits for Nigeria)
         if (!empty($bvn) && !preg_match('/^\d{11}$/', $bvn)) {
             wp_send_json_error(['message' => __('BVN must be 11 digits', 'matrix-mlm')]);
         }
 
-        // Generate reference
         $reference = 'MTX-VW-' . $user_id . '-' . time();
 
-        // Call Fintava API to generate virtual wallet
         $result = $this->generate_virtual_wallet([
             'first_name' => $first_name,
             'last_name' => $last_name,
@@ -1278,30 +1163,32 @@ class Matrix_MLM_Fintava {
             return;
         }
 
-        // Store wallet in database
         global $wpdb;
-        $wpdb->insert($wpdb->prefix . 'matrix_fintava_wallets', [
-            'user_id' => $user_id,
-            'wallet_id' => $result['wallet_id'],
-            'account_number' => $result['account_number'],
-            'account_name' => $result['account_name'],
-            'bank_name' => $result['bank_name'],
-            'bank_code' => $result['bank_code'],
-            'currency' => $result['currency'],
-            'customer_email' => $email,
-            'customer_phone' => $phone,
-            'bvn' => $bvn ?: null,
-            'status' => 'active',
-            'metadata' => json_encode([
-                'first_name' => $first_name,
-                'last_name' => $last_name,
-                'date_of_birth' => $date_of_birth,
-                'gender' => $gender,
-                'reference' => $reference,
-            ]),
-        ]);
+        $wpdb->insert(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            [
+                'user_id' => $user_id,
+                'wallet_id' => $result['wallet_id'],
+                'account_number' => $result['account_number'],
+                'account_name' => $result['account_name'],
+                'bank_name' => $result['bank_name'],
+                'bank_code' => $result['bank_code'],
+                'currency' => $result['currency'],
+                'customer_email' => $email,
+                'customer_phone' => $phone,
+                'bvn' => $bvn ?: null,
+                'status' => 'active',
+                'metadata' => json_encode([
+                    'first_name' => $first_name,
+                    'last_name' => $last_name,
+                    'date_of_birth' => $date_of_birth,
+                    'gender' => $gender,
+                    'reference' => $reference,
+                ]),
+            ],
+            ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
 
-        // Send notification
         Matrix_MLM_Notifications::send_admin_notification(
             'virtual_wallet_created',
             sprintf(__('Virtual wallet created for user %s (%s). Account: %s', 'matrix-mlm'),
@@ -1318,9 +1205,6 @@ class Matrix_MLM_Fintava {
         ]);
     }
 
-    /**
-     * AJAX: Get current user's virtual wallet details
-     */
     public function ajax_get_virtual_wallet() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
@@ -1330,22 +1214,22 @@ class Matrix_MLM_Fintava {
         }
 
         $wallet = $this->get_user_wallet($user_id);
-
         if (!$wallet) {
             wp_send_json_error(['message' => __('No virtual wallet found', 'matrix-mlm'), 'has_wallet' => false]);
         }
 
-        // Optionally refresh from API if wallet_id exists
         if (!empty($wallet->wallet_id)) {
             $api_details = $this->get_virtual_wallet_details($wallet->wallet_id);
             if (!is_wp_error($api_details) && isset($api_details['status'])) {
-                // Update local status if changed
                 if ($api_details['status'] !== $wallet->status) {
                     global $wpdb;
-                    $wpdb->update($wpdb->prefix . 'matrix_fintava_wallets', [
-                        'status' => $api_details['status'],
-                        'updated_at' => current_time('mysql'),
-                    ], ['id' => $wallet->id]);
+                    $wpdb->update(
+                        $wpdb->prefix . 'matrix_fintava_wallets',
+                        ['status' => $api_details['status'], 'updated_at' => current_time('mysql')],
+                        ['id' => $wallet->id],
+                        ['%s', '%s'],
+                        ['%d']
+                    );
                     $wallet->status = $api_details['status'];
                 }
             }
@@ -1365,64 +1249,99 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Create the fintava_payouts database table
+     * Credit a user's virtual wallet (used internally when a withdrawal is approved).
      */
-    public static function create_table() {
+    public function credit_wallet($user_id, $amount, $type = 'credit', $description = '') {
+        // Placeholder for future Fintava-side wallet credit operations.
+        // Currently the credit flow is recorded on the Matrix wallet side; this
+        // method exists for backward compatibility with callers in admin.
+        do_action('matrix_fintava_credit_wallet', $user_id, $amount, $type, $description);
+    }
+
+    public function get_user_payouts($user_id, $limit = 20, $offset = 0) {
         global $wpdb;
-        $charset_collate = $wpdb->get_charset_collate();
-        $table_name = $wpdb->prefix . 'matrix_fintava_payouts';
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_fintava_payouts
+             WHERE user_id = %d
+             ORDER BY created_at DESC
+             LIMIT %d OFFSET %d",
+            $user_id, $limit, $offset
+        ));
+    }
 
-        $sql = "CREATE TABLE $table_name (
-            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            user_id bigint(20) UNSIGNED NOT NULL,
-            reference varchar(100) NOT NULL UNIQUE,
-            transfer_id varchar(100) DEFAULT NULL,
-            amount decimal(12,2) NOT NULL,
-            charge decimal(12,2) NOT NULL DEFAULT 0.00,
-            total_debit decimal(12,2) NOT NULL,
-            bank_code varchar(20) NOT NULL,
-            bank_name varchar(100) NOT NULL,
-            account_number varchar(20) NOT NULL,
-            account_name varchar(255) NOT NULL,
-            narration varchar(255) DEFAULT NULL,
-            currency varchar(5) NOT NULL DEFAULT 'NGN',
-            status enum('pending','processing','completed','failed','refunded') NOT NULL DEFAULT 'pending',
-            failure_reason text,
-            created_at datetime DEFAULT CURRENT_TIMESTAMP,
-            completed_at datetime DEFAULT NULL,
-            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY reference (reference),
-            KEY user_id (user_id),
-            KEY status (status)
-        ) $charset_collate;";
+    public function get_all_payouts($status = null, $limit = 50, $offset = 0) {
+        global $wpdb;
 
-        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
-        dbDelta($sql);
+        $where = "WHERE 1=1";
+        $params = [];
 
-        // Virtual wallets table
-        $table_wallets = $wpdb->prefix . 'matrix_fintava_wallets';
-        $sql_wallets = "CREATE TABLE $table_wallets (
-            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            user_id bigint(20) UNSIGNED NOT NULL,
-            wallet_id varchar(100) DEFAULT NULL,
-            account_number varchar(20) NOT NULL,
-            account_name varchar(255) NOT NULL,
-            bank_name varchar(100) NOT NULL DEFAULT 'Fintava',
-            bank_code varchar(20) DEFAULT NULL,
-            currency varchar(5) NOT NULL DEFAULT 'NGN',
-            customer_email varchar(255) DEFAULT NULL,
-            customer_phone varchar(20) DEFAULT NULL,
-            bvn varchar(20) DEFAULT NULL,
-            status enum('active','inactive','frozen','closed') NOT NULL DEFAULT 'active',
-            metadata text,
-            created_at datetime DEFAULT CURRENT_TIMESTAMP,
-            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY user_id (user_id),
-            KEY account_number (account_number),
-            KEY status (status)
-        ) $charset_collate;";
-        dbDelta($sql_wallets);
+        if ($status) {
+            $where .= " AND p.status = %s";
+            $params[] = $status;
+        }
+
+        $params[] = $limit;
+        $params[] = $offset;
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT p.*, u.user_login, u.user_email
+             FROM {$wpdb->prefix}matrix_fintava_payouts p
+             LEFT JOIN {$wpdb->users} u ON p.user_id = u.ID
+             $where ORDER BY p.created_at DESC LIMIT %d OFFSET %d",
+            $params
+        ));
+    }
+
+    // =========================================================================
+    // UTILITY
+    // =========================================================================
+
+    /**
+     * Make HTTP request to Fintava API.
+     */
+    private function make_request($method, $endpoint, $body = null) {
+        if (empty($this->secret_key)) {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava Pay is not configured. Please add your Live API Key in admin.', 'matrix-mlm')
+            );
+        }
+
+        $url = $this->base_url . $endpoint;
+
+        $args = [
+            'method' => $method,
+            'headers' => [
+                'Authorization' => 'Bearer ' . $this->secret_key,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ],
+            'timeout' => 30,
+        ];
+
+        if ($body && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+            $args['body'] = json_encode($body);
+        }
+
+        $response = wp_remote_request($url, $args);
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $status_code = wp_remote_retrieve_response_code($response);
+        $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($status_code >= 400) {
+            $error_message = $body_decoded['message']
+                ?? sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            return new WP_Error('fintava_api_error', $error_message);
+        }
+
+        return $body_decoded;
+    }
+
+    private function generate_reference() {
+        return 'MTX-FTV-' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 12)) . '-' . time();
     }
 }

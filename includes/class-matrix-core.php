@@ -24,6 +24,11 @@ class Matrix_MLM_Core {
             Matrix_MLM_Admin_Gateways::ensure_default_gateways();
         }
 
+        // Self-healing seed: ensure Fintava tables exist on every load.
+        if (class_exists('Matrix_MLM_Fintava')) {
+            Matrix_MLM_Fintava::ensure_tables_exist();
+        }
+
         // Ensure default root user exists for the referral system
         if (class_exists('Matrix_MLM_Database')) {
             Matrix_MLM_Database::create_default_user();
