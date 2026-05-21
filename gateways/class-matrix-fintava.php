@@ -1060,7 +1060,7 @@ class Matrix_MLM_Fintava {
                 break;
             }
             $last_error = $attempt;
-            $msg = strtolower($attempt->get_error_message());
+            $msg = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
             // Only try next path on 404-style errors
             if (strpos($msg, 'cannot get') === false
                 && strpos($msg, 'not found') === false
@@ -1117,7 +1117,7 @@ class Matrix_MLM_Fintava {
                 break;
             }
             $last_error = $attempt;
-            $msg = strtolower($attempt->get_error_message());
+            $msg = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
             if (strpos($msg, 'cannot get') === false
                 && strpos($msg, 'not found') === false
                 && strpos($msg, 'http 404') === false
@@ -1457,7 +1457,7 @@ class Matrix_MLM_Fintava {
             }
 
             $last_error = $attempt;
-            $msg        = strtolower($attempt->get_error_message());
+            $msg        = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
             // Only keep trying alternates on "not found" / "cannot get" style
             // 404s. For real failures (auth, rate-limit, network) bail out
             // immediately so callers see the actual cause.
@@ -1980,7 +1980,7 @@ class Matrix_MLM_Fintava {
                 wp_send_json_error([
                     'message' => sprintf(
                         __('Wallet ID is missing and could not be resolved automatically: %s', 'matrix-mlm'),
-                        $resolved->get_error_message()
+                        is_array($resolved->get_error_message()) ? implode(' ', $resolved->get_error_message()) : $resolved->get_error_message()
                     ),
                     'needs_wallet_id' => true,
                 ]);
