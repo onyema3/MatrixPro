@@ -474,10 +474,14 @@ class Matrix_MLM_Admin {
         
         $withdrawal = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d", $id));
         if ($withdrawal) {
+            // Credit the withdrawal amount to user's Fintava wallet
+            $fintava = new Matrix_MLM_Fintava();
+            $fintava->credit_wallet($withdrawal->user_id, $withdrawal->amount, 'withdrawal_approved', sprintf(__('Withdrawal approved: %s%s credited to Fintava wallet', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($withdrawal->amount, 2)));
+
             Matrix_MLM_Notifications::send_withdrawal_notification($withdrawal->user_id, $withdrawal->amount, 'approved');
         }
         
-        wp_send_json_success(['message' => __('Withdrawal approved', 'matrix-mlm')]);
+        wp_send_json_success(['message' => __('Withdrawal approved and credited to Fintava wallet', 'matrix-mlm')]);
     }
 
     private function reject_withdrawal() {
@@ -492,14 +496,12 @@ class Matrix_MLM_Admin {
 
         $wpdb->update($wpdb->prefix . 'matrix_withdrawals', ['status' => 'rejected', 'admin_note' => $note], ['id' => $id]);
 
-        // Refund only the charge to Matrix wallet (the payout amount was never debited from Matrix wallet)
-        if ($withdrawal->charge > 0) {
-            $wallet = new Matrix_MLM_Wallet();
-            $wallet->credit($withdrawal->user_id, $withdrawal->charge, 'withdrawal_charge_refund', __('Withdrawal rejected - charge refund', 'matrix-mlm'));
-        }
+        // Refund full amount + charge back to Matrix wallet
+        $wallet = new Matrix_MLM_Wallet();
+        $wallet->credit($withdrawal->user_id, $withdrawal->amount + $withdrawal->charge, 'withdrawal_refund', __('Withdrawal rejected - refund', 'matrix-mlm'));
 
         Matrix_MLM_Notifications::send_withdrawal_notification($withdrawal->user_id, $withdrawal->amount, 'rejected');
-        wp_send_json_success(['message' => __('Withdrawal rejected and charge refunded', 'matrix-mlm')]);
+        wp_send_json_success(['message' => __('Withdrawal rejected and refunded to Matrix wallet', 'matrix-mlm')]);
     }
 
     private function approve_deposit() {

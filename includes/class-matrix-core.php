@@ -363,23 +363,24 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => sprintf(__('Amount must be between %s and %s', 'matrix-mlm'), $min, $max)]);
         }
 
-        // User must have a Fintava wallet — withdrawal amount is paid from Fintava wallet
+        // User must have a Fintava wallet — funds move from Matrix wallet to Fintava wallet on approval
         $fintava = new Matrix_MLM_Fintava();
         if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to withdraw. The withdrawal amount is paid from your Fintava wallet. Please create one first.', 'matrix-mlm')]);
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to withdraw. Please create one from the Virtual Wallet tab first.', 'matrix-mlm')]);
         }
 
-        // Calculate charge — only the charge is debited from Matrix wallet
+        // Calculate charge
         $charge_type = get_option('matrix_mlm_withdraw_charge_type', 'percent');
         $charge_value = get_option('matrix_mlm_withdraw_charge', 5);
         $charge = $charge_type === 'percent' ? ($amount * $charge_value / 100) : $charge_value;
+        $total = $amount + $charge;
 
-        // Check Matrix wallet has enough for the charge only
+        // Check Matrix wallet has enough for full amount + charge
         $wallet = new Matrix_MLM_Wallet();
         $balance = $wallet->get_balance($user_id);
 
-        if ($charge > 0 && $balance < $charge) {
-            wp_send_json_error(['message' => sprintf(__('Insufficient Matrix wallet balance for withdrawal charge (%s%s). Please fund your Matrix wallet.', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($charge, 2))]);
+        if ($balance < $total) {
+            wp_send_json_error(['message' => __('Insufficient Matrix wallet balance', 'matrix-mlm')]);
         }
 
         global $wpdb;
@@ -394,12 +395,10 @@ class Matrix_MLM_Core {
             'status' => 'pending'
         ]);
 
-        // Debit only the charge from Matrix wallet (the payout amount comes from Fintava wallet)
-        if ($charge > 0) {
-            $wallet->debit($user_id, $charge, 'withdrawal_charge', sprintf(__('Withdrawal charge for %s%s request', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount, 2)));
-        }
+        // Debit full amount + charge from Matrix wallet (funds move to Fintava wallet on approval)
+        $wallet->debit($user_id, $total, 'withdrawal', sprintf(__('Withdrawal request: %s%s to Fintava wallet', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount, 2)));
 
-        wp_send_json_success(['message' => __('Withdrawal request submitted successfully. The charge has been debited from your Matrix wallet. The payout amount will be processed from your Fintava wallet.', 'matrix-mlm')]);
+        wp_send_json_success(['message' => __('Withdrawal request submitted successfully. Funds have been held from your Matrix wallet and will be credited to your Fintava wallet upon admin approval.', 'matrix-mlm')]);
     }
 
     private function process_transfer() {
