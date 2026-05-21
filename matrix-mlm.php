@@ -76,6 +76,7 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-reports.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-settings.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-frontend.php';
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-migration.php';
 }
 
 // User Dashboard

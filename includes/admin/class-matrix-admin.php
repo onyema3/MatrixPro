@@ -40,6 +40,7 @@ class Matrix_MLM_Admin {
         add_submenu_page('matrix-mlm', __('Support Tickets', 'matrix-mlm'), __('Tickets', 'matrix-mlm'), 'manage_matrix_tickets', 'matrix-mlm-tickets', [new Matrix_MLM_Admin_Tickets(), 'render']);
         add_submenu_page('matrix-mlm', __('Reports', 'matrix-mlm'), __('Reports', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-reports', [new Matrix_MLM_Admin_Reports(), 'render']);
         add_submenu_page('matrix-mlm', __('Frontend Manager', 'matrix-mlm'), __('Frontend', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-frontend', [new Matrix_MLM_Admin_Frontend(), 'render']);
+        add_submenu_page('matrix-mlm', __('Migration', 'matrix-mlm'), __('Migration', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-migration', [new Matrix_MLM_Admin_Migration(), 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
@@ -468,6 +469,9 @@ class Matrix_MLM_Admin {
             case 'move_user_position':
                 $this->move_user_position();
                 break;
+            case 'link_fintava_account':
+                $this->link_fintava_account();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -812,5 +816,86 @@ class Matrix_MLM_Admin {
             $count += $this->count_all_descendants($child->id, $plan_id);
         }
         return $count;
+    }
+
+    /**
+     * Link a Fintava wallet/card to a user (admin action)
+     */
+    private function link_fintava_account() {
+        global $wpdb;
+
+        $username = sanitize_text_field($_POST['username'] ?? '');
+        if (empty($username)) {
+            wp_send_json_error(['message' => __('Username is required', 'matrix-mlm')]);
+        }
+
+        $user = get_user_by('login', $username);
+        if (!$user) {
+            wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+
+        $user_id = $user->ID;
+        $wallet_id = sanitize_text_field($_POST['wallet_id'] ?? '');
+        $account_number = sanitize_text_field($_POST['account_number'] ?? '');
+        $account_name = sanitize_text_field($_POST['account_name'] ?? '');
+        $bank_name = sanitize_text_field($_POST['bank_name'] ?? 'Fintava');
+        $card_id = sanitize_text_field($_POST['card_id'] ?? '');
+        $last_four = sanitize_text_field($_POST['last_four'] ?? '');
+        $card_status = sanitize_text_field($_POST['card_status'] ?? 'active');
+
+        $linked = [];
+
+        // Link wallet
+        if ($account_number || $wallet_id) {
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$wpdb->prefix}matrix_fintava_wallets WHERE user_id = %d", $user_id
+            ));
+
+            $wallet_data = [
+                'user_id' => $user_id,
+                'wallet_id' => $wallet_id,
+                'account_number' => $account_number,
+                'account_name' => $account_name ?: $user->display_name,
+                'bank_name' => $bank_name,
+                'currency' => 'NGN',
+                'customer_email' => $user->user_email,
+                'status' => 'active',
+            ];
+
+            if ($existing) {
+                $wpdb->update($wpdb->prefix . 'matrix_fintava_wallets', $wallet_data, ['id' => $existing]);
+            } else {
+                $wpdb->insert($wpdb->prefix . 'matrix_fintava_wallets', $wallet_data);
+            }
+            $linked[] = __('wallet', 'matrix-mlm');
+        }
+
+        // Link card
+        if ($card_id) {
+            $existing_card = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$wpdb->prefix}matrix_fintava_cards WHERE user_id = %d", $user_id
+            ));
+
+            $card_data = [
+                'user_id' => $user_id,
+                'card_id' => $card_id,
+                'wallet_id' => $wallet_id,
+                'last_four' => $last_four,
+                'status' => $card_status,
+            ];
+
+            if ($existing_card) {
+                $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', $card_data, ['id' => $existing_card]);
+            } else {
+                $wpdb->insert($wpdb->prefix . 'matrix_fintava_cards', $card_data);
+            }
+            $linked[] = __('card', 'matrix-mlm');
+        }
+
+        if (empty($linked)) {
+            wp_send_json_error(['message' => __('No wallet or card data provided', 'matrix-mlm')]);
+        }
+
+        wp_send_json_success(['message' => sprintf(__('Successfully linked %s to %s', 'matrix-mlm'), implode(' & ', $linked), $username)]);
     }
 }
