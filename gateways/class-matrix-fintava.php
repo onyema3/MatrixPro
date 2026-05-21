@@ -1047,9 +1047,31 @@ class Matrix_MLM_Fintava {
      * @return array|WP_Error Array of customer records on success.
      */
     public function get_customer_list() {
-        $response = $this->make_request('GET', '/customers');
-        if (is_wp_error($response)) {
-            return $response;
+        // Try multiple endpoint paths — Fintava uses /customers on some tiers
+        // and /merchant/customers on others.
+        $paths = ['/customers', '/merchant/customers'];
+        $response = null;
+        $last_error = null;
+
+        foreach ($paths as $path) {
+            $attempt = $this->make_request('GET', $path);
+            if (!is_wp_error($attempt)) {
+                $response = $attempt;
+                break;
+            }
+            $last_error = $attempt;
+            $msg = strtolower($attempt->get_error_message());
+            // Only try next path on 404-style errors
+            if (strpos($msg, 'cannot get') === false
+                && strpos($msg, 'not found') === false
+                && strpos($msg, 'http 404') === false
+                && strpos($msg, '(http 404)') === false) {
+                return $attempt; // Real error, don't retry
+            }
+        }
+
+        if ($response === null) {
+            return $last_error ?: new WP_Error('fintava_customer_list_error', __('Could not retrieve customer list', 'matrix-mlm'));
         }
 
         // Fintava wraps the list in { data: [...], status: 200, message: "successful" }
@@ -1083,9 +1105,29 @@ class Matrix_MLM_Fintava {
             return new WP_Error('missing_customer_id', __('Customer ID is required', 'matrix-mlm'));
         }
 
-        $response = $this->make_request('GET', '/customers/' . $customer_id);
-        if (is_wp_error($response)) {
-            return $response;
+        // Try multiple endpoint paths
+        $paths = ['/customers/' . $customer_id, '/merchant/customers/' . $customer_id];
+        $response = null;
+        $last_error = null;
+
+        foreach ($paths as $path) {
+            $attempt = $this->make_request('GET', $path);
+            if (!is_wp_error($attempt)) {
+                $response = $attempt;
+                break;
+            }
+            $last_error = $attempt;
+            $msg = strtolower($attempt->get_error_message());
+            if (strpos($msg, 'cannot get') === false
+                && strpos($msg, 'not found') === false
+                && strpos($msg, 'http 404') === false
+                && strpos($msg, '(http 404)') === false) {
+                return $attempt;
+            }
+        }
+
+        if ($response === null) {
+            return $last_error ?: new WP_Error('fintava_customer_error', __('Could not retrieve customer details', 'matrix-mlm'));
         }
 
         // Standard Fintava envelope: { data: { userInfo: {...}, wallet: {...} }, status: 200 }

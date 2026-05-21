@@ -125,6 +125,16 @@ class Matrix_MLM_User_Virtual_Wallet {
         $fintava_balance_currency = $wallet->currency ?? 'NGN';
         $fintava_balance_error    = '';
         $fintava_balance_reason   = ''; // 'missing_wallet_id' | 'api_error' | ''
+
+        // Auto-resolve wallet_id via Customer API if missing
+        if (empty($wallet->wallet_id)) {
+            $resolved = $fintava->resolve_wallet_id_from_customer($wallet);
+            if (!is_wp_error($resolved)) {
+                // Refresh the wallet object with the newly-saved wallet_id
+                $wallet = $fintava->get_user_wallet($user_id);
+            }
+        }
+
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id);
             if (is_wp_error($balance_result)) {
