@@ -18,6 +18,11 @@ class Matrix_MLM_Admin_Plans {
             $this->save_plan();
         }
 
+        // Handle delete
+        if (isset($_GET['action']) && $_GET['action'] === 'delete' && isset($_GET['id']) && wp_verify_nonce($_GET['_wpnonce'] ?? '', 'matrix_delete_plan')) {
+            $this->delete_plan(intval($_GET['id']));
+        }
+
         if (isset($_GET['action']) && $_GET['action'] === 'edit' && isset($_GET['id'])) {
             $this->render_edit_form(intval($_GET['id']));
             return;
@@ -65,6 +70,11 @@ class Matrix_MLM_Admin_Plans {
                         <td><span class="matrix-badge matrix-badge-<?php echo $plan->status; ?>"><?php echo ucfirst($plan->status); ?></span></td>
                         <td>
                             <a href="<?php echo admin_url('admin.php?page=matrix-mlm-plans&action=edit&id=' . $plan->id); ?>" class="button button-small"><?php _e('Edit', 'matrix-mlm'); ?></a>
+                            <?php if ($members == 0): ?>
+                            <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-plans&action=delete&id=' . $plan->id), 'matrix_delete_plan'); ?>" class="button button-small" style="color:#dc2626;" onclick="return confirm('<?php _e('Are you sure you want to delete this plan? This cannot be undone.', 'matrix-mlm'); ?>')"><?php _e('Delete', 'matrix-mlm'); ?></a>
+                            <?php else: ?>
+                            <span class="description" style="font-size:11px;"><?php _e('Has members', 'matrix-mlm'); ?></span>
+                            <?php endif; ?>
                         </td>
                     </tr>
                     <?php endforeach; ?>
@@ -265,6 +275,36 @@ class Matrix_MLM_Admin_Plans {
             </script>
         </div>
         <?php
+    }
+
+    private function delete_plan($plan_id) {
+        global $wpdb;
+
+        // Check if plan has active members
+        $members = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_positions WHERE plan_id = %d AND status = 'active'",
+            $plan_id
+        ));
+
+        if ($members > 0) {
+            echo '<div class="notice notice-error"><p>' . __('Cannot delete a plan that has active members. Set it to inactive instead.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        // Check plan exists
+        $plan = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d", $plan_id));
+        if (!$plan) {
+            echo '<div class="notice notice-error"><p>' . __('Plan not found.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        // Delete any inactive/completed positions for this plan
+        $wpdb->delete($wpdb->prefix . 'matrix_positions', ['plan_id' => $plan_id]);
+
+        // Delete the plan
+        $wpdb->delete($wpdb->prefix . 'matrix_plans', ['id' => $plan_id]);
+
+        echo '<div class="notice notice-success"><p>' . sprintf(__('Plan "%s" has been deleted.', 'matrix-mlm'), esc_html($plan->name)) . '</p></div>';
     }
 
     private function save_plan() {
