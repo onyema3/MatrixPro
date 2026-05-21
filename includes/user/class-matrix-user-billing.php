@@ -17,12 +17,22 @@ class Matrix_MLM_User_Billing {
         $billing = new Matrix_MLM_Fintava_Billing();
         $history = $billing->get_user_history($user_id, null, 10);
         $sub_tab = sanitize_text_field($_GET['service'] ?? 'airtime');
+        $fintava = new Matrix_MLM_Fintava();
+        $has_fintava_wallet = $fintava->user_has_wallet($user_id);
         ?>
         <h2><?php _e('Bill Payments', 'matrix-mlm'); ?></h2>
-        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills directly from your Matrix wallet.', 'matrix-mlm'); ?></p>
+        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Fintava virtual wallet.', 'matrix-mlm'); ?></p>
+
+        <?php if (!$has_fintava_wallet): ?>
+        <div class="matrix-alert matrix-alert-warning">
+            <?php _e('You need a Fintava virtual wallet to pay bills. All bill payments are debited directly from your Fintava wallet balance.', 'matrix-mlm'); ?>
+            <a href="<?php echo home_url('/matrix-dashboard/?tab=virtual-wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Fintava Wallet', 'matrix-mlm'); ?></a>
+        </div>
+        <?php else: ?>
 
         <div class="matrix-info-box" style="margin-bottom:16px;">
-            <p><strong><?php _e('Matrix Wallet Balance:', 'matrix-mlm'); ?></strong> <?php echo $currency . number_format($balance, 2); ?></p>
+            <p><strong><?php _e('Payment Source:', 'matrix-mlm'); ?></strong> <?php _e('Fintava Virtual Wallet', 'matrix-mlm'); ?></p>
+            <p style="font-size:12px;color:#6b7280;"><?php _e('All bill payments are charged to your Fintava wallet. Ensure your Fintava wallet has sufficient balance.', 'matrix-mlm'); ?></p>
         </div>
 
         <!-- Service Tabs -->
@@ -63,6 +73,8 @@ class Matrix_MLM_User_Billing {
             </tbody>
         </table>
         <?php endif; ?>
+
+        <?php endif; // end has_fintava_wallet check ?>
 
         <style>
         .matrix-subtitle { color: #6b7280; margin: -10px 0 20px; font-size: 14px; }

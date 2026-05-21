@@ -198,22 +198,22 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('Phone, amount and network are required', 'matrix-mlm')]);
         }
 
-        // Debit matrix wallet
-        $wallet = new Matrix_MLM_Wallet();
-        if ($wallet->get_balance($user_id) < $amount) {
-            wp_send_json_error(['message' => __('Insufficient Matrix wallet balance', 'matrix-mlm')]);
+        // Require Fintava virtual wallet — bills are debited from Fintava wallet
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->user_has_wallet($user_id)) {
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
         }
-        $wallet->debit($user_id, $amount, 'billing_airtime', sprintf(__('Airtime %s - %s', 'matrix-mlm'), $network, $phone));
+
+        $user_wallet = $fintava->get_user_wallet($user_id);
 
         $result = $this->buy_airtime($phone, $amount, $network);
         if (is_wp_error($result)) {
-            $wallet->credit($user_id, $amount, 'billing_refund', __('Airtime purchase failed - refund', 'matrix-mlm'));
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'airtime', $amount, ['phone' => $phone, 'network' => $network], $result);
-        wp_send_json_success(['message' => sprintf(__('%s%s airtime sent to %s', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount), $phone)]);
+        $this->log_transaction($user_id, 'airtime', $amount, ['phone' => $phone, 'network' => $network, 'wallet_id' => $user_wallet->wallet_id], $result);
+        wp_send_json_success(['message' => sprintf(__('%s%s airtime sent to %s (debited from your Fintava wallet)', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount), $phone)]);
     }
 
     public function ajax_list_data_bundles() {
@@ -242,21 +242,22 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        $wallet = new Matrix_MLM_Wallet();
-        if ($wallet->get_balance($user_id) < $amount) {
-            wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
+        // Require Fintava virtual wallet — bills are debited from Fintava wallet
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->user_has_wallet($user_id)) {
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
         }
-        $wallet->debit($user_id, $amount, 'billing_data', sprintf(__('Data bundle %s - %s', 'matrix-mlm'), $network, $phone));
+
+        $user_wallet = $fintava->get_user_wallet($user_id);
 
         $result = $this->buy_data($phone, $plan_id, $network);
         if (is_wp_error($result)) {
-            $wallet->credit($user_id, $amount, 'billing_refund', __('Data purchase failed - refund', 'matrix-mlm'));
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'data', $amount, ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id], $result);
-        wp_send_json_success(['message' => __('Data bundle purchased successfully!', 'matrix-mlm')]);
+        $this->log_transaction($user_id, 'data', $amount, ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id, 'wallet_id' => $user_wallet->wallet_id], $result);
+        wp_send_json_success(['message' => __('Data bundle purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm')]);
     }
 
     public function ajax_list_cable_providers() {
@@ -294,21 +295,22 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        $wallet = new Matrix_MLM_Wallet();
-        if ($wallet->get_balance($user_id) < $amount) {
-            wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
+        // Require Fintava virtual wallet — bills are debited from Fintava wallet
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->user_has_wallet($user_id)) {
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
         }
-        $wallet->debit($user_id, $amount, 'billing_cable', sprintf(__('Cable TV %s - %s', 'matrix-mlm'), $provider, $smartcard));
+
+        $user_wallet = $fintava->get_user_wallet($user_id);
 
         $result = $this->buy_cable($smartcard, $plan_id, $provider);
         if (is_wp_error($result)) {
-            $wallet->credit($user_id, $amount, 'billing_refund', __('Cable subscription failed - refund', 'matrix-mlm'));
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'cable', $amount, ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id], $result);
-        wp_send_json_success(['message' => __('Cable subscription purchased successfully!', 'matrix-mlm')]);
+        $this->log_transaction($user_id, 'cable', $amount, ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id, 'wallet_id' => $user_wallet->wallet_id], $result);
+        wp_send_json_success(['message' => __('Cable subscription purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm')]);
     }
 
     public function ajax_list_discos() {
@@ -352,23 +354,24 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        $wallet = new Matrix_MLM_Wallet();
-        if ($wallet->get_balance($user_id) < $amount) {
-            wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
+        // Require Fintava virtual wallet — bills are debited from Fintava wallet
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->user_has_wallet($user_id)) {
+            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
         }
-        $wallet->debit($user_id, $amount, 'billing_electricity', sprintf(__('Electricity %s - %s', 'matrix-mlm'), $disco, $meter_number));
+
+        $user_wallet = $fintava->get_user_wallet($user_id);
 
         $result = $this->buy_electricity($meter_number, $amount, $disco, $meter_type);
         if (is_wp_error($result)) {
-            $wallet->credit($user_id, $amount, 'billing_refund', __('Electricity purchase failed - refund', 'matrix-mlm'));
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
         $token = $result['data']['token'] ?? $result['token'] ?? '';
-        $this->log_transaction($user_id, 'electricity', $amount, ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type, 'token' => $token], $result);
+        $this->log_transaction($user_id, 'electricity', $amount, ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type, 'token' => $token, 'wallet_id' => $user_wallet->wallet_id], $result);
 
-        $msg = __('Electricity purchased successfully!', 'matrix-mlm');
+        $msg = __('Electricity purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm');
         if ($token) { $msg .= ' Token: ' . $token; }
         wp_send_json_success(['message' => $msg, 'token' => $token]);
     }
