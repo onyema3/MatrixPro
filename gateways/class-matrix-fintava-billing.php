@@ -394,9 +394,20 @@ class Matrix_MLM_Fintava_Billing {
     }
 
     private function make_request($method, $endpoint, $body = null) {
-        $base_url = get_option('matrix_mlm_fintava_base_url', '') ?: 'https://dev.fintavapay.com/api/dev';
-        $url = rtrim($base_url, '/') . $endpoint;
+        // Use the same base URL source as Matrix_MLM_Fintava (live by default,
+        // overridable via MATRIX_FINTAVA_API_BASE_URL constant).
+        $base_url = defined('MATRIX_FINTAVA_API_BASE_URL') && MATRIX_FINTAVA_API_BASE_URL
+            ? rtrim(MATRIX_FINTAVA_API_BASE_URL, '/')
+            : Matrix_MLM_Fintava::DEFAULT_BASE_URL;
+        $url = $base_url . $endpoint;
         $secret_key = get_option('matrix_mlm_fintava_secret_key', '');
+
+        if (empty($secret_key)) {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava Pay is not configured. Please add your Live API Key in admin.', 'matrix-mlm')
+            );
+        }
 
         $args = [
             'method' => $method,
@@ -408,7 +419,7 @@ class Matrix_MLM_Fintava_Billing {
             'timeout' => 30,
         ];
 
-        if ($body && in_array($method, ['POST', 'PUT', 'PATCH'])) {
+        if ($body && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
             $args['body'] = json_encode($body);
         }
 

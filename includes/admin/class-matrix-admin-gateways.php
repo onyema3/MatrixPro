@@ -237,7 +237,7 @@ class Matrix_MLM_Admin_Gateways {
                 </div>
             <?php endforeach; ?>
 
-            <!-- Fintava Settings (stored in wp_options) -->
+            <!-- Fintava Pay Settings (stored in wp_options) -->
             <div class="matrix-admin-card" style="margin-bottom: 20px;">
                 <h2>
                     <?php _e('Fintava Pay (Payouts & Virtual Wallet)', 'matrix-mlm'); ?>
@@ -246,40 +246,26 @@ class Matrix_MLM_Admin_Gateways {
                     </span>
                 </h2>
                 <p class="description" style="margin-bottom: 15px;">
-                    <?php _e('Fintava Pay is used for bank payouts (withdrawals to bank accounts) and virtual wallet generation. Configure your Fintava merchant credentials below.', 'matrix-mlm'); ?>
+                    <?php _e('Fintava Pay powers bank payouts and virtual wallet generation. Paste your Live API Key from your Fintava dashboard below.', 'matrix-mlm'); ?>
                 </p>
                 <form method="post">
                     <?php wp_nonce_field('matrix_save_fintava_gateway'); ?>
                     <table class="form-table">
                         <tr>
-                            <th><?php _e('Environment', 'matrix-mlm'); ?></th>
+                            <th><?php _e('Live API Key', 'matrix-mlm'); ?></th>
                             <td>
-                                <select name="fintava_environment">
-                                    <option value="sandbox" <?php selected(get_option('matrix_mlm_fintava_environment', 'sandbox'), 'sandbox'); ?>><?php _e('Sandbox (Test)', 'matrix-mlm'); ?></option>
-                                    <option value="live" <?php selected(get_option('matrix_mlm_fintava_environment', 'sandbox'), 'live'); ?>><?php _e('Live (Production)', 'matrix-mlm'); ?></option>
-                                </select>
-                            </td>
-                        </tr>
-                        <tr>
-                            <th><?php _e('Public Key', 'matrix-mlm'); ?></th>
-                            <td><input type="text" name="fintava_public_key" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_public_key', '')); ?>"></td>
-                        </tr>
-                        <tr>
-                            <th><?php _e('Secret Key', 'matrix-mlm'); ?></th>
-                            <td><input type="password" name="fintava_secret_key" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_secret_key', '')); ?>"></td>
-                        </tr>
-                        <tr>
-                            <th><?php _e('Base URL', 'matrix-mlm'); ?></th>
-                            <td>
-                                <input type="url" name="fintava_base_url" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_base_url', '')); ?>" placeholder="https://dev.fintavapay.com/api/dev">
-                                <p class="description"><?php _e('Leave blank to use the default Fintava API URL.', 'matrix-mlm'); ?></p>
+                                <input type="password" name="fintava_secret_key" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_secret_key', '')); ?>" autocomplete="off">
+                                <p class="description"><?php _e('Bearer token used for all Fintava API calls. Find it under Settings &rarr; API Keys &amp; Webhooks in your Fintava dashboard.', 'matrix-mlm'); ?></p>
                             </td>
                         </tr>
                         <tr>
                             <th><?php _e('Webhook Secret', 'matrix-mlm'); ?></th>
                             <td>
                                 <input type="text" name="fintava_webhook_secret" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_webhook_secret', '')); ?>">
-                                <p class="description"><?php _e('Webhook URL:', 'matrix-mlm'); ?> <code><?php echo rest_url('matrix-mlm/v1/payment/callback/fintava'); ?></code></p>
+                                <p class="description">
+                                    <?php _e('Optional but recommended &mdash; used to verify webhook signatures.', 'matrix-mlm'); ?><br>
+                                    <?php _e('Webhook URL:', 'matrix-mlm'); ?> <code><?php echo esc_html(rest_url('matrix-mlm/v1/fintava/webhook')); ?></code>
+                                </p>
                             </td>
                         </tr>
                         <tr>
@@ -400,15 +386,17 @@ class Matrix_MLM_Admin_Gateways {
     }
 
     /**
-     * Save Fintava Pay settings (stored in wp_options)
+     * Save Fintava Pay settings (stored in wp_options).
+     * Simplified to: Live API Key + optional Webhook Secret + Status toggle.
      */
     private function save_fintava_settings() {
-        update_option('matrix_mlm_fintava_environment', sanitize_text_field($_POST['fintava_environment'] ?? 'sandbox'));
-        update_option('matrix_mlm_fintava_public_key', sanitize_text_field($_POST['fintava_public_key'] ?? ''));
         update_option('matrix_mlm_fintava_secret_key', sanitize_text_field($_POST['fintava_secret_key'] ?? ''));
-        update_option('matrix_mlm_fintava_base_url', esc_url_raw($_POST['fintava_base_url'] ?? ''));
         update_option('matrix_mlm_fintava_webhook_secret', sanitize_text_field($_POST['fintava_webhook_secret'] ?? ''));
         update_option('matrix_mlm_fintava_status', intval($_POST['fintava_status'] ?? 0));
+
+        // Keep the legacy "_enabled" option in sync so any older code paths
+        // that still read it stay aligned with the toggle on this page.
+        update_option('matrix_mlm_fintava_enabled', intval($_POST['fintava_status'] ?? 0));
 
         echo '<div class="notice notice-success"><p>' . __('Fintava Pay settings saved successfully!', 'matrix-mlm') . '</p></div>';
     }
