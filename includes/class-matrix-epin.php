@@ -11,17 +11,35 @@ class Matrix_MLM_Epin {
 
     /**
      * Generate e-pins
+     * @param int $plan_id Plan ID (0 for custom amount)
+     * @param int $quantity Number of pins to generate
+     * @param int $created_by Admin user ID
+     * @param string|null $expires_at Expiry date
+     * @param float $custom_amount Custom amount (used when plan_id is 0)
      */
-    public function generate($plan_id, $quantity, $created_by, $expires_at = null) {
+    public function generate($plan_id, $quantity, $created_by, $expires_at = null, $custom_amount = 0) {
         global $wpdb;
 
-        $plan = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d",
-            $plan_id
-        ));
+        $amount = floatval($custom_amount);
 
-        if (!$plan) {
-            return ['success' => false, 'message' => __('Plan not found', 'matrix-mlm')];
+        if ($plan_id > 0) {
+            $plan = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d",
+                $plan_id
+            ));
+
+            if (!$plan) {
+                return ['success' => false, 'message' => __('Plan not found', 'matrix-mlm')];
+            }
+            $amount = $plan->price;
+        }
+
+        if ($amount <= 0) {
+            return ['success' => false, 'message' => __('Amount must be greater than zero', 'matrix-mlm')];
+        }
+
+        if ($quantity < 1 || $quantity > 500) {
+            return ['success' => false, 'message' => __('Quantity must be between 1 and 500', 'matrix-mlm')];
         }
 
         $pins = [];
@@ -30,16 +48,19 @@ class Matrix_MLM_Epin {
 
             $wpdb->insert($wpdb->prefix . 'matrix_epins', [
                 'pin_code' => $pin_code,
-                'plan_id' => $plan_id,
-                'amount' => $plan->price,
+                'plan_id' => $plan_id ?: null,
+                'amount' => $amount,
                 'created_by' => $created_by,
                 'expires_at' => $expires_at
             ]);
 
-            $pins[] = $pin_code;
+            $pins[] = [
+                'pin_code' => $pin_code,
+                'amount' => $amount,
+            ];
         }
 
-        return ['success' => true, 'pins' => $pins, 'count' => count($pins)];
+        return ['success' => true, 'pins' => $pins, 'count' => count($pins), 'amount' => $amount];
     }
 
     /**

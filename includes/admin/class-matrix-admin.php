@@ -185,51 +185,144 @@ class Matrix_MLM_Admin {
      * Render E-Pins page
      */
     public function render_epins() {
+        global $wpdb;
         $epin = new Matrix_MLM_Epin();
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $generated_pins = null;
 
+        // Handle export
+        if (isset($_GET['export_epins']) && wp_verify_nonce($_GET['_wpnonce'], 'matrix_export_epins')) {
+            $this->export_epins(sanitize_text_field($_GET['export_epins']));
+            return;
+        }
+
+        // Handle generation
         if (isset($_POST['generate_epins']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_generate_epins')) {
             $plan_id = intval($_POST['plan_id']);
             $quantity = intval($_POST['quantity']);
-            $result = $epin->generate($plan_id, $quantity, get_current_user_id());
+            $custom_amount = floatval($_POST['custom_amount'] ?? 0);
+            $expires_at = !empty($_POST['expires_at']) ? sanitize_text_field($_POST['expires_at']) : null;
+
+            $result = $epin->generate($plan_id, $quantity, get_current_user_id(), $expires_at, $custom_amount);
 
             if ($result['success']) {
-                echo '<div class="notice notice-success"><p>' . sprintf(__('%d E-Pins generated successfully!', 'matrix-mlm'), $result['count']) . '</p></div>';
+                $generated_pins = $result['pins'];
+                echo '<div class="notice notice-success"><p>' . sprintf(__('%d E-Pins generated successfully! Amount: %s per pin.', 'matrix-mlm'), $result['count'], $currency . number_format($result['amount'], 2)) . '</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>' . esc_html($result['message']) . '</p></div>';
             }
         }
 
-        $pins = $epin->get_all_pins(null, 50, 0);
+        // Filters
+        $status_filter = isset($_GET['pin_status']) ? sanitize_text_field($_GET['pin_status']) : '';
+        $pins = $epin->get_all_pins($status_filter ?: null, 100, 0);
         $plan_engine = new Matrix_MLM_Plan_Engine();
         $plans = $plan_engine->get_plans('active');
+
+        // Stats
+        $total_pins = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_epins");
+        $unused_pins = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_epins WHERE status = 'unused'");
+        $used_pins = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_epins WHERE status = 'used'");
+        $expired_pins = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_epins WHERE status = 'expired'");
+        $total_value = $wpdb->get_var("SELECT COALESCE(SUM(amount), 0) FROM {$wpdb->prefix}matrix_epins WHERE status = 'unused'");
         ?>
         <div class="wrap matrix-admin-wrap">
             <h1><?php _e('E-Pin Management', 'matrix-mlm'); ?></h1>
 
+            <!-- Stats -->
+            <div class="matrix-admin-stats">
+                <div class="stat-card stat-primary"><h3><?php echo number_format($total_pins); ?></h3><p><?php _e('Total Pins', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-success"><h3><?php echo number_format($unused_pins); ?></h3><p><?php _e('Unused', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-warning"><h3><?php echo number_format($used_pins); ?></h3><p><?php _e('Used', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-danger"><h3><?php echo number_format($expired_pins); ?></h3><p><?php _e('Expired', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-info"><h3><?php echo $currency . number_format($total_value, 2); ?></h3><p><?php _e('Unused Value', 'matrix-mlm'); ?></p></div>
+            </div>
+
+            <!-- Generate Form -->
             <div class="matrix-admin-card">
                 <h2><?php _e('Generate E-Pins', 'matrix-mlm'); ?></h2>
                 <form method="post">
                     <?php wp_nonce_field('matrix_generate_epins'); ?>
                     <table class="form-table">
                         <tr>
-                            <th><?php _e('Plan', 'matrix-mlm'); ?></th>
+                            <th><?php _e('Amount Source', 'matrix-mlm'); ?></th>
                             <td>
-                                <select name="plan_id" required>
+                                <label style="display:block;margin-bottom:8px;"><input type="radio" name="amount_source" value="plan" checked onchange="document.getElementById('plan-select').style.display='block';document.getElementById('custom-amount').style.display='none';"> <?php _e('From Plan Price', 'matrix-mlm'); ?></label>
+                                <label><input type="radio" name="amount_source" value="custom" onchange="document.getElementById('plan-select').style.display='none';document.getElementById('custom-amount').style.display='block';"> <?php _e('Custom Amount', 'matrix-mlm'); ?></label>
+                            </td>
+                        </tr>
+                        <tr id="plan-select">
+                            <th><?php _e('Select Plan', 'matrix-mlm'); ?></th>
+                            <td>
+                                <select name="plan_id">
                                     <?php foreach ($plans as $plan): ?>
-                                    <option value="<?php echo $plan->id; ?>"><?php echo esc_html($plan->name . ' - ' . get_option('matrix_mlm_currency_symbol', '₦') . number_format($plan->price, 2)); ?></option>
+                                    <option value="<?php echo $plan->id; ?>"><?php echo esc_html($plan->name . ' - ' . $currency . number_format($plan->price, 2)); ?></option>
                                     <?php endforeach; ?>
                                 </select>
                             </td>
                         </tr>
+                        <tr id="custom-amount" style="display:none;">
+                            <th><?php _e('Pin Amount', 'matrix-mlm'); ?> (<?php echo $currency; ?>)</th>
+                            <td><input type="number" name="custom_amount" step="0.01" min="1" value="1000" class="regular-text"></td>
+                        </tr>
                         <tr>
                             <th><?php _e('Quantity', 'matrix-mlm'); ?></th>
-                            <td><input type="number" name="quantity" min="1" max="100" value="10" required></td>
+                            <td>
+                                <input type="number" name="quantity" min="1" max="500" value="10" required>
+                                <p class="description"><?php _e('Maximum 500 pins per batch.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Expiry Date (Optional)', 'matrix-mlm'); ?></th>
+                            <td>
+                                <input type="date" name="expires_at" min="<?php echo date('Y-m-d', strtotime('+1 day')); ?>">
+                                <p class="description"><?php _e('Leave empty for no expiration.', 'matrix-mlm'); ?></p>
+                            </td>
                         </tr>
                     </table>
                     <p><input type="submit" name="generate_epins" class="button button-primary" value="<?php _e('Generate Pins', 'matrix-mlm'); ?>"></p>
                 </form>
+                <script>
+                document.querySelector('[name="amount_source"][value="custom"]').addEventListener('change', function(){ document.querySelector('[name="plan_id"]').removeAttribute('name'); });
+                document.querySelector('[name="amount_source"][value="plan"]').addEventListener('change', function(){ document.getElementById('plan-select').querySelector('select').setAttribute('name','plan_id'); });
+                </script>
             </div>
 
+            <?php if ($generated_pins): ?>
+            <!-- Just Generated Pins -->
+            <div class="matrix-admin-card" style="border-left:4px solid #059669;">
+                <h2><?php _e('Newly Generated Pins', 'matrix-mlm'); ?></h2>
+                <p><?php printf(__('%d pins generated at %s each.', 'matrix-mlm'), count($generated_pins), $currency . number_format($generated_pins[0]['amount'], 2)); ?></p>
+                <div style="margin-bottom:12px;display:flex;gap:8px;">
+                    <button class="button" onclick="matrixCopyPins()"><?php _e('Copy All to Clipboard', 'matrix-mlm'); ?></button>
+                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=csv&batch=latest'), 'matrix_export_epins'); ?>" class="button">CSV</a>
+                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=excel&batch=latest'), 'matrix_export_epins'); ?>" class="button">Excel</a>
+                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=pdf&batch=latest'), 'matrix_export_epins'); ?>" class="button">PDF</a>
+                    <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=json&batch=latest'), 'matrix_export_epins'); ?>" class="button">JSON</a>
+                </div>
+                <textarea id="generated-pins-text" rows="6" class="large-text code" readonly><?php foreach ($generated_pins as $p) { echo $p['pin_code'] . '  (' . $currency . number_format($p['amount'], 2) . ")\n"; } ?></textarea>
+                <script>function matrixCopyPins(){var t=document.getElementById('generated-pins-text');t.select();document.execCommand('copy');alert('<?php _e('Copied!', 'matrix-mlm'); ?>');}</script>
+            </div>
+            <?php endif; ?>
+
+            <!-- Export & Filter -->
             <div class="matrix-admin-card">
-                <h2><?php _e('All E-Pins', 'matrix-mlm'); ?></h2>
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:15px;">
+                    <h2 style="margin:0;"><?php _e('All E-Pins', 'matrix-mlm'); ?></h2>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <a href="<?php echo admin_url('admin.php?page=matrix-mlm-epins'); ?>" class="button <?php echo !$status_filter ? 'button-primary' : ''; ?>"><?php _e('All', 'matrix-mlm'); ?></a>
+                        <a href="<?php echo admin_url('admin.php?page=matrix-mlm-epins&pin_status=unused'); ?>" class="button <?php echo $status_filter === 'unused' ? 'button-primary' : ''; ?>"><?php _e('Unused', 'matrix-mlm'); ?></a>
+                        <a href="<?php echo admin_url('admin.php?page=matrix-mlm-epins&pin_status=used'); ?>" class="button <?php echo $status_filter === 'used' ? 'button-primary' : ''; ?>"><?php _e('Used', 'matrix-mlm'); ?></a>
+                        <a href="<?php echo admin_url('admin.php?page=matrix-mlm-epins&pin_status=expired'); ?>" class="button <?php echo $status_filter === 'expired' ? 'button-primary' : ''; ?>"><?php _e('Expired', 'matrix-mlm'); ?></a>
+                        <span>|</span>
+                        <strong><?php _e('Export:', 'matrix-mlm'); ?></strong>
+                        <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=csv&pin_status=' . $status_filter), 'matrix_export_epins'); ?>" class="button">CSV</a>
+                        <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=excel&pin_status=' . $status_filter), 'matrix_export_epins'); ?>" class="button">Excel</a>
+                        <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=pdf&pin_status=' . $status_filter), 'matrix_export_epins'); ?>" class="button">PDF</a>
+                        <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-epins&export_epins=json&pin_status=' . $status_filter), 'matrix_export_epins'); ?>" class="button">JSON</a>
+                    </div>
+                </div>
+
                 <table class="wp-list-table widefat fixed striped">
                     <thead>
                         <tr>
@@ -239,6 +332,7 @@ class Matrix_MLM_Admin {
                             <th><?php _e('Created By', 'matrix-mlm'); ?></th>
                             <th><?php _e('Used By', 'matrix-mlm'); ?></th>
                             <th><?php _e('Status', 'matrix-mlm'); ?></th>
+                            <th><?php _e('Expires', 'matrix-mlm'); ?></th>
                             <th><?php _e('Created', 'matrix-mlm'); ?></th>
                         </tr>
                     </thead>
@@ -246,11 +340,12 @@ class Matrix_MLM_Admin {
                         <?php foreach ($pins as $pin): ?>
                         <tr>
                             <td><code><?php echo esc_html($pin->pin_code); ?></code></td>
-                            <td><?php echo esc_html($pin->plan_name); ?></td>
-                            <td><?php echo get_option('matrix_mlm_currency_symbol', '₦') . number_format($pin->amount, 2); ?></td>
+                            <td><?php echo esc_html($pin->plan_name ?? __('Custom', 'matrix-mlm')); ?></td>
+                            <td><?php echo $currency . number_format($pin->amount, 2); ?></td>
                             <td><?php echo esc_html($pin->created_by_username ?? 'Admin'); ?></td>
                             <td><?php echo esc_html($pin->used_by_username ?? '-'); ?></td>
                             <td><span class="matrix-badge matrix-badge-<?php echo $pin->status; ?>"><?php echo ucfirst($pin->status); ?></span></td>
+                            <td><?php echo $pin->expires_at ? date('M d, Y', strtotime($pin->expires_at)) : '-'; ?></td>
                             <td><?php echo date('M d, Y', strtotime($pin->created_at)); ?></td>
                         </tr>
                         <?php endforeach; ?>
@@ -262,6 +357,78 @@ class Matrix_MLM_Admin {
     }
 
     /**
+     * Export E-Pins
+     */
+    private function export_epins($format) {
+        global $wpdb;
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $status_filter = sanitize_text_field($_GET['pin_status'] ?? '');
+        $batch = sanitize_text_field($_GET['batch'] ?? '');
+
+        $where = "WHERE 1=1";
+        $params = [];
+
+        if ($status_filter) {
+            $where .= " AND e.status = %s";
+            $params[] = $status_filter;
+        }
+
+        if ($batch === 'latest') {
+            // Get the most recent batch (pins created in the last 60 seconds by current admin)
+            $where .= " AND e.created_by = %d AND e.created_at >= DATE_SUB(NOW(), INTERVAL 60 SECOND)";
+            $params[] = get_current_user_id();
+        }
+
+        $query = "SELECT e.pin_code, e.amount, COALESCE(p.name, 'Custom') as plan, e.status, COALESCE(u1.user_login, 'Admin') as created_by, COALESCE(u2.user_login, '-') as used_by, e.expires_at, e.created_at FROM {$wpdb->prefix}matrix_epins e LEFT JOIN {$wpdb->prefix}matrix_plans p ON e.plan_id = p.id LEFT JOIN {$wpdb->users} u1 ON e.created_by = u1.ID LEFT JOIN {$wpdb->users} u2 ON e.used_by = u2.ID $where ORDER BY e.created_at DESC";
+
+        $data = !empty($params) ? $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A) : $wpdb->get_results($query, ARRAY_A);
+        $filename = 'matrix-epins-' . ($status_filter ?: 'all') . '-' . date('Y-m-d');
+
+        switch ($format) {
+            case 'csv':
+                header('Content-Type: text/csv; charset=utf-8');
+                header('Content-Disposition: attachment; filename="' . $filename . '.csv"');
+                $output = fopen('php://output', 'w');
+                fprintf($output, chr(0xEF) . chr(0xBB) . chr(0xBF));
+                if (!empty($data)) { fputcsv($output, array_keys($data[0])); foreach ($data as $row) { fputcsv($output, $row); } }
+                fclose($output);
+                break;
+
+            case 'excel':
+                header('Content-Type: application/vnd.ms-excel');
+                header('Content-Disposition: attachment; filename="' . $filename . '.xls"');
+                echo '<html><head><meta charset="UTF-8"></head><body><table border="1">';
+                if (!empty($data)) {
+                    echo '<tr>'; foreach (array_keys($data[0]) as $h) { echo '<th style="background:#4f46e5;color:#fff;padding:8px;">' . esc_html(ucwords(str_replace('_', ' ', $h))) . '</th>'; } echo '</tr>';
+                    foreach ($data as $row) { echo '<tr>'; foreach ($row as $cell) { echo '<td style="padding:6px;">' . esc_html($cell) . '</td>'; } echo '</tr>'; }
+                }
+                echo '</table></body></html>';
+                break;
+
+            case 'pdf':
+                header('Content-Type: text/html; charset=utf-8');
+                $title = get_option('matrix_mlm_site_title', 'Matrix MLM Pro') . ' - E-Pins';
+                echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . esc_html($title) . '</title><style>body{font-family:Arial,sans-serif;margin:20px;font-size:12px;}h1{font-size:18px;color:#4f46e5;}table{width:100%;border-collapse:collapse;margin-top:15px;}th{background:#4f46e5;color:#fff;padding:6px 8px;text-align:left;font-size:11px;}td{padding:5px 8px;border-bottom:1px solid #e5e7eb;font-size:11px;}tr:nth-child(even){background:#f9fafb;}.no-print{margin-bottom:15px;}@media print{.no-print{display:none;}}</style></head><body>';
+                echo '<div class="no-print"><button onclick="window.print()" style="padding:8px 16px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;">Print / Save as PDF</button></div>';
+                echo '<h1>' . esc_html($title) . '</h1><p style="color:#666;font-size:11px;">Generated: ' . date('F d, Y H:i:s') . ' | Pins: ' . count($data) . '</p>';
+                if (!empty($data)) {
+                    echo '<table><thead><tr>'; foreach (array_keys($data[0]) as $h) { echo '<th>' . esc_html(ucwords(str_replace('_', ' ', $h))) . '</th>'; } echo '</tr></thead><tbody>';
+                    foreach ($data as $row) { echo '<tr>'; foreach ($row as $cell) { echo '<td>' . esc_html($cell) . '</td>'; } echo '</tr>'; }
+                    echo '</tbody></table>';
+                }
+                echo '</body></html>';
+                break;
+
+            case 'json':
+                header('Content-Type: application/json; charset=utf-8');
+                header('Content-Disposition: attachment; filename="' . $filename . '.json"');
+                echo json_encode(['report' => 'epins', 'generated_at' => current_time('mysql'), 'total_pins' => count($data), 'filter' => $status_filter ?: 'all', 'data' => $data], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+                break;
+        }
+        exit;
+    }
+
+    /**    /**
      * Handle admin AJAX actions
      */
     public function handle_admin_ajax() {
