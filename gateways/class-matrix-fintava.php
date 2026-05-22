@@ -1738,12 +1738,16 @@ class Matrix_MLM_Fintava {
         // flow surfaced.
         if (empty($user_wallet->bank_code)) {
             // Step 1: GET /wallet/details?accountNumber=... — also
-            // backfills wallet_id and customer_id when they're missing,
-            // since /wallet/details returns the lot in one round-trip.
-            $resolve = $this->resolve_wallet_id_from_customer($user_wallet);
-            if (!is_wp_error($resolve)) {
-                $user_wallet = $this->get_user_wallet($user_id);
-            }
+            // backfills wallet_id, customer_id, and (importantly for
+            // older rows) bank_name when Fintava returns the partner
+            // bank name verbatim. We re-read the wallet row
+            // unconditionally because resolve_wallet_id_from_customer()
+            // persists metadata opportunistically — even on a
+            // wallet_id miss it may have updated bank_name from the
+            // schema-default "Fintava" placeholder to the real
+            // partner bank, which is what Step 2 below needs.
+            $this->resolve_wallet_id_from_customer($user_wallet);
+            $user_wallet = $this->get_user_wallet($user_id);
 
             // Step 2: derive bank_code from bank_name. Fintava's
             // /wallet/details on some tiers returns `bank: "Globus
@@ -2673,21 +2677,9 @@ class Matrix_MLM_Fintava {
             return $details;
         }
 
-        // Extract the wallet ID from the response
-        $resolved_wallet_id = self::extract_wallet_id($details);
-        if (empty($resolved_wallet_id)) {
-            // Fallback: use the top-level 'id' field
-            $resolved_wallet_id = $details['id'] ?? '';
-        }
-
-        if (empty($resolved_wallet_id)) {
-            return new WP_Error(
-                'fintava_no_wallet_id_in_response',
-                __('The enquiry response does not contain a wallet ID.', 'matrix-mlm')
-            );
-        }
-
-        // Verify the account number matches (safety check)
+        // Account-number mismatch is a hard failure — do NOT persist
+        // anything from a response that's clearly for a different
+        // wallet. Run this check before any persistence below.
         $remote_account = self::extract_account_number($details);
         if (!empty($remote_account) && trim($remote_account) !== $account_number) {
             return new WP_Error(
@@ -2696,36 +2688,96 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        // Build the update — always persist wallet_id
-        $update_data = [
-            'wallet_id'  => $resolved_wallet_id,
-            'updated_at' => current_time('mysql'),
-        ];
-        $update_formats = ['%s', '%s'];
+        // ------------------------------------------------------------------
+        // Step A: opportunistically extract every wallet attribute Fintava
+        // returned and stage them for persistence. We do this BEFORE the
+        // wallet_id null-check below because /wallet/details on some
+        // tiers returns the bank name + sortCode without echoing the
+        // wallet UUID — and the bank-payout / matrix-to-virtual flows
+        // need the bank_code regardless of whether wallet_id resolved.
+        // Discarding metadata on a wallet_id miss was the bug behind
+        // the "missing a bank code we couldn't auto-resolve" error
+        // when bank_name on the row was still the schema default
+        // "Fintava" placeholder.
+        // ------------------------------------------------------------------
+        $update_data    = [];
+        $update_formats = [];
 
-        // Save bank_code if available
-        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? null;
-        if (!empty($bank_code)) {
-            $update_data['bank_code'] = $bank_code;
-            $update_formats[] = '%s';
+        // bank_name: persist when Fintava gave us a real partner bank
+        // (extract_bank_name reads `bank`, `bank_name`, `bankName`) AND
+        // the local row is either empty or holds the literal schema
+        // default "Fintava" — Fintava is the fintech, not a CBN bank,
+        // so it's never a valid sortCode-lookup key for the
+        // derive_bank_code_from_name() fallback.
+        $remote_bank_name = self::extract_bank_name($details);
+        if ($remote_bank_name !== ''
+            && (empty($wallet_row->bank_name)
+                || strcasecmp((string) $wallet_row->bank_name, 'Fintava') === 0)) {
+            $update_data['bank_name'] = $remote_bank_name;
+            $update_formats[]         = '%s';
         }
 
-        // Also extract customer_id if it's present in the response.
-        // The /wallet/details endpoint sometimes returns it as customerId,
-        // customer_id, or nested under userInfo.id.
-        $customer_id = self::extract_customer_id($details);
-        if (!empty($customer_id) && empty($wallet_row->customer_id)) {
-            $update_data['customer_id'] = $customer_id;
-            $update_formats[] = '%s';
+        // bank_code: Fintava varies the key across tiers — bank_code,
+        // bankCode, and sortCode have all been observed on
+        // /wallet/details. First non-empty wins.
+        $remote_bank_code = '';
+        foreach (['bank_code', 'bankCode', 'sortCode', 'sort_code'] as $key) {
+            if (!empty($details[$key])) {
+                $remote_bank_code = (string) $details[$key];
+                break;
+            }
+        }
+        if ($remote_bank_code !== '' && empty($wallet_row->bank_code)) {
+            $update_data['bank_code'] = $remote_bank_code;
+            $update_formats[]         = '%s';
         }
 
-        $wpdb->update(
-            $wpdb->prefix . 'matrix_fintava_wallets',
-            $update_data,
-            ['id' => $wallet_row->id],
-            $update_formats,
-            ['%d']
-        );
+        // customer_id: same shape rules as before (userInfo.id /
+        // customerId / customer_id). Only persist when the row
+        // doesn't already have one.
+        $remote_customer_id = self::extract_customer_id($details);
+        if (!empty($remote_customer_id) && empty($wallet_row->customer_id)) {
+            $update_data['customer_id'] = $remote_customer_id;
+            $update_formats[]           = '%s';
+        }
+
+        // ------------------------------------------------------------------
+        // Step B: resolve wallet_id from the same response. Stage it
+        // alongside the metadata so a single UPDATE covers everything,
+        // and so we can return the resolved UUID as the success
+        // signal.
+        // ------------------------------------------------------------------
+        $resolved_wallet_id = self::extract_wallet_id($details);
+        if (empty($resolved_wallet_id)) {
+            // Fallback: use the top-level 'id' field
+            $resolved_wallet_id = $details['id'] ?? '';
+        }
+        if (!empty($resolved_wallet_id)) {
+            $update_data['wallet_id'] = $resolved_wallet_id;
+            $update_formats[]         = '%s';
+        }
+
+        // Flush whatever we have. Persisting partial metadata even on
+        // a wallet_id miss is intentional — see the docblock above
+        // Step A.
+        if (!empty($update_data)) {
+            $update_data['updated_at'] = current_time('mysql');
+            $update_formats[]          = '%s';
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_fintava_wallets',
+                $update_data,
+                ['id' => $wallet_row->id],
+                $update_formats,
+                ['%d']
+            );
+        }
+
+        if (empty($resolved_wallet_id)) {
+            return new WP_Error(
+                'fintava_no_wallet_id_in_response',
+                __('The enquiry response does not contain a wallet ID.', 'matrix-mlm')
+            );
+        }
 
         return $resolved_wallet_id;
     }
