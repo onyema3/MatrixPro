@@ -29,9 +29,7 @@ class Matrix_MLM_User_Dashboard {
         'commissions',
         'plans',
         'epin',
-        'transfer',
-        'bank-payout',
-        'virtual-wallet',
+        'wallet',
         'card',
         'billing',
         'tickets',
@@ -147,9 +145,7 @@ class Matrix_MLM_User_Dashboard {
                     <a href="<?php echo self::tab_url('commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('epin'); ?>" class="<?php echo $tab === 'epin' ? 'active' : ''; ?>"><span class="dashicons dashicons-tickets-alt"></span> <?php _e('E-Pin Recharge', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('transfer'); ?>" class="<?php echo $tab === 'transfer' ? 'active' : ''; ?>"><span class="dashicons dashicons-randomize"></span> <?php _e('Balance Transfer', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('bank-payout'); ?>" class="<?php echo $tab === 'bank-payout' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Bank Payout', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('virtual-wallet'); ?>" class="<?php echo $tab === 'virtual-wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-id-alt"></span> <?php _e('Virtual Wallet', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('wallet'); ?>" class="<?php echo $tab === 'wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Wallet', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('card'); ?>" class="<?php echo $tab === 'card' ? 'active' : ''; ?>"><span class="dashicons dashicons-credit-card"></span> <?php _e('Verve Card', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('billing'); ?>" class="<?php echo $tab === 'billing' ? 'active' : ''; ?>"><span class="dashicons dashicons-smartphone"></span> <?php _e('Bill Payments', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
@@ -208,14 +204,16 @@ class Matrix_MLM_User_Dashboard {
             case 'epin':
                 (new Matrix_MLM_User_Epin())->render($user_id);
                 break;
-            case 'transfer':
-                (new Matrix_MLM_User_Transfer())->render($user_id);
-                break;
-            case 'bank-payout':
-                (new Matrix_MLM_User_Bank_Payout())->render($user_id);
-                break;
-            case 'virtual-wallet':
-                (new Matrix_MLM_User_Virtual_Wallet())->render($user_id);
+            case 'wallet':
+                // Consolidated wallet page — replaces the old separate
+                // 'transfer', 'bank-payout', and 'virtual-wallet' tabs.
+                // The legacy slugs are no longer in $valid_tabs so any
+                // bookmark or email link to them now falls through to
+                // overview; the underlying classes are kept on disk and
+                // continue to back this consolidated page (Bank_Payout
+                // is embedded directly, Virtual_Wallet's create-form
+                // helper is invoked for first-time onboarding).
+                (new Matrix_MLM_User_Wallet())->render($user_id);
                 break;
             case 'card':
                 (new Matrix_MLM_User_Card())->render($user_id);

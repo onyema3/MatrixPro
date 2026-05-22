@@ -10,7 +10,25 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_User_Bank_Payout {
 
-    public function render($user_id) {
+    /**
+     * Render the Bank Payout page (or just its body when embedded).
+     *
+     * @param int  $user_id      The user being rendered for.
+     * @param bool $skip_header  When true, suppress the H2 + subtitle so
+     *                           the form body can be embedded inside the
+     *                           consolidated Wallet page (which renders
+     *                           its own page-level header and uses tabs
+     *                           to label this section). Defaults to
+     *                           false so the legacy ?tab=bank-payout
+     *                           URL still renders a complete standalone
+     *                           page if any old link or bookmark hits
+     *                           it. The whitelist in the dashboard
+     *                           dispatcher rejects that slug today, but
+     *                           the class is still callable directly
+     *                           and we don't want a silent regression
+     *                           if the slug is ever re-enabled.
+     */
+    public function render($user_id, $skip_header = false) {
         $wallet = new Matrix_MLM_Wallet();
         $balance = $wallet->get_balance($user_id);
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
@@ -74,8 +92,10 @@ class Matrix_MLM_User_Bank_Payout {
         // Get payout history
         $payouts = $fintava->get_user_payouts($user_id, 20);
         ?>
+        <?php if (!$skip_header): ?>
         <h2><?php _e('Bank Transfer (Instant Payout)', 'matrix-mlm'); ?></h2>
         <p class="matrix-subtitle"><?php _e('Transfer funds directly from your wallet to your bank account via Fintava.', 'matrix-mlm'); ?></p>
+        <?php endif; ?>
 
         <?php if (!$is_active): ?>
         <div class="matrix-alert matrix-alert-warning">

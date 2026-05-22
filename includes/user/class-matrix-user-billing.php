@@ -26,7 +26,7 @@ class Matrix_MLM_User_Billing {
         <?php if (!$has_fintava_wallet): ?>
         <div class="matrix-alert matrix-alert-warning">
             <?php _e('You need a Fintava virtual wallet to pay bills. All bill payments are debited directly from your Fintava wallet balance.', 'matrix-mlm'); ?>
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=virtual-wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Fintava Wallet', 'matrix-mlm'); ?></a>
+            <a href="<?php echo Matrix_MLM_User_Dashboard::tab_url('wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Fintava Wallet', 'matrix-mlm'); ?></a>
         </div>
         <?php else: ?>
 
