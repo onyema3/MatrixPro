@@ -993,6 +993,146 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * POST /transaction/wallet-to-wallet — wallet-to-wallet transfer between
+     * two Fintava-hosted accounts, identified by NUBAN.
+     *
+     * This is the production endpoint used by the legacy Laravel
+     * implementation (App\Lib\Fintava::singleTransfer) and the only
+     * wallet-to-wallet path Fintava actually publishes. The earlier
+     * /single/transfer attempt below (internal_wallet_transfer) was
+     * derived from doc-best-effort and produces transport-level errors
+     * on live tiers because the endpoint isn't surfaced — which is what
+     * was generating the misleading "Network error. Please try again."
+     * on the Matrix -> Virtual transfer button.
+     *
+     * Payload shape (matches legacy verbatim):
+     *
+     *   - senderAccount      Source wallet NUBAN. Defaults to the admin
+     *                        setting `matrix_mlm_fintava_operating_account`
+     *                        (the merchant operating account that funds
+     *                        these transfers); override per-call via
+     *                        $transfer_data['sender_account'].
+     *   - receiverAccount    Destination wallet NUBAN.
+     *   - amount             Float. Sent as float unconditionally —
+     *                        legacy passes (float) and Fintava's
+     *                        wallet-to-wallet validator accepts it for
+     *                        whole-naira amounts (the int coercion in
+     *                        bank_credit() / internal_wallet_transfer
+     *                        was a /bank/credit-specific workaround
+     *                        that does not apply here).
+     *   - narration          Optional free text.
+     *   - CustomerReference  Required by Fintava as the idempotency /
+     *                        reconciliation key. Auto-generated when
+     *                        not supplied.
+     *
+     * Retry semantics: same as internal_wallet_transfer — one retry on
+     * HTTP 5xx or transport failure, immediate surface for any
+     * application-level "no" so we don't double-spend on a request that
+     * may already have settled.
+     *
+     * @param array $transfer_data {
+     *     @type float|int $amount             Required.
+     *     @type string    $receiver_account   Required.
+     *     @type string    $sender_account     Optional. Defaults to the
+     *                                         operating-account setting.
+     *     @type string    $narration          Optional.
+     *     @type string    $customer_reference Optional. Auto-generated if
+     *                                         missing.
+     * }
+     * @return array|WP_Error Same success / error shape as bank_credit().
+     */
+    public function wallet_to_wallet_transfer($transfer_data) {
+        $required_fields = ['amount', 'receiver_account'];
+        foreach ($required_fields as $field) {
+            if (empty($transfer_data[$field])) {
+                return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
+            }
+        }
+
+        // Sender defaults to the configured operating-account NUBAN.
+        // Strip whitespace defensively in case a caller passes through
+        // user-entered data; the saved setting is already trimmed but
+        // belt-and-suspenders never hurts on a money path.
+        $sender_account = !empty($transfer_data['sender_account'])
+            ? preg_replace('/\s+/', '', sanitize_text_field((string) $transfer_data['sender_account']))
+            : preg_replace('/\s+/', '', (string) get_option('matrix_mlm_fintava_operating_account', ''));
+
+        if (empty($sender_account)) {
+            return new WP_Error(
+                'missing_sender_account',
+                __('Cannot dispatch wallet-to-wallet transfer: no operating account number is configured. Set it on the Gateways page (Fintava section).', 'matrix-mlm')
+            );
+        }
+
+        $receiver_account = preg_replace('/\s+/', '', sanitize_text_field((string) $transfer_data['receiver_account']));
+        $reference        = !empty($transfer_data['customer_reference'])
+            ? sanitize_text_field((string) $transfer_data['customer_reference'])
+            : $this->generate_reference();
+
+        $payload = [
+            'senderAccount'     => $sender_account,
+            'receiverAccount'   => $receiver_account,
+            'amount'            => (float) $transfer_data['amount'],
+            'narration'         => !empty($transfer_data['narration'])
+                ? sanitize_text_field((string) $transfer_data['narration'])
+                : null,
+            'CustomerReference' => $reference,
+        ];
+
+        $max_attempts = 2;
+        $last_error   = null;
+
+        for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+            $response = $this->make_request('POST', '/transaction/wallet-to-wallet', $payload);
+
+            if (is_wp_error($response)) {
+                $error_msg    = $response->get_error_message();
+                $is_5xx       = preg_match('/API Error \(HTTP 5\d{2}\)/', $error_msg);
+                $is_transport = in_array($response->get_error_code(), ['http_request_failed'], true);
+
+                if ($attempt < $max_attempts && ($is_5xx || $is_transport)) {
+                    $last_error = $response;
+                    sleep(2);
+                    continue;
+                }
+                return $response;
+            }
+
+            if (self::is_api_success($response)) {
+                return [
+                    'success'     => true,
+                    'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
+                    'reference'   => $response['data']['reference'] ?? $response['data']['CustomerReference'] ?? $reference,
+                    'status'      => $response['data']['status'] ?? 'completed',
+                    'message'     => self::normalize_api_message(
+                        $response['message'] ?? null,
+                        __('Wallet-to-wallet transfer completed', 'matrix-mlm')
+                    ),
+                ];
+            }
+
+            // 200 + status:false is application-level "no". Don't retry.
+            return new WP_Error(
+                'fintava_wallet_to_wallet_error',
+                self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Wallet-to-wallet transfer failed', 'matrix-mlm')
+                )
+            );
+        }
+
+        if ($last_error) {
+            return $last_error;
+        }
+        return new WP_Error(
+            'fintava_wallet_to_wallet_error',
+            __('Wallet-to-wallet transfer failed after retry', 'matrix-mlm')
+        );
+    }
+
+    /**
+     * @deprecated Use wallet_to_wallet_transfer() instead.
+     *
      * POST /single/transfer — internal wallet-to-wallet transfer between
      * Fintava-hosted wallets. Used by ajax_transfer_matrix_to_virtual()
      * to move money from the merchant's Fintava balance into a user's
@@ -1828,17 +1968,19 @@ class Matrix_MLM_Fintava {
      *   1. Debit the user's Matrix (internal) wallet by amount + charge.
      *      Charge is read from the same admin-configured options
      *      (matrix_mlm_fintava_charge_*) the on-page form previews.
-     *   2. Move REAL CASH on Fintava's side from the merchant Fintava
-     *      balance to the user's own virtual wallet by calling
-     *      POST /single/transfer (internal_wallet_transfer()) with
-     *      sourceId = merchant ID and destinationAccountNumber =
-     *      the user's NUBAN. The merchant balance is what funds the
+     *   2. Move REAL CASH on Fintava's side from the merchant's
+     *      operating Fintava wallet to the user's own virtual wallet
+     *      by calling POST /transaction/wallet-to-wallet
+     *      (wallet_to_wallet_transfer()) with senderAccount = the
+     *      configured operating-account NUBAN and receiverAccount =
+     *      the user's NUBAN. The operating wallet is what funds the
      *      credit; the user's Matrix debit is the bookkeeping side
-     *      that "pays" the merchant for that movement.
+     *      that "pays" the platform for that movement.
      *   3. If Fintava rejects the credit, refund the Matrix wallet so
      *      the user is made whole — money never half-moved.
      *
-     * Why /single/transfer and not /bank/credit/merchant:
+     * Why /transaction/wallet-to-wallet and not /bank/credit/merchant
+     * or /single/transfer:
      *   - /bank/credit/merchant validates a CBN sortCode on the
      *     wire-format. When the destination is a Fintava-hosted
      *     virtual NUBAN, that validator rejects the request whenever
@@ -1846,17 +1988,17 @@ class Matrix_MLM_Fintava {
      *     though Fintava could route the credit purely internally.
      *     This was the long-standing source of the "Your Virtual
      *     wallet (Fintava) is missing a bank code we couldn't
-     *     auto-resolve" surface — the row's bank_code couldn't be
-     *     resolved by the self-heal chain on tiers where the
-     *     /wallet/details and /customers endpoints don't echo a
-     *     partner bank back.
-     *   - /single/transfer is Fintava's internal-routing endpoint.
-     *     It identifies source by merchant ID and destination by
-     *     NUBAN (and optionally walletId), with no sortCode required.
-     *     Switching to it removes the bank-code requirement entirely
-     *     for this flow without sacrificing safety: the destination
-     *     is still validated by Fintava against the merchant's own
-     *     wallet directory.
+     *     auto-resolve" surface.
+     *   - /single/transfer was a doc-best-effort guess by an earlier
+     *     port and isn't surfaced on Fintava's live tier — every
+     *     attempt produced a transport-level error that the front-end
+     *     reported as "Network error. Please try again." This is the
+     *     bug being fixed here.
+     *   - /transaction/wallet-to-wallet is the production endpoint
+     *     used by the legacy Laravel implementation. It identifies
+     *     both source and destination by NUBAN with no sortCode
+     *     required, removing the bank-code requirement entirely for
+     *     this flow without sacrificing safety.
      *   - /bank/credit (the user-funded path used by
      *     ajax_initiate_transfer) stays on the bank-rails endpoint
      *     because external bank payouts genuinely need sortCode
@@ -2029,22 +2171,21 @@ class Matrix_MLM_Fintava {
 
         $wpdb->query('COMMIT');
 
-        // Step 2: move real cash on Fintava's side via /single/transfer
-        // — the internal wallet-to-wallet endpoint. Source is the
-        // configured merchant ID (auto-supplied by
-        // internal_wallet_transfer); destination is the user's own
-        // virtual NUBAN, with destinationWalletId sent alongside when
-        // we have it for faster routing on tiers that prefer it.
+        // Step 2: move real cash on Fintava's side via
+        // /transaction/wallet-to-wallet — the same endpoint the legacy
+        // Laravel system uses (App\Lib\Fintava::singleTransfer). Source
+        // is the configured operating-account NUBAN (set on the
+        // Gateways page); destination is the user's own virtual NUBAN.
         // Routing is purely internal — no CBN sortCode required, no
         // partner-bank lookup, no /bank/credit/merchant rejection on
-        // missing bank_code.
-        $result = $this->internal_wallet_transfer([
-            'amount'                     => $amount,
-            'destination_account_number' => $user_wallet->account_number,
-            'destination_wallet_id'      => $user_wallet->wallet_id ?: '',
-            'narration'                  => $narration,
-            'reference'                  => $reference,
-            'currency'                   => $user_wallet->currency ?: 'NGN',
+        // missing bank_code. Replaces the earlier /single/transfer
+        // attempt, which produced transport-level "Network error" on
+        // live tiers because that endpoint isn't surfaced.
+        $result = $this->wallet_to_wallet_transfer([
+            'amount'             => $amount,
+            'receiver_account'   => $user_wallet->account_number,
+            'narration'          => $narration,
+            'customer_reference' => $reference,
         ]);
 
         if (is_wp_error($result)) {
