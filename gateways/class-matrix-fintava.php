@@ -1305,18 +1305,43 @@ class Matrix_MLM_Fintava {
             ]);
         }
 
+        // Fintava's /name/enquiry returns camelCase
+        // (`accountName`/`accountNumber`/`bankName`); the inline JS in
+        // class-matrix-user-bank-payout.php reads our response under
+        // snake_case keys (`response.data.account_name` etc.). Use the
+        // existing casing-tolerant extractors as the bridge so the JS
+        // keeps working regardless of which casing Fintava sends back
+        // on a given tier — they accept both shapes and were already
+        // correctly used elsewhere; this site was the leftover.
+        $resolved_name   = self::extract_account_name($result) ?: ($result['account_name'] ?? '');
+        $resolved_number = self::extract_account_number($result) ?: ($result['account_number'] ?? $account_number);
+        $resolved_bank   = self::extract_bank_name($result) ?: ($result['bank_name'] ?? '');
+
+        // Some merchant tiers ack /name/enquiry with HTTP 200 but no
+        // usable accountName (empty string, "null", or the field
+        // missing entirely). Treating that as `success: true` would
+        // populate the readonly name field with '', flip the JS
+        // accountVerified flag to true, enable Submit, and the user
+        // would only learn the name was missing when ajax_initiate_transfer
+        // throws "Account name is required" on submit — with no UI
+        // path to recover, since the field stays readonly on the
+        // verified branch. Convert empty resolved names into the same
+        // resolve_error + allow_manual_override response we already
+        // emit for is_wp_error() so the JS surfaces the manual-entry
+        // notice and the operator can type the holder's name and
+        // proceed. The actual /bank/credit/merchant call still
+        // arbitrates whether the account is real on Fintava's side.
+        if (trim((string) $resolved_name) === '') {
+            wp_send_json_error([
+                'message'               => __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm'),
+                'allow_manual_override' => true,
+            ]);
+        }
+
         wp_send_json_success([
-            // Fintava's /name/enquiry returns camelCase
-            // (`accountName`/`accountNumber`/`bankName`); the inline JS in
-            // class-matrix-user-bank-payout.php reads our response under
-            // snake_case keys (`response.data.account_name` etc.). Use the
-            // existing casing-tolerant extractors as the bridge so the JS
-            // keeps working regardless of which casing Fintava sends back
-            // on a given tier — they accept both shapes and were already
-            // correctly used elsewhere; this site was the leftover.
-            'account_name'   => self::extract_account_name($result) ?: ($result['account_name'] ?? ''),
-            'account_number' => self::extract_account_number($result) ?: ($result['account_number'] ?? $account_number),
-            'bank_name'      => self::extract_bank_name($result) ?: ($result['bank_name'] ?? ''),
+            'account_name'   => $resolved_name,
+            'account_number' => $resolved_number,
+            'bank_name'      => $resolved_bank,
         ]);
     }
 
