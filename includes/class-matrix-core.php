@@ -91,6 +91,27 @@ class Matrix_MLM_Core {
 
         // Email verification handler
         add_action('init', [$this, 'handle_email_verification']);
+
+        // Suppress HTTP-level caching of any page that hosts the
+        // [matrix_dashboard] shortcode. Reported symptom: after a
+        // successful Wallet→Wallet transfer or e-pin recharge the
+        // user sees a flash of the old balance until they manually
+        // clear the app cache. Root cause is that the dashboard
+        // page is served from an HTTP-level cache (browser cache,
+        // server-side full-page cache, CDN edge cache) so the
+        // post-transaction location.reload() in the inline JS gets
+        // the stale HTML back even though the database is correct.
+        //
+        // Calling nocache_headers() here adds the standard
+        // no-store/no-cache/must-revalidate header trio early in
+        // the request lifecycle (before the shortcode emits any
+        // output and therefore before the headers are flushed),
+        // which all standards-compliant caches honour. We gate it
+        // on actually being on a dashboard-bearing page so we
+        // don't poison cacheability of the marketing/landing pages
+        // — `wp` fires after the main query is set up, so $post
+        // and has_shortcode() are usable at that point.
+        add_action('wp', [$this, 'nocache_dashboard_pages']);
     }
 
     public function enqueue_public_assets() {
@@ -127,6 +148,39 @@ class Matrix_MLM_Core {
             'userEmail' => is_user_logged_in() ? wp_get_current_user()->user_email : '',
             'userName' => is_user_logged_in() ? wp_get_current_user()->display_name : '',
         ]);
+    }
+
+    /**
+     * Send no-cache HTTP headers on any page that hosts the
+     * [matrix_dashboard] shortcode.
+     *
+     * Hooked on `wp` (after the main query is set up, before any
+     * output is sent) so $post is populated and we can detect the
+     * shortcode without scanning the whole site. Limiting to
+     * singular() avoids touching archive/feed responses where the
+     * dashboard shortcode wouldn't run anyway, and the
+     * `has_shortcode($post->post_content, ...)` check keeps
+     * marketing/landing pages cacheable.
+     *
+     * Pairs with the JS-side cache-busting reload in
+     * matrix-public.js (matrixMLMReload): the headers stop
+     * intermediate caches from storing the dashboard HTML, and the
+     * cache-busting URL on reload makes sure even non-compliant
+     * caches (Cloudflare APO, some hosting-provider edge caches)
+     * still serve a fresh page after a balance-changing action.
+     */
+    public function nocache_dashboard_pages() {
+        if (!is_singular()) {
+            return;
+        }
+        global $post;
+        if (!$post || !is_a($post, 'WP_Post')) {
+            return;
+        }
+        if (!has_shortcode($post->post_content, 'matrix_dashboard')) {
+            return;
+        }
+        nocache_headers();
     }
 
     public function enqueue_admin_assets($hook) {

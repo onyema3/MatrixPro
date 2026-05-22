@@ -4,6 +4,48 @@
 (function($) {
     'use strict';
 
+    // Cache-busting reload helper.
+    //
+    // Reported symptom: after a successful Wallet→Wallet transfer
+    // or e-pin recharge the database is correct but the user sees
+    // the old balance on the dashboard until they manually clear
+    // their app cache. Root cause is HTTP-level page caching
+    // (browser cache, server-side full-page cache, Cloudflare APO,
+    // hosting-provider edge cache) serving the pre-transaction
+    // HTML when location.reload() requests the dashboard.
+    //
+    // Plain location.reload() in modern browsers usually does
+    // revalidate against Cache-Control headers, but a few cache
+    // layers — Cloudflare APO with "Cache by device type" enabled,
+    // some shared-hosting object caches, certain WAF edge rules —
+    // ignore those headers for logged-in users and serve a stored
+    // copy regardless. Appending a unique query parameter
+    // (`?_mlmts=<timestamp>`) makes the reload URL distinct from
+    // any cached entry, so even non-compliant caches treat it as
+    // a fresh request.
+    //
+    // Exposed on `window` so inline scripts in PHP-rendered
+    // dashboard partials can call matrixMLMReload() instead of
+    // location.reload() after a wallet-changing action lands.
+    // Pairs with the nocache_headers() hook in
+    // Matrix_MLM_Core::nocache_dashboard_pages(): headers stop
+    // compliant caches from storing the page in the first place,
+    // and the cache-busting URL is the belt-and-braces fallback.
+    window.matrixMLMReload = function() {
+        try {
+            var url = new URL(window.location.href);
+            url.searchParams.set('_mlmts', String(Date.now()));
+            window.location.href = url.toString();
+        } catch (e) {
+            // URL constructor not available (very old browser) or
+            // the page URL is unusual enough that the constructor
+            // throws. Fall back to a plain reload — better than no
+            // reload, and the nocache_headers() server-side hint
+            // will handle most modern stacks anyway.
+            window.location.reload();
+        }
+    };
+
     // Helper: Show notification
     function showNotification(message, type) {
         const notification = $('<div class="matrix-notification matrix-notification-' + type + '">' + message + '</div>');
@@ -122,7 +164,7 @@
             account_details: form.find('[name="account_details"]').val()
         }, function(data) {
             showNotification(data.message, 'success');
-            setTimeout(function() { location.reload(); }, 2000);
+            setTimeout(function() { matrixMLMReload(); }, 2000);
         }, function() {
             btn.prop('disabled', false).text('Submit Withdrawal');
         });
@@ -145,7 +187,7 @@
             amount: form.find('[name="amount"]').val()
         }, function(data) {
             showNotification(data.message, 'success');
-            setTimeout(function() { location.reload(); }, 2000);
+            setTimeout(function() { matrixMLMReload(); }, 2000);
         }, function() {
             btn.prop('disabled', false).text('Transfer');
         });
@@ -164,7 +206,7 @@
             pin_code: form.find('[name="pin_code"]').val()
         }, function(data) {
             showNotification(data.message, 'success');
-            setTimeout(function() { location.reload(); }, 2000);
+            setTimeout(function() { matrixMLMReload(); }, 2000);
         }, function() {
             btn.prop('disabled', false).text('Redeem Pin');
         });
@@ -185,7 +227,7 @@
             priority: form.find('[name="priority"]').val()
         }, function(data) {
             showNotification(data.message, 'success');
-            setTimeout(function() { location.reload(); }, 1500);
+            setTimeout(function() { matrixMLMReload(); }, 1500);
         }, function() {
             btn.prop('disabled', false).text('Submit Ticket');
         });
@@ -229,7 +271,7 @@
             plan_id: planId
         }, function(data) {
             showNotification(data.message, 'success');
-            setTimeout(function() { location.reload(); }, 2000);
+            setTimeout(function() { matrixMLMReload(); }, 2000);
         });
     };
 
@@ -253,7 +295,7 @@
             matrix_action: 'disable_2fa'
         }, function() {
             showNotification('2FA disabled successfully', 'success');
-            setTimeout(function() { location.reload(); }, 1500);
+            setTimeout(function() { matrixMLMReload(); }, 1500);
         });
     };
 

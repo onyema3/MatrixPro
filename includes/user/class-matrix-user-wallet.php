@@ -778,7 +778,7 @@ class Matrix_MLM_User_Wallet {
                         success: function(res) {
                             if (res && res.success) {
                                 alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                                location.reload();
+                                (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                             } else {
                                 alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                                 $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
@@ -1591,7 +1591,7 @@ class Matrix_MLM_User_Wallet {
                         $btn.prop('disabled', false).text(orig);
                         if (res && res.success) {
                             $status.css('color', '#a7f3d0').text((res.data && res.data.message) || '<?php echo esc_js(__('Saved.', 'matrix-mlm')); ?>');
-                            setTimeout(function() { location.reload(); }, 600);
+                            setTimeout(function() { (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })(); }, 600);
                         } else {
                             var err = (res && res.data && res.data.message)
                                 ? res.data.message
@@ -1681,7 +1681,7 @@ class Matrix_MLM_User_Wallet {
                     success: function(res) {
                         if (res && res.success) {
                             alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
@@ -1781,7 +1781,7 @@ class Matrix_MLM_User_Wallet {
                     success: function(res) {
                         if (res && res.success) {
                             alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');

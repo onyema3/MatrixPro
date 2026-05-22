@@ -386,7 +386,7 @@ class Matrix_MLM_User_Virtual_Wallet {
                         if (res && res.success) {
                             statusEl.css('color', '#a7f3d0').text(res.data && res.data.message ? res.data.message : '<?php echo esc_js(__('Saved.', 'matrix-mlm')); ?>');
                             // Reload so the server-side balance fetch runs with the new wallet_id.
-                            setTimeout(function() { location.reload(); }, 600);
+                            setTimeout(function() { (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })(); }, 600);
                         } else {
                             var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Could not save Wallet ID.', 'matrix-mlm')); ?>';
                             statusEl.css('color', '#fecaca').text('✗ ' + err);
@@ -465,7 +465,7 @@ class Matrix_MLM_User_Virtual_Wallet {
                     success: function(response) {
                         if (response.success) {
                             alert(response.data.message);
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             alert(response.data.message || '<?php _e("Transfer failed", "matrix-mlm"); ?>');
                             btn.prop('disabled', false).text('<?php _e("Transfer to Fintava Wallet", "matrix-mlm"); ?>');
@@ -626,7 +626,7 @@ class Matrix_MLM_User_Virtual_Wallet {
                     success: function(response) {
                         if (response.success) {
                             alert(response.data.message + '\n\n<?php _e("Account Number:", "matrix-mlm"); ?> ' + response.data.wallet.account_number + '\n<?php _e("Bank:", "matrix-mlm"); ?> ' + response.data.wallet.bank_name);
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             alert(response.data.message || '<?php _e("Failed to create wallet", "matrix-mlm"); ?>');
                             btn.prop('disabled', false).text('<?php _e("Create Fintava Wallet", "matrix-mlm"); ?>');
