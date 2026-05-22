@@ -448,6 +448,242 @@ class Matrix_MLM_Admin_Gateways {
                             </details>
                         <?php endif; ?>
                     </div>
+
+                    <?php
+                    // =========================================================
+                    // SYSTEM FINTAVA ENDPOINTS — FULL DIAGNOSTIC PANEL
+                    // =========================================================
+                    // Comprehensive endpoint probe. Exercises every Fintava
+                    // endpoint the plugin may call so the operator can confirm
+                    // reachability, authentication, and response shape from
+                    // a single admin page. Fires live API requests — one per
+                    // endpoint — so gated behind its own button.
+                    $sys_diag_requested = isset($_POST['matrix_run_system_endpoints'])
+                        && check_admin_referer('matrix_fintava_system_endpoints_diag', 'matrix_se_nonce');
+
+                    // Individual endpoint test
+                    $single_ep_requested = isset($_POST['matrix_run_single_endpoint'])
+                        && check_admin_referer('matrix_fintava_single_endpoint_diag', 'matrix_sep_nonce');
+                    $single_ep_key    = isset($_POST['matrix_ep_key']) ? sanitize_text_field(wp_unslash($_POST['matrix_ep_key'])) : '';
+                    $single_ep_params = isset($_POST['matrix_ep_params']) && is_array($_POST['matrix_ep_params'])
+                        ? array_map('sanitize_text_field', wp_unslash($_POST['matrix_ep_params']))
+                        : [];
+                    ?>
+                    <div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed #f59e0b;">
+                        <h4 style="margin: 0 0 8px; color: #92400e; font-size: 13px;">
+                            <?php esc_html_e('System Fintava Endpoints — Full Diagnostic', 'matrix-mlm'); ?>
+                        </h4>
+                        <p style="margin: 0 0 12px; font-size: 12px; color: #78350f;">
+                            <?php esc_html_e('Probe all Fintava API endpoints to verify reachability, authentication, and response format. GET endpoints are called directly; POST endpoints send an empty body to surface required-field validation. Endpoints that require path parameters are skipped in bulk mode — use the individual test form below.', 'matrix-mlm'); ?>
+                        </p>
+
+                        <!-- Bulk test all endpoints -->
+                        <form method="post" style="margin-bottom: 16px;">
+                            <?php wp_nonce_field('matrix_fintava_system_endpoints_diag', 'matrix_se_nonce'); ?>
+                            <input type="submit" name="matrix_run_system_endpoints" class="button button-secondary"
+                                   value="<?php esc_attr_e('Run All Endpoint Diagnostics', 'matrix-mlm'); ?>">
+                        </form>
+
+                        <?php if ($sys_diag_requested): ?>
+                            <?php
+                            $sys_results = $fintava_for_diag->debug_all_system_endpoints();
+                            $all_endpoints = Matrix_MLM_Fintava::get_system_endpoints();
+
+                            // Group by category
+                            $grouped = [];
+                            foreach ($sys_results as $key => $result) {
+                                $category = $all_endpoints[$key]['category'] ?? 'Other';
+                                $grouped[$category][$key] = $result;
+                            }
+                            ?>
+                            <?php foreach ($grouped as $category => $endpoints): ?>
+                                <details style="margin-top: 10px;">
+                                    <summary style="cursor:pointer;font-weight:600;color:#92400e;font-size:13px;">
+                                        <?php echo esc_html($category); ?>
+                                        <span style="font-weight:normal;color:#78350f;font-size:11px;">
+                                            (<?php echo count($endpoints); ?> endpoint<?php echo count($endpoints) > 1 ? 's' : ''; ?>)
+                                        </span>
+                                    </summary>
+                                    <?php foreach ($endpoints as $ep_key => $result): ?>
+                                        <?php
+                                        $ep_meta   = $all_endpoints[$ep_key] ?? [];
+                                        $ep_label  = $ep_meta['label'] ?? $ep_key;
+                                        $ep_method = $ep_meta['method'] ?? '?';
+                                        $ep_path   = $ep_meta['path'] ?? '';
+                                        $http_code = $result['http_code'] ?? null;
+                                        $skipped   = !empty($result['skipped']);
+                                        $has_error = !empty($result['wp_error']);
+
+                                        // Status indicator
+                                        if ($skipped) {
+                                            $status_color = '#6b7280';
+                                            $status_label = 'SKIPPED';
+                                        } elseif ($has_error) {
+                                            $status_color = '#dc2626';
+                                            $status_label = 'ERROR';
+                                        } elseif ($http_code >= 200 && $http_code < 300) {
+                                            $status_color = '#059669';
+                                            $status_label = $http_code;
+                                        } elseif ($http_code >= 400 && $http_code < 500) {
+                                            $status_color = '#d97706';
+                                            $status_label = $http_code;
+                                        } else {
+                                            $status_color = '#dc2626';
+                                            $status_label = $http_code ?: 'FAIL';
+                                        }
+
+                                        $result_json = wp_json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                                        ?>
+                                        <div style="margin: 8px 0 0 16px; padding: 8px 12px; background: #fff; border: 1px solid #e5e7eb; border-radius: 4px;">
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span style="display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;color:#fff;background:<?php echo esc_attr($status_color); ?>;">
+                                                    <?php echo esc_html($status_label); ?>
+                                                </span>
+                                                <span style="font-size:11px;font-weight:600;color:#374151;">
+                                                    <?php echo esc_html($ep_method); ?>
+                                                </span>
+                                                <code style="font-size:11px;color:#6b7280;"><?php echo esc_html($ep_path); ?></code>
+                                                <span style="font-size:11px;color:#374151;margin-left:auto;">
+                                                    <?php echo esc_html($ep_label); ?>
+                                                </span>
+                                            </div>
+                                            <?php if (!$skipped): ?>
+                                                <details style="margin-top: 6px;">
+                                                    <summary style="cursor:pointer;font-size:11px;color:#6b7280;">
+                                                        <?php esc_html_e('View raw response', 'matrix-mlm'); ?>
+                                                    </summary>
+                                                    <pre style="margin:4px 0 0;padding:8px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:3px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:10px;color:#1f2937;line-height:1.3;max-height:300px;overflow-y:auto;"><?php echo esc_html($result_json); ?></pre>
+                                                </details>
+                                            <?php else: ?>
+                                                <p style="margin:4px 0 0;font-size:11px;color:#6b7280;font-style:italic;">
+                                                    <?php echo esc_html($result['note'] ?? ''); ?>
+                                                </p>
+                                            <?php endif; ?>
+                                        </div>
+                                    <?php endforeach; ?>
+                                </details>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+
+                        <!-- Individual endpoint test with path parameters -->
+                        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px dotted #f59e0b;">
+                            <h4 style="margin: 0 0 8px; color: #92400e; font-size: 12px;">
+                                <?php esc_html_e('Test Individual Endpoint (with parameters)', 'matrix-mlm'); ?>
+                            </h4>
+                            <form method="post">
+                                <?php wp_nonce_field('matrix_fintava_single_endpoint_diag', 'matrix_sep_nonce'); ?>
+                                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:8px;">
+                                    <div>
+                                        <label style="font-size:11px;color:#374151;display:block;margin-bottom:2px;">
+                                            <?php esc_html_e('Endpoint', 'matrix-mlm'); ?>
+                                        </label>
+                                        <select name="matrix_ep_key" style="min-width:280px;" id="matrix-sep-select">
+                                            <?php
+                                            $all_ep = Matrix_MLM_Fintava::get_system_endpoints();
+                                            $prev_cat = '';
+                                            foreach ($all_ep as $key => $ep):
+                                                if ($ep['category'] !== $prev_cat):
+                                                    if ($prev_cat !== '') echo '</optgroup>';
+                                                    $prev_cat = $ep['category'];
+                                                    echo '<optgroup label="' . esc_attr($ep['category']) . '">';
+                                                endif;
+                                                $needs_params = !empty($ep['params']);
+                                                $param_hint = $needs_params ? ' *' : '';
+                                                ?>
+                                                <option value="<?php echo esc_attr($key); ?>"
+                                                    <?php selected($key, $single_ep_key); ?>
+                                                    data-params="<?php echo esc_attr(wp_json_encode($ep['params'])); ?>"
+                                                    data-method="<?php echo esc_attr($ep['method']); ?>">
+                                                    <?php echo esc_html($ep['method'] . ' ' . $ep['path'] . $param_hint . ' — ' . $ep['label']); ?>
+                                                </option>
+                                            <?php endforeach; ?>
+                                            <?php if ($prev_cat !== '') echo '</optgroup>'; ?>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <div id="matrix-sep-params" style="margin-bottom:8px;">
+                                    <?php
+                                    // Render param inputs for selected endpoint if it has params
+                                    if ($single_ep_key && isset($all_ep[$single_ep_key]) && !empty($all_ep[$single_ep_key]['params'])):
+                                        foreach ($all_ep[$single_ep_key]['params'] as $param):
+                                            ?>
+                                            <div style="margin-bottom:4px;">
+                                                <label style="font-size:11px;color:#374151;">
+                                                    <?php echo esc_html($param['label']); ?>
+                                                    <?php if ($param['required']): ?><span style="color:#dc2626;">*</span><?php endif; ?>
+                                                </label>
+                                                <input type="text" name="matrix_ep_params[<?php echo esc_attr($param['name']); ?>]"
+                                                       value="<?php echo esc_attr($single_ep_params[$param['name']] ?? ''); ?>"
+                                                       placeholder="<?php echo esc_attr($param['label']); ?>"
+                                                       style="width:260px;margin-left:8px;">
+                                            </div>
+                                        <?php endforeach;
+                                    endif;
+                                    ?>
+                                </div>
+
+                                <input type="submit" name="matrix_run_single_endpoint" class="button button-secondary"
+                                       value="<?php esc_attr_e('Test Endpoint', 'matrix-mlm'); ?>">
+                            </form>
+
+                            <?php if ($single_ep_requested && $single_ep_key !== ''): ?>
+                                <?php
+                                $single_result = $fintava_for_diag->debug_system_endpoint($single_ep_key, $single_ep_params);
+                                $single_json   = wp_json_encode($single_result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                                $single_meta   = $all_ep[$single_ep_key] ?? [];
+                                ?>
+                                <details open style="margin-top: 8px;">
+                                    <summary style="cursor:pointer;font-weight:600;color:#92400e;font-size:12px;">
+                                        <?php
+                                        printf(
+                                            '%s %s — %s',
+                                            esc_html($single_meta['method'] ?? '?'),
+                                            esc_html($single_meta['path'] ?? $single_ep_key),
+                                            esc_html($single_meta['label'] ?? $single_ep_key)
+                                        );
+                                        ?>
+                                    </summary>
+                                    <pre style="margin:4px 0 0;padding:8px;background:#fff;border:1px solid #fcd34d;border-radius:3px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:10px;color:#1f2937;line-height:1.3;max-height:400px;overflow-y:auto;"><?php echo esc_html($single_json); ?></pre>
+                                </details>
+                            <?php endif; ?>
+                        </div>
+
+                        <!-- Inline JS to show/hide param fields based on endpoint selection -->
+                        <script>
+                        (function() {
+                            var select = document.getElementById('matrix-sep-select');
+                            if (!select) return;
+
+                            function updateParams() {
+                                var opt = select.options[select.selectedIndex];
+                                var params = JSON.parse(opt.getAttribute('data-params') || '[]');
+                                var container = document.getElementById('matrix-sep-params');
+                                container.innerHTML = '';
+                                if (!params.length) return;
+                                params.forEach(function(p) {
+                                    var div = document.createElement('div');
+                                    div.style.marginBottom = '4px';
+                                    var label = document.createElement('label');
+                                    label.style.fontSize = '11px';
+                                    label.style.color = '#374151';
+                                    label.textContent = p.label + (p.required ? ' *' : '');
+                                    var input = document.createElement('input');
+                                    input.type = 'text';
+                                    input.name = 'matrix_ep_params[' + p.name + ']';
+                                    input.placeholder = p.label;
+                                    input.style.width = '260px';
+                                    input.style.marginLeft = '8px';
+                                    div.appendChild(label);
+                                    div.appendChild(input);
+                                    container.appendChild(div);
+                                });
+                            }
+
+                            select.addEventListener('change', updateParams);
+                        })();
+                        </script>
+                    </div>
                 </div>
                 <?php endif; ?>
             </div>

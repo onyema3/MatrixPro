@@ -4120,4 +4120,416 @@ class Matrix_MLM_Fintava {
         }
         return '';
     }
+
+    // =========================================================================
+    // SYSTEM FINTAVA ENDPOINTS — FULL DIAGNOSTIC SUITE
+    // =========================================================================
+
+    /**
+     * Return the complete list of Fintava system endpoints available for
+     * diagnostic testing. Each entry contains:
+     *   - label:    Human-readable name for the admin UI.
+     *   - method:   HTTP verb (GET or POST).
+     *   - path:     API path (may contain {placeholders}).
+     *   - params:   Array of placeholder/body parameter definitions, each with
+     *               'name', 'label', 'required', 'type' (path|body|query).
+     *   - category: Grouping key for the admin UI accordion.
+     *
+     * @return array<string, array>
+     */
+    public static function get_system_endpoints() {
+        return [
+            // --- Customers ---
+            'create_customer' => [
+                'label'    => 'Create Customer',
+                'method'   => 'POST',
+                'path'     => '/create/customer',
+                'params'   => [],
+                'category' => 'Customers',
+            ],
+            'get_customers' => [
+                'label'    => 'Get Customers',
+                'method'   => 'GET',
+                'path'     => '/customers/list',
+                'params'   => [],
+                'category' => 'Customers',
+            ],
+            'get_customer_by_phone' => [
+                'label'    => 'Get Customer by Phone',
+                'method'   => 'GET',
+                'path'     => '/customers/details',
+                'params'   => [],
+                'category' => 'Customers',
+            ],
+            'fetch_customer' => [
+                'label'    => 'Fetch Customer',
+                'method'   => 'GET',
+                'path'     => '/customers/{customerId}',
+                'params'   => [
+                    ['name' => 'customerId', 'label' => 'Customer ID', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Customers',
+            ],
+
+            // --- Transactions ---
+            'get_customer_transaction' => [
+                'label'    => 'Get Customer Transaction',
+                'method'   => 'GET',
+                'path'     => '/txn',
+                'params'   => [],
+                'category' => 'Transactions',
+            ],
+            'get_merchant_transaction' => [
+                'label'    => 'Get Merchant Transaction',
+                'method'   => 'GET',
+                'path'     => '/txn/merchant',
+                'params'   => [],
+                'category' => 'Transactions',
+            ],
+            'get_transaction_by_id' => [
+                'label'    => 'Get Transaction by ID',
+                'method'   => 'GET',
+                'path'     => '/transaction/id/{transactionId}',
+                'params'   => [
+                    ['name' => 'transactionId', 'label' => 'Transaction ID', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Transactions',
+            ],
+            'get_transaction_by_reference' => [
+                'label'    => 'Get Transaction by Reference',
+                'method'   => 'GET',
+                'path'     => '/transaction/reference/{reference}',
+                'params'   => [
+                    ['name' => 'reference', 'label' => 'Reference', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Transactions',
+            ],
+
+            // --- Merchant ---
+            'get_merchant_wallet_balance' => [
+                'label'    => 'Get Merchant Wallet Balance',
+                'method'   => 'GET',
+                'path'     => '/merchant/balance',
+                'params'   => [],
+                'category' => 'Merchant',
+            ],
+            'merchant_transfer' => [
+                'label'    => 'Merchant Transfer',
+                'method'   => 'POST',
+                'path'     => '/bank/credit/merchant',
+                'params'   => [],
+                'category' => 'Merchant',
+            ],
+
+            // --- Virtual Wallet ---
+            'create_virtual_wallet' => [
+                'label'    => 'Create Virtual Wallet',
+                'method'   => 'POST',
+                'path'     => '/virtual-wallet/generate',
+                'params'   => [],
+                'category' => 'Virtual Wallet',
+            ],
+            'get_virtual_wallet_details' => [
+                'label'    => 'Get Virtual Wallet Details',
+                'method'   => 'GET',
+                'path'     => '/virtual-wallet/{id}',
+                'params'   => [
+                    ['name' => 'id', 'label' => 'Wallet ID', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Virtual Wallet',
+            ],
+            'wallet_balance' => [
+                'label'    => 'Wallet Balance',
+                'method'   => 'GET',
+                'path'     => '/customer/wallet/balance/{walletId}',
+                'params'   => [
+                    ['name' => 'walletId', 'label' => 'Wallet ID', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Virtual Wallet',
+            ],
+            'get_wallet_details' => [
+                'label'    => 'Get Wallet Details (Loma Name Enquiry)',
+                'method'   => 'GET',
+                'path'     => '/loma-name/enquiry',
+                'params'   => [],
+                'category' => 'Virtual Wallet',
+            ],
+            'wallet_transfer' => [
+                'label'    => 'Wallet Transfer (Wallet-to-Wallet)',
+                'method'   => 'POST',
+                'path'     => '/transaction/wallet-to-wallet',
+                'params'   => [],
+                'category' => 'Virtual Wallet',
+            ],
+
+            // --- Bank Transfers ---
+            'transfer_to_bank' => [
+                'label'    => 'Transfer to Bank',
+                'method'   => 'POST',
+                'path'     => '/bank/credit',
+                'params'   => [],
+                'category' => 'Bank Transfers',
+            ],
+            'get_bank_list' => [
+                'label'    => 'Get Bank List',
+                'method'   => 'GET',
+                'path'     => '/banks',
+                'params'   => [],
+                'category' => 'Bank Transfers',
+            ],
+            'transfer_between_wallets' => [
+                'label'    => 'Transfer Between Wallets (Single Transfer)',
+                'method'   => 'POST',
+                'path'     => '/single/transfer',
+                'params'   => [],
+                'category' => 'Bank Transfers',
+            ],
+            'get_account_details' => [
+                'label'    => 'Get Account Details (Name Enquiry)',
+                'method'   => 'GET',
+                'path'     => '/name/enquiry',
+                'params'   => [],
+                'category' => 'Bank Transfers',
+            ],
+
+            // --- Cards ---
+            'create_card' => [
+                'label'    => 'Create Card (Physical Request)',
+                'method'   => 'POST',
+                'path'     => '/cards/physical/request',
+                'params'   => [],
+                'category' => 'Cards',
+            ],
+            'card_status' => [
+                'label'    => 'Card Status',
+                'method'   => 'GET',
+                'path'     => '/cards/status',
+                'params'   => [],
+                'category' => 'Cards',
+            ],
+            'activate_card' => [
+                'label'    => 'Activate Card',
+                'method'   => 'POST',
+                'path'     => '/cards/activate',
+                'params'   => [],
+                'category' => 'Cards',
+            ],
+            'link_card' => [
+                'label'    => 'Link Card',
+                'method'   => 'POST',
+                'path'     => '/cards/activate',
+                'params'   => [],
+                'category' => 'Cards',
+            ],
+            'view_card' => [
+                'label'    => 'View Card',
+                'method'   => 'GET',
+                'path'     => '/cards/fetch/{id}',
+                'params'   => [
+                    ['name' => 'id', 'label' => 'Card ID', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Cards',
+            ],
+            'change_card_pin' => [
+                'label'    => 'Change Card PIN',
+                'method'   => 'POST',
+                'path'     => '/cards/update-pin',
+                'params'   => [],
+                'category' => 'Cards',
+            ],
+
+            // --- Billing / VAS ---
+            'buy_airtime' => [
+                'label'    => 'Buy Airtime',
+                'method'   => 'POST',
+                'path'     => '/billing/airtime',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'list_cable_providers' => [
+                'label'    => 'List Cable Service Providers',
+                'method'   => 'GET',
+                'path'     => '/cable-service-name',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'list_cable_subscriptions' => [
+                'label'    => 'List Cable Subscriptions',
+                'method'   => 'GET',
+                'path'     => '/cable-service-name/{network}',
+                'params'   => [
+                    ['name' => 'network', 'label' => 'Network/Provider', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Billing',
+            ],
+            'buy_cable_subscription' => [
+                'label'    => 'Buy Cable Subscription',
+                'method'   => 'POST',
+                'path'     => '/billing/cable-subscription',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'list_data_bundles' => [
+                'label'    => 'List Data Bundles',
+                'method'   => 'GET',
+                'path'     => '/billing/data-bundles/{name}',
+                'params'   => [
+                    ['name' => 'name', 'label' => 'Network Name', 'required' => true, 'type' => 'path'],
+                ],
+                'category' => 'Billing',
+            ],
+            'buy_data_bundle' => [
+                'label'    => 'Buy Data Bundle',
+                'method'   => 'POST',
+                'path'     => '/billing/data-bundle',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'list_discos' => [
+                'label'    => 'List Discos',
+                'method'   => 'GET',
+                'path'     => '/billing/discos',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'preview_meter' => [
+                'label'    => 'Preview Meter Details',
+                'method'   => 'POST',
+                'path'     => '/billing/preview-meter',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+            'buy_electricity' => [
+                'label'    => 'Buy Electricity',
+                'method'   => 'POST',
+                'path'     => '/billing/electricity',
+                'params'   => [],
+                'category' => 'Billing',
+            ],
+        ];
+    }
+
+    /**
+     * Run a diagnostic probe against a single system endpoint. Accepts the
+     * endpoint key from get_system_endpoints() and an optional array of
+     * path-parameter values. Returns the raw debug envelope from
+     * debug_raw_request().
+     *
+     * For GET endpoints this fires the request immediately (read-only,
+     * safe to probe). For POST endpoints with no body it sends an empty
+     * JSON object `{}` — Fintava typically returns a validation error
+     * listing the required fields, which itself is useful diagnostic
+     * information ("is the endpoint reachable, and what does it expect?").
+     *
+     * @param string $endpoint_key Key from get_system_endpoints().
+     * @param array  $path_params  Associative array of path placeholder values.
+     * @return array Diagnostic payload (never a WP_Error).
+     */
+    public function debug_system_endpoint($endpoint_key, $path_params = []) {
+        if (empty($this->secret_key)) {
+            return ['note' => 'no secret_key on the gateway instance', 'has_key' => false];
+        }
+
+        $endpoints = self::get_system_endpoints();
+        if (!isset($endpoints[$endpoint_key])) {
+            return ['note' => 'unknown endpoint key: ' . $endpoint_key];
+        }
+
+        $ep   = $endpoints[$endpoint_key];
+        $path = $ep['path'];
+
+        // Replace path placeholders with provided values.
+        if (!empty($ep['params'])) {
+            foreach ($ep['params'] as $param) {
+                if ($param['type'] === 'path') {
+                    $value = $path_params[$param['name']] ?? '';
+                    if ($value === '' && $param['required']) {
+                        return [
+                            'note'     => sprintf('missing required path parameter: %s', $param['name']),
+                            'endpoint' => $endpoint_key,
+                        ];
+                    }
+                    $path = str_replace('{' . $param['name'] . '}', rawurlencode($value), $path);
+                }
+            }
+        }
+
+        $url    = $this->base_url . $path;
+        $method = strtoupper($ep['method']);
+
+        if ($method === 'GET') {
+            return $this->debug_raw_request('GET', $url, true);
+        }
+
+        // POST endpoints: send empty body to probe reachability and
+        // discover required fields from the validation response.
+        $headers = [
+            'Authorization' => 'Bearer ' . $this->secret_key,
+            'Accept'        => 'application/json',
+            'Content-Type'  => 'application/json',
+            'Merchant-Id'   => $this->merchant_id,
+        ];
+        $args = [
+            'method'  => 'POST',
+            'headers' => $headers,
+            'timeout' => 30,
+            'body'    => '{}',
+        ];
+
+        $response = wp_remote_request($url, $args);
+        if (is_wp_error($response)) {
+            return [
+                'url'      => $url,
+                'method'   => $method,
+                'wp_error' => $response->get_error_message(),
+            ];
+        }
+
+        $raw = wp_remote_retrieve_body($response);
+        return [
+            'url'          => $url,
+            'method'       => $method,
+            'http_code'    => wp_remote_retrieve_response_code($response),
+            'body_raw'     => is_string($raw) && strlen($raw) > 4000 ? substr($raw, 0, 4000) . '... [truncated]' : $raw,
+            'body_decoded' => json_decode($raw, true),
+        ];
+    }
+
+    /**
+     * Run diagnostic probes against ALL system endpoints that don't require
+     * path parameters. Returns an associative array keyed by endpoint key.
+     *
+     * @return array<string, array>
+     */
+    public function debug_all_system_endpoints() {
+        $endpoints = self::get_system_endpoints();
+        $results   = [];
+
+        foreach ($endpoints as $key => $ep) {
+            // Skip endpoints that require path params — they need user input.
+            $requires_path_param = false;
+            if (!empty($ep['params'])) {
+                foreach ($ep['params'] as $param) {
+                    if ($param['type'] === 'path' && $param['required']) {
+                        $requires_path_param = true;
+                        break;
+                    }
+                }
+            }
+            if ($requires_path_param) {
+                $results[$key] = [
+                    'skipped' => true,
+                    'note'    => sprintf('requires path parameter(s) — use the individual test form'),
+                    'label'   => $ep['label'],
+                    'path'    => $ep['path'],
+                ];
+                continue;
+            }
+
+            $results[$key] = $this->debug_system_endpoint($key);
+            $results[$key]['label'] = $ep['label'];
+        }
+
+        return $results;
+    }
 }
