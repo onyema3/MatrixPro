@@ -11,7 +11,7 @@
  * - Webhook Secret (optional but recommended)
  * - Active toggle
  *
- * The API base URL defaults to https://live.fintavapay.com/api/v1 and can
+ * The API base URL defaults to https://live.fintavapay.com/api/dev and can
  * be overridden by defining MATRIX_FINTAVA_API_BASE_URL in wp-config.php if
  * Fintava ever changes their endpoint.
  *
@@ -38,7 +38,7 @@ class Matrix_MLM_Fintava {
      * `dev`) which the admin sets on the Gateways page. Both URLs can be
      * overridden in one shot via the MATRIX_FINTAVA_API_BASE_URL constant.
      */
-    const LIVE_BASE_URL = 'https://live.fintavapay.com/api/v1';
+    const LIVE_BASE_URL = 'https://live.fintavapay.com/api/dev';
     const DEV_BASE_URL  = 'https://dev.fintavapay.com/api/dev';
 
     /**
@@ -52,7 +52,7 @@ class Matrix_MLM_Fintava {
      * literal rather than a self::LIVE_BASE_URL reference, since older PHP
      * versions reject constant-to-constant references at parse time.
      */
-    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/v1';
+    const DEFAULT_BASE_URL = 'https://live.fintavapay.com/api/dev';
 
     /**
      * Default Merchant ID for Fintava Pay.
