@@ -171,21 +171,60 @@ class Matrix_MLM_User_Bank_Payout {
         </style>
 
         <script>
-        // Defer to DOM-ready so the matrixMLM global (localized against the
-        // footer-loaded matrix-mlm-public.js handle) is guaranteed to exist
-        // before the bank-loading AJAX fires. The original IIFE
-        // `(function($){...})(jQuery)` ran synchronously while the body was
-        // still being parsed — at that point matrix-mlm-public.js had not
-        // been printed yet, so `matrixMLM` was undefined and reading
-        // `matrixMLM.ajaxUrl` threw a ReferenceError that aborted the IIFE
-        // before $.ajax() could be invoked. The result was a dropdown stuck
-        // on "-- Loading banks..." forever, with no `error:` handler firing
-        // because the throw preceded the ajax call. The other handlers in
-        // this script (resolve_account, initiate_transfer) are bound to user
-        // input and only fire after the footer has rendered, so they were
-        // never affected and the bug appeared isolated to the bank dropdown.
-        jQuery(function($) {
-            'use strict';
+        // Wait for jQuery to load before binding the DOM-ready handler.
+        //
+        // Calling `jQuery(function($){...})` directly here used to be the
+        // fix for an even older "matrixMLM is undefined" bug, but it has
+        // its own failure mode: this inline <script> is printed in the
+        // body while the page is still parsing, so it can run BEFORE the
+        // <script src=".../jquery.js"> tag has executed when a theme or
+        // performance plugin moves jQuery to the footer (Astra,
+        // GeneratePress, OceanWP, WP Rocket, SG Optimizer, FlyingPress,
+        // Perfmatters and most of the popular optimizers all do this).
+        // In that window, `jQuery` is undefined → calling `jQuery(...)`
+        // throws ReferenceError → the script aborts before any of the
+        // handlers register → the bank <select> keeps its initial
+        // "-- Loading banks..." option forever, with no `error:` branch
+        // and no console output to point at the cause.
+        //
+        // Polling window.jQuery up to ~10s handles both the head-loaded
+        // case (the very first tick passes the typeof check and the
+        // DOM-ready callback fires immediately) and the footer-loaded
+        // case (a few ms after wp_footer prints, the footer <script>
+        // tags execute, jQuery becomes defined, and the next poll tick
+        // fires the callback). If jQuery never arrives — e.g. another
+        // plugin dequeued it entirely — we surface that explicitly in
+        // the dropdown so the operator gets a debuggable failure mode
+        // instead of an indefinitely-spinning select.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    // jQuery(cb) calls cb($) once DOM-ready fires (or
+                    // immediately if DOM is already ready), passing
+                    // jQuery as the first argument — same contract the
+                    // old `jQuery(function($){})` wrapper relied on, so
+                    // the inner code below doesn't need to change.
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    var sel = document.getElementById('fintava-bank-select');
+                    if (sel) {
+                        sel.innerHTML = '<option value=""><?php echo esc_js(__("jQuery not loaded — please refresh the page", "matrix-mlm")); ?></option>';
+                    }
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; bank dropdown init aborted.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
+                'use strict';
 
             const currency = '<?php echo esc_js(get_option("matrix_mlm_currency_symbol", "₦")); ?>';
             const chargeType = '<?php echo esc_js($charge_type); ?>';
@@ -579,7 +618,8 @@ class Matrix_MLM_User_Bank_Payout {
                 });
             });
 
-        });
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
