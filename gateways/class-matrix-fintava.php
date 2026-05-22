@@ -993,6 +993,174 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * POST /single/transfer — internal wallet-to-wallet transfer between
+     * Fintava-hosted wallets. Used by ajax_transfer_matrix_to_virtual()
+     * to move money from the merchant's Fintava balance into a user's
+     * own Fintava virtual wallet without going through the bank-rails
+     * validator.
+     *
+     * Why this is distinct from /bank/credit/merchant:
+     *
+     *   - /bank/credit/merchant treats the destination as a generic
+     *     external bank account and validates a CBN `sortCode` on the
+     *     wire-format. When the destination is a Fintava-hosted virtual
+     *     NUBAN, that validation rejects the request whenever the local
+     *     row's `bank_code` column is missing or stale — even though
+     *     Fintava could route the credit purely internally. That mismatch
+     *     is the long-standing "Your Virtual wallet (Fintava) is missing
+     *     a bank code we couldn't auto-resolve" surface in the
+     *     matrix→virtual transfer flow.
+     *
+     *   - /single/transfer is Fintava's internal-routing endpoint. It
+     *     identifies the source by merchant ID and the destination by
+     *     NUBAN (and optionally walletId), with no sortCode required.
+     *     The bank-code self-heal chain becomes a non-issue.
+     *
+     * Payload shape (best-effort against Fintava's docs; the validator
+     * response feeds straight back into the WP_Error so the operator
+     * can iterate if a tier expects different field names):
+     *
+     *   - sourceId                   Merchant UUID. Defaults to
+     *                                $this->merchant_id; override via
+     *                                $transfer_data['source_id'] for
+     *                                multi-merchant setups.
+     *   - destinationAccountNumber   The destination wallet's NUBAN.
+     *   - destinationWalletId        Sent only when the caller's row
+     *                                has one — some tiers prefer it
+     *                                over the NUBAN for routing speed
+     *                                and ignore it otherwise, so it's
+     *                                safe to include unconditionally.
+     *   - amount                     Int when whole-naira, float when
+     *                                kobo. /bank/credit was documented
+     *                                crashing on decimal floats; we
+     *                                apply the same coercion here on
+     *                                the assumption /single/transfer
+     *                                shares the validator stack.
+     *   - narration / reference / currency  Standard.
+     *
+     * Retry semantics mirror bank_credit(): one retry on HTTP 5xx or a
+     * transport failure (Fintava's transient "An unexpected error
+     * occurred"); 4xx validator failures and duplicate-reference 409s
+     * surface immediately so we don't double-spend.
+     *
+     * @param array $transfer_data {
+     *     @type float|int $amount                     Required.
+     *     @type string    $destination_account_number Required.
+     *     @type string    $destination_wallet_id      Optional.
+     *     @type string    $source_id                  Optional. Defaults
+     *                                                 to $this->merchant_id.
+     *     @type string    $narration                  Optional.
+     *     @type string    $reference                  Optional. Auto-
+     *                                                 generated if missing.
+     *     @type string    $currency                   Optional. NGN default.
+     * }
+     * @return array|WP_Error Same success / error shape as bank_credit().
+     */
+    public function internal_wallet_transfer($transfer_data) {
+        $required_fields = ['amount', 'destination_account_number'];
+        foreach ($required_fields as $field) {
+            if (empty($transfer_data[$field])) {
+                return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
+            }
+        }
+
+        // Source defaults to the configured merchant ID. Keeping the
+        // override path open lets a future multi-merchant setup pass
+        // a different source without changing the call signature.
+        $source_id = !empty($transfer_data['source_id'])
+            ? sanitize_text_field($transfer_data['source_id'])
+            : $this->merchant_id;
+        if (empty($source_id)) {
+            return new WP_Error(
+                'missing_source_id',
+                __('Cannot dispatch internal transfer: no merchant ID is configured. Set MATRIX_FINTAVA_MERCHANT_ID in wp-config.php or fill it in on the Gateways page.', 'matrix-mlm')
+            );
+        }
+
+        // Same int-when-whole / float-when-kobo coercion as bank_credit().
+        // /bank/credit was observed crashing (HTTP 500) on decimal floats
+        // for whole-naira amounts; assume /single/transfer shares the
+        // validator stack until we observe otherwise.
+        $raw_amount  = floatval($transfer_data['amount']);
+        $send_amount = (floor($raw_amount) == $raw_amount) ? intval($raw_amount) : $raw_amount;
+
+        $payload = [
+            'sourceId'                 => $source_id,
+            'destinationAccountNumber' => sanitize_text_field($transfer_data['destination_account_number']),
+            'amount'                   => $send_amount,
+            'currency'                 => $transfer_data['currency'] ?? 'NGN',
+            'reference'                => $transfer_data['reference'] ?? $this->generate_reference(),
+        ];
+
+        // Belt-and-suspenders: send destinationWalletId when the local
+        // row has one. Fintava ignores it on tiers that route by NUBAN,
+        // so including it unconditionally is safe and gives faster-tier
+        // routing without conditional code.
+        if (!empty($transfer_data['destination_wallet_id'])) {
+            $payload['destinationWalletId'] = sanitize_text_field($transfer_data['destination_wallet_id']);
+        }
+        if (!empty($transfer_data['narration'])) {
+            $payload['narration'] = sanitize_text_field($transfer_data['narration']);
+        }
+
+        // Retry once on 5xx or transport failure; everything else
+        // (4xx validator rejection, application-level "no" responses,
+        // duplicate-reference 409s) surfaces immediately so we don't
+        // double-spend on a request that may already have settled.
+        $max_attempts = 2;
+        $last_error   = null;
+
+        for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+            $response = $this->make_request('POST', '/single/transfer', $payload);
+
+            if (is_wp_error($response)) {
+                $error_msg    = $response->get_error_message();
+                $is_5xx       = preg_match('/API Error \(HTTP 5\d{2}\)/', $error_msg);
+                $is_transport = in_array($response->get_error_code(), ['http_request_failed'], true);
+
+                if ($attempt < $max_attempts && ($is_5xx || $is_transport)) {
+                    $last_error = $response;
+                    sleep(2);
+                    continue;
+                }
+                return $response;
+            }
+
+            if (self::is_api_success($response)) {
+                return [
+                    'success'     => true,
+                    'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
+                    'reference'   => $response['data']['reference'] ?? $payload['reference'],
+                    'status'      => $response['data']['status'] ?? 'completed',
+                    'message'     => self::normalize_api_message(
+                        $response['message'] ?? null,
+                        __('Internal transfer completed', 'matrix-mlm')
+                    ),
+                ];
+            }
+
+            // Application-level "no" — surface the upstream message
+            // directly. Don't retry: a 200 + status:false isn't a
+            // transient.
+            return new WP_Error(
+                'fintava_internal_transfer_error',
+                self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Internal transfer failed', 'matrix-mlm')
+                )
+            );
+        }
+
+        if ($last_error) {
+            return $last_error;
+        }
+        return new WP_Error(
+            'fintava_internal_transfer_error',
+            __('Internal transfer failed after retry', 'matrix-mlm')
+        );
+    }
+
+    /**
      * POST /bank/credit — bank payout from user's Fintava virtual wallet to
      * an external bank account.
      *
@@ -1660,25 +1828,39 @@ class Matrix_MLM_Fintava {
      *   1. Debit the user's Matrix (internal) wallet by amount + charge.
      *      Charge is read from the same admin-configured options
      *      (matrix_mlm_fintava_charge_*) the on-page form previews.
-     *   2. Move REAL CASH on Fintava's side from the merchant wallet
-     *      to the user's own virtual wallet by calling
-     *      POST /bank/credit/merchant with destination =
-     *      (user.account_number, user.bank_code). The merchant balance
-     *      is what funds the credit; the user's Matrix debit is the
-     *      bookkeeping side that "pays" the merchant for that movement.
+     *   2. Move REAL CASH on Fintava's side from the merchant Fintava
+     *      balance to the user's own virtual wallet by calling
+     *      POST /single/transfer (internal_wallet_transfer()) with
+     *      sourceId = merchant ID and destinationAccountNumber =
+     *      the user's NUBAN. The merchant balance is what funds the
+     *      credit; the user's Matrix debit is the bookkeeping side
+     *      that "pays" the merchant for that movement.
      *   3. If Fintava rejects the credit, refund the Matrix wallet so
      *      the user is made whole — money never half-moved.
      *
-     * Why /bank/credit/merchant and not /bank/credit:
-     *   - /bank/credit debits the user's own Fintava virtual wallet
-     *     to credit some external bank. Wrong direction here: we want
-     *     to credit the user's wallet, not debit it.
-     *   - /bank/credit/merchant debits the merchant wallet to credit
-     *     a bank account; when the destination account is the user's
-     *     own Fintava virtual NUBAN, Fintava routes the credit
-     *     internally and the user's virtual wallet balance increases.
-     *     This is the "merchant funds a user's wallet" path that the
-     *     existing merchant_bank_credit() docstring already calls out.
+     * Why /single/transfer and not /bank/credit/merchant:
+     *   - /bank/credit/merchant validates a CBN sortCode on the
+     *     wire-format. When the destination is a Fintava-hosted
+     *     virtual NUBAN, that validator rejects the request whenever
+     *     the local row's bank_code column is missing or stale, even
+     *     though Fintava could route the credit purely internally.
+     *     This was the long-standing source of the "Your Virtual
+     *     wallet (Fintava) is missing a bank code we couldn't
+     *     auto-resolve" surface — the row's bank_code couldn't be
+     *     resolved by the self-heal chain on tiers where the
+     *     /wallet/details and /customers endpoints don't echo a
+     *     partner bank back.
+     *   - /single/transfer is Fintava's internal-routing endpoint.
+     *     It identifies source by merchant ID and destination by
+     *     NUBAN (and optionally walletId), with no sortCode required.
+     *     Switching to it removes the bank-code requirement entirely
+     *     for this flow without sacrificing safety: the destination
+     *     is still validated by Fintava against the merchant's own
+     *     wallet directory.
+     *   - /bank/credit (the user-funded path used by
+     *     ajax_initiate_transfer) stays on the bank-rails endpoint
+     *     because external bank payouts genuinely need sortCode
+     *     routing.
      *
      * Why the Matrix wallet debit is committed before calling Fintava:
      *   - We want a durable "pending" record on disk regardless of
@@ -1722,158 +1904,21 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Your Virtual wallet is missing an account number. Please contact support.', 'matrix-mlm')]);
         }
 
-        // bank_code is schema-NULLABLE and is regularly NULL on rows
-        // generated before bank_code persistence was reliable, or when
-        // Fintava's /virtual-wallet/generate response didn't echo it
-        // back. We now self-heal in two steps before deciding whether
-        // to fail: (1) call /wallet/details and persist whatever
-        // Fintava returns, (2) if Fintava still doesn't tell us, map
-        // the wallet's existing bank_name (e.g., "Globus Bank") to a
-        // CBN sortCode via the static banks fallback — Fintava issues
-        // virtual NUBANs through Nigerian partner banks whose sort
-        // codes are in our existing static list. This is the FIRST
-        // flow that needs bank_code on the wallet row (bank-payout
-        // takes it from the form dropdown, not the wallet row), so
-        // older installs reasonably have NULLs here that no prior
-        // flow surfaced.
-        if (empty($user_wallet->bank_code)) {
-            // Capture per-step outcomes for the diagnostic log emitted by
-            // the final guard below. The log line tells support _which_
-            // self-heal step regressed when bank_code can't be resolved —
-            // without it the only signal is the user-facing error string,
-            // which doesn't tell us whether /wallet/details returned an
-            // unexpected shape, the customer endpoints are gated off, or
-            // the row's bank_name simply isn't in get_static_banks_fallback().
-            $diag = [
-                'user_id'           => (int) $user_id,
-                'wallet_row_id'     => (int) $user_wallet->id,
-                'account_number'    => (string) $user_wallet->account_number,
-                'wallet_id_present' => !empty($user_wallet->wallet_id),
-                'customer_id_present' => !empty($user_wallet->customer_id),
-                'bank_name_initial' => (string) $user_wallet->bank_name,
-                'bank_code_initial' => (string) $user_wallet->bank_code,
-            ];
-
-            // Step 1: GET /wallet/details?accountNumber=... — also
-            // backfills wallet_id, customer_id, and (importantly for
-            // older rows) bank_name when Fintava returns the partner
-            // bank name verbatim. We re-read the wallet row
-            // unconditionally because resolve_wallet_id_from_customer()
-            // persists metadata opportunistically — even on a
-            // wallet_id miss it may have updated bank_name from the
-            // schema-default "Fintava" placeholder to the real
-            // partner bank, which is what Step 2 below needs.
-            $step1_result = $this->resolve_wallet_id_from_customer($user_wallet);
-            $user_wallet  = $this->get_user_wallet($user_id);
-            $diag['step1_wallet_details'] = is_wp_error($step1_result)
-                ? 'err:' . $step1_result->get_error_code()
-                : 'ok';
-            $diag['step1_bank_name'] = (string) $user_wallet->bank_name;
-            $diag['step1_bank_code'] = (string) $user_wallet->bank_code;
-
-            // Step 1b: customer-endpoint enrichment. /wallet/details
-            // is unavailable on some Fintava live tiers (the
-            // negative-cache flag in get_virtual_wallet_details() is
-            // already documented), and even when reachable a few
-            // tiers don't include the partner-bank field. The
-            // customer endpoints (/customers/{id}, /customers/list,
-            // /customers/details) all return the wallet object with
-            // the partner bank populated, so they're the most
-            // reliable source — same chain the bank-payout flow's
-            // resolve_customer_id() already exercises. Only kicks in
-            // when bank_name is still the "Fintava" placeholder OR
-            // bank_code is still missing after Step 1; idempotent
-            // when both are already populated.
-            $diag['step1b_enrich'] = 'skipped_already_resolved';
-            if (empty($user_wallet->bank_code)
-                || empty($user_wallet->bank_name)
-                || strcasecmp((string) $user_wallet->bank_name, 'Fintava') === 0) {
-                $enrich_changed = $this->enrich_partner_bank_metadata($user_wallet);
-                $user_wallet    = $this->get_user_wallet($user_id);
-                $diag['step1b_enrich']    = $enrich_changed ? 'persisted' : 'noop';
-                $diag['step1b_bank_name'] = (string) $user_wallet->bank_name;
-                $diag['step1b_bank_code'] = (string) $user_wallet->bank_code;
-            }
-
-            // Step 2: derive bank_code from bank_name. Fintava's
-            // /wallet/details on some tiers returns `bank: "Globus
-            // Bank"` but no `bankCode`/`bank_code` field. Looking up
-            // the bank name in get_static_banks_fallback() gives us
-            // the CBN sortCode — that list is the authoritative
-            // 3-digit CBN registry the rest of the gateway already
-            // uses for sortCode validation, so a name-match here is
-            // safe to persist. Persist on success so subsequent
-            // transfers skip the derivation entirely.
-            $diag['step2_derive'] = 'skipped_already_resolved';
-            if (empty($user_wallet->bank_code) && !empty($user_wallet->bank_name)) {
-                $bank_name_for_lookup = (string) $user_wallet->bank_name;
-                $diag['step2_input']  = $bank_name_for_lookup;
-                if (strcasecmp($bank_name_for_lookup, 'Fintava') === 0) {
-                    // The placeholder is intentionally never a valid
-                    // sortCode-lookup key (Fintava is a fintech, not a
-                    // CBN bank). Surface that explicitly in the log so
-                    // support knows the chain stalled because Steps 1
-                    // and 1b never resolved a real partner bank.
-                    $diag['step2_derive']    = 'skipped_placeholder_name';
-                    $diag['step2_candidate'] = '';
-                } else {
-                    $candidate = $this->derive_bank_code_from_name($bank_name_for_lookup);
-                    $diag['step2_candidate'] = (string) $candidate;
-                    if ($candidate !== '') {
-                        global $wpdb;
-                        $wpdb->update(
-                            $wpdb->prefix . 'matrix_fintava_wallets',
-                            ['bank_code' => $candidate, 'updated_at' => current_time('mysql')],
-                            ['id' => $user_wallet->id],
-                            ['%s', '%s'],
-                            ['%d']
-                        );
-                        $user_wallet = $this->get_user_wallet($user_id);
-                        $diag['step2_derive'] = 'persisted';
-                    } else {
-                        $diag['step2_derive'] = 'no_static_match';
-                    }
-                }
-            } elseif (empty($user_wallet->bank_code)) {
-                // bank_code still empty AND bank_name empty — nothing to
-                // look up. Distinct from "no_static_match" because the
-                // operator's recovery is different (set bank_name first).
-                $diag['step2_derive'] = 'skipped_empty_name';
-            }
-
-            $diag['bank_name_final'] = (string) $user_wallet->bank_name;
-            $diag['bank_code_final'] = (string) $user_wallet->bank_code;
-        }
-
-        // Final guard: Fintava's /bank/credit/merchant validator
-        // requires `sortCode` (it must be coerceable to a number on
-        // the upstream side), so we cannot proceed without bank_code
-        // on hand. If both API resolution and bank-name derivation
-        // failed, surface a diagnostic the operator can act on:
-        // contact support, OR have an admin populate bank_code on the
-        // wallet row from Fintava's dashboard. The bank_name we
-        // already display is included so the support touchpoint can
-        // jump straight to "the wallet is on $bank_name, look up its
-        // sortCode" without round-tripping the user.
-        if (empty($user_wallet->bank_code)) {
-            // Structured diagnostic. Single grep-friendly prefix
-            // ('matrix-mlm[fintava] missing_bank_code_after_self_heal')
-            // and the rest is JSON so it survives unchanged through
-            // error_log shipping pipelines. Emitted only on the
-            // failure path; the success path stays silent. Guarded
-            // by isset() because the self-heal block is skipped
-            // entirely when bank_code was already populated at entry
-            // (and we should never reach this point in that case).
-            if (isset($diag)) {
-                error_log('matrix-mlm[fintava] missing_bank_code_after_self_heal ' . wp_json_encode($diag));
-            }
-            wp_send_json_error([
-                'message' => sprintf(
-                    /* translators: %s: bank name on the wallet row, e.g., "Globus Bank" */
-                    __('Your Virtual wallet (%s) is missing a bank code we couldn\'t auto-resolve. Please contact support so we can populate it from your Fintava dashboard.', 'matrix-mlm'),
-                    $user_wallet->bank_name ?: __('unknown bank', 'matrix-mlm')
-                ),
-            ]);
+        // bank_code is NOT required on this path anymore: /single/transfer
+        // (the internal-routing endpoint we use below) identifies the
+        // destination by NUBAN — and optionally walletId — without a
+        // CBN sortCode. The schema-default placeholder bank_name=Fintava
+        // and any NULL bank_code values become non-issues.
+        //
+        // We still opportunistically resolve wallet_id when it's missing,
+        // because (a) Fintava routes faster on tiers that prefer
+        // walletId over accountNumber and (b) the same wallet_id is
+        // useful elsewhere (balance refresh, /customers/{id} fallback).
+        // This call is non-fatal: on a miss we proceed with NUBAN-only
+        // routing and let Fintava's response be the source of truth.
+        if (empty($user_wallet->wallet_id)) {
+            $this->resolve_wallet_id_from_customer($user_wallet);
+            $user_wallet = $this->get_user_wallet($user_id);
         }
 
         $amount = floatval($_POST['amount'] ?? 0);
@@ -1984,20 +2029,22 @@ class Matrix_MLM_Fintava {
 
         $wpdb->query('COMMIT');
 
-        // Step 2: move real cash on Fintava's side. /bank/credit/merchant
-        // debits the merchant Fintava balance and credits the destination
-        // account; here the destination is the user's own virtual NUBAN,
-        // so Fintava routes the credit internally and the user's
-        // virtual-wallet balance goes up.
-        $result = $this->merchant_bank_credit([
-            'amount'         => $amount,
-            'account_number' => $user_wallet->account_number,
-            'bank_code'      => $user_wallet->bank_code,
-            'bank_name'      => $user_wallet->bank_name,
-            'account_name'   => $user_wallet->account_name,
-            'narration'      => $narration,
-            'reference'      => $reference,
-            'currency'       => $user_wallet->currency ?: 'NGN',
+        // Step 2: move real cash on Fintava's side via /single/transfer
+        // — the internal wallet-to-wallet endpoint. Source is the
+        // configured merchant ID (auto-supplied by
+        // internal_wallet_transfer); destination is the user's own
+        // virtual NUBAN, with destinationWalletId sent alongside when
+        // we have it for faster routing on tiers that prefer it.
+        // Routing is purely internal — no CBN sortCode required, no
+        // partner-bank lookup, no /bank/credit/merchant rejection on
+        // missing bank_code.
+        $result = $this->internal_wallet_transfer([
+            'amount'                     => $amount,
+            'destination_account_number' => $user_wallet->account_number,
+            'destination_wallet_id'      => $user_wallet->wallet_id ?: '',
+            'narration'                  => $narration,
+            'reference'                  => $reference,
+            'currency'                   => $user_wallet->currency ?: 'NGN',
         ]);
 
         if (is_wp_error($result)) {
