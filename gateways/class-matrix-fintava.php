@@ -2263,9 +2263,18 @@ class Matrix_MLM_Fintava {
      * Pull available_balance / ledger_balance / currency out of any of the
      * field-name variations Fintava uses across endpoints (snake_case vs
      * camelCase, balance vs available_balance vs wallet_balance vs
-     * current_balance, etc.). Returns null when neither an available nor a
-     * ledger balance can be located so the caller can fall through to the
-     * next strategy.
+     * current_balance, etc.).
+     *
+     * Recursively descends into nested arrays — Fintava's /merchant/balance
+     * has been observed returning `data.balance` as either a scalar amount
+     * or an object `{available_balance, ledger_balance}`, and the latter
+     * shape used to crash here: PHP's floatval() on an array returns 1.0
+     * (because non-empty arrays cast to true → 1), which is exactly the
+     * "₦1.00 instead of the real balance" symptom this method fixes.
+     *
+     * Returns null when neither an available nor a ledger balance can be
+     * located anywhere in the payload, so the caller can fall through to
+     * the next strategy.
      *
      * @param array $payload Decoded wallet/balance object.
      * @return array{available_balance: float, ledger_balance: float, currency: string}|null
@@ -2275,31 +2284,91 @@ class Matrix_MLM_Fintava {
             return null;
         }
 
-        $available = null;
-        foreach (['available_balance', 'availableBalance', 'wallet_balance', 'walletBalance', 'balance', 'current_balance', 'currentBalance'] as $key) {
-            if (isset($payload[$key]) && $payload[$key] !== '') {
-                $available = floatval($payload[$key]);
-                break;
-            }
-        }
+        $available_keys = ['available_balance', 'availableBalance', 'wallet_balance', 'walletBalance', 'balance', 'current_balance', 'currentBalance'];
+        $ledger_keys    = ['ledger_balance', 'ledgerBalance', 'book_balance', 'bookBalance'];
 
-        $ledger = null;
-        foreach (['ledger_balance', 'ledgerBalance', 'book_balance', 'bookBalance'] as $key) {
-            if (isset($payload[$key]) && $payload[$key] !== '') {
-                $ledger = floatval($payload[$key]);
-                break;
-            }
-        }
+        $available = self::find_scalar_numeric($payload, $available_keys);
+        $ledger    = self::find_scalar_numeric($payload, $ledger_keys);
 
         if ($available === null && $ledger === null) {
             return null;
         }
 
+        // Currency hunts the same payload for any 'currency' field, scalar
+        // string only. Falls back to NGN to stay backwards-compatible with
+        // existing callers (the merchant is Nigeria-only today).
+        $currency = self::find_scalar_string($payload, ['currency', 'currencyCode', 'currency_code']) ?? 'NGN';
+
         return [
             'available_balance' => $available !== null ? $available : $ledger,
             'ledger_balance'    => $ledger !== null ? $ledger : $available,
-            'currency'          => $payload['currency'] ?? 'NGN',
+            'currency'          => $currency,
         ];
+    }
+
+    /**
+     * Recursively search a decoded JSON object for the first scalar numeric
+     * value at any of the given keys. Skips non-scalar (array/object) values
+     * at matching keys so that a `balance: { available_balance: 1000 }`
+     * shape doesn't return floatval([...]) === 1.0 — that bug is exactly
+     * what surfaced as "Merchant Wallet Balance ₦1.00" on production.
+     *
+     * Search order at every level:
+     *   1. Try every requested key at this level (scalar numeric only).
+     *   2. If nothing matches, recurse into each array-valued child.
+     *
+     * @param array    $payload Object to search.
+     * @param string[] $keys    Field names to try, in priority order.
+     * @return float|null
+     */
+    private static function find_scalar_numeric(array $payload, array $keys) {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $payload)) {
+                $value = $payload[$key];
+                if (is_scalar($value) && $value !== '' && is_numeric($value)) {
+                    return (float) $value;
+                }
+            }
+        }
+        foreach ($payload as $value) {
+            if (is_array($value)) {
+                $found = self::find_scalar_numeric($value, $keys);
+                if ($found !== null) {
+                    return $found;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Companion to find_scalar_numeric() that returns the first non-empty
+     * scalar STRING value at any of the given keys. Used for the currency
+     * field (which is always a string) so it follows the same recursive
+     * search semantics as the numeric fields.
+     *
+     * @param array    $payload Object to search.
+     * @param string[] $keys    Field names to try, in priority order.
+     * @return string|null
+     */
+    private static function find_scalar_string(array $payload, array $keys) {
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $payload)) {
+                $value = $payload[$key];
+                if (is_scalar($value) && $value !== '') {
+                    return (string) $value;
+                }
+            }
+        }
+        foreach ($payload as $value) {
+            if (is_array($value)) {
+                $found = self::find_scalar_string($value, $keys);
+                if ($found !== null) {
+                    return $found;
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -3064,8 +3133,58 @@ class Matrix_MLM_Fintava {
         }
 
         $url = $this->base_url . '/customer/wallet/balance/' . rawurlencode($wallet_id);
+        return $this->debug_raw_request('GET', $url);
+    }
+
+    /**
+     * TEMPORARY admin diagnostic — fetch GET /merchant/balance and return the
+     * raw, unparsed Fintava response. Bypasses get_merchant_balance() and
+     * normalize_balance_payload() so an operator can see exactly which
+     * fields the API exposes for the merchant wallet on this tier.
+     *
+     * Used by the Gateways admin page when the displayed balance disagrees
+     * with the real balance shown in the Fintava dashboard. Output shape
+     * mirrors debug_balance_raw().
+     *
+     * @return array Diagnostic payload (never a WP_Error).
+     */
+    public function debug_merchant_balance_raw() {
+        if (empty($this->secret_key)) {
+            return ['note' => 'no secret_key on the gateway instance', 'has_key' => false];
+        }
+        return $this->debug_raw_request('GET', $this->base_url . '/merchant/balance');
+    }
+
+    /**
+     * TEMPORARY admin diagnostic — fetch GET /banks (against the dev host
+     * that actually serves it) and return the raw response. Lets an
+     * operator confirm whether the bank list endpoint is reachable from
+     * this WordPress install at all, and what envelope shape Fintava is
+     * returning today.
+     *
+     * Output shape mirrors debug_balance_raw().
+     *
+     * @return array Diagnostic payload (never a WP_Error).
+     */
+    public function debug_banks_raw() {
+        if (empty($this->secret_key)) {
+            return ['note' => 'no secret_key on the gateway instance', 'has_key' => false];
+        }
+        // /banks is dev-host-only; mirror get_banks() routing so the
+        // diagnostic exercises the exact same call path the real bank
+        // dropdown uses.
+        return $this->debug_raw_request('GET', self::DEV_BASE_URL . '/banks');
+    }
+
+    /**
+     * Internal helper for the debug_*_raw() methods. Performs a
+     * Fintava-authenticated request and returns a uniform diagnostic
+     * envelope (url, http_code, body_raw, body_decoded — or wp_error on
+     * transport failure).
+     */
+    private function debug_raw_request($method, $url) {
         $args = [
-            'method'  => 'GET',
+            'method'  => $method,
             'headers' => [
                 'Authorization' => 'Bearer ' . $this->secret_key,
                 'Content-Type'  => 'application/json',
@@ -3087,7 +3206,7 @@ class Matrix_MLM_Fintava {
         return [
             'url'          => $url,
             'http_code'    => wp_remote_retrieve_response_code($response),
-            'body_raw'     => $raw,
+            'body_raw'     => is_string($raw) && strlen($raw) > 4000 ? substr($raw, 0, 4000) . '... [truncated]' : $raw,
             'body_decoded' => json_decode($raw, true),
         ];
     }

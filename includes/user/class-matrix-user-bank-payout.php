@@ -231,9 +231,45 @@ class Matrix_MLM_User_Bank_Payout {
                 type: 'POST',
                 timeout: 15000,
                 data: { action: 'matrix_fintava_get_banks', nonce: matrixMLM.nonce },
-                success: function(response) {
+                // dataType is intentionally LEFT OFF here — we want to
+                // inspect the raw responseText below when the response
+                // isn't valid JSON (e.g. admin-ajax returned the literal
+                // "0" because the action handler isn't registered, or "-1"
+                // because the nonce check failed, or an HTML error page
+                // because some upstream plugin fataled and dumped an error
+                // page over the JSON output). Letting jQuery auto-detect
+                // means we still get an object on success and a parse
+                // failure surfaces in the error handler with status:
+                // 'parsererror' — at which point we render the actual body
+                // text so the operator can see what broke.
+                success: function(response, status, xhr) {
                     const select = $('#fintava-bank-select');
                     select.empty().append('<option value=""><?php _e("-- Select Bank --", "matrix-mlm"); ?></option>');
+
+                    // Treat literal "0" / "-1" admin-ajax sentinels as
+                    // surfaceable errors instead of silently falling into
+                    // the generic "Failed to load banks" branch — the
+                    // operator can't fix what they can't see.
+                    if (response === 0 || response === '0') {
+                        select.empty().append(
+                            $('<option/>').attr('value', '').text(
+                                '<?php echo esc_js(__("admin-ajax returned 0 — Fintava AJAX handler not registered. Plugin failed to bootstrap.", "matrix-mlm")); ?>'
+                            )
+                        );
+                        if (window.console && console.error) {
+                            console.error('[Matrix MLM] admin-ajax returned 0; matrix_fintava_get_banks handler is not registered.');
+                        }
+                        return;
+                    }
+                    if (response === -1 || response === '-1') {
+                        select.empty().append(
+                            $('<option/>').attr('value', '').text(
+                                '<?php echo esc_js(__("Nonce check failed — please refresh the page.", "matrix-mlm")); ?>'
+                            )
+                        );
+                        return;
+                    }
+
                     if (response && response.success && response.data && Array.isArray(response.data.banks) && response.data.banks.length) {
                         response.data.banks.forEach(function(bank) {
                             if (!bank || !bank.code || !bank.name) { return; }
@@ -261,9 +297,14 @@ class Matrix_MLM_User_Bank_Payout {
                             }
                         }
                     } else {
-                        const serverMsg = response && response.data && response.data.message
+                        // Surface the actual server message if the
+                        // payload shape is odd. When the response
+                        // succeeded but carried no usable banks list, we
+                        // still want the operator to see why so they
+                        // can act on it.
+                        var serverMsg = (response && response.data && response.data.message)
                             ? response.data.message
-                            : '<?php echo esc_js(__("Failed to load banks", "matrix-mlm")); ?>';
+                            : '<?php echo esc_js(__("Failed to load banks (response shape unexpected)", "matrix-mlm")); ?>';
                         select.append($('<option/>').attr('value', '').text(serverMsg));
                         if (window.console && console.warn) {
                             console.warn('[Matrix MLM] Bank list load failed:', response);
@@ -272,13 +313,28 @@ class Matrix_MLM_User_Bank_Payout {
                 },
                 error: function(xhr, status, err) {
                     // status === 'timeout' means the 15s ceiling was
-                    // hit; everything else is a transport-level error
-                    // (network, 4xx, 5xx). Either way the dropdown
-                    // gets a definite end state instead of staying on
-                    // "-- Loading banks..." forever.
-                    var label = status === 'timeout'
-                        ? '<?php echo esc_js(__("Bank list timed out — please refresh", "matrix-mlm")); ?>'
-                        : '<?php echo esc_js(__("Error loading banks", "matrix-mlm")); ?>';
+                    // hit; 'parsererror' means admin-ajax returned
+                    // something that wasn't JSON (an HTML error page,
+                    // a literal "0"/"-1", or upstream plugin output);
+                    // everything else is a real transport-level error
+                    // (network, 4xx, 5xx). Surface the HTTP status and
+                    // a short body snippet so the operator can read
+                    // the actual cause from the dropdown rather than
+                    // having to crack open DevTools.
+                    var label;
+                    if (status === 'timeout') {
+                        label = '<?php echo esc_js(__("Bank list timed out — please refresh", "matrix-mlm")); ?>';
+                    } else {
+                        var snippet = '';
+                        if (xhr && typeof xhr.responseText === 'string' && xhr.responseText.length) {
+                            snippet = xhr.responseText.replace(/\s+/g, ' ').trim();
+                            if (snippet.length > 140) { snippet = snippet.slice(0, 137) + '...'; }
+                        }
+                        var httpCode = xhr && xhr.status ? xhr.status : '?';
+                        label = '<?php echo esc_js(__("Error loading banks", "matrix-mlm")); ?>'
+                              + ' (HTTP ' + httpCode + '/' + status + ')'
+                              + (snippet ? ' — ' + snippet : '');
+                    }
                     $('#fintava-bank-select').empty().append(
                         $('<option/>').attr('value', '').text(label)
                     );
