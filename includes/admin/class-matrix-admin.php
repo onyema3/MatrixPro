@@ -942,6 +942,7 @@ class Matrix_MLM_Admin {
 
         $user_id = $user->ID;
         $wallet_id = sanitize_text_field($_POST['wallet_id'] ?? '');
+        $customer_id = sanitize_text_field($_POST['customer_id'] ?? '');
         $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         $account_name = sanitize_text_field($_POST['account_name'] ?? '');
         $bank_name = sanitize_text_field($_POST['bank_name'] ?? 'Fintava');
@@ -960,6 +961,7 @@ class Matrix_MLM_Admin {
             $wallet_data = [
                 'user_id' => $user_id,
                 'wallet_id' => $wallet_id,
+                'customer_id' => $customer_id ?: null,
                 'account_number' => $account_number,
                 'account_name' => $account_name ?: $user->display_name,
                 'bank_name' => $bank_name,

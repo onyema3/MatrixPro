@@ -1387,24 +1387,25 @@ class Matrix_MLM_Fintava {
 
         // Fintava's /bank/credit endpoint requires `sourceId` — the UUID
         // of the user's Fintava customer record that funds the payout.
-        // If the local row is missing customer_id (e.g. linked manually
-        // with only the account number), try to auto-resolve via the
-        // Customer API before failing.
-        if (empty($user_wallet->customer_id)) {
+        // We also need wallet_id for balance checks. If either is missing
+        // (e.g. linked manually with only the account number), try to
+        // auto-resolve via the Customer API before failing.
+        if (empty($user_wallet->wallet_id) || empty($user_wallet->customer_id)) {
             $resolved = $this->resolve_wallet_id_from_customer($user_wallet);
             if (is_wp_error($resolved)) {
                 wp_send_json_error([
                     'message' => sprintf(
-                        __('Your Fintava customer ID is missing and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
+                        __('Your Fintava wallet details are incomplete and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
                         $resolved->get_error_message()
                     ),
                 ]);
             }
             // Refresh the wallet row after resolution.
             $user_wallet = $this->get_user_wallet($user_id);
-            if (!$user_wallet || empty($user_wallet->customer_id)) {
-                wp_send_json_error(['message' => __('Your Fintava customer ID is missing. Please contact support.', 'matrix-mlm')]);
-            }
+        }
+
+        if (!$user_wallet || empty($user_wallet->customer_id)) {
+            wp_send_json_error(['message' => __('Your Fintava customer ID is missing. Please contact support.', 'matrix-mlm')]);
         }
 
         // Validate customer_id is a proper UUID before sending to Fintava.
@@ -2166,12 +2167,29 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        // Persist wallet_id back to the local row
+        // Extract customer_id from the response — Fintava may return it as
+        // userInfo.id, customerId, or customer_id depending on the endpoint.
+        $resolved_customer_id = '';
+        if (isset($details['userInfo']['id'])) {
+            $resolved_customer_id = $details['userInfo']['id'];
+        } elseif (isset($details['customerId'])) {
+            $resolved_customer_id = $details['customerId'];
+        } elseif (isset($details['customer_id'])) {
+            $resolved_customer_id = $details['customer_id'];
+        }
+
+        // Persist wallet_id (and customer_id if found) back to the local row
         $update_data = [
             'wallet_id'  => $resolved_wallet_id,
             'updated_at' => current_time('mysql'),
         ];
         $update_formats = ['%s', '%s'];
+
+        // Save customer_id if available and not already on the row
+        if (!empty($resolved_customer_id) && empty($wallet_row->customer_id)) {
+            $update_data['customer_id'] = $resolved_customer_id;
+            $update_formats[] = '%s';
+        }
 
         // Save bank_code if available
         $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? null;
@@ -2207,14 +2225,17 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'first_name' => sanitize_text_field($customer_data['first_name']),
-            'last_name' => sanitize_text_field($customer_data['last_name']),
-            'email' => sanitize_email($customer_data['email']),
-            'phone' => sanitize_text_field($customer_data['phone']),
-            'currency' => $customer_data['currency'] ?? 'NGN',
+            'first_name'      => sanitize_text_field($customer_data['first_name']),
+            'last_name'       => sanitize_text_field($customer_data['last_name']),
+            'email'           => sanitize_email($customer_data['email']),
+            'phone'           => sanitize_text_field($customer_data['phone']),
+            'currency'        => $customer_data['currency'] ?? 'NGN',
+            'amount'          => intval($customer_data['amount'] ?? 100),
+            'expireTimeInMin' => intval($customer_data['expireTimeInMin'] ?? 525600),
+            'merchantReference' => $customer_data['reference'] ?? ('MTX-VW-' . uniqid()),
         ];
 
-        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address', 'reference'] as $optional) {
+        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address'] as $optional) {
             if (!empty($customer_data[$optional])) {
                 $payload[$optional] = sanitize_text_field($customer_data[$optional]);
             }

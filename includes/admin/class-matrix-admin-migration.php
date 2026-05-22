@@ -51,7 +51,7 @@ class Matrix_MLM_Admin_Migration {
             <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:16px 20px;margin:16px 0;">
                 <h4 style="margin:0 0 8px;color:#4338ca;"><?php _e('CSV Format', 'matrix-mlm'); ?></h4>
                 <p style="margin:0 0 8px;font-size:13px;color:#4b5563;"><?php _e('Your CSV should have the following columns (header row required):', 'matrix-mlm'); ?></p>
-                <code style="display:block;background:#fff;padding:10px 14px;border-radius:4px;font-size:12px;overflow-x:auto;">username,email,wallet_id,account_number,account_name,bank_name,customer_email,customer_phone,card_id,card_type,card_brand,last_four,card_status</code>
+                <code style="display:block;background:#fff;padding:10px 14px;border-radius:4px;font-size:12px;overflow-x:auto;">username,email,customer_id,wallet_id,account_number,account_name,bank_name,customer_email,customer_phone,card_id,card_type,card_brand,last_four,card_status</code>
                 <p style="margin:10px 0 0;font-size:12px;color:#6b7280;">
                     <?php _e('Required: <strong>username</strong> OR <strong>email</strong> (to match the user). All other fields are optional — include only what you have.', 'matrix-mlm'); ?>
                 </p>
@@ -146,6 +146,13 @@ class Matrix_MLM_Admin_Migration {
                 </tr>
                 <tr><td colspan="2"><hr><h3 style="margin:0;"><?php _e('Wallet Details', 'matrix-mlm'); ?></h3></td></tr>
                 <tr>
+                    <th><?php _e('Customer ID', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="text" id="link_customer_id" class="regular-text" placeholder="<?php _e('Fintava customer UUID (userInfo.id)', 'matrix-mlm'); ?>">
+                        <p class="description"><?php _e('<strong>Required for bank payouts.</strong> This is the customer UUID from Fintava (sent as sourceId to /bank/credit). Find it in the Fintava dashboard under the customer record.', 'matrix-mlm'); ?></p>
+                    </td>
+                </tr>
+                <tr>
                     <th><?php _e('Wallet ID', 'matrix-mlm'); ?></th>
                     <td>
                         <input type="text" id="link_wallet_id" class="regular-text" placeholder="<?php _e('Fintava wallet ID', 'matrix-mlm'); ?>">
@@ -202,6 +209,7 @@ class Matrix_MLM_Admin_Migration {
                 matrix_action: 'link_fintava_account',
                 username: username,
                 wallet_id: document.getElementById('link_wallet_id').value.trim(),
+                customer_id: document.getElementById('link_customer_id').value.trim(),
                 account_number: document.getElementById('link_account_number').value.trim(),
                 account_name: document.getElementById('link_account_name').value.trim(),
                 bank_name: document.getElementById('link_bank_name').value.trim(),
