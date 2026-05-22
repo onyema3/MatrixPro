@@ -1714,8 +1714,80 @@ class Matrix_MLM_Fintava {
         if (!$user_wallet) {
             wp_send_json_error(['message' => __('You do not have a Virtual wallet yet. Create one before transferring to it.', 'matrix-mlm')]);
         }
-        if (empty($user_wallet->account_number) || empty($user_wallet->bank_code)) {
-            wp_send_json_error(['message' => __('Your Virtual wallet is missing an account number or bank code. Please contact support.', 'matrix-mlm')]);
+
+        // Schema-required: account_number is NOT NULL on
+        // matrix_fintava_wallets, so an empty here only happens on data
+        // corruption. Surface support contact in that narrow case.
+        if (empty($user_wallet->account_number)) {
+            wp_send_json_error(['message' => __('Your Virtual wallet is missing an account number. Please contact support.', 'matrix-mlm')]);
+        }
+
+        // bank_code is schema-NULLABLE and is regularly NULL on rows
+        // generated before bank_code persistence was reliable, or when
+        // Fintava's /virtual-wallet/generate response didn't echo it
+        // back. We now self-heal in two steps before deciding whether
+        // to fail: (1) call /wallet/details and persist whatever
+        // Fintava returns, (2) if Fintava still doesn't tell us, map
+        // the wallet's existing bank_name (e.g., "Globus Bank") to a
+        // CBN sortCode via the static banks fallback — Fintava issues
+        // virtual NUBANs through Nigerian partner banks whose sort
+        // codes are in our existing static list. This is the FIRST
+        // flow that needs bank_code on the wallet row (bank-payout
+        // takes it from the form dropdown, not the wallet row), so
+        // older installs reasonably have NULLs here that no prior
+        // flow surfaced.
+        if (empty($user_wallet->bank_code)) {
+            // Step 1: GET /wallet/details?accountNumber=... — also
+            // backfills wallet_id and customer_id when they're missing,
+            // since /wallet/details returns the lot in one round-trip.
+            $resolve = $this->resolve_wallet_id_from_customer($user_wallet);
+            if (!is_wp_error($resolve)) {
+                $user_wallet = $this->get_user_wallet($user_id);
+            }
+
+            // Step 2: derive bank_code from bank_name. Fintava's
+            // /wallet/details on some tiers returns `bank: "Globus
+            // Bank"` but no `bankCode`/`bank_code` field. Looking up
+            // the bank name in get_static_banks_fallback() gives us
+            // the CBN sortCode — that list is the authoritative
+            // 3-digit CBN registry the rest of the gateway already
+            // uses for sortCode validation, so a name-match here is
+            // safe to persist. Persist on success so subsequent
+            // transfers skip the derivation entirely.
+            if (empty($user_wallet->bank_code) && !empty($user_wallet->bank_name)) {
+                $candidate = $this->derive_bank_code_from_name($user_wallet->bank_name);
+                if ($candidate !== '') {
+                    global $wpdb;
+                    $wpdb->update(
+                        $wpdb->prefix . 'matrix_fintava_wallets',
+                        ['bank_code' => $candidate, 'updated_at' => current_time('mysql')],
+                        ['id' => $user_wallet->id],
+                        ['%s', '%s'],
+                        ['%d']
+                    );
+                    $user_wallet = $this->get_user_wallet($user_id);
+                }
+            }
+        }
+
+        // Final guard: Fintava's /bank/credit/merchant validator
+        // requires `sortCode` (it must be coerceable to a number on
+        // the upstream side), so we cannot proceed without bank_code
+        // on hand. If both API resolution and bank-name derivation
+        // failed, surface a diagnostic the operator can act on:
+        // contact support, OR have an admin populate bank_code on the
+        // wallet row from Fintava's dashboard. The bank_name we
+        // already display is included so the support touchpoint can
+        // jump straight to "the wallet is on $bank_name, look up its
+        // sortCode" without round-tripping the user.
+        if (empty($user_wallet->bank_code)) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: bank name on the wallet row, e.g., "Globus Bank" */
+                    __('Your Virtual wallet (%s) is missing a bank code we couldn\'t auto-resolve. Please contact support so we can populate it from your Fintava dashboard.', 'matrix-mlm'),
+                    $user_wallet->bank_name ?: __('unknown bank', 'matrix-mlm')
+                ),
+            ]);
         }
 
         $amount = floatval($_POST['amount'] ?? 0);
@@ -4809,6 +4881,98 @@ class Matrix_MLM_Fintava {
         if (isset($obj['id']) && $obj['id'] !== '' && self::extract_account_number($obj) !== '') {
             return (string) $obj['id'];
         }
+        return '';
+    }
+
+    /**
+     * Map a Nigerian bank name (e.g., "Globus Bank", "Wema Bank
+     * Plc.") to a CBN 3-digit sortCode by looking it up in
+     * get_static_banks_fallback().
+     *
+     * Used by ajax_transfer_matrix_to_virtual() as a last-resort
+     * derivation when Fintava issues a virtual NUBAN through a
+     * partner bank but doesn't echo `bankCode`/`bank_code` in any of
+     * its wallet endpoints. The bank_name field on the wallet row
+     * always carries the partner-bank name verbatim from Fintava's
+     * generate response, so a name-match against the static registry
+     * is the cheapest reliable derivation.
+     *
+     * Matching strategy is intentionally generous to absorb
+     * Fintava's response-shape drift:
+     *
+     *   1. Exact case-insensitive match. Catches the canonical
+     *      forms ("Globus Bank", "Wema Bank") that map 1:1 to a
+     *      single registry entry.
+     *
+     *   2. Token-based match: strip "Bank", "PLC", "Limited", "Ltd"
+     *      and punctuation from both sides and compare the residual
+     *      institution name. Catches "Wema Bank Plc." vs "Wema
+     *      Bank", "Globus Bank Limited" vs "Globus Bank", etc.
+     *
+     *   3. Substring fallback: if either trimmed name contains the
+     *      other, accept. Catches longer marketing forms like
+     *      "Sterling Bank One Pay" or "Polaris Bank (formerly
+     *      Skye)" without us having to enumerate every variant.
+     *
+     * Returns '' when nothing matches; the caller's final guard
+     * surfaces a clearer error with the bank_name value the
+     * operator can hand to support.
+     *
+     * @param string $bank_name Partner-bank name from the wallet row.
+     * @return string CBN 3-digit (or NIBSS-issued longer) sortCode, or ''.
+     */
+    private function derive_bank_code_from_name($bank_name) {
+        $needle = trim((string) $bank_name);
+        if ($needle === '') {
+            return '';
+        }
+
+        $banks = self::get_static_banks_fallback();
+
+        // Step 1: exact case-insensitive match.
+        foreach ($banks as $bank) {
+            if (strcasecmp($bank['name'], $needle) === 0) {
+                return $bank['code'];
+            }
+        }
+
+        // Step 2 + 3: token + substring matching on a normalized
+        // form. Stripping the corporate suffixes is what makes
+        // "Wema Bank Plc." match "Wema Bank".
+        $normalize = static function ($name) {
+            $lower = strtolower($name);
+            // Remove punctuation, then strip the common corporate
+            // suffixes so we're comparing institution names alone.
+            $stripped = preg_replace('/[^a-z0-9 ]+/i', ' ', $lower);
+            $stripped = preg_replace('/\b(bank|plc|limited|ltd|nigeria|nig|ng|of)\b/i', '', $stripped);
+            $stripped = preg_replace('/\s+/', ' ', $stripped);
+            return trim($stripped);
+        };
+
+        $needle_norm = $normalize($needle);
+        if ($needle_norm === '') {
+            return '';
+        }
+
+        foreach ($banks as $bank) {
+            $candidate_norm = $normalize($bank['name']);
+            if ($candidate_norm === '') {
+                continue;
+            }
+            if ($candidate_norm === $needle_norm) {
+                return $bank['code'];
+            }
+            // Substring match in either direction. Constrained to
+            // entries whose normalized form is at least 3 chars to
+            // avoid spurious matches on stop-tokens.
+            if (strlen($candidate_norm) >= 3 && strlen($needle_norm) >= 3) {
+                if (strpos($candidate_norm, $needle_norm) !== false
+                    || strpos($needle_norm, $candidate_norm) !== false) {
+                    return $bank['code'];
+                }
+            }
+        }
+
         return '';
     }
 
