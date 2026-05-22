@@ -172,14 +172,48 @@ class Matrix_MLM_Epin {
         // Pin is safely claimed. Credit the wallet using the canonical
         // pin code from the database so the wallet `reference` column
         // exactly matches `matrix_epins.pin_code` for joins later.
+        //
+        // CRITICAL: check the return value. credit() returns false
+        // when the wallet UPSERT fails (DB error) or when the
+        // post-credit balance verification doesn't match what we
+        // expected — i.e., the credit did NOT actually land in the
+        // user's balance. The previous revision ignored this and
+        // unconditionally returned success, which is the bug behind
+        // the "Recharge successful but my balance is unchanged"
+        // report. If credit() fails, we also need to roll back our
+        // earlier UPDATE that marked the pin as used; otherwise the
+        // user would lose the pin without getting the funds.
         $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit(
+        $credit_result = $wallet->credit(
             $user_id,
             $pin->amount,
             'epin_recharge',
             sprintf(__('E-Pin recharge: %s', 'matrix-mlm'), $pin->pin_code),
             $pin->pin_code
         );
+
+        if ($credit_result === false) {
+            // Roll back the pin-claim UPDATE so the user can try
+            // again or contact support without losing the pin. Best
+            // effort: even if this UPDATE fails too (which would be
+            // very unusual), we still surface the credit failure.
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->prefix}matrix_epins
+                    SET status = 'unused', used_by = NULL, used_at = NULL
+                  WHERE id = %d AND used_by = %d",
+                $pin->id, $user_id
+            ));
+
+            error_log(sprintf(
+                '[Matrix MLM] epin redeem: credit() returned false; rolled back pin claim. user_id=%d, pin_id=%d, pin_code=%s, amount=%s',
+                $user_id, $pin->id, $pin->pin_code, $pin->amount
+            ));
+
+            return [
+                'success' => false,
+                'message' => __('Could not credit your wallet for this pin. Please try again or contact support; the pin remains usable.', 'matrix-mlm'),
+            ];
+        }
 
         return [
             'success' => true,
