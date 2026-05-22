@@ -596,6 +596,18 @@ class Matrix_MLM_Fintava {
     /**
      * GET /name/enquiry?accountNumber=...&sortCode=... — verify bank account (external name lookup).
      *
+     * Decorates failures with the bank_code that was actually sent so the
+     * UI can surface it to the operator. The failure cause for this endpoint
+     * is almost always one of three shapes — wrong sortCode format, the
+     * account doesn't exist, or `/name/enquiry` simply isn't enabled on the
+     * merchant tier (the same pattern as `/banks` for accounts that lack a
+     * dev API key) — and which one it is is impossible to tell from the
+     * generic upstream message alone. Including the code we sent lets us
+     * tell at a glance whether we're looking at a 3-digit CBN code (what
+     * the built-in fallback list ships) vs a 6-digit NIBSS sort code (what
+     * Fintava's own `/banks` returns when reachable), which is the most
+     * common source of "Unable to resolve account information" errors.
+     *
      * @param string $account_number 10-digit NUBAN.
      * @param string $bank_code      Bank sort code (passed as `sortCode` query param).
      */
@@ -608,7 +620,15 @@ class Matrix_MLM_Fintava {
         $response = $this->make_request('GET', '/name/enquiry?' . $query);
 
         if (is_wp_error($response)) {
-            return $response;
+            return new WP_Error(
+                $response->get_error_code(),
+                sprintf(
+                    /* translators: 1: original error, 2: bank code sent */
+                    __('%1$s [bank_code=%2$s]', 'matrix-mlm'),
+                    $response->get_error_message(),
+                    $bank_code
+                )
+            );
         }
 
         if (self::is_api_success($response) && isset($response['data'])) {
@@ -617,9 +637,14 @@ class Matrix_MLM_Fintava {
 
         return new WP_Error(
             'fintava_resolve_error',
-            self::normalize_api_message(
-                $response['message'] ?? null,
-                __('Could not resolve account details', 'matrix-mlm')
+            sprintf(
+                /* translators: 1: upstream message, 2: bank code sent */
+                __('%1$s [bank_code=%2$s]', 'matrix-mlm'),
+                self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Could not resolve account details', 'matrix-mlm')
+                ),
+                $bank_code
             )
         );
     }
@@ -832,7 +857,24 @@ class Matrix_MLM_Fintava {
 
         $result = $this->resolve_account($account_number, $bank_code);
         if (is_wp_error($result)) {
-            wp_send_json_error(['message' => $result->get_error_message()]);
+            // Always allow the JS to offer a "continue without verification"
+            // path. Fintava's /name/enquiry returns "Unable to resolve
+            // account information" for at least three distinct failure
+            // modes (wrong sortCode shape, account doesn't exist on the
+            // destination bank, endpoint not enabled on this merchant
+            // tier), and the operator can't tell which one applies from
+            // the generic message alone. The actual /bank/credit/merchant
+            // call is the source of truth for whether the transfer can go
+            // through, so blocking the form on enquiry success would
+            // permanently strand merchants whose tier doesn't expose
+            // /name/enquiry while their transfer endpoint is fully
+            // functional. Manual entry shifts the responsibility for the
+            // account name to the operator and lets the actual transfer
+            // arbitrate correctness.
+            wp_send_json_error([
+                'message'              => $result->get_error_message(),
+                'allow_manual_override' => true,
+            ]);
         }
 
         wp_send_json_success([

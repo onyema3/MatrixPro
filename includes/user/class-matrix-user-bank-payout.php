@@ -57,7 +57,7 @@ class Matrix_MLM_User_Bank_Payout {
                            placeholder="<?php _e('Enter 10-digit account number', 'matrix-mlm'); ?>">
                 </div>
 
-                <!-- Account Name (auto-resolved) -->
+                <!-- Account Name (auto-resolved or manually entered) -->
                 <div class="matrix-form-group" id="fintava-account-name-group" style="display:none;">
                     <label><?php _e('Account Name', 'matrix-mlm'); ?></label>
                     <div class="matrix-resolved-account">
@@ -69,6 +69,16 @@ class Matrix_MLM_User_Bank_Payout {
                 <!-- Resolving indicator -->
                 <div id="fintava-resolving" style="display:none;" class="matrix-loading-text">
                     <span class="matrix-spinner"></span> <?php _e('Verifying account...', 'matrix-mlm'); ?>
+                </div>
+
+                <!-- Verification-failed inline notice with a manual-entry escape hatch.
+                     Hidden by default; populated by the resolveAccount error
+                     handler when Fintava can't auto-verify the account. -->
+                <div id="fintava-verify-failed" style="display:none;" class="matrix-alert matrix-alert-warning" role="alert" aria-live="polite">
+                    <div id="fintava-verify-failed-msg" style="margin-bottom:8px;"></div>
+                    <button type="button" class="matrix-btn matrix-btn-secondary matrix-btn-sm" id="fintava-manual-override">
+                        <?php _e('Continue without verification &rarr;', 'matrix-mlm'); ?>
+                    </button>
                 </div>
 
                 <!-- Amount -->
@@ -149,6 +159,7 @@ class Matrix_MLM_User_Bank_Payout {
         .matrix-subtitle { color: #6b7280; margin: -10px 0 20px; font-size: 14px; }
         .matrix-resolved-account { position: relative; }
         .matrix-input-success { background: #ecfdf5 !important; border-color: #10b981 !important; }
+        .matrix-input-warning { background: #fffbeb !important; border-color: #f59e0b !important; }
         .matrix-verify-badge { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: #10b981; font-weight: 600; font-size: 13px; }
         .matrix-loading-text { padding: 8px 0; color: #6b7280; font-size: 13px; display: flex; align-items: center; gap: 8px; }
         .matrix-spinner { width: 16px; height: 16px; border: 2px solid #e5e7eb; border-top-color: #4f46e5; border-radius: 50%; animation: matrix-spin 0.6s linear infinite; display: inline-block; }
@@ -181,6 +192,12 @@ class Matrix_MLM_User_Bank_Payout {
             const chargeValue = <?php echo floatval($charge_value); ?>;
             const balance = <?php echo floatval($balance); ?>;
             let accountVerified = false;
+            // Tracks whether accountVerified was set by the user picking the
+            // manual-entry path after Fintava /name/enquiry failed, so the
+            // submit handler and the per-keystroke listener can honour the
+            // looser empty-name check on this branch without weakening the
+            // checks on the verified branch.
+            let manualOverride = false;
 
             // Defensive: surface a clear, debuggable failure mode if the
             // matrixMLM global is somehow still missing when DOM-ready fires
@@ -283,8 +300,15 @@ class Matrix_MLM_User_Bank_Payout {
                         resolveAccount(accNum, bankCode);
                     }, 500);
                 } else {
+                    // User is still typing or hasn't picked a bank yet.
+                    // Tear down both the verified and the manual-override
+                    // states so a stale account name from a previous
+                    // resolution can't ride into a transfer for a different
+                    // account number.
                     $('#fintava-account-name-group').hide();
+                    $('#fintava-verify-failed').hide();
                     accountVerified = false;
+                    manualOverride  = false;
                     updateSubmitButton();
                 }
             }
@@ -293,17 +317,23 @@ class Matrix_MLM_User_Bank_Payout {
             $('#fintava-bank-select').on('change', function() {
                 $('#fintava-bank-name').val($(this).find(':selected').data('name') || '');
                 tryResolveAccount();
-            });
-
-            function resolveAccount(accountNumber, bankCode) {
+            });            function resolveAccount(accountNumber, bankCode) {
                 $('#fintava-resolving').show();
+                $('#fintava-verify-failed').hide();
                 $('#fintava-account-name-group').hide();
                 accountVerified = false;
+                manualOverride = false;
                 updateSubmitButton();
 
                 $.ajax({
                     url: matrixMLM.ajaxUrl,
                     type: 'POST',
+                    // Mirror the /banks AJAX timeout so the verification step
+                    // also has a definite end state. 35s sits just above the
+                    // 30s server-side Fintava timeout in make_request() so a
+                    // hung upstream call surfaces as a real error rather
+                    // than a silently-pending request.
+                    timeout: 35000,
                     data: {
                         action: 'matrix_fintava_resolve_account',
                         nonce: matrixMLM.nonce,
@@ -313,23 +343,109 @@ class Matrix_MLM_User_Bank_Payout {
                     success: function(response) {
                         $('#fintava-resolving').hide();
                         if (response.success) {
-                            $('#fintava-account-name').val(response.data.account_name);
+                            // Reset to the verified-readonly state in case
+                            // the user is re-verifying after a previous
+                            // manual override on the same form load.
+                            const nameField = $('#fintava-account-name');
+                            nameField
+                                .val(response.data.account_name)
+                                .prop('readonly', true)
+                                .removeClass('matrix-input-warning')
+                                .addClass('matrix-input-success');
+                            $('#fintava-verify-badge')
+                                .text('\u2713 <?php echo esc_js(__("Verified", "matrix-mlm")); ?>')
+                                .css('color', '');
                             $('#fintava-account-name-group').show();
                             accountVerified = true;
+                            manualOverride  = false;
                         } else {
-                            alert(response.data.message || '<?php _e("Account verification failed", "matrix-mlm"); ?>');
+                            // Verification failed. If the server flagged the
+                            // failure as one where manual override is safe,
+                            // surface the inline notice + override button
+                            // instead of the previous blocking alert(). The
+                            // form remains submittable via the manual path.
+                            const data = response && response.data ? response.data : {};
+                            const msg  = data.message || '<?php echo esc_js(__("Account verification failed", "matrix-mlm")); ?>';
+
+                            if (data.allow_manual_override) {
+                                $('#fintava-verify-failed-msg').text(msg);
+                                $('#fintava-verify-failed').show();
+                            } else {
+                                alert(msg);
+                            }
                             accountVerified = false;
+                            manualOverride  = false;
                         }
                         updateSubmitButton();
                     },
-                    error: function() {
+                    error: function(xhr, status) {
                         $('#fintava-resolving').hide();
-                        alert('<?php _e("Network error during verification", "matrix-mlm"); ?>');
+                        // Surface the failure inline (with the manual
+                        // override) for transport errors too — including the
+                        // 35s timeout — so a slow Fintava upstream doesn't
+                        // strand the user. Network errors are the same
+                        // class of "we can't tell from here whether the
+                        // account is real" failure that the server-side
+                        // resolve_error path already declares safe to
+                        // override.
+                        const msg = status === 'timeout'
+                            ? '<?php echo esc_js(__("Verification timed out — please try again or continue without verification.", "matrix-mlm")); ?>'
+                            : '<?php echo esc_js(__("Network error during verification.", "matrix-mlm")); ?>';
+                        $('#fintava-verify-failed-msg').text(msg);
+                        $('#fintava-verify-failed').show();
                         accountVerified = false;
+                        manualOverride  = false;
                         updateSubmitButton();
                     }
                 });
             }
+
+            // Manual override: when Fintava /name/enquiry can't verify the
+            // account (wrong sortCode shape on this merchant tier, endpoint
+            // disabled, or any other failure mode), allow the operator to
+            // type the account name themselves and proceed. The actual
+            // /bank/credit/merchant call still validates account ownership
+            // on Fintava's side at transfer time, so manual entry only
+            // shifts the responsibility for the displayed name — it can't
+            // route money to a wrong account just because the user typed
+            // the wrong name into the box.
+            $('#fintava-manual-override').on('click', function() {
+                $('#fintava-verify-failed').hide();
+
+                const nameField = $('#fintava-account-name');
+                nameField
+                    .val('')
+                    .prop('readonly', false)
+                    .removeClass('matrix-input-success')
+                    .addClass('matrix-input-warning')
+                    .attr('placeholder', '<?php echo esc_js(__("Type the account holder name", "matrix-mlm")); ?>')
+                    .focus();
+
+                $('#fintava-verify-badge')
+                    .text('<?php echo esc_js(__("Manual entry", "matrix-mlm")); ?>')
+                    .css('color', '#92400e');
+
+                $('#fintava-account-name-group').show();
+
+                // Stay disabled until the operator actually types a name —
+                // the per-keystroke `input` handler below flips
+                // accountVerified the moment the field has any non-empty
+                // content, so submit is gated on visible user intent
+                // rather than the click alone.
+                accountVerified = false;
+                manualOverride  = true;
+                updateSubmitButton();
+            });
+
+            // Re-disable submit on every keystroke until the manual-entry
+            // field actually has a non-empty name, so an empty box can't
+            // sneak through with manualOverride=true set.
+            $('#fintava-account-name').on('input', function() {
+                if (manualOverride) {
+                    accountVerified = $(this).val().trim().length > 0;
+                    updateSubmitButton();
+                }
+            });
 
             // Calculate charges on amount input
             $('#fintava-amount').on('input', function() {
