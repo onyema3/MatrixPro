@@ -27,6 +27,7 @@ class Matrix_MLM_Admin_Migration {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=export'); ?>" class="nav-tab <?php echo $tab === 'export' ? 'nav-tab-active' : ''; ?>"><?php _e('Export', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=link'); ?>" class="nav-tab <?php echo $tab === 'link' ? 'nav-tab-active' : ''; ?>"><?php _e('Link Single User', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=backfill'); ?>" class="nav-tab <?php echo $tab === 'backfill' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Wallet IDs', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=bank_codes'); ?>" class="nav-tab <?php echo $tab === 'bank_codes' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Bank Codes', 'matrix-mlm'); ?></a>
             </nav>
 
             <?php
@@ -35,6 +36,7 @@ class Matrix_MLM_Admin_Migration {
                 case 'export': $this->render_export_tab(); break;
                 case 'link': $this->render_link_tab(); break;
                 case 'backfill': $this->render_backfill_tab(); break;
+                case 'bank_codes': $this->render_bank_codes_backfill_tab(); break;
             }
             ?>
         </div>
@@ -433,6 +435,194 @@ class Matrix_MLM_Admin_Migration {
                         action: 'matrix_admin_action',
                         nonce: matrixMLMAdmin.nonce,
                         matrix_action: 'fintava_backfill_wallet_ids'
+                    }
+                }).done(function(res) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    if (!res || !res.success) {
+                        var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Backfill failed.', 'matrix-mlm')); ?>';
+                        statusEl.textContent = '✗ ' + err;
+                        statusEl.style.color = '#b91c1c';
+                        return;
+                    }
+                    statusEl.textContent = '✓ ' + res.data.message;
+                    statusEl.style.color = '#059669';
+                    if (res.data.report) renderReport(res.data.report);
+                }).fail(function(xhr, textStatus) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    statusEl.textContent = '<?php echo esc_js(__('Network error or timeout.', 'matrix-mlm')); ?> (' + textStatus + ')';
+                    statusEl.style.color = '#b91c1c';
+                });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "Backfill Bank Codes" admin tab.
+     *
+     * Counts wallets that hit the `Your Virtual wallet (Fintava) is missing
+     * a bank code we couldn't auto-resolve` final guard in the matrix→virtual
+     * transfer flow, exposes a button that runs the backfill orchestrator
+     * (same self-heal chain as the live transfer, but in bulk), and renders
+     * a per-row report indicating which step resolved each wallet — or, for
+     * rows still stuck, a precise reason the operator can act on.
+     */
+    private function render_bank_codes_backfill_tab() {
+        global $wpdb;
+        $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
+
+        $total_linked  = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wallets_table}");
+        $missing_count = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wallets_table}
+              WHERE (bank_code IS NULL OR bank_code = '')
+                AND account_number IS NOT NULL
+                AND account_number <> ''"
+        );
+        $placeholder_count = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wallets_table}
+              WHERE (bank_code IS NULL OR bank_code = '')
+                AND (bank_name IS NULL OR bank_name = '' OR bank_name = 'Fintava')"
+        );
+        ?>
+        <div class="matrix-admin-card">
+            <h2><?php _e('Backfill Missing Bank Codes', 'matrix-mlm'); ?></h2>
+            <p><?php _e('Some Fintava virtual wallets are missing the partner-bank <code>bank_code</code> (CBN sortCode) that <code>/bank/credit/merchant</code> requires. Affected users see "Your Virtual wallet (Fintava) is missing a bank code we couldn\'t auto-resolve" when transferring from their matrix wallet to their virtual wallet. This tool runs the full self-heal chain in bulk so the entries clear up before the next transfer attempt.', 'matrix-mlm'); ?></p>
+
+            <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:14px 18px;margin:14px 0;">
+                <p style="margin:0 0 6px;font-size:13px;color:#374151;"><strong><?php _e('How it works', 'matrix-mlm'); ?></strong></p>
+                <ol style="margin:0 0 0 20px;font-size:13px;color:#4b5563;">
+                    <li><?php _e('Calls <code>GET /wallet/details?accountNumber=...</code>. Persists <code>bank_name</code>, <code>bank_code</code>, <code>customer_id</code>, and <code>wallet_id</code> opportunistically — finishes the job by itself on tiers where Fintava echoes the partner bank back.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('Falls back to <code>/customers/{id}</code>, <code>/customers/list</code> (matched on account_number), and <code>/customers/details?phone=...</code> for tiers where <code>/wallet/details</code> is gated off.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('Maps the resolved <code>bank_name</code> against the static CBN sortCode registry. Rows whose <code>bank_name</code> remains the schema default <code>Fintava</code> placeholder bubble up unresolved with an actionable reason.', 'matrix-mlm'); ?></li>
+                </ol>
+            </div>
+
+            <div class="matrix-admin-stats" style="margin-bottom:20px;">
+                <div class="stat-card stat-primary"><h3><?php echo number_format($total_linked); ?></h3><p><?php _e('Linked Wallets', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-warning"><h3><?php echo number_format($missing_count); ?></h3><p><?php _e('Missing Bank Code', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-danger"><h3><?php echo number_format($placeholder_count); ?></h3><p><?php _e('Stuck on "Fintava" placeholder', 'matrix-mlm'); ?></p></div>
+            </div>
+
+            <?php if ($missing_count === 0): ?>
+                <p style="color:#059669;font-weight:500;">✓ <?php _e('Every linked wallet already has a bank_code. Nothing to backfill.', 'matrix-mlm'); ?></p>
+            <?php else: ?>
+                <p>
+                    <button type="button" class="button button-primary" id="btn_run_bank_code_backfill">
+                        <?php printf(
+                            /* translators: %d: count of wallets needing backfill */
+                            esc_html__('Run Bank-Code Backfill (%d wallets)', 'matrix-mlm'),
+                            $missing_count
+                        ); ?>
+                    </button>
+                    <span id="bank_code_backfill_status" style="margin-left:12px;font-size:13px;color:#6b7280;"></span>
+                </p>
+            <?php endif; ?>
+
+            <div id="bank_code_backfill_results" style="display:none;margin-top:24px;"></div>
+        </div>
+
+        <script>
+        (function() {
+            var btn       = document.getElementById('btn_run_bank_code_backfill');
+            var statusEl  = document.getElementById('bank_code_backfill_status');
+            var resultsEl = document.getElementById('bank_code_backfill_results');
+            if (!btn) return;
+
+            function escapeHtml(s) {
+                if (s === null || s === undefined) return '';
+                return String(s)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function sourceLabel(source) {
+                switch (source) {
+                    case 'wallet_details': return '<?php echo esc_js(__('GET /wallet/details', 'matrix-mlm')); ?>';
+                    case 'customer_api':   return '<?php echo esc_js(__('Customer API', 'matrix-mlm')); ?>';
+                    case 'static_lookup':  return '<?php echo esc_js(__('Static CBN lookup', 'matrix-mlm')); ?>';
+                    default:               return '—';
+                }
+            }
+
+            function renderReport(report) {
+                var resolved = report.resolved_via_wallet_details
+                             + report.resolved_via_customer_api
+                             + report.resolved_via_static_lookup;
+
+                var html = '';
+                html += '<div class="matrix-admin-stats" style="margin-bottom:16px;">';
+                html += '<div class="stat-card stat-success"><h3>' + report.resolved_via_wallet_details + '</h3><p><?php echo esc_js(__('via /wallet/details', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-info"><h3>' + report.resolved_via_customer_api + '</h3><p><?php echo esc_js(__('via Customer API', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-primary"><h3>' + report.resolved_via_static_lookup + '</h3><p><?php echo esc_js(__('via static lookup', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-danger"><h3>' + report.still_missing + '</h3><p><?php echo esc_js(__('still missing', 'matrix-mlm')); ?></p></div>';
+                html += '</div>';
+
+                if (resolved === 0 && report.still_missing > 0) {
+                    html += '<div class="notice notice-info inline" style="padding:12px 16px;margin:10px 0;">';
+                    html += '<p style="margin:0 0 8px;"><strong><?php echo esc_js(__('Nothing could be backfilled automatically. To recover these wallets:', 'matrix-mlm')); ?></strong></p>';
+                    html += '<ol style="margin:0 0 0 20px;font-size:13px;">';
+                    html += '<li><?php echo esc_js(__('Open the user\'s admin detail page and use the Fintava Virtual Wallet card to set bank_name + bank_code by hand from the Fintava dashboard.', 'matrix-mlm')); ?></li>';
+                    html += '<li><?php echo esc_js(__('If many rows are stuck on the "Fintava" placeholder, ask Fintava support to enable /wallet/details (or the customer endpoints) on this account tier so the chain can resolve future wallets automatically.', 'matrix-mlm')); ?></li>';
+                    html += '</ol></div>';
+                }
+
+                if (report.details && report.details.length) {
+                    html += '<h3 style="margin-top:18px;"><?php echo esc_js(__('Per-wallet outcomes', 'matrix-mlm')); ?></h3>';
+                    html += '<table class="wp-list-table widefat striped"><thead><tr>';
+                    html += '<th><?php echo esc_js(__('User ID', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Account #', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Bank (before → after)', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Bank Code', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Resolved By', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Status', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Detail', 'matrix-mlm')); ?></th>';
+                    html += '</tr></thead><tbody>';
+                    report.details.forEach(function(d) {
+                        var bankShift = (d.bank_name_before || '—') +
+                            (d.bank_name_before !== d.bank_name_after ? ' → ' + (d.bank_name_after || '—') : '');
+                        var statusBadge = d.status === 'resolved'
+                            ? '<span style="color:#059669;font-weight:500;">✓ resolved</span>'
+                            : '<span style="color:#b91c1c;font-weight:500;">✗ still missing</span>';
+                        html += '<tr>';
+                        html += '<td>' + escapeHtml(d.user_id || '') + '</td>';
+                        html += '<td><code style="font-size:11px;">' + escapeHtml(d.account_number || '') + '</code></td>';
+                        html += '<td>' + escapeHtml(bankShift) + '</td>';
+                        html += '<td><code style="font-size:11px;">' + escapeHtml(d.bank_code_after || '—') + '</code></td>';
+                        html += '<td>' + escapeHtml(sourceLabel(d.source)) + '</td>';
+                        html += '<td>' + statusBadge + '</td>';
+                        html += '<td style="font-size:12px;color:#6b7280;">' + escapeHtml(d.reason || '') + '</td>';
+                        html += '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+
+                resultsEl.innerHTML = html;
+                resultsEl.style.display = 'block';
+            }
+
+            btn.addEventListener('click', function() {
+                if (!confirm('<?php echo esc_js(__('Run bank-code backfill now? This will call Fintava\'s API for each affected wallet (up to 5 round-trips per row, throttled at 200ms).', 'matrix-mlm')); ?>')) return;
+
+                btn.disabled = true;
+                var originalLabel = btn.textContent;
+                btn.textContent = '<?php echo esc_js(__('Working…', 'matrix-mlm')); ?>';
+                statusEl.textContent = '<?php echo esc_js(__('Calling Fintava — this may take up to 3 minutes.', 'matrix-mlm')); ?>';
+                statusEl.style.color = '#6b7280';
+
+                jQuery.ajax({
+                    url: matrixMLMAdmin.ajaxUrl,
+                    type: 'POST',
+                    timeout: 200000,
+                    data: {
+                        action: 'matrix_admin_action',
+                        nonce: matrixMLMAdmin.nonce,
+                        matrix_action: 'fintava_backfill_bank_codes'
                     }
                 }).done(function(res) {
                     btn.disabled = false;

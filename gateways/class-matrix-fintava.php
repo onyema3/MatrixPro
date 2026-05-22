@@ -4213,6 +4213,174 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * Backfill missing bank_code values on local matrix_fintava_wallets rows
+     * by running the same self-heal chain that ajax_transfer_matrix_to_virtual()
+     * fires lazily on the first transfer attempt — but in bulk, so operators
+     * can clear the "Your Virtual wallet (Fintava) is missing a bank code we
+     * couldn't auto-resolve" surface without waiting for every affected user
+     * to hit it themselves.
+     *
+     * Per-row chain (early-exits when bank_code lands on the row):
+     *
+     *   1. resolve_wallet_id_from_customer() — GET /wallet/details. Persists
+     *      bank_name + bank_code + customer_id + wallet_id opportunistically,
+     *      so this single call may finish the job by itself on tiers where
+     *      Fintava echoes the partner-bank fields back.
+     *
+     *   2. enrich_partner_bank_metadata() — falls back to /customers/{id},
+     *      /customers/list (matched on account_number), and
+     *      /customers/details?phone=... for tiers where /wallet/details is
+     *      gated off or doesn't include the partner bank.
+     *
+     *   3. derive_bank_code_from_name() — local lookup of the now-resolved
+     *      bank_name against get_static_banks_fallback() (the CBN sortCode
+     *      registry). The helper is a pure lookup; this orchestrator
+     *      writes the persisted bank_code itself.
+     *
+     * The schema-default placeholder bank_name = 'Fintava' is treated as
+     * "not a real bank" by every step (Fintava is a fintech, not a CBN
+     * member), so rows stuck on the placeholder bubble up to the report
+     * with an actionable reason instead of being silently considered
+     * resolved.
+     *
+     * @return array Diagnostic report with counts and per-row outcomes.
+     */
+    public function backfill_missing_bank_codes() {
+        global $wpdb;
+
+        if (!$this->is_active()) {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava is not active. Configure the live API key first.', 'matrix-mlm')
+            );
+        }
+
+        self::ensure_tables_exist();
+        $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
+
+        $missing_rows = $wpdb->get_results(
+            "SELECT id, user_id, account_number, account_name, bank_name, bank_code,
+                    customer_id, customer_phone, wallet_id
+               FROM {$wallets_table}
+              WHERE (bank_code IS NULL OR bank_code = '')
+                AND account_number IS NOT NULL
+                AND account_number <> ''"
+        );
+
+        $report = [
+            'total_missing_before'        => count($missing_rows),
+            'resolved_via_wallet_details' => 0,
+            'resolved_via_customer_api'   => 0,
+            'resolved_via_static_lookup'  => 0,
+            'still_missing'               => 0,
+            'details'                     => [],
+        ];
+
+        if (empty($missing_rows)) {
+            return $report;
+        }
+
+        foreach ($missing_rows as $row) {
+            $bank_name_before = (string) $row->bank_name;
+            $source = '';
+            $reason = '';
+
+            // Step 1: GET /wallet/details. We don't branch on its return
+            // value — even on WP_Error it may have persisted bank_name
+            // before bailing out. The authoritative signal is whether
+            // bank_code is now populated on the row.
+            $this->resolve_wallet_id_from_customer($row);
+            $row = $this->get_wallet_row_by_id($row->id);
+            if (!empty($row->bank_code)) {
+                $source = 'wallet_details';
+                $report['resolved_via_wallet_details']++;
+            }
+
+            // Step 2: customer-endpoint enrichment. enrich_partner_bank_metadata
+            // is itself idempotent and short-circuits when the row is already
+            // populated, so calling it again is safe — but we skip the
+            // round-trip when Step 1 already succeeded to be polite to
+            // Fintava's rate limiter.
+            if ($source === '') {
+                $this->enrich_partner_bank_metadata($row);
+                $row = $this->get_wallet_row_by_id($row->id);
+                if (!empty($row->bank_code)) {
+                    $source = 'customer_api';
+                    $report['resolved_via_customer_api']++;
+                }
+            }
+
+            // Step 3: derive bank_code from the (now possibly resolved)
+            // bank_name via the local static CBN list. Pure lookup,
+            // no API call — orchestrator persists the result.
+            if ($source === '' && !empty($row->bank_name)) {
+                $candidate = $this->derive_bank_code_from_name($row->bank_name);
+                if ($candidate !== '') {
+                    $wpdb->update(
+                        $wallets_table,
+                        ['bank_code' => $candidate, 'updated_at' => current_time('mysql')],
+                        ['id' => $row->id],
+                        ['%s', '%s'],
+                        ['%d']
+                    );
+                    $row->bank_code = $candidate;
+                    $source = 'static_lookup';
+                    $report['resolved_via_static_lookup']++;
+                }
+            }
+
+            if (empty($row->bank_code)) {
+                $report['still_missing']++;
+                $is_placeholder = empty($row->bank_name)
+                    || strcasecmp((string) $row->bank_name, 'Fintava') === 0;
+                if ($is_placeholder) {
+                    $reason = __('bank_name is still empty or the "Fintava" placeholder — Fintava\'s API didn\'t return a partner bank for this wallet, so there\'s no name to look up. Set bank_name and bank_code manually from the Fintava dashboard.', 'matrix-mlm');
+                } else {
+                    $reason = sprintf(
+                        /* translators: %s: bank name on the wallet row */
+                        __('No CBN sortCode match for "%s" in the static bank list. Verify the name on Fintava and set bank_code manually, or extend get_static_banks_fallback().', 'matrix-mlm'),
+                        $row->bank_name
+                    );
+                }
+            }
+
+            $report['details'][] = [
+                'user_id'          => (int) $row->user_id,
+                'account_number'   => (string) $row->account_number,
+                'bank_name_before' => $bank_name_before,
+                'bank_name_after'  => (string) $row->bank_name,
+                'bank_code_after'  => (string) $row->bank_code,
+                'source'           => $source,
+                'status'           => $source !== '' ? 'resolved' : 'still_missing',
+                'reason'           => $reason,
+            ];
+
+            // Throttle. A fully-missing row can fire up to 5 round-trips
+            // (1 wallet/details + up to 3 customer endpoints) so 200ms
+            // between rows keeps a 100-row batch under Fintava's typical
+            // per-minute caps.
+            usleep(200000);
+        }
+
+        return $report;
+    }
+
+    /**
+     * Lightweight helper: re-read a single matrix_fintava_wallets row by
+     * primary key. Used by the bank-code backfill orchestrator after each
+     * self-heal step persists row metadata as a side-effect — get_user_wallet()
+     * filters to active rows, but here we want the row whatever its status
+     * because the orchestrator only enumerates rows it already selected.
+     */
+    private function get_wallet_row_by_id($id) {
+        global $wpdb;
+        return $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_fintava_wallets WHERE id = %d",
+            (int) $id
+        ));
+    }
+
+    /**
      * Verify a candidate wallet_id against a local wallet row and persist it
      * if the account_number reported by Fintava matches what we have on file.
      *
