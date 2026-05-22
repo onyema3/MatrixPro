@@ -147,6 +147,9 @@ class Matrix_MLM_User_Bank_Payout {
                         <span class="matrix-badge matrix-badge-<?php echo esc_attr($payout->status); ?>">
                             <?php echo ucfirst($payout->status); ?>
                         </span>
+                        <?php if (!empty($payout->failure_reason) && in_array($payout->status, ['failed', 'refunded'], true)): ?>
+                        <div class="matrix-payout-reason" title="<?php echo esc_attr($payout->failure_reason); ?>"><?php echo esc_html($payout->failure_reason); ?></div>
+                        <?php endif; ?>
                     </td>
                     <td><small><code><?php echo esc_html($payout->reference); ?></code></small></td>
                 </tr>
@@ -168,6 +171,7 @@ class Matrix_MLM_User_Bank_Payout {
         .matrix-charge-info small { color: #92400e; }
         .matrix-badge-processing { background: #eff6ff; color: #1e40af; }
         .matrix-badge-refunded { background: #f5f3ff; color: #7c3aed; }
+        .matrix-payout-reason { margin-top:6px; padding:6px 8px; background:#fef2f2; border-left:3px solid #dc2626; border-radius:3px; font-size:11px; line-height:1.4; color:#991b1b; word-break:break-word; max-width:280px; }
         </style>
 
         <script>
