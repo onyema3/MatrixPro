@@ -13,12 +13,13 @@ class Matrix_MLM_Admin {
         add_action('admin_menu', [$this, 'add_admin_menus']);
         add_action('wp_ajax_matrix_admin_action', [$this, 'handle_admin_ajax']);
 
-        // Surface a one-click admin notice on Matrix MLM screens when any
-        // Fintava virtual wallets still have NULL bank_code, so operators
-        // get prompted to run the bulk backfill from the migration page
-        // without having to navigate there first to discover the count.
-        // Implemented as a static method on the migration class — see
-        // its docblock for the why and the gating rules.
+        // Surface a one-click admin notice on the Matrix MLM Dashboard
+        // when any Fintava virtual wallets still have NULL bank_code, so
+        // operators get prompted to run the bulk backfill from the
+        // migration page without having to navigate there first to
+        // discover the count. Implemented as a static method on the
+        // migration class — see its docblock for the why and the
+        // gating rules (capability, page-slug scope, transient cache).
         add_action('admin_notices', ['Matrix_MLM_Admin_Migration', 'render_bank_code_admin_notice']);
     }
 
