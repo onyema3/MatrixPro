@@ -21,6 +21,56 @@ class Matrix_MLM_User_Bank_Payout {
         $fintava = new Matrix_MLM_Fintava();
         $is_active = $fintava->is_active();
 
+        // Pre-render the bank list server-side. The previous flow loaded
+        // banks with a $.ajax({ action: 'matrix_fintava_get_banks' }) call
+        // fired from an inline <script> at DOM-ready, which had three
+        // distinct failure modes that all surfaced as the dropdown stuck
+        // on "-- Loading banks..." until the user refreshed:
+        //
+        //   1. Cold-transient first load — get_banks() walks up to three
+        //      Fintava hosts on a cache miss, and a slow chain plus the
+        //      15s frontend timeout meant the user typically refreshed
+        //      before the AJAX resolved. On the second load the transient
+        //      was warm and the call returned instantly, which is exactly
+        //      the "only loads when I hit refresh" pattern reported.
+        //
+        //   2. SPA-style navigation by themes/optimizers (FlyingPress,
+        //      Astra "instant click", WP Rocket prefetch, etc.) that
+        //      swap body content via fetch instead of doing a full page
+        //      reload. Inline <script> blocks inside the body do NOT
+        //      re-execute when the content is swapped that way — only a
+        //      hard refresh re-runs them, which matches the observed UX.
+        //
+        //   3. Footer-script ordering races — both jQuery and the
+        //      matrixMLM localize variable are emitted in the footer,
+        //      and aggressive optimizer plugins occasionally reorder or
+        //      defer them in ways that left the polling wrapper
+        //      executing before matrixMLM was defined.
+        //
+        // Doing the lookup at render time eliminates all three classes
+        // of failure: the <select> is part of the static HTML, no AJAX
+        // is needed to populate it, and the 24-hour transient in
+        // get_banks() means this only adds latency on the first call
+        // after cache expiry. Subsequent loads reuse the transient and
+        // render instantly.
+        //
+        // Mirrors the AJAX handler's fallback rule: when the live call
+        // fails (WP_Error from get_banks()), fall back to the bundled
+        // CBN/NIBSS list and surface the underlying reason inline so
+        // the operator still has the diagnostic that the old AJAX path
+        // emitted via response.data.reason.
+        $banks_list = [];
+        $banks_fallback_reason = '';
+        if ($is_active) {
+            $banks_result = $fintava->get_banks();
+            if (is_wp_error($banks_result)) {
+                $banks_list = Matrix_MLM_Fintava::get_static_banks_fallback();
+                $banks_fallback_reason = $banks_result->get_error_message();
+            } elseif (is_array($banks_result)) {
+                $banks_list = $banks_result;
+            }
+        }
+
         // Get payout history
         $payouts = $fintava->get_user_payouts($user_id, 20);
         ?>
@@ -45,8 +95,33 @@ class Matrix_MLM_User_Bank_Payout {
                 <div class="matrix-form-group">
                     <label><?php _e('Select Bank', 'matrix-mlm'); ?></label>
                     <select name="bank_code" id="fintava-bank-select" required>
-                        <option value=""><?php _e('-- Loading banks...', 'matrix-mlm'); ?></option>
+                        <?php if (empty($banks_list)): ?>
+                        <option value=""><?php _e('-- No banks available, please contact support --', 'matrix-mlm'); ?></option>
+                        <?php else: ?>
+                        <option value=""><?php _e('-- Select Bank --', 'matrix-mlm'); ?></option>
+                        <?php foreach ($banks_list as $bank):
+                            if (empty($bank['code']) || empty($bank['name'])) { continue; }
+                        ?>
+                        <option value="<?php echo esc_attr($bank['code']); ?>" data-name="<?php echo esc_attr($bank['name']); ?>"><?php echo esc_html($bank['name']); ?></option>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
                     </select>
+                    <?php if ($banks_fallback_reason !== ''): ?>
+                    <!--
+                        Same diagnostic the previous AJAX path emitted via
+                        response.data.reason — surfaced inline so an
+                        operator without DevTools open can still see *why*
+                        Fintava /banks failed and we're on the bundled
+                        CBN/NIBSS list. The form is fully usable in this
+                        state; this note exists so a later transfer
+                        failing with an unknown-bank error has a visible
+                        cause attached.
+                    -->
+                    <div class="matrix-bank-fallback-note" style="margin-top:6px;font-size:12px;line-height:1.4;color:#92400e;">
+                        <div><?php _e('Note: using built-in Nigerian banks list. Fintava /banks is unreachable from your account.', 'matrix-mlm'); ?></div>
+                        <div style="margin-top:4px;font-style:italic;word-break:break-word;"><?php _e('Reason:', 'matrix-mlm'); ?> <?php echo esc_html($banks_fallback_reason); ?></div>
+                    </div>
+                    <?php endif; ?>
                 </div>
 
                 <!-- Account Number -->
@@ -239,9 +314,24 @@ class Matrix_MLM_User_Bank_Payout {
                     return;
                 }
                 if (++attempts > maxAttempts) {
-                    var sel = document.getElementById('fintava-bank-select');
-                    if (sel) {
-                        sel.innerHTML = '<option value=""><?php echo esc_js(__("jQuery not loaded — please refresh the page", "matrix-mlm")); ?></option>';
+                    // jQuery never arrived — surface a non-destructive
+                    // notice above the form rather than wiping the
+                    // <select>'s pre-rendered bank options. The form is
+                    // not usable in this state (account verification,
+                    // submit, etc. all depend on jQuery), so the inputs
+                    // are disabled, but the bank list itself stays
+                    // visible so the operator/user can still tell that
+                    // the rest of the page rendered correctly.
+                    var form = document.getElementById('matrix-bank-payout-form');
+                    if (form) {
+                        var inputs = form.querySelectorAll('input, select, button, textarea');
+                        for (var i = 0; i < inputs.length; i++) {
+                            inputs[i].disabled = true;
+                        }
+                        var notice = document.createElement('div');
+                        notice.className = 'matrix-alert matrix-alert-danger';
+                        notice.textContent = '<?php echo esc_js(__("jQuery not loaded — please refresh the page or contact support.", "matrix-mlm")); ?>';
+                        form.parentNode.insertBefore(notice, form);
                     }
                     if (window.console && console.error) {
                         console.error('[Matrix MLM] jQuery not loaded after 10s; bank dropdown init aborted.');
@@ -269,11 +359,22 @@ class Matrix_MLM_User_Bank_Payout {
             // Defensive: surface a clear, debuggable failure mode if the
             // matrixMLM global is somehow still missing when DOM-ready fires
             // (e.g. another plugin dequeued matrix-mlm-public, or a JS error
-            // earlier in the page broke wp_footer). Without this the
-            // dropdown stays at "Loading banks..." with no console signal.
+            // earlier in the page broke wp_footer). The bank dropdown is
+            // pre-rendered server-side now so it stays usable for visual
+            // selection, but the rest of the form (account verification,
+            // charge calculation, transfer submit) all depend on
+            // matrixMLM.ajaxUrl/nonce, so the form has to be disabled when
+            // those are unreachable. We surface the error inline above
+            // the form rather than wiping the <select>'s pre-rendered
+            // options, which would have been the worse of the two
+            // failure modes.
             if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
-                $('#fintava-bank-select').empty().append(
-                    '<option value=""><?php _e("Cannot reach server (matrixMLM missing)", "matrix-mlm"); ?></option>'
+                var $form = $('#matrix-bank-payout-form');
+                $form.find(':input').prop('disabled', true);
+                $form.before(
+                    $('<div/>')
+                        .addClass('matrix-alert matrix-alert-danger')
+                        .text('<?php echo esc_js(__("Cannot reach server (matrixMLM missing). Please refresh the page or contact support.", "matrix-mlm")); ?>')
                 );
                 if (window.console && console.error) {
                     console.error('[Matrix MLM] matrixMLM global is not defined — matrix-mlm-public.js was not enqueued on this page.');
@@ -281,157 +382,20 @@ class Matrix_MLM_User_Bank_Payout {
                 return;
             }
 
-            // Load banks on page load
+            // Bank list is now pre-rendered server-side as part of the
+            // <select> markup (see render() in this file). The earlier
+            // $.ajax({ action: 'matrix_fintava_get_banks' }) call that
+            // used to live here was the source of the "dropdown stuck on
+            // -- Loading banks... until I refresh" bug — see the comment
+            // block in render() for the three failure modes that drove
+            // the move to server-side rendering.
             //
-            // An explicit timeout is set so the dropdown can never get
-            // stuck on "-- Loading banks..." regardless of what Fintava
-            // does upstream. Without this, a slow/hung /banks call would
-            // sit pending until the browser's default timeout (often
-            // minutes), and the user would assume the form is broken
-            // because no error/success handler had run yet. 15s leaves
-            // ample headroom for the server-side 30s Fintava timeout to
-            // finish and the fallback list to be returned, while still
-            // giving the user a definite end state if the AJAX itself
-            // wedges (which is rare but has been seen on this stack).
-            $.ajax({
-                url: matrixMLM.ajaxUrl,
-                type: 'POST',
-                timeout: 15000,
-                data: { action: 'matrix_fintava_get_banks', nonce: matrixMLM.nonce },
-                // dataType is intentionally LEFT OFF here — we want to
-                // inspect the raw responseText below when the response
-                // isn't valid JSON (e.g. admin-ajax returned the literal
-                // "0" because the action handler isn't registered, or "-1"
-                // because the nonce check failed, or an HTML error page
-                // because some upstream plugin fataled and dumped an error
-                // page over the JSON output). Letting jQuery auto-detect
-                // means we still get an object on success and a parse
-                // failure surfaces in the error handler with status:
-                // 'parsererror' — at which point we render the actual body
-                // text so the operator can see what broke.
-                success: function(response, status, xhr) {
-                    const select = $('#fintava-bank-select');
-                    select.empty().append('<option value=""><?php _e("-- Select Bank --", "matrix-mlm"); ?></option>');
-
-                    // Treat literal "0" / "-1" admin-ajax sentinels as
-                    // surfaceable errors instead of silently falling into
-                    // the generic "Failed to load banks" branch — the
-                    // operator can't fix what they can't see.
-                    if (response === 0 || response === '0') {
-                        select.empty().append(
-                            $('<option/>').attr('value', '').text(
-                                '<?php echo esc_js(__("admin-ajax returned 0 — Fintava AJAX handler not registered. Plugin failed to bootstrap.", "matrix-mlm")); ?>'
-                            )
-                        );
-                        if (window.console && console.error) {
-                            console.error('[Matrix MLM] admin-ajax returned 0; matrix_fintava_get_banks handler is not registered.');
-                        }
-                        return;
-                    }
-                    if (response === -1 || response === '-1') {
-                        select.empty().append(
-                            $('<option/>').attr('value', '').text(
-                                '<?php echo esc_js(__("Nonce check failed — please refresh the page.", "matrix-mlm")); ?>'
-                            )
-                        );
-                        return;
-                    }
-
-                    if (response && response.success && response.data && Array.isArray(response.data.banks) && response.data.banks.length) {
-                        response.data.banks.forEach(function(bank) {
-                            if (!bank || !bank.code || !bank.name) { return; }
-                            const opt = $('<option/>')
-                                .attr('value', bank.code)
-                                .attr('data-name', bank.name)
-                                .text(bank.name);
-                            select.append(opt);
-                        });
-
-                        // Surface a non-blocking notice when the server
-                        // fell back to the built-in bank list because
-                        // Fintava's /banks was unreachable. The form is
-                        // fully usable in this state, but if a transfer
-                        // later fails with an unknown-bank error the
-                        // notice points the operator to the cause.
-                        //
-                        // The reason string carries Fintava's actual
-                        // upstream message (e.g. "Invalid API Key
-                        // [base=https://dev.fintavapay.com/api/dev]") and
-                        // is the single most useful signal for
-                        // diagnosing why the live /banks call failed.
-                        // Render it inline so an operator without
-                        // DevTools open can read it directly.
-                        if (response.data.fallback) {
-                            select.parent().find('.matrix-bank-fallback-note').remove();
-                            const wrap = $('<div/>')
-                                .addClass('matrix-bank-fallback-note')
-                                .css({ marginTop: '6px', fontSize: '12px', lineHeight: '1.4', color: '#92400e' });
-
-                            wrap.append(
-                                $('<div/>')
-                                    .text('<?php echo esc_js(__("Note: using built-in Nigerian banks list. Fintava /banks is unreachable from your account.", "matrix-mlm")); ?>')
-                            );
-
-                            if (response.data.reason) {
-                                wrap.append(
-                                    $('<div/>')
-                                        .css({ marginTop: '4px', fontStyle: 'italic', wordBreak: 'break-word' })
-                                        .text('<?php echo esc_js(__("Reason:", "matrix-mlm")); ?> ' + response.data.reason)
-                                );
-                            }
-
-                            select.parent().append(wrap);
-                            if (window.console && console.info) {
-                                console.info('[Matrix MLM] Bank list fallback engaged. Reason:', response.data.reason || '(unspecified)');
-                            }
-                        }
-                    } else {
-                        // Surface the actual server message if the
-                        // payload shape is odd. When the response
-                        // succeeded but carried no usable banks list, we
-                        // still want the operator to see why so they
-                        // can act on it.
-                        var serverMsg = (response && response.data && response.data.message)
-                            ? response.data.message
-                            : '<?php echo esc_js(__("Failed to load banks (response shape unexpected)", "matrix-mlm")); ?>';
-                        select.append($('<option/>').attr('value', '').text(serverMsg));
-                        if (window.console && console.warn) {
-                            console.warn('[Matrix MLM] Bank list load failed:', response);
-                        }
-                    }
-                },
-                error: function(xhr, status, err) {
-                    // status === 'timeout' means the 15s ceiling was
-                    // hit; 'parsererror' means admin-ajax returned
-                    // something that wasn't JSON (an HTML error page,
-                    // a literal "0"/"-1", or upstream plugin output);
-                    // everything else is a real transport-level error
-                    // (network, 4xx, 5xx). Surface the HTTP status and
-                    // a short body snippet so the operator can read
-                    // the actual cause from the dropdown rather than
-                    // having to crack open DevTools.
-                    var label;
-                    if (status === 'timeout') {
-                        label = '<?php echo esc_js(__("Bank list timed out — please refresh", "matrix-mlm")); ?>';
-                    } else {
-                        var snippet = '';
-                        if (xhr && typeof xhr.responseText === 'string' && xhr.responseText.length) {
-                            snippet = xhr.responseText.replace(/\s+/g, ' ').trim();
-                            if (snippet.length > 140) { snippet = snippet.slice(0, 137) + '...'; }
-                        }
-                        var httpCode = xhr && xhr.status ? xhr.status : '?';
-                        label = '<?php echo esc_js(__("Error loading banks", "matrix-mlm")); ?>'
-                              + ' (HTTP ' + httpCode + '/' + status + ')'
-                              + (snippet ? ' — ' + snippet : '');
-                    }
-                    $('#fintava-bank-select').empty().append(
-                        $('<option/>').attr('value', '').text(label)
-                    );
-                    if (window.console && console.error) {
-                        console.error('[Matrix MLM] Bank list AJAX error:', status, err, xhr && xhr.responseText);
-                    }
-                }
-            });
+            // The matrix_fintava_get_banks AJAX handler is intentionally
+            // left registered server-side; it's still useful as a
+            // diagnostic endpoint (the admin migration tools and any
+            // future "refresh banks" UI can call it without a page
+            // reload), and removing it would be a breaking change for
+            // anything that pokes at it directly.
 
             // Auto-resolve account when account number is 10 digits and bank is selected
             let resolveTimeout;
