@@ -463,7 +463,21 @@ class Matrix_MLM_User_Bank_Payout {
                     },
                     success: function(response) {
                         $('#fintava-resolving').hide();
-                        if (response.success) {
+                        // Treat an empty response.data.account_name on a
+                        // success:true response as a verification failure
+                        // with manual override available. Fintava can ack
+                        // /name/enquiry with HTTP 200 but no usable
+                        // accountName on certain merchant tiers; the
+                        // server-side handler is now expected to convert
+                        // that into a resolve_error, but we re-check here
+                        // so the form never lands in the "verified, but
+                        // the readonly box is blank" state regardless of
+                        // server version (older builds can still hit this
+                        // page until the plugin update lands).
+                        var resolvedName = (response && response.success && response.data && typeof response.data.account_name === 'string')
+                            ? response.data.account_name.trim()
+                            : '';
+                        if (response.success && resolvedName !== '') {
                             // Reset to the verified-readonly state in case
                             // the user is re-verifying after a previous
                             // manual override on the same form load.
@@ -480,15 +494,29 @@ class Matrix_MLM_User_Bank_Payout {
                             accountVerified = true;
                             manualOverride  = false;
                         } else {
-                            // Verification failed. If the server flagged the
-                            // failure as one where manual override is safe,
-                            // surface the inline notice + override button
-                            // instead of the previous blocking alert(). The
-                            // form remains submittable via the manual path.
+                            // Verification failed (or succeeded with an
+                            // empty name). If the server flagged the
+                            // failure as one where manual override is safe
+                            // — or we synthesised an empty-name failure
+                            // here on the client — surface the inline
+                            // notice + override button instead of a
+                            // blocking alert(). The form remains
+                            // submittable via the manual path.
                             const data = response && response.data ? response.data : {};
-                            const msg  = data.message || '<?php echo esc_js(__("Account verification failed", "matrix-mlm")); ?>';
+                            var msg = data.message || '<?php echo esc_js(__("Account verification failed", "matrix-mlm")); ?>';
+                            var allowOverride = !!data.allow_manual_override;
 
-                            if (data.allow_manual_override) {
+                            // Synthesised empty-name failure on a
+                            // success:true response — server didn't tell
+                            // us it's safe to override, but we know it is
+                            // (we have nothing else to display either
+                            // way), so unconditionally offer manual entry.
+                            if (response.success) {
+                                msg = '<?php echo esc_js(__("Could not auto-verify the account name. Please continue without verification and type the holder\'s name.", "matrix-mlm")); ?>';
+                                allowOverride = true;
+                            }
+
+                            if (allowOverride) {
                                 $('#fintava-verify-failed-msg').text(msg);
                                 $('#fintava-verify-failed').show();
                             } else {
