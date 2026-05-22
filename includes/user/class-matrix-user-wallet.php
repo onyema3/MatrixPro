@@ -48,11 +48,15 @@ class Matrix_MLM_User_Wallet {
      *
      * Branch order:
      *   1. Fintava integration disabled → warning, bail.
-     *   2. User has no virtual wallet row yet → delegate to the existing
+     *   2. User has no virtual wallet row yet → render the same Wallet
+     *      page chrome (header cards, single "Create Fintava Wallet"
+     *      action button, embedded create form pane, transaction
+     *      history) so the page is consistent before and after
+     *      onboarding. The create form itself is delegated to
      *      Matrix_MLM_User_Virtual_Wallet::render_create_form() so the
-     *      onboarding flow stays in one canonical place.
+     *      onboarding markup stays in one canonical place.
      *   3. Wallet exists → render the header (account info + balances)
-     *      and the action buttons + form panes.
+     *      and the three action buttons + form panes.
      */
     public function render($user_id) {
         $fintava   = new Matrix_MLM_Fintava();
@@ -70,24 +74,43 @@ class Matrix_MLM_User_Wallet {
         }
 
         $wallet = $fintava->get_user_wallet($user_id);
-        if (!$wallet) {
-            // First-time onboarding: hand off to the canonical create
-            // flow. We don't duplicate that markup here because the
-            // create form has its own JS and AJAX wiring tied to
-            // matrix_fintava_create_virtual_wallet, and the visual cost
-            // of having one extra H3 ("Create Your Fintava Wallet") is
-            // smaller than the cost of two diverging copies of a form
-            // that touches user identity (BVN, DOB, etc.).
-            $user = get_userdata($user_id);
-            $meta = Matrix_MLM_User::get_meta($user_id);
-            (new Matrix_MLM_User_Virtual_Wallet())->render_create_form($user, $meta);
-            $this->render_base_styles();
-            return;
-        }
-
         $matrix_wallet  = new Matrix_MLM_Wallet();
         $matrix_balance = $matrix_wallet->get_balance($user_id);
         $currency       = get_option('matrix_mlm_currency_symbol', '₦');
+
+        if (!$wallet) {
+            // No-Fintava onboarding state. Render the standard Wallet
+            // page chrome (Matrix Wallet card + Virtual Account
+            // placeholder card on top, a single "Create Fintava Wallet"
+            // action button that reveals the embedded create form on
+            // click, and the transaction history table at the bottom)
+            // instead of replacing the whole page with the bare create
+            // form. The previous revision short-circuited to
+            // Matrix_MLM_User_Virtual_Wallet::render_create_form()
+            // directly when the user had no wallet, which made the
+            // Wallet sidebar item feel like two different pages — a
+            // "Create Wallet" mode for new users and a normal Wallet
+            // page for everyone else. Users who landed on the page
+            // expecting to see their Matrix balance were instead
+            // confronted with a BVN form, which is the bug behind the
+            // "wallet should be active with three buttons or a create
+            // wallet button" report.
+            //
+            // Wallet-to-Wallet (Matrix user-to-user) doesn't strictly
+            // require a Fintava wallet, but signposting it alongside
+            // the create-wallet CTA would dilute the single next step
+            // we want first-time users to take. The action button row
+            // shows just one button until onboarding completes; once
+            // the wallet exists the full three-button row is rendered
+            // by the normal flow below.
+            $this->render_header_no_wallet($matrix_balance, $currency);
+            $this->render_action_buttons_no_wallet();
+            $this->render_panes_no_wallet($user_id);
+            $this->render_transaction_history($user_id, $currency);
+            $this->render_base_styles();
+            $this->render_scripts_no_wallet();
+            return;
+        }
 
         $this->render_header($wallet, $user_id, $matrix_balance, $currency, $fintava);
         $this->render_action_buttons();
@@ -350,6 +373,187 @@ class Matrix_MLM_User_Wallet {
             (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
             ?>
         </section>
+        <?php
+    }
+
+    /**
+     * Render the header for the no-Fintava-wallet onboarding state.
+     *
+     * Same two-card layout as the normal render_header() — Virtual
+     * Account on the left, Matrix Wallet on the right — but the
+     * Virtual Account card shows a "Not Activated" badge plus a
+     * one-line explanation of what a Fintava wallet does, instead of
+     * the account number / balance / refresh button. The Matrix
+     * Wallet card is unchanged: the user has a Matrix balance
+     * regardless of Fintava onboarding status, and seeing it here
+     * gives them context for the Wallet-to-Wallet and (later, after
+     * onboarding) Transfer-to-Bank flows.
+     *
+     * Kept separate from render_header() because that method needs
+     * the live Fintava balance fetch (which requires $wallet) and
+     * the inline "Verify & Save Wallet ID" recovery form (which is
+     * meaningless for users who don't have a wallet at all). Sharing
+     * one method via if-branching would have made both paths harder
+     * to read.
+     */
+    private function render_header_no_wallet($matrix_balance, $currency) {
+        ?>
+        <div class="matrix-wallet-overview">
+            <!-- Virtual Account placeholder -->
+            <div class="matrix-wallet-card matrix-wallet-card-virtual">
+                <div class="matrix-wallet-card-header">
+                    <span class="matrix-wallet-card-label"><?php esc_html_e('Virtual Account', 'matrix-mlm'); ?></span>
+                    <span class="matrix-wallet-status">
+                        <?php esc_html_e('Not Activated', 'matrix-mlm'); ?>
+                    </span>
+                </div>
+                <div class="matrix-wallet-help-text matrix-wallet-help-text-light" style="margin-top:16px;line-height:1.5;">
+                    <?php esc_html_e('You don\'t have a Fintava virtual account yet. Create one to receive deposits and transfer funds to any Nigerian bank account.', 'matrix-mlm'); ?>
+                </div>
+            </div>
+
+            <!-- Matrix Wallet card -->
+            <div class="matrix-wallet-card matrix-wallet-card-matrix">
+                <div class="matrix-wallet-card-header">
+                    <span class="matrix-wallet-card-label"><?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?></span>
+                </div>
+                <div class="matrix-wallet-balance-value matrix-wallet-balance-value-large">
+                    <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?>
+                </div>
+                <div class="matrix-wallet-help-text matrix-wallet-help-text-light">
+                    <?php esc_html_e('Internal earnings wallet. Create a Fintava wallet below to start moving funds out.', 'matrix-mlm'); ?>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the single "Create Fintava Wallet" action button shown
+     * to users who haven't completed Fintava onboarding yet.
+     *
+     * Uses the same .matrix-wallet-actions row + .matrix-wallet-action-btn
+     * markup as the normal three-button row (see render_action_buttons())
+     * so the click-to-reveal pane toggle in render_scripts_no_wallet()
+     * uses the exact same JS contract — data-target on the button,
+     * data-pane on the matching <section> in render_panes_no_wallet().
+     * The CSS grid auto-fills around the missing two columns; the
+     * single button takes the first cell of the grid and the rest
+     * stays empty, which reads as "this is the only thing for you to
+     * do right now" rather than as a layout glitch.
+     */
+    private function render_action_buttons_no_wallet() {
+        ?>
+        <div class="matrix-wallet-actions">
+            <button type="button" class="matrix-wallet-action-btn" data-target="create-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-plus-alt"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Create Fintava Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('One-time setup. Get a virtual bank account to receive earnings and transfer to any bank.', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the single create-wallet pane shown to users who haven't
+     * completed Fintava onboarding yet.
+     *
+     * Embeds Matrix_MLM_User_Virtual_Wallet::render_create_form() —
+     * same canonical create form the standalone /virtual-wallet page
+     * has always used, including its own AJAX submit handler hitting
+     * matrix_fintava_create_virtual_wallet. On submit success the
+     * create-form JS fires location.reload(), at which point this
+     * page re-renders through the normal "wallet exists" flow with
+     * the three action buttons and live Fintava balance, so the
+     * one-time onboarding step transitions directly into the full
+     * wallet experience without any further navigation.
+     *
+     * The pane carries [hidden] by default so it sits collapsed
+     * under the action button on initial page load. Clicking the
+     * "Create Fintava Wallet" button removes [hidden] (see the
+     * toggle in render_scripts_no_wallet()).
+     */
+    private function render_panes_no_wallet($user_id) {
+        $user = get_userdata($user_id);
+        $meta = Matrix_MLM_User::get_meta($user_id);
+        ?>
+        <section class="matrix-wallet-pane" data-pane="create-wallet" hidden>
+            <?php (new Matrix_MLM_User_Virtual_Wallet())->render_create_form($user, $meta); ?>
+        </section>
+        <?php
+    }
+
+    /**
+     * Inline JS for the no-Fintava-wallet onboarding state.
+     *
+     * Strict subset of render_scripts(): only the action-button →
+     * pane toggle, no AJAX-dependent handlers (refresh-balance,
+     * wallet-id-save, transfer forms — none of those exist in the
+     * DOM in this state). The create form itself ships its own
+     * submit-handler JS as part of render_create_form()'s output, so
+     * we don't need to wire that up here either.
+     *
+     * Same jQuery-polling guard as the main render_scripts() — see
+     * that method's header comment (and the bank-payout pane's twin
+     * pattern) for why direct (function($){})(jQuery) on inline body
+     * scripts breaks on sites where an optimizer plugin defers
+     * jQuery to the footer.
+     */
+    private function render_scripts_no_wallet() {
+        ?>
+        <script>
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; wallet onboarding toggle not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
+                'use strict';
+
+                // Single-button action-pane toggle. Same contract as
+                // the multi-button toggle in render_scripts(): clicking
+                // the active button collapses the pane back to the
+                // overview state, clicking it from the overview state
+                // reveals the pane.
+                $('.matrix-wallet-action-btn').on('click', function() {
+                    var $btn    = $(this);
+                    var target  = $btn.data('target');
+                    var $pane   = $('.matrix-wallet-pane[data-pane="' + target + '"]');
+                    var wasOpen = $btn.hasClass('is-active');
+
+                    $('.matrix-wallet-action-btn').removeClass('is-active');
+                    $('.matrix-wallet-pane').attr('hidden', true);
+
+                    if (!wasOpen) {
+                        $btn.addClass('is-active');
+                        $pane.removeAttr('hidden');
+                        // Smooth-scroll the create form into view on
+                        // small screens, mirroring the behaviour of
+                        // the three-button toggle in render_scripts().
+                        if (window.innerWidth < 900) {
+                            var top = $pane.offset().top - 20;
+                            $('html, body').animate({ scrollTop: top }, 250);
+                        }
+                    }
+                });
+            });
+        })();
+        </script>
         <?php
     }
 
