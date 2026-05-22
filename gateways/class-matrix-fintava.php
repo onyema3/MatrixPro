@@ -733,6 +733,17 @@ class Matrix_MLM_Fintava {
 
     /**
      * POST /transfer — initiate a transfer.
+     *
+     * Currently unused (ajax_initiate_transfer routes through
+     * merchant_bank_credit instead), but kept for forward compatibility
+     * with Fintava tiers that prefer the generic /transfer endpoint over
+     * /bank/credit/merchant.
+     *
+     * Same camelCase wire-format requirement as merchant_bank_credit() —
+     * see that method's docblock for the full explanation. Field names
+     * matched here defensively so a future re-enable doesn't reproduce
+     * the original 400 "accountNumber should not be empty / must be a
+     * number" failure mode.
      */
     public function initiate_transfer($transfer_data) {
         $required_fields = ['amount', 'account_number', 'bank_code', 'narration'];
@@ -743,20 +754,20 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'amount' => floatval($transfer_data['amount']),
-            'account_number' => sanitize_text_field($transfer_data['account_number']),
-            'bank_code' => sanitize_text_field($transfer_data['bank_code']),
-            'narration' => sanitize_text_field($transfer_data['narration']),
-            'currency' => $transfer_data['currency'] ?? 'NGN',
-            'reference' => $transfer_data['reference'] ?? $this->generate_reference(),
-            'callback_url' => $this->callback_url,
+            'amount'        => floatval($transfer_data['amount']),
+            'accountNumber' => sanitize_text_field($transfer_data['account_number']),
+            'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
+            'narration'     => sanitize_text_field($transfer_data['narration']),
+            'currency'      => $transfer_data['currency'] ?? 'NGN',
+            'reference'     => $transfer_data['reference'] ?? $this->generate_reference(),
+            'callbackUrl'   => $this->callback_url,
         ];
 
         if (!empty($transfer_data['account_name'])) {
-            $payload['account_name'] = sanitize_text_field($transfer_data['account_name']);
+            $payload['accountName'] = sanitize_text_field($transfer_data['account_name']);
         }
         if (!empty($transfer_data['bank_name'])) {
-            $payload['bank_name'] = sanitize_text_field($transfer_data['bank_name']);
+            $payload['bankName'] = sanitize_text_field($transfer_data['bank_name']);
         }
 
         $response = $this->make_request('POST', '/transfer', $payload);
@@ -871,6 +882,26 @@ class Matrix_MLM_Fintava {
 
     /**
      * POST /bank/credit/merchant — payout from merchant wallet to bank account.
+     *
+     * Wire-format note: Fintava's class-validator on this endpoint expects
+     * camelCase field names (`accountNumber`, `sortCode`, `accountName`,
+     * `bankName`) — sending the snake_case keys we use internally produces
+     * a 400 with all four of these errors at once:
+     *   - accountNumber should not be empty
+     *   - accountNumber must be a number conforming to the specified constraints
+     *   - sortCode should not be empty
+     *   - sortCode must be a number conforming to the specified constraints
+     * That dual "empty + must be a number" combo is class-validator's tell
+     * for a missing required field (the @IsNotEmpty + @IsNumberString
+     * decorators both fire when the field is absent under the expected
+     * name). Renaming the wire keys is the actual fix; the values are
+     * already digit-only strings, which @IsNumberString accepts as-is, so
+     * we don't need to cast — and casting would be wrong for sort codes
+     * with leading zeros like "044" anyway (intval('044') === 44 loses
+     * the leading zero, which the rails reject downstream).
+     *
+     * The internal $transfer_data keys remain snake_case to match what the
+     * AJAX handler builds; only the outgoing payload is renamed.
      */
     public function merchant_bank_credit($transfer_data) {
         $required_fields = ['amount', 'account_number', 'bank_code'];
@@ -881,14 +912,25 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'amount' => floatval($transfer_data['amount']),
-            'account_number' => sanitize_text_field($transfer_data['account_number']),
-            'bank_code' => sanitize_text_field($transfer_data['bank_code']),
+            'amount'        => floatval($transfer_data['amount']),
+            'accountNumber' => sanitize_text_field($transfer_data['account_number']),
+            'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
         ];
 
-        foreach (['narration', 'reference', 'account_name', 'bank_name', 'currency'] as $optional_field) {
-            if (!empty($transfer_data[$optional_field])) {
-                $payload[$optional_field] = sanitize_text_field($transfer_data[$optional_field]);
+        // Map our internal snake_case keys to Fintava's camelCase wire keys.
+        // Single-word fields (narration, reference, currency) keep their
+        // names; account_name/bank_name need the camelCase rename to
+        // match what the rest of Fintava's endpoints emit and accept.
+        $optional_field_map = [
+            'narration'    => 'narration',
+            'reference'    => 'reference',
+            'currency'     => 'currency',
+            'account_name' => 'accountName',
+            'bank_name'    => 'bankName',
+        ];
+        foreach ($optional_field_map as $internal => $wire) {
+            if (!empty($transfer_data[$internal])) {
+                $payload[$wire] = sanitize_text_field($transfer_data[$internal]);
             }
         }
 
@@ -991,10 +1033,20 @@ class Matrix_MLM_Fintava {
             ]);
         }
 
+        // Pull names through the casing-tolerant extractors so the JS
+        // layer sees consistent snake_case fields no matter which shape
+        // Fintava returned. The /name/enquiry endpoint emits camelCase
+        // (`accountName` / `accountNumber` / `bankName`), but the form's
+        // inline JS reads `account_name` / `account_number` / `bank_name`
+        // — without these helpers the verified name renders blank even
+        // when Fintava confirmed the account, exactly the symptom the
+        // operator hit. Account number falls back to the value the user
+        // typed when Fintava omits it from the response.
+        $resolved_account_number = self::extract_account_number($result);
         wp_send_json_success([
-            'account_name' => $result['account_name'] ?? '',
-            'account_number' => $result['account_number'] ?? $account_number,
-            'bank_name' => $result['bank_name'] ?? '',
+            'account_name'   => self::extract_account_name($result),
+            'account_number' => $resolved_account_number !== '' ? $resolved_account_number : $account_number,
+            'bank_name'      => self::extract_bank_name($result),
         ]);
     }
 
