@@ -1016,9 +1016,17 @@ class Matrix_MLM_Fintava {
      * bankName) and snake_case keys cause the four-line "should not be
      * empty / must be a number" error stack. Our internal $transfer_data
      * contract stays snake_case; only the outbound payload is renamed.
+     *
+     * Required wire-level field beyond the merchant variant: `sourceId`,
+     * the UUID of the user's Fintava virtual wallet to debit. Without it
+     * the endpoint 400s with "sourceId should not be empty / sourceId
+     * must be a UUID" — the validator's way of saying "we won't pull
+     * funds from an unspecified wallet." Callers pass it as
+     * $transfer_data['wallet_id']; the local matrix_fintava_wallets row
+     * already carries this UUID per user.
      */
     public function bank_credit($transfer_data) {
-        $required_fields = ['amount', 'account_number', 'bank_code'];
+        $required_fields = ['amount', 'account_number', 'bank_code', 'wallet_id'];
         foreach ($required_fields as $field) {
             if (empty($transfer_data[$field])) {
                 return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
@@ -1029,6 +1037,10 @@ class Matrix_MLM_Fintava {
             'amount'        => floatval($transfer_data['amount']),
             'accountNumber' => sanitize_text_field($transfer_data['account_number']),
             'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
+            // Fintava's /bank/credit validator requires `sourceId` (UUID of
+            // the wallet to debit). The internal contract calls this
+            // `wallet_id`; only the outbound key is renamed.
+            'sourceId'      => sanitize_text_field($transfer_data['wallet_id']),
         ];
 
         // Map our snake_case optionals to the camelCase keys Fintava expects.
@@ -1269,6 +1281,28 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('You do not have a Fintava wallet yet. Generate one before you can pay out.', 'matrix-mlm')]);
         }
 
+        // Fintava's /bank/credit endpoint requires the source wallet's UUID
+        // as `sourceId`. Older wallet rows can have an empty wallet_id (it
+        // was added later, and the column is nullable) — when that happens,
+        // try to resolve it from Fintava's /wallet/details enquiry the same
+        // way ajax_get_virtual_wallet_balance does. If the resolution fails
+        // we surface a clear error rather than letting the payout 400 with
+        // "sourceId should not be empty" downstream.
+        if (empty($user_wallet->wallet_id)) {
+            $resolved = $this->resolve_wallet_id_from_customer($user_wallet);
+            if (is_wp_error($resolved)) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        __('Your Fintava wallet ID is missing and could not be resolved automatically: %s. Open the dashboard balance card and follow the "Set Wallet ID" prompt, then retry.', 'matrix-mlm'),
+                        $resolved->get_error_message()
+                    ),
+                ]);
+            }
+            // Refresh the wallet row so $user_wallet->wallet_id reflects the
+            // value we just persisted.
+            $user_wallet = $this->get_user_wallet($user_id);
+        }
+
         $reference = $this->generate_reference();
 
         global $wpdb;
@@ -1303,6 +1337,9 @@ class Matrix_MLM_Fintava {
             'narration'      => $narration,
             'reference'      => $reference,
             'currency'       => 'NGN',
+            // sourceId on the wire — the user's Fintava virtual wallet to
+            // debit. Already resolved above if it was missing on the row.
+            'wallet_id'      => $user_wallet->wallet_id,
         ]);
 
         if (is_wp_error($result)) {
