@@ -1016,9 +1016,16 @@ class Matrix_MLM_Fintava {
      * bankName) and snake_case keys cause the four-line "should not be
      * empty / must be a number" error stack. Our internal $transfer_data
      * contract stays snake_case; only the outbound payload is renamed.
+     *
+     * Required `wallet_id` (sent as `sourceId`): Fintava's class-validator
+     * on /bank/credit rejects the request with "sourceId must be a UUID"
+     * when omitted. It identifies the user's Fintava virtual wallet that
+     * funds the payout — without it Fintava can't tell which wallet to
+     * debit. Callers must resolve it (via resolve_wallet_id_from_customer
+     * if the local row is missing it) before calling bank_credit().
      */
     public function bank_credit($transfer_data) {
-        $required_fields = ['amount', 'account_number', 'bank_code'];
+        $required_fields = ['amount', 'account_number', 'bank_code', 'wallet_id'];
         foreach ($required_fields as $field) {
             if (empty($transfer_data[$field])) {
                 return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
@@ -1026,6 +1033,7 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
+            'sourceId'      => sanitize_text_field($transfer_data['wallet_id']),
             'amount'        => floatval($transfer_data['amount']),
             'accountNumber' => sanitize_text_field($transfer_data['account_number']),
             'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
@@ -1269,6 +1277,31 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('You do not have a Fintava wallet yet. Generate one before you can pay out.', 'matrix-mlm')]);
         }
 
+        // Fintava's /bank/credit endpoint requires `sourceId` — the UUID
+        // of the user's virtual wallet that funds the payout. If the
+        // local row was linked manually with only the account number
+        // (the same scenario handled in ajax_get_virtual_wallet_balance),
+        // try to auto-resolve the wallet_id via the Customer API before
+        // failing. Mirrors the balance-refresh flow so users don't get
+        // stuck with "sourceId must be a UUID" 400s on an otherwise
+        // working wallet.
+        if (empty($user_wallet->wallet_id)) {
+            $resolved = $this->resolve_wallet_id_from_customer($user_wallet);
+            if (is_wp_error($resolved)) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        __('Your Fintava wallet ID is missing and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
+                        $resolved->get_error_message()
+                    ),
+                ]);
+            }
+            // Refresh the wallet row after resolution.
+            $user_wallet = $this->get_user_wallet($user_id);
+            if (!$user_wallet || empty($user_wallet->wallet_id)) {
+                wp_send_json_error(['message' => __('Your Fintava wallet ID is missing. Please contact support.', 'matrix-mlm')]);
+            }
+        }
+
         $reference = $this->generate_reference();
 
         global $wpdb;
@@ -1303,6 +1336,7 @@ class Matrix_MLM_Fintava {
             'narration'      => $narration,
             'reference'      => $reference,
             'currency'       => 'NGN',
+            'wallet_id'      => $user_wallet->wallet_id,
         ]);
 
         if (is_wp_error($result)) {
