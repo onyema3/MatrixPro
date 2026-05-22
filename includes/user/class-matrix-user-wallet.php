@@ -96,19 +96,32 @@ class Matrix_MLM_User_Wallet {
             // "wallet should be active with three buttons or a create
             // wallet button" report.
             //
-            // Wallet-to-Wallet (Matrix user-to-user) doesn't strictly
-            // require a Fintava wallet, but signposting it alongside
-            // the create-wallet CTA would dilute the single next step
-            // we want first-time users to take. The action button row
-            // shows just one button until onboarding completes; once
-            // the wallet exists the full three-button row is rendered
-            // by the normal flow below.
+            // The action button row shows three buttons in this state:
+            //   - Transfer to Own Wallet — Matrix → Virtual. Needs a
+            //     Fintava wallet as destination, which doesn't exist
+            //     yet, so the matching pane shows a notice prompting
+            //     the user to create their Virtual Account first
+            //     (with a one-click jump to the create-wallet pane).
+            //   - Wallet to Wallet — Matrix → another user's Matrix
+            //     wallet (internal transfer). Doesn't require Fintava
+            //     at all, so the matching pane renders the full
+            //     functional form using the existing matrix_mlm_action
+            //     transfer endpoint, identical to the wallet-exists
+            //     flow.
+            //   - Create Fintava Wallet — one-time onboarding CTA.
+            //
+            // "Transfer to Bank" is not surfaced here: it's exclusively
+            // a Fintava bank-payout flow with no meaningful no-wallet
+            // fallback (the source account doesn't exist yet), so
+            // showing it would only invite confused clicks. Once the
+            // wallet exists the normal flow below renders the full
+            // three-button row including bank.
             $this->render_header_no_wallet($matrix_balance, $currency);
             $this->render_action_buttons_no_wallet();
-            $this->render_panes_no_wallet($user_id);
+            $this->render_panes_no_wallet($user_id, $matrix_balance, $currency);
             $this->render_transaction_history($user_id, $currency);
             $this->render_base_styles();
-            $this->render_scripts_no_wallet();
+            $this->render_scripts_no_wallet($matrix_balance, $currency);
             return;
         }
 
@@ -421,7 +434,7 @@ class Matrix_MLM_User_Wallet {
                     <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?>
                 </div>
                 <div class="matrix-wallet-help-text matrix-wallet-help-text-light">
-                    <?php esc_html_e('Internal earnings wallet. Create a Fintava wallet below to start moving funds out.', 'matrix-mlm'); ?>
+                    <?php esc_html_e('Internal earnings wallet. You can already send funds to another user below; create a Fintava wallet to also transfer to your own Virtual account or to any Nigerian bank.', 'matrix-mlm'); ?>
                 </div>
             </div>
         </div>
@@ -429,22 +442,50 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the single "Create Fintava Wallet" action button shown
-     * to users who haven't completed Fintava onboarding yet.
+     * Render the action button row shown to users who haven't
+     * completed Fintava onboarding yet.
+     *
+     * Three buttons, mirroring the wallet-exists row's layout and
+     * data-target/data-pane contract (see render_action_buttons() and
+     * render_panes_no_wallet()):
+     *
+     *   own-wallet     — Matrix → Virtual. Pane shows a notice +
+     *                    one-click jump to create-wallet because the
+     *                    destination doesn't exist yet.
+     *   user-wallet    — Matrix → Matrix (another user). Pane shows
+     *                    the full functional wallet-to-wallet form;
+     *                    this flow doesn't need Fintava at all.
+     *   create-wallet  — one-time Fintava onboarding CTA.
+     *
+     * "Transfer to Bank" is intentionally omitted here — it's a pure
+     * Fintava bank-payout flow with no meaningful no-wallet fallback
+     * (the source account doesn't exist yet), so surfacing it would
+     * only invite confused clicks. Once the wallet exists the full
+     * three-button row (own-wallet, user-wallet, bank) is rendered by
+     * render_action_buttons().
      *
      * Uses the same .matrix-wallet-actions row + .matrix-wallet-action-btn
-     * markup as the normal three-button row (see render_action_buttons())
-     * so the click-to-reveal pane toggle in render_scripts_no_wallet()
-     * uses the exact same JS contract — data-target on the button,
-     * data-pane on the matching <section> in render_panes_no_wallet().
-     * The CSS grid auto-fills around the missing two columns; the
-     * single button takes the first cell of the grid and the rest
-     * stays empty, which reads as "this is the only thing for you to
-     * do right now" rather than as a layout glitch.
+     * markup as render_action_buttons() so the click-to-reveal pane
+     * toggle in render_scripts_no_wallet() uses the exact same JS
+     * contract.
      */
     private function render_action_buttons_no_wallet() {
         ?>
         <div class="matrix-wallet-actions">
+            <button type="button" class="matrix-wallet-action-btn" data-target="own-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-randomize"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Move funds from your Matrix wallet to your Virtual account', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <button type="button" class="matrix-wallet-action-btn" data-target="user-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-share"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Wallet to Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Send funds to another user\'s Matrix wallet (internal transfer)', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
             <button type="button" class="matrix-wallet-action-btn" data-target="create-wallet">
                 <span class="matrix-wallet-action-icon dashicons dashicons-plus-alt"></span>
                 <span class="matrix-wallet-action-text">
@@ -457,28 +498,62 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the single create-wallet pane shown to users who haven't
-     * completed Fintava onboarding yet.
+     * Render the action panes shown to users who haven't completed
+     * Fintava onboarding yet.
      *
-     * Embeds Matrix_MLM_User_Virtual_Wallet::render_create_form() —
-     * same canonical create form the standalone /virtual-wallet page
-     * has always used, including its own AJAX submit handler hitting
-     * matrix_fintava_create_virtual_wallet. On submit success the
-     * create-form JS fires location.reload(), at which point this
-     * page re-renders through the normal "wallet exists" flow with
-     * the three action buttons and live Fintava balance, so the
-     * one-time onboarding step transitions directly into the full
-     * wallet experience without any further navigation.
+     * Three panes (hidden by default; each revealed by clicking its
+     * matching button in render_action_buttons_no_wallet()):
      *
-     * The pane carries [hidden] by default so it sits collapsed
-     * under the action button on initial page load. Clicking the
-     * "Create Fintava Wallet" button removes [hidden] (see the
-     * toggle in render_scripts_no_wallet()).
+     *   own-wallet    — Matrix → Virtual. The destination doesn't
+     *                   exist yet, so we show an in-pane notice
+     *                   instead of the full transfer form, with a
+     *                   button that programmatically clicks the
+     *                   "Create Fintava Wallet" action button (so
+     *                   the user lands directly on the create form
+     *                   without losing the "I want to move funds to
+     *                   my own wallet" intent that brought them
+     *                   here).
+     *   user-wallet   — Matrix → Matrix internal transfer. Renders
+     *                   the same form the wallet-exists flow uses
+     *                   (render_wallet_to_wallet_form()) — that flow
+     *                   doesn't depend on $wallet at all, only on
+     *                   the user's Matrix balance.
+     *   create-wallet — Embeds the canonical Fintava create form
+     *                   from Matrix_MLM_User_Virtual_Wallet so the
+     *                   onboarding markup stays in one place. On
+     *                   submit success the create-form JS fires
+     *                   location.reload(), and the page re-renders
+     *                   through the wallet-exists flow with the
+     *                   full three-button row + live Fintava
+     *                   balance.
      */
-    private function render_panes_no_wallet($user_id) {
+    private function render_panes_no_wallet($user_id, $matrix_balance, $currency) {
         $user = get_userdata($user_id);
         $meta = Matrix_MLM_User::get_meta($user_id);
         ?>
+        <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
+            <h3><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></h3>
+
+            <div class="matrix-transfer-note">
+                <?php esc_html_e('To transfer funds from your Matrix wallet into your own Virtual account you first need to create a Fintava virtual wallet. It only takes a moment — once it is set up, this option will be enabled for you.', 'matrix-mlm'); ?>
+            </div>
+
+            <div class="matrix-info-box">
+                <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
+                <p><strong><?php esc_html_e('Destination:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Your Virtual Account (not yet created)', 'matrix-mlm'); ?></p>
+            </div>
+
+            <button type="button"
+                    class="matrix-btn matrix-btn-primary matrix-btn-block"
+                    id="matrix-own-wallet-create-cta">
+                <?php esc_html_e('Create Virtual Wallet to Continue', 'matrix-mlm'); ?>
+            </button>
+        </section>
+
+        <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
+            <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
+        </section>
+
         <section class="matrix-wallet-pane" data-pane="create-wallet" hidden>
             <?php (new Matrix_MLM_User_Virtual_Wallet())->render_create_form($user, $meta); ?>
         </section>
@@ -488,12 +563,26 @@ class Matrix_MLM_User_Wallet {
     /**
      * Inline JS for the no-Fintava-wallet onboarding state.
      *
-     * Strict subset of render_scripts(): only the action-button →
-     * pane toggle, no AJAX-dependent handlers (refresh-balance,
-     * wallet-id-save, transfer forms — none of those exist in the
-     * DOM in this state). The create form itself ships its own
-     * submit-handler JS as part of render_create_form()'s output, so
-     * we don't need to wire that up here either.
+     * Binds the action-button → pane toggle (UI only), the
+     * Wallet-to-Wallet form submit + amount preview (Matrix → Matrix
+     * internal transfer; works without Fintava), and the "Create
+     * Virtual Wallet to Continue" CTA inside the own-wallet pane
+     * (which programmatically clicks the create-wallet action button
+     * so the user lands on the create form without losing context).
+     *
+     * The Wallet-to-Wallet binding is a verbatim port of the matching
+     * block in render_scripts() — same matrix_mlm_action endpoint,
+     * same matrix_action=transfer branch, same #matrix-w2w-form ID,
+     * same client-side validation and confirmation copy. Copying it
+     * over (rather than refactoring into a shared helper) keeps the
+     * no-wallet path self-contained and avoids risking regressions in
+     * the working wallet-exists path.
+     *
+     * AJAX-dependent handlers gate on matrixMLM the same way as
+     * render_scripts(): if the global is missing we disable the W2W
+     * form's inputs so the user gets a visible "form is dead"
+     * affordance, but still bind the UI-only toggles so the page
+     * stays navigable.
      *
      * Same jQuery-polling guard as the main render_scripts() — see
      * that method's header comment (and the bank-payout pane's twin
@@ -501,7 +590,7 @@ class Matrix_MLM_User_Wallet {
      * scripts breaks on sites where an optimizer plugin defers
      * jQuery to the footer.
      */
-    private function render_scripts_no_wallet() {
+    private function render_scripts_no_wallet($matrix_balance, $currency) {
         ?>
         <script>
         (function() {
@@ -525,11 +614,20 @@ class Matrix_MLM_User_Wallet {
             whenJQueryReady(function($) {
                 'use strict';
 
-                // Single-button action-pane toggle. Same contract as
-                // the multi-button toggle in render_scripts(): clicking
-                // the active button collapses the pane back to the
-                // overview state, clicking it from the overview state
-                // reveals the pane.
+                // -----------------------------------------------------------
+                // UI-only handlers (do NOT depend on matrixMLM).
+                //
+                // These bind first and unconditionally so the action
+                // buttons + create-wallet CTA jump still work even
+                // when matrixMLM is missing (e.g., an optimizer
+                // dequeued matrix-mlm-public.js).
+                // -----------------------------------------------------------
+
+                // Action button → pane toggle. Same contract as the
+                // multi-button toggle in render_scripts(): clicking the
+                // active button collapses its pane back to the overview
+                // state, clicking it from the overview state reveals
+                // the pane.
                 $('.matrix-wallet-action-btn').on('click', function() {
                     var $btn    = $(this);
                     var target  = $btn.data('target');
@@ -542,14 +640,126 @@ class Matrix_MLM_User_Wallet {
                     if (!wasOpen) {
                         $btn.addClass('is-active');
                         $pane.removeAttr('hidden');
-                        // Smooth-scroll the create form into view on
-                        // small screens, mirroring the behaviour of
-                        // the three-button toggle in render_scripts().
                         if (window.innerWidth < 900) {
                             var top = $pane.offset().top - 20;
                             $('html, body').animate({ scrollTop: top }, 250);
                         }
                     }
+                });
+
+                // "Create Virtual Wallet to Continue" CTA inside the
+                // own-wallet pane. Programmatically clicks the
+                // create-wallet action button so the user is
+                // teleported straight onto the canonical create form,
+                // preserving their "I want to move funds to my own
+                // wallet" intent.
+                $('#matrix-own-wallet-create-cta').on('click', function() {
+                    $('.matrix-wallet-action-btn[data-target="create-wallet"]').trigger('click');
+                });
+
+                // -----------------------------------------------------------
+                // AJAX-dependent handlers — gate on matrixMLM the same
+                // way render_scripts() does.
+                // -----------------------------------------------------------
+                if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
+                    $('#matrix-w2w-form :input').prop('disabled', true);
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] matrixMLM global is not defined — wallet-to-wallet form not bound.');
+                    }
+                    return;
+                }
+
+                // -----------------------------------------------------------
+                // Wallet → Wallet transfer (internal user-to-user).
+                //
+                // Verbatim port of the matching block in
+                // render_scripts(). Hits matrix_mlm_action with
+                // matrix_action=transfer; the server-side handler
+                // (Matrix_MLM_Core::process_transfer) does the
+                // username lookup, balance check, debit/credit,
+                // matrix_transfers row insert, and recipient email
+                // notification — none of which touch Fintava — so
+                // this works fine for users with no virtual wallet.
+                // -----------------------------------------------------------
+                var ownCurrency    = '<?php echo esc_js($currency); ?>';
+                var w2wMin         = <?php echo floatval(get_option('matrix_mlm_min_transfer', 500)); ?>;
+                var w2wChargeType  = '<?php echo esc_js(get_option('matrix_mlm_transfer_charge_type', 'fixed')); ?>';
+                var w2wChargeValue = <?php echo floatval(get_option('matrix_mlm_transfer_charge', 100)); ?>;
+                var w2wBalance     = <?php echo floatval($matrix_balance); ?>;
+
+                $('#matrix-w2w-amount').on('input', function() {
+                    var amount = parseFloat($(this).val()) || 0;
+                    if (amount > 0) {
+                        var charge = w2wChargeType === 'percent'
+                            ? (amount * w2wChargeValue / 100)
+                            : w2wChargeValue;
+                        charge = Math.round(charge * 100) / 100;
+                        var total = amount + charge;
+                        $('#matrix-w2w-charge').text(ownCurrency + charge.toLocaleString());
+                        $('#matrix-w2w-total').text(ownCurrency + total.toLocaleString());
+                        $('#matrix-w2w-receive').text(ownCurrency + amount.toLocaleString());
+                        $('#matrix-w2w-charge-info').show();
+                    } else {
+                        $('#matrix-w2w-charge-info').hide();
+                    }
+                });
+
+                $('#matrix-w2w-form').on('submit', function(e) {
+                    e.preventDefault();
+
+                    var recipient = ($('#matrix-w2w-recipient').val() || '').trim();
+                    var amount    = parseFloat($('#matrix-w2w-amount').val());
+
+                    if (!recipient) {
+                        alert('<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
+                        return;
+                    }
+                    if (!amount || amount < w2wMin) {
+                        alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                        return;
+                    }
+
+                    var charge = w2wChargeType === 'percent'
+                        ? (amount * w2wChargeValue / 100)
+                        : w2wChargeValue;
+                    charge = Math.round(charge * 100) / 100;
+                    var total = amount + charge;
+                    if (total > w2wBalance) {
+                        alert('<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
+                        return;
+                    }
+
+                    if (!confirm('<?php echo esc_js(__('Send', 'matrix-mlm')); ?> ' + ownCurrency + amount.toLocaleString() + ' <?php echo esc_js(__('to', 'matrix-mlm')); ?> ' + recipient + '?\n\n<?php echo esc_js(__('Charge:', 'matrix-mlm')); ?> ' + ownCurrency + charge.toFixed(2) + '\n<?php echo esc_js(__('Total Debit:', 'matrix-mlm')); ?> ' + ownCurrency + total.toFixed(2))) {
+                        return;
+                    }
+
+                    var $btn = $('#matrix-w2w-submit-btn');
+                    $btn.prop('disabled', true).text('<?php echo esc_js(__('Processing…', 'matrix-mlm')); ?>');
+
+                    $.ajax({
+                        url:  matrixMLM.ajaxUrl,
+                        type: 'POST',
+                        data: {
+                            action:        'matrix_mlm_action',
+                            nonce:         matrixMLM.nonce,
+                            matrix_action: 'transfer',
+                            recipient:     recipient,
+                            amount:        amount
+                        },
+                        success: function(res) {
+                            if (res && res.success) {
+                                alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
+                                location.reload();
+                            } else {
+                                alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
+                                $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
+                            }
+                        },
+                        error: function() {
+                            alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                            $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
+                        }
+                    });
                 });
             });
         })();
