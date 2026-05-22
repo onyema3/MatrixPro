@@ -561,7 +561,40 @@ class Matrix_MLM_User_Virtual_Wallet {
         </div>
 
         <script>
-        (function($) {
+        // Same jQuery-polling guard the wallet page uses on its inline
+        // scripts. Previous revision called `(function($){...})(jQuery)`
+        // directly, which throws ReferenceError on the *very first
+        // parse* on any site that defers jQuery to the footer (the
+        // matrix-mlm-public enqueue declares jQuery as a dep but is
+        // itself enqueued $in_footer=true, so jQuery loads in the
+        // footer too). The thrown error is contained to this script
+        // tag — it doesn't break the rest of the page — but in
+        // hosting environments where this script runs *inside* a
+        // section that's a sibling to the wallet page's toggle
+        // script, the early ReferenceError would surface in the
+        // console as a noisy red error and made it harder to spot
+        // the actual binding state of subsequent scripts. Polling
+        // window.jQuery removes the noise and lets this submit
+        // handler bind cleanly once jQuery is available.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; create-wallet submit not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             'use strict';
 
             $('#matrix-create-virtual-wallet-form').on('submit', function(e) {
@@ -605,7 +638,8 @@ class Matrix_MLM_User_Virtual_Wallet {
                     }
                 });
             });
-        })(jQuery);
+        }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
