@@ -967,18 +967,54 @@ class Matrix_MLM_User_Wallet {
         $charge_value = floatval(get_option('matrix_mlm_fintava_charge_value', 50));
         ?>
         <script>
-        (function($) {
+        // Wait for jQuery to load before binding any handlers. Same
+        // pattern the embedded bank-payout pane uses: this inline
+        // <script> is printed in the body while parsing, but a theme
+        // or optimizer plugin (Astra, GeneratePress, OceanWP, WP
+        // Rocket, FlyingPress, Perfmatters, SG Optimizer, etc.) often
+        // defers jQuery to the footer. In that window, calling
+        // `(function($){...})(jQuery)` directly throws ReferenceError
+        // immediately, the script aborts, and NONE of the handlers
+        // below ever bind — which presents to the user as "I clicked
+        // Transfer to Bank and absolutely nothing happened". Polling
+        // window.jQuery for up to ~10s lets the footer-loaded path
+        // succeed once jQuery actually arrives.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; wallet page handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             'use strict';
 
-            // matrixMLM is localized in the footer with the rest of the
-            // public scripts. Same defensive check the bank-payout page
-            // does, but here we only disable the "Transfer to Own Wallet"
-            // form — the embedded bank-payout pane has its own check
-            // and disables its own form independently.
-            if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
-                $('#matrix-transfer-to-own-wallet-form :input').prop('disabled', true);
-                return;
-            }
+            // -----------------------------------------------------------
+            // UI-only handlers (do NOT depend on matrixMLM).
+            //
+            // These bind FIRST and unconditionally so the page
+            // chrome — action-button pane toggle, copy-to-clipboard —
+            // works even when matrixMLM is missing or arrives late.
+            // The previous revision returned early when matrixMLM was
+            // undefined, which left the action buttons inert (clicks
+            // did literally nothing) on any site whose optimizer
+            // deferred matrix-mlm-public.js — exactly the
+            // "nothing happens when I click Transfer to Bank" report.
+            // AJAX-dependent handlers further down still gate on
+            // matrixMLM, but they're now allowed to fail individually
+            // instead of taking the entire page's JS down with them.
+            // -----------------------------------------------------------
 
             // -----------------------------------------------------------
             // Action button → pane toggling.
@@ -1030,6 +1066,28 @@ class Matrix_MLM_User_Wallet {
                     done();
                 }
             });
+
+            // -----------------------------------------------------------
+            // Everything below this point hits the WordPress AJAX
+            // endpoint via matrixMLM.ajaxUrl/nonce. If the matrixMLM
+            // global isn't available — usually because a caching
+            // plugin dequeued matrix-mlm-public.js or the wp_footer
+            // didn't run — disable the AJAX-dependent forms inline so
+            // the user gets a visible "form is dead" affordance, then
+            // bail out of binding the rest of the handlers. The
+            // UI-only handlers above are already bound, so the action
+            // buttons (and copy-to-clipboard) keep working regardless
+            // — which means the user can still navigate the page even
+            // when matrixMLM is unreachable.
+            // -----------------------------------------------------------
+            if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
+                $('#matrix-transfer-to-own-wallet-form :input').prop('disabled', true);
+                $('#matrix-w2w-form :input').prop('disabled', true);
+                if (window.console && console.error) {
+                    console.error('[Matrix MLM] matrixMLM global is not defined — wallet page AJAX handlers not bound.');
+                }
+                return;
+            }
 
             // -----------------------------------------------------------
             // Refresh Fintava balance without reloading.
@@ -1293,7 +1351,8 @@ class Matrix_MLM_User_Wallet {
                 });
             });
 
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
