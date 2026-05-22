@@ -1046,37 +1046,18 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        // Amount: Fintava's /bank/credit has been observed crashing (HTTP 500)
-        // when amount is sent as a float with decimals (e.g. 100.00) but
-        // succeeding when sent as a plain integer (e.g. 100). The old system
-        // that works sends integer amounts. We cast to int when the amount
-        // has no fractional part (the common case for NGN transfers); keep
-        // as float only when there are actual kobo (e.g. 100.50).
-        $raw_amount = floatval($transfer_data['amount']);
-        $send_amount = (floor($raw_amount) == $raw_amount) ? intval($raw_amount) : $raw_amount;
-
+        // Payload: match the old Laravel system's bankCredit() exactly.
+        // The old system sends ONLY these 6 fields in this exact order
+        // with these exact types. Sending extra fields (reference,
+        // currency, bankName) or wrong types causes Fintava to 500.
         $payload = [
-            'sourceId'      => $wallet_id,
-            'amount'        => $send_amount,
-            'accountNumber' => sanitize_text_field($transfer_data['account_number']),
-            'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
+            'accountName'   => (string) ($transfer_data['account_name'] ?? ''),
+            'accountNumber' => (string) sanitize_text_field($transfer_data['account_number']),
+            'narration'     => (string) ($transfer_data['narration'] ?? ''),
+            'sortCode'      => (string) sanitize_text_field($transfer_data['bank_code']),
+            'amount'        => (float) $transfer_data['amount'],
+            'sourceId'      => (string) $wallet_id,
         ];
-
-        // Map our snake_case optionals to the camelCase keys Fintava expects.
-        // `narration`, `reference`, `currency` retain their names because
-        // those are already lowercase single tokens on both sides.
-        $optional_map = [
-            'narration'    => 'narration',
-            'reference'    => 'reference',
-            'currency'     => 'currency',
-            'account_name' => 'accountName',
-            'bank_name'    => 'bankName',
-        ];
-        foreach ($optional_map as $local_key => $api_key) {
-            if (!empty($transfer_data[$local_key])) {
-                $payload[$api_key] = sanitize_text_field($transfer_data[$local_key]);
-            }
-        }
 
         $base = $this->get_bank_credit_base_url();
 
@@ -1092,7 +1073,11 @@ class Matrix_MLM_Fintava {
         $last_error = null;
 
         for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
-            $response = $this->make_request('POST', '/bank/credit', $payload, $base);
+            // Use lean_headers=true to match the old system which does NOT
+            // send Merchant-Id header. The old Laravel system only sends:
+            // Authorization, accept, content-type. make_request() will
+            // re-attach Content-Type for POST bodies even in lean mode.
+            $response = $this->make_request('POST', '/bank/credit', $payload, $base, true);
 
             if (is_wp_error($response)) {
                 $error_msg = $response->get_error_message();
