@@ -325,7 +325,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (self::is_api_success($response) && isset($response['data'])) {
             set_transient($cache_key, $response['data'], DAY_IN_SECONDS);
             return $response['data'];
         }
@@ -354,7 +354,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (self::is_api_success($response) && isset($response['data'])) {
             return $response['data'];
         }
 
@@ -400,7 +400,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true) {
+        if (self::is_api_success($response)) {
             return [
                 'success' => true,
                 'transfer_id' => $response['data']['id'] ?? null,
@@ -431,7 +431,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (self::is_api_success($response) && isset($response['data'])) {
             return $response['data'];
         }
 
@@ -453,7 +453,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (self::is_api_success($response) && isset($response['data'])) {
             return $response['data'];
         }
 
@@ -501,7 +501,7 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true) {
+        if (self::is_api_success($response)) {
             return [
                 'success' => true,
                 'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
@@ -2788,6 +2788,51 @@ class Matrix_MLM_Fintava {
         }
 
         return $body_decoded;
+    }
+
+    /**
+     * Decide whether a decoded Fintava API response represents application
+     * success. Historically Fintava used boolean `status: true`, but their
+     * current envelope returns the numeric HTTP code (`status: 200`) — and
+     * the legacy `=== true` check throughout this gateway silently treated
+     * every successful live-tier call as a failure, so the bank dropdown,
+     * resolve-account, transfer, merchant balance, and card endpoints all
+     * fell through to WP_Error even on 2xx responses.
+     *
+     * make_request() already converts HTTP 4xx/5xx to WP_Error before any
+     * caller sees the body, so here we only need to honor the application-
+     * level success flag. Tolerated values:
+     *   - boolean true (legacy)
+     *   - numeric 200..299 (current Fintava envelope)
+     *   - string 'success' / 'successful' / 'ok' (occasional shape)
+     *   - missing entirely (treat as success — body is the data)
+     *
+     * @param mixed $response Decoded API body.
+     * @return bool
+     */
+    public static function is_api_success($response) {
+        if (!is_array($response)) {
+            return false;
+        }
+        if (!array_key_exists('status', $response)) {
+            // No envelope status field; rely on make_request having
+            // already filtered out HTTP errors.
+            return true;
+        }
+        $status = $response['status'];
+        if ($status === true) {
+            return true;
+        }
+        if (is_numeric($status) && (int) $status >= 200 && (int) $status < 300) {
+            return true;
+        }
+        if (is_string($status)) {
+            $lower = strtolower(trim($status));
+            if (in_array($lower, ['success', 'successful', 'ok'], true)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
