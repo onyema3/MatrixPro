@@ -877,7 +877,23 @@ class Matrix_MLM_User_Wallet {
         $charge_value = floatval(get_option('matrix_mlm_fintava_charge_value', 50));
 
         $fintava = new Matrix_MLM_Fintava();
-        $payouts = $fintava->get_user_payouts($user_id, 10);
+        // Pull a wider page from the gateway (50) and filter client-side
+        // to rows whose destination matches the user's own virtual
+        // account. The matrix_fintava_payouts table is shared with the
+        // bank-payout flow, so without this filter the "Recent Transfers
+        // (Matrix → Virtual)" heading below would mix in external bank
+        // payouts and mislead the user. We slice to 10 after filtering
+        // so the on-screen list stays compact.
+        $all_payouts = $fintava->get_user_payouts($user_id, 50);
+        $payouts     = [];
+        foreach ($all_payouts as $row) {
+            if (isset($row->account_number) && $row->account_number === $wallet->account_number) {
+                $payouts[] = $row;
+                if (count($payouts) >= 10) {
+                    break;
+                }
+            }
+        }
 
         // Compute effective max upfront so the user can't type a value
         // that would silently fail the (amount + charge) ≤ balance gate.
@@ -1668,14 +1684,18 @@ class Matrix_MLM_User_Wallet {
                 $.ajax({
                     url: matrixMLM.ajaxUrl,
                     type: 'POST',
+                    // Action is matrix_transfer_matrix_to_virtual
+                    // (Matrix debit + merchant->user virtual credit) —
+                    // distinct from matrix_fintava_initiate_transfer
+                    // (bank payout). We deliberately do NOT send the
+                    // destination account fields from the client: the
+                    // server reads them off the user's own wallet row
+                    // so a tampered POST can't redirect the credit to
+                    // another account.
                     data: {
-                        action:         'matrix_fintava_initiate_transfer',
+                        action:         'matrix_transfer_matrix_to_virtual',
                         nonce:          matrixMLM.nonce,
                         amount:         amount,
-                        account_number: ownAccountNum,
-                        bank_code:      ownBankCode,
-                        bank_name:      ownBankName,
-                        account_name:   ownAccountName,
                         narration:      '<?php echo esc_js(__('Matrix to Virtual wallet transfer', 'matrix-mlm')); ?>'
                     },
                     success: function(res) {

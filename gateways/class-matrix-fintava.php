@@ -198,6 +198,15 @@ class Matrix_MLM_Fintava {
         add_action('wp_ajax_matrix_fintava_merchant_balance', [$this, 'ajax_get_merchant_balance']);
         add_action('wp_ajax_matrix_fintava_clear_failed_payouts', [$this, 'ajax_clear_failed_payouts']);
 
+        // Matrix wallet -> user's own Fintava virtual wallet. Distinct
+        // flow from ajax_initiate_transfer (bank payout): the source of
+        // funds here is the user's Matrix balance plus a real-cash
+        // movement from the merchant's Fintava wallet to the user's
+        // Fintava virtual wallet, not the user's Fintava wallet to an
+        // external bank. See ajax_transfer_matrix_to_virtual() for the
+        // bookkeeping rationale.
+        add_action('wp_ajax_matrix_transfer_matrix_to_virtual', [$this, 'ajax_transfer_matrix_to_virtual']);
+
         // Virtual Wallet AJAX handlers
         add_action('wp_ajax_matrix_fintava_create_virtual_wallet', [$this, 'ajax_create_virtual_wallet']);
         add_action('wp_ajax_matrix_fintava_get_virtual_wallet', [$this, 'ajax_get_virtual_wallet']);
@@ -1638,6 +1647,280 @@ class Matrix_MLM_Fintava {
             ),
             'reference' => $reference,
             'status'    => $result['status'] ?? 'processing',
+        ]);
+    }
+
+    /**
+     * AJAX: Matrix wallet -> user's own Fintava virtual wallet.
+     *
+     * The flow this implements (intentionally distinct from
+     * ajax_initiate_transfer, which is the external bank-payout
+     * flow):
+     *
+     *   1. Debit the user's Matrix (internal) wallet by amount + charge.
+     *      Charge is read from the same admin-configured options
+     *      (matrix_mlm_fintava_charge_*) the on-page form previews.
+     *   2. Move REAL CASH on Fintava's side from the merchant wallet
+     *      to the user's own virtual wallet by calling
+     *      POST /bank/credit/merchant with destination =
+     *      (user.account_number, user.bank_code). The merchant balance
+     *      is what funds the credit; the user's Matrix debit is the
+     *      bookkeeping side that "pays" the merchant for that movement.
+     *   3. If Fintava rejects the credit, refund the Matrix wallet so
+     *      the user is made whole — money never half-moved.
+     *
+     * Why /bank/credit/merchant and not /bank/credit:
+     *   - /bank/credit debits the user's own Fintava virtual wallet
+     *     to credit some external bank. Wrong direction here: we want
+     *     to credit the user's wallet, not debit it.
+     *   - /bank/credit/merchant debits the merchant wallet to credit
+     *     a bank account; when the destination account is the user's
+     *     own Fintava virtual NUBAN, Fintava routes the credit
+     *     internally and the user's virtual wallet balance increases.
+     *     This is the "merchant funds a user's wallet" path that the
+     *     existing merchant_bank_credit() docstring already calls out.
+     *
+     * Why the Matrix wallet debit is committed before calling Fintava:
+     *   - We want a durable "pending" record on disk regardless of
+     *     what Fintava does next (success, failure, timeout). If we
+     *     held the transaction open across the HTTP call and the
+     *     PHP request timed out, MySQL would roll back the debit and
+     *     the payout row both — leaving zero trace of the attempt.
+     *     Committing first means the Matrix ledger has a debit + a
+     *     pending payout row even when the network step misbehaves,
+     *     and on Fintava error we apply a compensating credit
+     *     (refund) instead of a rollback.
+     */
+    public function ajax_transfer_matrix_to_virtual() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+        self::ensure_tables_exist();
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        if (!Matrix_MLM_User::is_active($user_id)) {
+            wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
+        }
+
+        if (!$this->is_active()) {
+            wp_send_json_error(['message' => __('Wallet transfers are not available at the moment.', 'matrix-mlm')]);
+        }
+
+        // Destination wallet must exist; we cannot credit a wallet that
+        // hasn't been generated on Fintava yet.
+        $user_wallet = $this->get_user_wallet($user_id);
+        if (!$user_wallet) {
+            wp_send_json_error(['message' => __('You do not have a Virtual wallet yet. Create one before transferring to it.', 'matrix-mlm')]);
+        }
+        if (empty($user_wallet->account_number) || empty($user_wallet->bank_code)) {
+            wp_send_json_error(['message' => __('Your Virtual wallet is missing an account number or bank code. Please contact support.', 'matrix-mlm')]);
+        }
+
+        $amount = floatval($_POST['amount'] ?? 0);
+        if ($amount <= 0) {
+            wp_send_json_error(['message' => __('Please enter a valid amount.', 'matrix-mlm')]);
+        }
+
+        $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
+        $min_transfer    = floatval(get_option('matrix_mlm_fintava_min_payout', 1000));
+        $max_transfer    = floatval(get_option('matrix_mlm_fintava_max_payout', 5000000));
+
+        if ($amount < $min_transfer) {
+            wp_send_json_error(['message' => sprintf(__('Minimum transfer amount is %s%s', 'matrix-mlm'), $currency_symbol, number_format($min_transfer, 2))]);
+        }
+        if ($amount > $max_transfer) {
+            wp_send_json_error(['message' => sprintf(__('Maximum transfer amount is %s%s', 'matrix-mlm'), $currency_symbol, number_format($max_transfer, 2))]);
+        }
+
+        // Charge math — mirrors the inline preview the on-page form
+        // shows. Same options the bank-payout pane reads, so admin
+        // configuration stays in one place.
+        $charge_type  = get_option('matrix_mlm_fintava_charge_type', 'fixed');
+        $charge_value = floatval(get_option('matrix_mlm_fintava_charge_value', 50));
+        $charge       = ($charge_type === 'percent')
+            ? round($amount * $charge_value / 100, 2)
+            : round($charge_value, 2);
+        $total_debit  = round($amount + $charge, 2);
+
+        // Pre-flight balance check. The atomic conditional UPDATE in
+        // Matrix_MLM_Wallet::debit() already enforces this, but
+        // checking up front lets us return a friendlier error before
+        // we open a DB transaction.
+        $matrix_wallet  = new Matrix_MLM_Wallet();
+        $matrix_balance = $matrix_wallet->get_balance($user_id);
+        if ($matrix_balance < $total_debit) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: 1: currency symbol, 2: required amount, 3: available balance */
+                    __('Insufficient Matrix wallet balance. You need %1$s%2$s (amount + charge) but have only %1$s%3$s.', 'matrix-mlm'),
+                    $currency_symbol,
+                    number_format($total_debit, 2),
+                    number_format($matrix_balance, 2)
+                ),
+            ]);
+        }
+
+        $reference = $this->generate_reference();
+        $narration = sanitize_text_field(
+            (string) ($_POST['narration'] ?? sprintf(
+                __('Matrix wallet to Virtual wallet (%s)', 'matrix-mlm'),
+                wp_get_current_user()->user_login
+            ))
+        );
+
+        global $wpdb;
+        $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
+
+        // Step 1: debit the Matrix wallet + record the pending payout
+        // row inside a single transaction so they commit (or roll
+        // back) together. We deliberately do NOT keep the transaction
+        // open across the Fintava HTTP call below — see the docblock.
+        $wpdb->query('START TRANSACTION');
+
+        $debit_result = $matrix_wallet->debit(
+            $user_id,
+            $total_debit,
+            'transfer_to_virtual_wallet',
+            sprintf(__('Transfer to Virtual wallet (%s)', 'matrix-mlm'), $user_wallet->account_number),
+            $reference
+        );
+        if ($debit_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] ajax_transfer_matrix_to_virtual: debit() returned false. user_id=%d total=%s last_error=%s',
+                $user_id, $total_debit, $wpdb->last_error
+            ));
+            wp_send_json_error(['message' => __('Could not debit your Matrix wallet. Please refresh and try again.', 'matrix-mlm')]);
+        }
+
+        $insert_result = $wpdb->insert(
+            $payouts_table,
+            [
+                'user_id'        => $user_id,
+                'reference'      => $reference,
+                'amount'         => $amount,
+                'charge'         => $charge,
+                'total_debit'    => $total_debit,
+                'bank_code'      => $user_wallet->bank_code,
+                'bank_name'      => $user_wallet->bank_name,
+                'account_number' => $user_wallet->account_number,
+                'account_name'   => $user_wallet->account_name,
+                'narration'      => $narration,
+                'currency'       => $user_wallet->currency ?: 'NGN',
+                'status'         => 'pending',
+                'created_at'     => current_time('mysql'),
+            ],
+            ['%d', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
+        );
+        if ($insert_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] ajax_transfer_matrix_to_virtual: payout insert failed. user_id=%d ref=%s last_error=%s',
+                $user_id, $reference, $wpdb->last_error
+            ));
+            wp_send_json_error(['message' => __('Could not record the transfer. Please try again.', 'matrix-mlm')]);
+        }
+        $payout_id = $wpdb->insert_id;
+
+        $wpdb->query('COMMIT');
+
+        // Step 2: move real cash on Fintava's side. /bank/credit/merchant
+        // debits the merchant Fintava balance and credits the destination
+        // account; here the destination is the user's own virtual NUBAN,
+        // so Fintava routes the credit internally and the user's
+        // virtual-wallet balance goes up.
+        $result = $this->merchant_bank_credit([
+            'amount'         => $amount,
+            'account_number' => $user_wallet->account_number,
+            'bank_code'      => $user_wallet->bank_code,
+            'bank_name'      => $user_wallet->bank_name,
+            'account_name'   => $user_wallet->account_name,
+            'narration'      => $narration,
+            'reference'      => $reference,
+            'currency'       => $user_wallet->currency ?: 'NGN',
+        ]);
+
+        if (is_wp_error($result)) {
+            // Step 3: compensating refund. Credit the Matrix wallet
+            // back by the full total_debit so the user's balance is
+            // restored. Mark the payout row failed with the upstream
+            // reason so support can see exactly what Fintava rejected.
+            $refund = $matrix_wallet->credit(
+                $user_id,
+                $total_debit,
+                'transfer_to_virtual_wallet_refund',
+                sprintf(__('Refund: failed transfer to Virtual wallet (%s)', 'matrix-mlm'), $reference),
+                $reference
+            );
+            if ($refund === false) {
+                // Auditor-visible state: debit landed, refund did not.
+                // We surface a deliberately loud error so support can
+                // intervene; the failure_reason on the payout row
+                // captures the Fintava error AND the refund failure.
+                error_log(sprintf(
+                    '[Matrix MLM] ajax_transfer_matrix_to_virtual: refund credit() returned false after Fintava failure. user_id=%d ref=%s total=%s',
+                    $user_id, $reference, $total_debit
+                ));
+            }
+
+            $wpdb->update(
+                $payouts_table,
+                [
+                    'status'         => 'failed',
+                    'failure_reason' => $result->get_error_message() . ($refund === false ? ' [refund failed]' : ''),
+                    'updated_at'     => current_time('mysql'),
+                ],
+                ['id' => $payout_id],
+                ['%s', '%s', '%s'],
+                ['%d']
+            );
+
+            $message = $result->get_error_message();
+            if ($refund === false) {
+                $message .= ' ' . __('Note: your Matrix wallet refund did not apply automatically — please contact support with reference', 'matrix-mlm') . ' ' . $reference . '.';
+            }
+
+            wp_send_json_error(['message' => $message, 'reference' => $reference]);
+            return;
+        }
+
+        // Step 4: happy path. Fintava accepted the credit.
+        $wpdb->update(
+            $payouts_table,
+            [
+                'transfer_id'  => $result['transfer_id'] ?? '',
+                'status'       => $result['status'] ?? 'completed',
+                'completed_at' => current_time('mysql'),
+                'updated_at'   => current_time('mysql'),
+            ],
+            ['id' => $payout_id],
+            ['%s', '%s', '%s', '%s'],
+            ['%d']
+        );
+
+        Matrix_MLM_Notifications::send_admin_notification(
+            'matrix_to_virtual_transfer',
+            sprintf(
+                __('Matrix -> Virtual transfer: %s%s by %s to wallet %s. Ref: %s', 'matrix-mlm'),
+                $currency_symbol,
+                number_format($amount, 2),
+                wp_get_current_user()->user_login,
+                $user_wallet->account_number,
+                $reference
+            )
+        );
+
+        wp_send_json_success([
+            'message' => sprintf(
+                __('Transfer of %s%s to your Virtual wallet (%s) was successful.', 'matrix-mlm'),
+                $currency_symbol,
+                number_format($amount, 2),
+                $user_wallet->account_number
+            ),
+            'reference' => $reference,
+            'status'    => $result['status'] ?? 'completed',
         ]);
     }
 
