@@ -3705,14 +3705,41 @@ class Matrix_MLM_Fintava {
         $body_decoded = json_decode($raw_body, true);
 
         if ($status_code >= 400) {
-            $error_message = self::normalize_api_message(
-                is_array($body_decoded) ? ($body_decoded['message'] ?? null) : null,
-                sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint)
-            );
+            // Always prefix the error with HTTP status + endpoint so a
+            // generic upstream `message` like "An unexpected error
+            // occurred" — or a 500 with an empty body — is still
+            // diagnosable from the displayed error alone. Previously we
+            // fell through to using Fintava's `message` field verbatim,
+            // which is useless when the upstream surfaces the same
+            // generic string for unrelated failure modes (validator
+            // rejection, internal server error, auth issue).
+            $base_msg     = sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            $upstream_msg = is_array($body_decoded) ? ($body_decoded['message'] ?? null) : null;
+            $upstream_str = self::normalize_api_message($upstream_msg, '');
+            $error_message = $upstream_str !== '' ? $base_msg . ': ' . $upstream_str : $base_msg;
+
+            // Many JSON validators — including class-validator, which
+            // Fintava uses on /bank/credit and friends — put the
+            // field-level detail in `errors` / `error` / `details`
+            // rather than `message`. Pull whichever is populated and
+            // append a truncated snippet so the operator can see what
+            // actually failed without needing DevTools or the database.
+            if (is_array($body_decoded)) {
+                foreach (['errors', 'error', 'details', 'detail'] as $detail_key) {
+                    if (!isset($body_decoded[$detail_key])) {
+                        continue;
+                    }
+                    $detail_str = self::normalize_api_message($body_decoded[$detail_key], '');
+                    if ($detail_str !== '' && $detail_str !== $upstream_str) {
+                        $error_message .= sprintf(' [%s=%s]', $detail_key, substr($detail_str, 0, 200));
+                        break;
+                    }
+                }
+            }
+
             // Include a short body snippet so non-JSON or HTML error pages
             // (Cloudflare interstitials, WAF blocks, gateway 502s) are
             // identifiable from the dropdown alone.
-            $snippet = '';
             if (!is_array($body_decoded) && is_string($raw_body) && $raw_body !== '') {
                 $snippet = substr(trim(preg_replace('/\s+/', ' ', wp_strip_all_tags($raw_body))), 0, 120);
                 if ($snippet !== '') {
