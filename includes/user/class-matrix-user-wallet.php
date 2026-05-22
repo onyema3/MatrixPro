@@ -784,8 +784,8 @@ class Matrix_MLM_User_Wallet {
                                 $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                             }
                         },
-                        error: function() {
-                            alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                        error: function(xhr, textStatus, errorMsg) {
+                            var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                         }
                     });
@@ -1573,7 +1573,7 @@ class Matrix_MLM_User_Wallet {
                             alert(msg);
                         }
                     },
-                    error: function() {
+                    error: function(xhr, textStatus, errorMsg) {
                         $btn.prop('disabled', false).text(orig);
                         alert('<?php echo esc_js(__('Network error refreshing balance.', 'matrix-mlm')); ?>');
                     }
@@ -1615,7 +1615,7 @@ class Matrix_MLM_User_Wallet {
                             $status.css('color', '#fecaca').text('✗ ' + err);
                         }
                     },
-                    error: function() {
+                    error: function(xhr, textStatus, errorMsg) {
                         $btn.prop('disabled', false).text(orig);
                         $status.css('color', '#fecaca').text('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>');
                     }
@@ -1707,8 +1707,8 @@ class Matrix_MLM_User_Wallet {
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
                         }
                     },
-                    error: function() {
-                        alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                    error: function(xhr, textStatus, errorMsg) {
+                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
                     }
                 });
@@ -1807,8 +1807,8 @@ class Matrix_MLM_User_Wallet {
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                         }
                     },
-                    error: function() {
-                        alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                    error: function(xhr, textStatus, errorMsg) {
+                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                     }
                 });
