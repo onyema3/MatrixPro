@@ -1017,31 +1017,31 @@ class Matrix_MLM_Fintava {
      * empty / must be a number" error stack. Our internal $transfer_data
      * contract stays snake_case; only the outbound payload is renamed.
      *
-     * Required `wallet_id` (sent as `sourceId`): Fintava's class-validator
+     * Required `customer_id` (sent as `sourceId`): Fintava's class-validator
      * on /bank/credit rejects the request with "sourceId must be a UUID"
-     * when omitted. It identifies the user's Fintava virtual wallet that
+     * when omitted. It identifies the user's Fintava customer record that
      * funds the payout — without it Fintava can't tell which wallet to
-     * debit. Callers must resolve it (via resolve_wallet_id_from_customer
-     * if the local row is missing it) before calling bank_credit().
+     * debit. Callers must ensure customer_id is available on the wallet
+     * row before calling bank_credit().
      */
     public function bank_credit($transfer_data) {
-        $required_fields = ['amount', 'account_number', 'bank_code', 'wallet_id'];
+        $required_fields = ['amount', 'account_number', 'bank_code', 'customer_id'];
         foreach ($required_fields as $field) {
             if (empty($transfer_data[$field])) {
                 return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
             }
         }
 
-        // Validate wallet_id format — Fintava requires a valid UUID v4.
+        // Validate customer_id format — Fintava requires a valid UUID v4.
         // Catch malformed IDs before they hit the wire and trigger a
         // cryptic 500 on Fintava's side.
-        $wallet_id = sanitize_text_field($transfer_data['wallet_id']);
-        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $wallet_id)) {
+        $customer_id = sanitize_text_field($transfer_data['customer_id']);
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $customer_id)) {
             return new WP_Error(
-                'invalid_wallet_id',
+                'invalid_customer_id',
                 sprintf(
-                    __('Invalid Fintava wallet ID format (expected UUID, got "%s"). Please contact support to re-link your wallet.', 'matrix-mlm'),
-                    substr($wallet_id, 0, 40)
+                    __('Invalid Fintava customer ID format (expected UUID, got "%s"). Please contact support to re-link your wallet.', 'matrix-mlm'),
+                    substr($customer_id, 0, 40)
                 )
             );
         }
@@ -1056,7 +1056,7 @@ class Matrix_MLM_Fintava {
         $send_amount = (floor($raw_amount) == $raw_amount) ? intval($raw_amount) : $raw_amount;
 
         $payload = [
-            'sourceId'      => $wallet_id,
+            'sourceId'      => $customer_id,
             'amount'        => $send_amount,
             'accountNumber' => sanitize_text_field($transfer_data['account_number']),
             'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
@@ -1386,38 +1386,35 @@ class Matrix_MLM_Fintava {
         }
 
         // Fintava's /bank/credit endpoint requires `sourceId` — the UUID
-        // of the user's virtual wallet that funds the payout. If the
-        // local row was linked manually with only the account number
-        // (the same scenario handled in ajax_get_virtual_wallet_balance),
-        // try to auto-resolve the wallet_id via the Customer API before
-        // failing. Mirrors the balance-refresh flow so users don't get
-        // stuck with "sourceId must be a UUID" 400s on an otherwise
-        // working wallet.
-        if (empty($user_wallet->wallet_id)) {
+        // of the user's Fintava customer record that funds the payout.
+        // If the local row is missing customer_id (e.g. linked manually
+        // with only the account number), try to auto-resolve via the
+        // Customer API before failing.
+        if (empty($user_wallet->customer_id)) {
             $resolved = $this->resolve_wallet_id_from_customer($user_wallet);
             if (is_wp_error($resolved)) {
                 wp_send_json_error([
                     'message' => sprintf(
-                        __('Your Fintava wallet ID is missing and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
+                        __('Your Fintava customer ID is missing and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
                         $resolved->get_error_message()
                     ),
                 ]);
             }
             // Refresh the wallet row after resolution.
             $user_wallet = $this->get_user_wallet($user_id);
-            if (!$user_wallet || empty($user_wallet->wallet_id)) {
-                wp_send_json_error(['message' => __('Your Fintava wallet ID is missing. Please contact support.', 'matrix-mlm')]);
+            if (!$user_wallet || empty($user_wallet->customer_id)) {
+                wp_send_json_error(['message' => __('Your Fintava customer ID is missing. Please contact support.', 'matrix-mlm')]);
             }
         }
 
-        // Validate wallet_id is a proper UUID before sending to Fintava.
+        // Validate customer_id is a proper UUID before sending to Fintava.
         // A malformed sourceId triggers a 500 on their side instead of a
         // clean 400, which is the exact error pattern we're fixing here.
-        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $user_wallet->wallet_id)) {
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $user_wallet->customer_id)) {
             wp_send_json_error([
                 'message' => sprintf(
-                    __('Your Fintava wallet ID appears to be invalid (not a UUID). Stored value: "%s". Please contact support to re-link your wallet.', 'matrix-mlm'),
-                    substr($user_wallet->wallet_id, 0, 40)
+                    __('Your Fintava customer ID appears to be invalid (not a UUID). Stored value: "%s". Please contact support to re-link your wallet.', 'matrix-mlm'),
+                    substr($user_wallet->customer_id, 0, 40)
                 ),
             ]);
         }
@@ -1515,7 +1512,7 @@ class Matrix_MLM_Fintava {
             'narration'      => $narration,
             'reference'      => $reference,
             'currency'       => 'NGN',
-            'wallet_id'      => $user_wallet->wallet_id,
+            'customer_id'    => $user_wallet->customer_id,
         ]);
 
         if (is_wp_error($result)) {
