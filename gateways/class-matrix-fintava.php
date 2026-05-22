@@ -1025,7 +1025,15 @@ class Matrix_MLM_Fintava {
      * row before calling bank_credit().
      */
     public function bank_credit($transfer_data) {
-        $required_fields = ['amount', 'account_number', 'bank_code', 'customer_id'];
+        // `account_name` is required by Fintava's class-validator on
+        // /bank/credit ("Account Name is a required field" surfaces as a
+        // 400 on the wire when omitted). Treating it as required here
+        // means any bypass of the frontend form — a second AJAX submit
+        // that races with the manual-override input clear, a programmatic
+        // caller, or a retry from elsewhere in the codebase — fails fast
+        // with a clear local error instead of bouncing off Fintava with
+        // the cryptic generic message.
+        $required_fields = ['amount', 'account_number', 'bank_code', 'customer_id', 'account_name'];
         foreach ($required_fields as $field) {
             if (empty($transfer_data[$field])) {
                 return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
@@ -1354,6 +1362,31 @@ class Matrix_MLM_Fintava {
 
         if (empty($account_number) || empty($bank_code)) {
             wp_send_json_error(['message' => __('Bank account details are required', 'matrix-mlm')]);
+        }
+
+        // Fintava's /bank/credit requires `accountName`. The frontend
+        // gates submit on a non-empty name field (verified or
+        // manually-entered), but defensive checks here catch any path
+        // that bypasses the form: a programmatic resubmit, a stale form
+        // state where the manual-override clear ran but the keystroke
+        // input handler didn't, or a future non-form caller. If the
+        // POST didn't carry one, try a server-side /name/enquiry as a
+        // best-effort recovery before failing — saves the user a
+        // round-trip when the original verification just timed out.
+        if (empty($account_name)) {
+            $resolved = $this->resolve_account($account_number, $bank_code);
+            if (!is_wp_error($resolved)) {
+                $resolved_name = self::extract_account_name($resolved);
+                if ($resolved_name === '' && isset($resolved['account_name'])) {
+                    $resolved_name = (string) $resolved['account_name'];
+                }
+                if ($resolved_name !== '') {
+                    $account_name = sanitize_text_field($resolved_name);
+                }
+            }
+        }
+        if (empty($account_name)) {
+            wp_send_json_error(['message' => __('Account name is required. Please verify the destination account or type the holder\'s name before submitting.', 'matrix-mlm')]);
         }
 
         // Bank payouts source funds from the user's own Fintava virtual
