@@ -503,6 +503,9 @@ class Matrix_MLM_Admin {
             case 'update_fintava_wallet_bank':
                 $this->update_fintava_wallet_bank();
                 break;
+            case 'repair_database_schema':
+                $this->repair_database_schema();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -1053,6 +1056,54 @@ class Matrix_MLM_Admin {
                 $bank_name,
                 $bank_code
             ),
+        ]);
+    }
+
+    /**
+     * Force-re-run every plugin schema bootstrap path and return a structured
+     * report of what was created or left as-is. Surfaced from Migration →
+     * Database Schema as a one-click recovery tool for installs whose
+     * version-stamp short-circuit lied about reality (e.g. a row of CREATE
+     * TABLE silently failed when the activator first ran, leaving the stamp
+     * saved but the table missing — see Matrix_MLM_Database::maybe_upgrade()
+     * for the full rationale).
+     *
+     * Idempotent: every call eventually delegates to dbDelta or
+     * `CREATE TABLE IF NOT EXISTS`, so running it on a healthy install is a
+     * no-op that just confirms everything's already in place.
+     */
+    private function repair_database_schema() {
+        if (!class_exists('Matrix_MLM_Database')) {
+            wp_send_json_error(['message' => __('Database helper class not loaded — cannot run repair.', 'matrix-mlm')]);
+        }
+
+        // dbDelta + extension CREATE TABLEs run quickly even on a fully
+        // missing schema, but bump the time limit defensively so a slow
+        // shared-hosting MySQL instance does not trip the 30s default
+        // mid-bootstrap and leave the schema half-built.
+        @set_time_limit(120);
+
+        $report = Matrix_MLM_Database::repair();
+
+        $created_count = count($report['created']);
+        $missing_count = count($report['after']['missing']);
+        $error_count   = count($report['errors']);
+
+        if ($created_count === 0 && $missing_count === 0 && $error_count === 0) {
+            $message = __('Schema is up to date — every expected table was already on disk.', 'matrix-mlm');
+        } else {
+            $message = sprintf(
+                /* translators: 1: tables newly created on this run, 2: tables still missing, 3: DB errors emitted */
+                __('Schema repair complete: %1$d created, %2$d still missing, %3$d DB errors.', 'matrix-mlm'),
+                $created_count,
+                $missing_count,
+                $error_count
+            );
+        }
+
+        wp_send_json_success([
+            'message' => $message,
+            'report'  => $report,
         ]);
     }
 
