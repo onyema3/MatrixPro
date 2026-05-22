@@ -1387,24 +1387,44 @@ class Matrix_MLM_Fintava {
 
         // Fintava's /bank/credit endpoint requires `sourceId` — the UUID
         // of the user's Fintava customer record that funds the payout.
-        // If the local row is missing customer_id (e.g. linked manually
-        // with only the account number), try to auto-resolve via the
-        // Customer API before failing.
+        // If the local row is missing customer_id (e.g. wallet was created
+        // before customer_id support was added, or Fintava didn't return it
+        // at wallet-generation time), resolve it now via the Customer API.
+        //
+        // Resolution uses resolve_customer_id() which tries three strategies:
+        //   1. GET /customers/details (by phone)
+        //   2. GET /customers/list (scan all, match by account_number)
+        //   3. GET /wallet/details (extract customer_id from wallet object)
+        //
+        // On success the customer_id (and wallet_id if also missing) is
+        // persisted to the local row so subsequent transfers skip resolution.
         if (empty($user_wallet->customer_id)) {
-            $resolved = $this->resolve_wallet_id_from_customer($user_wallet);
-            if (is_wp_error($resolved)) {
+            $resolved_cid = $this->resolve_customer_id($user_wallet);
+            if (is_wp_error($resolved_cid)) {
                 wp_send_json_error([
                     'message' => sprintf(
-                        __('Your Fintava customer ID is missing and could not be resolved automatically: %s. Please contact support.', 'matrix-mlm'),
-                        $resolved->get_error_message()
+                        __('Your Fintava customer ID is missing and could not be resolved automatically: %s', 'matrix-mlm'),
+                        $resolved_cid->get_error_message()
                     ),
                 ]);
             }
             // Refresh the wallet row after resolution.
             $user_wallet = $this->get_user_wallet($user_id);
             if (!$user_wallet || empty($user_wallet->customer_id)) {
-                wp_send_json_error(['message' => __('Your Fintava customer ID is missing. Please contact support.', 'matrix-mlm')]);
+                wp_send_json_error(['message' => __('Your Fintava customer ID could not be determined. Please contact support.', 'matrix-mlm')]);
             }
+        }
+
+        // Also ensure wallet_id is populated (needed for the balance
+        // pre-flight check below). If it's still missing after the
+        // customer_id resolution above, resolve it separately.
+        if (empty($user_wallet->wallet_id)) {
+            $resolved_wid = $this->resolve_wallet_id_from_customer($user_wallet);
+            if (!is_wp_error($resolved_wid)) {
+                $user_wallet = $this->get_user_wallet($user_id);
+            }
+            // Non-fatal: we can still attempt the transfer without a
+            // wallet_id — the balance pre-flight will just be skipped.
         }
 
         // Validate customer_id is a proper UUID before sending to Fintava.
@@ -2137,8 +2157,10 @@ class Matrix_MLM_Fintava {
             );
         }
 
+        $account_number = trim($wallet_row->account_number);
+
         // Call the wallet details enquiry endpoint with the account number
-        $details = $this->get_wallet_by_account_number(trim($wallet_row->account_number));
+        $details = $this->get_wallet_by_account_number($account_number);
         if (is_wp_error($details)) {
             return $details;
         }
@@ -2159,14 +2181,14 @@ class Matrix_MLM_Fintava {
 
         // Verify the account number matches (safety check)
         $remote_account = self::extract_account_number($details);
-        if (!empty($remote_account) && trim($remote_account) !== trim($wallet_row->account_number)) {
+        if (!empty($remote_account) && trim($remote_account) !== $account_number) {
             return new WP_Error(
                 'fintava_account_mismatch',
                 __('The enquiry returned a different account number than expected.', 'matrix-mlm')
             );
         }
 
-        // Persist wallet_id back to the local row
+        // Build the update — always persist wallet_id
         $update_data = [
             'wallet_id'  => $resolved_wallet_id,
             'updated_at' => current_time('mysql'),
@@ -2180,6 +2202,15 @@ class Matrix_MLM_Fintava {
             $update_formats[] = '%s';
         }
 
+        // Also extract customer_id if it's present in the response.
+        // The /wallet/details endpoint sometimes returns it as customerId,
+        // customer_id, or nested under userInfo.id.
+        $customer_id = self::extract_customer_id($details);
+        if (!empty($customer_id)) {
+            $update_data['customer_id'] = $customer_id;
+            $update_formats[] = '%s';
+        }
+
         $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_wallets',
             $update_data,
@@ -2189,6 +2220,227 @@ class Matrix_MLM_Fintava {
         );
 
         return $resolved_wallet_id;
+    }
+
+    /**
+     * Extract a Fintava customer UUID from any response object.
+     *
+     * Fintava returns the customer ID under different keys depending on the
+     * endpoint: userInfo.id (customer list/detail), customerId (wallet
+     * generate), customer_id (some tiers), userId (transfers). This helper
+     * checks all known shapes and returns the first valid UUID found, or ''
+     * if none is present.
+     *
+     * @param array $obj Decoded Fintava response (any endpoint).
+     * @return string Customer UUID or ''.
+     */
+    public static function extract_customer_id($obj) {
+        if (!is_array($obj)) {
+            return '';
+        }
+
+        // Direct field names
+        $direct_keys = ['customerId', 'customer_id', 'userId', 'user_id', 'sourceId', 'source_id'];
+        foreach ($direct_keys as $key) {
+            if (isset($obj[$key]) && $obj[$key] !== '') {
+                $val = trim((string) $obj[$key]);
+                if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $val)) {
+                    return $val;
+                }
+            }
+        }
+
+        // Nested under userInfo.id (customer list/detail response)
+        if (isset($obj['userInfo']['id']) && $obj['userInfo']['id'] !== '') {
+            $val = trim((string) $obj['userInfo']['id']);
+            if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $val)) {
+                return $val;
+            }
+        }
+
+        // Nested under customer.id
+        if (isset($obj['customer']['id']) && $obj['customer']['id'] !== '') {
+            $val = trim((string) $obj['customer']['id']);
+            if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $val)) {
+                return $val;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Resolve the customer_id (Fintava's customer UUID / sourceId) for a
+     * local wallet row.
+     *
+     * This is the key method that makes bank payouts work. Fintava's
+     * POST /bank/credit requires a `sourceId` that identifies the customer
+     * whose virtual wallet to debit. Without it, transfers always fail.
+     *
+     * Resolution chain (first success wins):
+     *
+     *   1. GET /customers/details (with phone number from local row) —
+     *      returns the customer record with userInfo.id.
+     *
+     *   2. GET /customers/list — pulls all customers under this merchant,
+     *      matches by account_number embedded in each customer's wallet
+     *      object. Extracts userInfo.id from the matching record.
+     *
+     *   3. GET /customers/{customerId} — if we already have a candidate
+     *      customer_id on the row (e.g. partially populated), verify it
+     *      by fetching the customer and confirming the wallet's account
+     *      number matches.
+     *
+     * On success, persists customer_id (and wallet_id if also resolved)
+     * back to the local wallet row so subsequent transfers skip the
+     * resolution entirely.
+     *
+     * @param object $wallet_row The local matrix_fintava_wallets row.
+     * @return string|WP_Error The resolved customer_id UUID on success.
+     */
+    public function resolve_customer_id($wallet_row) {
+        global $wpdb;
+
+        if (empty($wallet_row->account_number)) {
+            return new WP_Error(
+                'missing_account_number',
+                __('No account number on file — cannot resolve customer ID.', 'matrix-mlm')
+            );
+        }
+
+        $account_number = trim($wallet_row->account_number);
+        $resolved_customer_id = '';
+        $resolved_wallet_id   = '';
+
+        // -----------------------------------------------------------------
+        // Strategy 1: GET /customers/details with phone number
+        // -----------------------------------------------------------------
+        // The /customers/details endpoint accepts a phone query and returns
+        // the customer record directly. This is the fastest path when we
+        // have the phone on file.
+        if (!empty($wallet_row->customer_phone)) {
+            $phone = trim($wallet_row->customer_phone);
+            $response = $this->make_request('GET', '/customers/details?phone=' . urlencode($phone), null, null, true);
+            if (!is_wp_error($response)) {
+                $data = isset($response['data']) && is_array($response['data']) ? $response['data'] : $response;
+                $cid = self::extract_customer_id($data);
+                if (!empty($cid)) {
+                    // Verify it matches our account number
+                    $wallet_in_response = isset($data['wallet']) && is_array($data['wallet']) ? $data['wallet'] : $data;
+                    $remote_account = self::extract_account_number($wallet_in_response);
+                    if (empty($remote_account) || trim($remote_account) === $account_number) {
+                        $resolved_customer_id = $cid;
+                        // Also grab wallet_id if available
+                        $wid = self::extract_wallet_id($wallet_in_response);
+                        if (!empty($wid)) {
+                            $resolved_wallet_id = $wid;
+                        }
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Strategy 2: GET /customers/list — scan all customers
+        // -----------------------------------------------------------------
+        // Pull the full customer list and match by account_number embedded
+        // in each customer's wallet object. This is the most reliable path
+        // because it doesn't depend on having a phone number, and the
+        // customer list always includes the wallet with its account number.
+        if (empty($resolved_customer_id)) {
+            $list = $this->get_customer_list();
+            if (!is_wp_error($list) && is_array($list)) {
+                foreach ($list as $customer) {
+                    if (!is_array($customer)) {
+                        continue;
+                    }
+
+                    // The customer list returns each entry with a nested
+                    // wallet object, or the wallet fields at the root level.
+                    $wallet_obj = isset($customer['wallet']) && is_array($customer['wallet'])
+                        ? $customer['wallet']
+                        : $customer;
+
+                    $remote_account = self::extract_account_number($wallet_obj);
+                    if (empty($remote_account) || trim($remote_account) !== $account_number) {
+                        continue;
+                    }
+
+                    // Found a match — extract the customer UUID
+                    $cid = self::extract_customer_id($customer);
+                    if (!empty($cid)) {
+                        $resolved_customer_id = $cid;
+                        // Also grab wallet_id
+                        $wid = self::extract_wallet_id($wallet_obj);
+                        if (!empty($wid)) {
+                            $resolved_wallet_id = $wid;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Strategy 3: GET /wallet/details then extract customer_id
+        // -----------------------------------------------------------------
+        // Some Fintava tiers include customer_id in the wallet details
+        // response. Try this as a last resort.
+        if (empty($resolved_customer_id)) {
+            $details = $this->get_wallet_by_account_number($account_number);
+            if (!is_wp_error($details)) {
+                $cid = self::extract_customer_id($details);
+                if (!empty($cid)) {
+                    $resolved_customer_id = $cid;
+                }
+                // Also grab wallet_id if not yet resolved
+                if (empty($resolved_wallet_id)) {
+                    $wid = self::extract_wallet_id($details);
+                    if (empty($wid)) {
+                        $wid = $details['id'] ?? '';
+                    }
+                    if (!empty($wid)) {
+                        $resolved_wallet_id = $wid;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Persist results
+        // -----------------------------------------------------------------
+        if (empty($resolved_customer_id)) {
+            return new WP_Error(
+                'fintava_customer_id_not_found',
+                sprintf(
+                    __('Could not find your Fintava customer ID. Searched by account number %s across /customers/details, /customers/list, and /wallet/details. Please contact support.', 'matrix-mlm'),
+                    $account_number
+                )
+            );
+        }
+
+        // Build the DB update
+        $update_data = [
+            'customer_id' => $resolved_customer_id,
+            'updated_at'  => current_time('mysql'),
+        ];
+        $update_formats = ['%s', '%s'];
+
+        // Also persist wallet_id if we found one and the row is missing it
+        if (!empty($resolved_wallet_id) && empty($wallet_row->wallet_id)) {
+            $update_data['wallet_id'] = $resolved_wallet_id;
+            $update_formats[] = '%s';
+        }
+
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            $update_data,
+            ['id' => $wallet_row->id],
+            $update_formats,
+            ['%d']
+        );
+
+        return $resolved_customer_id;
     }
 
     // =========================================================================
