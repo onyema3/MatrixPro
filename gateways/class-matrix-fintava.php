@@ -196,6 +196,7 @@ class Matrix_MLM_Fintava {
         add_action('wp_ajax_matrix_fintava_initiate_transfer', [$this, 'ajax_initiate_transfer']);
         add_action('wp_ajax_matrix_fintava_check_status', [$this, 'ajax_check_transfer_status']);
         add_action('wp_ajax_matrix_fintava_merchant_balance', [$this, 'ajax_get_merchant_balance']);
+        add_action('wp_ajax_matrix_fintava_clear_failed_payouts', [$this, 'ajax_clear_failed_payouts']);
 
         // Virtual Wallet AJAX handlers
         add_action('wp_ajax_matrix_fintava_create_virtual_wallet', [$this, 'ajax_create_virtual_wallet']);
@@ -1703,6 +1704,63 @@ class Matrix_MLM_Fintava {
         }
 
         wp_send_json_success(['balance' => $balance]);
+    }
+
+    /**
+     * Bulk-delete the current user's failed bank-payout rows from the
+     * payout history.
+     *
+     * Scope is intentionally narrow:
+     *   - Filtered to user_id = current user, so a logged-in user can only
+     *     ever clear their own rows. There is no admin / cross-user variant
+     *     here; that path goes through the database directly or through the
+     *     admin Payouts screen.
+     *   - Filtered to status = 'failed' only. NEVER clears completed,
+     *     processing, pending, or refunded rows. Those carry money-movement
+     *     audit trail (refunded means the Matrix wallet was credited back;
+     *     completed means Fintava confirmed the transfer settled) and must
+     *     stay on the row even if the user requests cleanup.
+     *
+     * Failed rows are safe to hard-delete because by definition no money
+     * left the user's Fintava wallet — Fintava rejected the request before
+     * settlement (the four failure modes that produce status='failed' on
+     * this table are: missing accountName/sourceId validator rejection,
+     * insufficient balance pre-flight, transient HTTP 5xx that didn't
+     * recover on retry, and webhook-driven transfer.failed). The webhook
+     * log table separately keeps the diagnostic payload for any postmortem
+     * needed.
+     */
+    public function ajax_clear_failed_payouts() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+        $deleted = $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->prefix}matrix_fintava_payouts
+              WHERE user_id = %d
+                AND status = 'failed'",
+            $user_id
+        ));
+
+        if ($deleted === false) {
+            wp_send_json_error([
+                'message' => __('Could not clear failed transactions. Please try again.', 'matrix-mlm'),
+            ]);
+        }
+
+        $count = intval($deleted);
+        wp_send_json_success([
+            'deleted' => $count,
+            'message' => sprintf(
+                /* translators: %d: number of failed transactions deleted */
+                _n('%d failed transaction cleared.', '%d failed transactions cleared.', $count, 'matrix-mlm'),
+                $count
+            ),
+        ]);
     }
 
     // =========================================================================

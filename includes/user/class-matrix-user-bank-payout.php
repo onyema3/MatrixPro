@@ -117,6 +117,30 @@ class Matrix_MLM_User_Bank_Payout {
 
         <!-- Payout History -->
         <h3><?php _e('Bank Payout History', 'matrix-mlm'); ?></h3>
+        <?php
+        // Count failed rows so the toolbar only renders when there's
+        // something to clear. Cheaper than re-querying since we already
+        // have the list in memory above.
+        $failed_count = 0;
+        foreach ($payouts as $_p) {
+            if (isset($_p->status) && $_p->status === 'failed') {
+                $failed_count++;
+            }
+        }
+        ?>
+        <?php if ($failed_count > 0): ?>
+        <div class="matrix-payout-toolbar" style="margin: 0 0 12px; display: flex; justify-content: flex-end;">
+            <button type="button" id="fintava-clear-failed-btn" class="matrix-btn matrix-btn-secondary matrix-btn-sm" data-failed-count="<?php echo esc_attr($failed_count); ?>">
+                <?php
+                echo esc_html(sprintf(
+                    /* translators: %d: number of failed transactions */
+                    _n('Clear %d failed transaction', 'Clear %d failed transactions', $failed_count, 'matrix-mlm'),
+                    $failed_count
+                ));
+                ?>
+            </button>
+        </div>
+        <?php endif; ?>
         <?php if (empty($payouts)): ?>
         <div class="matrix-alert matrix-alert-info"><?php _e('No bank payouts yet.', 'matrix-mlm'); ?></div>
         <?php else: ?>
@@ -668,6 +692,57 @@ class Matrix_MLM_User_Bank_Payout {
                     error: function() {
                         alert('<?php _e("Network error. Please try again.", "matrix-mlm"); ?>');
                         btn.prop('disabled', false).text('<?php _e("Transfer to Bank", "matrix-mlm"); ?>');
+                    }
+                });
+            });
+
+            // "Clear failed transactions" toolbar button — bulk-deletes
+            // the current user's failed payout history rows. Server-side
+            // filters to user_id + status='failed' so this can only ever
+            // remove the user's own failures; completed/processing/refunded
+            // rows are untouched (they carry money-movement audit trail).
+            //
+            // The button is only rendered server-side when there is at
+            // least one failed row, but the click handler is registered
+            // unconditionally — `.on('click', ...)` on a non-existent
+            // element is a harmless no-op and keeps the JS branchless.
+            $('#fintava-clear-failed-btn').on('click', function() {
+                var btn = $(this);
+                var count = btn.data('failedCount') || 0;
+                var prompt = count === 1
+                    ? '<?php echo esc_js(__("Permanently delete this failed transaction from your history?", "matrix-mlm")); ?>'
+                    : '<?php echo esc_js(__("Permanently delete %d failed transactions from your history?", "matrix-mlm")); ?>'
+                          .replace('%d', count);
+
+                if (!confirm(prompt)) { return; }
+
+                var originalText = btn.text();
+                btn.prop('disabled', true).text('<?php echo esc_js(__("Clearing...", "matrix-mlm")); ?>');
+
+                $.ajax({
+                    url: matrixMLM.ajaxUrl,
+                    type: 'POST',
+                    data: {
+                        action: 'matrix_fintava_clear_failed_payouts',
+                        nonce: matrixMLM.nonce
+                    },
+                    success: function(response) {
+                        if (response && response.success) {
+                            // Reload so the table re-renders without the
+                            // cleared rows AND the toolbar button hides
+                            // itself (server-side $failed_count drops to 0).
+                            location.reload();
+                        } else {
+                            var msg = (response && response.data && response.data.message)
+                                ? response.data.message
+                                : '<?php echo esc_js(__("Could not clear failed transactions.", "matrix-mlm")); ?>';
+                            alert(msg);
+                            btn.prop('disabled', false).text(originalText);
+                        }
+                    },
+                    error: function() {
+                        alert('<?php echo esc_js(__("Network error. Please try again.", "matrix-mlm")); ?>');
+                        btn.prop('disabled', false).text(originalText);
                     }
                 });
             });
