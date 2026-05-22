@@ -313,7 +313,10 @@ class Matrix_MLM_Fintava {
      * GET /banks
      */
     public function get_banks() {
-        $cache_key = 'matrix_fintava_banks_list';
+        // Cache key is versioned (`_v2`) so any transient stored in the
+        // pre-normalization raw Fintava shape is bypassed on upgrade. Bump
+        // the suffix again if the normalized shape ever changes.
+        $cache_key = 'matrix_fintava_banks_list_v2';
         $cached = get_transient($cache_key);
 
         if ($cached !== false) {
@@ -326,14 +329,59 @@ class Matrix_MLM_Fintava {
         }
 
         if (self::is_api_success($response) && isset($response['data'])) {
-            set_transient($cache_key, $response['data'], DAY_IN_SECONDS);
-            return $response['data'];
+            $normalized = self::normalize_banks_list($response['data']);
+            set_transient($cache_key, $normalized, DAY_IN_SECONDS);
+            return $normalized;
         }
 
         return new WP_Error('fintava_error', self::normalize_api_message(
             $response['message'] ?? null,
             __('Failed to retrieve bank list', 'matrix-mlm')
         ));
+    }
+
+    /**
+     * Normalize Fintava's `/banks` response into the `{code, name}` shape the
+     * frontend dropdown expects.
+     *
+     * Fintava returns each bank as `{ sortCode: "...", bankName: "..." }`, but
+     * the inline JS in class-matrix-user-bank-payout.php iterates with
+     * `bank.code` / `bank.name`. Without this mapping the dropdown renders
+     * `<option value="undefined">undefined</option>` for every entry, which
+     * presents to the user as "the dropdown didn't load."
+     *
+     * Accepts a few alternate field names (`bankCode`, `code`, `bank`, `name`)
+     * so the gateway is resilient if Fintava ever renames their fields.
+     *
+     * @param mixed $banks Raw `data` array from /banks.
+     * @return array<int, array{code:string,name:string}>
+     */
+    public static function normalize_banks_list($banks) {
+        if (!is_array($banks)) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($banks as $bank) {
+            if (!is_array($bank)) {
+                continue;
+            }
+            $code = $bank['sortCode'] ?? $bank['bankCode'] ?? $bank['code'] ?? '';
+            $name = $bank['bankName'] ?? $bank['name']     ?? $bank['bank'] ?? '';
+            $code = is_scalar($code) ? trim((string) $code) : '';
+            $name = is_scalar($name) ? trim((string) $name) : '';
+            if ($code === '' || $name === '') {
+                continue;
+            }
+            $out[] = ['code' => $code, 'name' => $name];
+        }
+
+        // Alphabetize so the dropdown is predictable regardless of API order.
+        usort($out, static function ($a, $b) {
+            return strcasecmp($a['name'], $b['name']);
+        });
+
+        return $out;
     }
 
     /**
