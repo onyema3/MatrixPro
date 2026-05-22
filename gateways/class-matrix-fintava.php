@@ -2356,10 +2356,17 @@ class Matrix_MLM_Fintava {
                     }
 
                     // The customer list returns each entry with a nested
-                    // wallet object, or the wallet fields at the root level.
-                    $wallet_obj = isset($customer['wallet']) && is_array($customer['wallet'])
-                        ? $customer['wallet']
-                        : $customer;
+                    // wallet object. Fintava nests it under userInfo.wallet
+                    // (confirmed from live /customers/list response), but we
+                    // also check customer.wallet for simpler tiers.
+                    $wallet_obj = null;
+                    if (isset($customer['userInfo']['wallet']) && is_array($customer['userInfo']['wallet'])) {
+                        $wallet_obj = $customer['userInfo']['wallet'];
+                    } elseif (isset($customer['wallet']) && is_array($customer['wallet'])) {
+                        $wallet_obj = $customer['wallet'];
+                    } else {
+                        $wallet_obj = $customer;
+                    }
 
                     $remote_account = self::extract_account_number($wallet_obj);
                     if (empty($remote_account) || trim($remote_account) !== $account_number) {
