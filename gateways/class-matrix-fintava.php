@@ -2140,6 +2140,21 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Could not debit your Matrix wallet. Please refresh and try again.', 'matrix-mlm')]);
         }
 
+        // Coerce NULL bank_code / bank_name / account_name to empty string
+        // to match the matrix_fintava_payouts schema, where these columns
+        // are NOT NULL. The destination wallet row (matrix_fintava_wallets)
+        // allows NULL bank_code on purpose — see the comment above on this
+        // path tolerating NULL bank_code, since /single/transfer routes by
+        // NUBAN and does not need a CBN sortCode. Without this coercion,
+        // wallets that were created before the bank-code self-heal landed
+        // (or that Fintava never returned a partner bank for) blow up the
+        // INSERT with "Column 'bank_code' cannot be null", which prints a
+        // wpdberror HTML block ahead of the JSON response and surfaces in
+        // the browser as a generic "Network error" because jQuery cannot
+        // parse the corrupted response. The empty-string fallback matches
+        // what the admin wallet-linker already writes on creation
+        // (Matrix_MLM_Admin::link_user → 'bank_code' => $details['bank_code']
+        // ?? $details['bankCode'] ?? '').
         $insert_result = $wpdb->insert(
             $payouts_table,
             [
@@ -2148,10 +2163,10 @@ class Matrix_MLM_Fintava {
                 'amount'         => $amount,
                 'charge'         => $charge,
                 'total_debit'    => $total_debit,
-                'bank_code'      => $user_wallet->bank_code,
-                'bank_name'      => $user_wallet->bank_name,
+                'bank_code'      => $user_wallet->bank_code   ?? '',
+                'bank_name'      => $user_wallet->bank_name   ?? '',
                 'account_number' => $user_wallet->account_number,
-                'account_name'   => $user_wallet->account_name,
+                'account_name'   => $user_wallet->account_name ?? '',
                 'narration'      => $narration,
                 'currency'       => $user_wallet->currency ?: 'NGN',
                 'status'         => 'pending',
