@@ -152,6 +152,21 @@ class Matrix_MLM_User_Virtual_Wallet {
             $fintava_balance_reason = 'missing_wallet_id';
         }
         $is_admin_viewing = current_user_can('manage_matrix_mlm');
+
+        // TEMPORARY admin-only diagnostic. Renders the raw Fintava balance
+        // response in an HTML comment so an operator can compare what Fintava
+        // actually returns against what we display, without exposing the
+        // payload to non-admins. Visible via right-click → "View Page Source"
+        // on the Virtual Wallet tab. Remove once the displayed balance is
+        // verified correct in production. Pairs with
+        // Matrix_MLM_Fintava::debug_balance_raw().
+        if ($is_admin_viewing && !empty($wallet->wallet_id)) {
+            $debug_raw  = $fintava->debug_balance_raw($wallet->wallet_id);
+            $debug_json = wp_json_encode($debug_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            // Defensive: neutralize any '-->' that could close the comment early.
+            $debug_json = str_replace('-->', '--&gt;', (string) $debug_json);
+            echo "\n<!-- FINTAVA_BALANCE_DEBUG_BEGIN\n" . $debug_json . "\nFINTAVA_BALANCE_DEBUG_END -->\n";
+        }
         ?>
 
         <!-- Visual: Matrix Wallet → Fintava Wallet -->
