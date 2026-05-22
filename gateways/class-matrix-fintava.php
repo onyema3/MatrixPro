@@ -2225,14 +2225,17 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'first_name' => sanitize_text_field($customer_data['first_name']),
-            'last_name' => sanitize_text_field($customer_data['last_name']),
-            'email' => sanitize_email($customer_data['email']),
-            'phone' => sanitize_text_field($customer_data['phone']),
-            'currency' => $customer_data['currency'] ?? 'NGN',
+            'first_name'      => sanitize_text_field($customer_data['first_name']),
+            'last_name'       => sanitize_text_field($customer_data['last_name']),
+            'email'           => sanitize_email($customer_data['email']),
+            'phone'           => sanitize_text_field($customer_data['phone']),
+            'currency'        => $customer_data['currency'] ?? 'NGN',
+            'amount'          => intval($customer_data['amount'] ?? 100),
+            'expireTimeInMin' => intval($customer_data['expireTimeInMin'] ?? 525600),
+            'merchantReference' => $customer_data['reference'] ?? ('MTX-VW-' . uniqid()),
         ];
 
-        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address', 'reference'] as $optional) {
+        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address'] as $optional) {
             if (!empty($customer_data[$optional])) {
                 $payload[$optional] = sanitize_text_field($customer_data[$optional]);
             }
