@@ -1055,18 +1055,11 @@ class Matrix_MLM_Fintava {
         $raw_amount = floatval($transfer_data['amount']);
         $send_amount = (floor($raw_amount) == $raw_amount) ? intval($raw_amount) : $raw_amount;
 
-        // sortCode: Fintava's class-validator requires sortCode to be
-        // coerceable to a number. Sending it as a numeric type (not a
-        // quoted string) in the JSON payload ensures the validator sees
-        // a number. The old system sends this as a number.
-        $sort_code_raw = sanitize_text_field($transfer_data['bank_code']);
-        $sort_code = is_numeric($sort_code_raw) ? (int) $sort_code_raw : $sort_code_raw;
-
         $payload = [
             'sourceId'      => $wallet_id,
             'amount'        => $send_amount,
             'accountNumber' => sanitize_text_field($transfer_data['account_number']),
-            'sortCode'      => $sort_code,
+            'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
         ];
 
         // Map our snake_case optionals to the camelCase keys Fintava expects.
