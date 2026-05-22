@@ -26,16 +26,22 @@
  * - GET  /name/enquiry?accountNumber=...&sortCode=... - External name enquiry (3rd-party banks)
  * - GET  /banks                               - List supported banks
  *
- * Per-endpoint host routing (overrides the env-specific dev/live host):
- * - POST /bank/credit       -> https://api.fintavapay.com (BANK_CREDIT_BASE_URL).
- *   Bank payouts source funds from the user's own Fintava virtual wallet,
- *   not from the merchant wallet, and live on the unified public host
- *   regardless of merchant tier. Override via the
- *   MATRIX_FINTAVA_BANK_CREDIT_URL constant in wp-config.php.
+ * Per-endpoint host routing:
+ * - POST /bank/credit       -> the configured env-specific host (live or
+ *   dev) — same as every other endpoint. An earlier revision pinned this
+ *   to a hypothetical "unified public host" at https://api.fintavapay.com
+ *   on the assumption that bank payouts lived there regardless of
+ *   merchant tier, but that hostname does not resolve on public DNS
+ *   (cURL error 6 "Could not resolve host" in the wild) and was never a
+ *   real Fintava endpoint. Override via the MATRIX_FINTAVA_BANK_CREDIT_URL
+ *   constant in wp-config.php if Fintava ever publishes a separate host.
  * - GET  /banks fallback    -> https://api.fintavapay.com/api/v1 (PUBLIC_BANKS_URL),
  *   tried after the configured environment host and its opposite when
  *   both reject the request, since the env-specific hosts have been
  *   observed to fail with "Invalid API Key" on at least one tier.
+ *   NOTE: the public host above does not currently resolve either, so
+ *   this third fallback always errors. Kept for now in case Fintava
+ *   stands the host up; remove once confirmed dead for good.
  */
 
 if (!defined('ABSPATH')) {
@@ -66,14 +72,20 @@ class Matrix_MLM_Fintava {
     const PUBLIC_BANKS_URL = 'https://api.fintavapay.com/api/v1';
 
     /**
-     * Base host for bank payouts (POST /bank/credit). Distinct from the
-     * env-specific dev/live host because /bank/credit is a user-wallet ->
-     * external-bank transfer that lives on the unified public surface
-     * regardless of merchant tier — Fintava deducts its own fee from the
-     * user's Fintava wallet, no merchant wallet involvement, no plugin-
-     * side Matrix wallet debit. Override the full base via the
-     * MATRIX_FINTAVA_BANK_CREDIT_URL constant in wp-config.php if Fintava
-     * ever relocates the endpoint.
+     * Legacy "unified public host" for bank payouts. Was the historical
+     * default for POST /bank/credit on the assumption that bank payouts
+     * lived on a single environment-agnostic host regardless of merchant
+     * tier — but this hostname does not resolve on public DNS, so any
+     * call routed here failed with cURL error 6 "Could not resolve host:
+     * api.fintavapay.com".
+     *
+     * Kept as a class constant only so external code that referenced it
+     * does not fatal; new callers should rely on get_bank_credit_base_url()
+     * which now defaults to the configured env-specific host (live or dev).
+     *
+     * @deprecated Routing fell back to the env-specific host. Override with
+     *             MATRIX_FINTAVA_BANK_CREDIT_URL in wp-config.php if Fintava
+     *             ever publishes a real dedicated host.
      */
     const BANK_CREDIT_BASE_URL = 'https://api.fintavapay.com';
 
@@ -985,10 +997,14 @@ class Matrix_MLM_Fintava {
      *      failing with "account balance insufficient" whenever the
      *      merchant wallet ran low, even though the user had enough.
      *
-     *   2. Host. /bank/credit lives on Fintava's unified public host
-     *      (https://api.fintavapay.com), not the env-specific dev/live
-     *      host. Override the base via the MATRIX_FINTAVA_BANK_CREDIT_URL
-     *      constant in wp-config.php if Fintava ever moves it.
+     *   2. Host. /bank/credit is routed through the same env-specific
+     *      host (live or dev) as every other Fintava endpoint. An earlier
+     *      revision pinned it to https://api.fintavapay.com on the
+     *      assumption that bank payouts lived on a unified public host
+     *      regardless of tier, but that hostname does not resolve on
+     *      public DNS and every call cURL-error-6'd. Override via the
+     *      MATRIX_FINTAVA_BANK_CREDIT_URL constant in wp-config.php if
+     *      Fintava ever publishes a real dedicated host.
      *
      *   3. Fees. Fintava deducts its own transfer fee directly from the
      *      user's Fintava wallet — there is no plugin-side fee added on
@@ -1060,17 +1076,31 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Resolve the base URL for /bank/credit calls. Honours the
-     * MATRIX_FINTAVA_BANK_CREDIT_URL wp-config constant when defined, falling
-     * back to BANK_CREDIT_BASE_URL otherwise. Override accepts a base URL
-     * (no trailing slash); the `/bank/credit` path is appended in
-     * bank_credit().
+     * Resolve the base URL for /bank/credit calls.
+     *
+     * Resolution order:
+     *   1. MATRIX_FINTAVA_BANK_CREDIT_URL constant — full pinned override
+     *      for operators who have a dedicated Fintava host issued to them.
+     *   2. The configured env-specific host (live or dev) via
+     *      get_base_url() — same as every other endpoint.
+     *
+     * Override accepts a base URL (no trailing slash); the `/bank/credit`
+     * path is appended in bank_credit().
+     *
+     * History: this previously fell back to the BANK_CREDIT_BASE_URL
+     * constant (https://api.fintavapay.com) on the assumption that bank
+     * payouts lived on a unified public host. That hostname does not
+     * resolve on public DNS, so production installs were getting "cURL
+     * error 6: Could not resolve host: api.fintavapay.com" on every
+     * payout attempt. Defaulting to get_base_url() puts /bank/credit on
+     * the same env-specific live/dev host that authenticates everywhere
+     * else.
      */
     private function get_bank_credit_base_url() {
         if (defined('MATRIX_FINTAVA_BANK_CREDIT_URL') && MATRIX_FINTAVA_BANK_CREDIT_URL) {
             return rtrim(MATRIX_FINTAVA_BANK_CREDIT_URL, '/');
         }
-        return self::BANK_CREDIT_BASE_URL;
+        return self::get_base_url();
     }
 
     // =========================================================================
