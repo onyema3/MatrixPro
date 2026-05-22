@@ -1302,6 +1302,41 @@ class Matrix_MLM_Fintava {
             }
         }
 
+        // Pre-flight: check the user's Fintava virtual-wallet balance
+        // before making the real /bank/credit call. Fintava has been
+        // observed returning HTTP 500 with a generic "An unexpected
+        // error occurred" message when the source wallet can't fund the
+        // transfer (their handler crashes instead of returning a clean
+        // 400). Surface a clear, actionable error here so the user
+        // knows exactly what's wrong and that the Fintava wallet is
+        // SEPARATE from their Matrix wallet.
+        //
+        // Best-effort: if the balance fetch itself fails for any reason
+        // (endpoint unavailable on this tier, transient Fintava issue,
+        // wallet object in a state we can't parse), we proceed to
+        // /bank/credit anyway and let Fintava's response be the source
+        // of truth. We don't want a flaky balance endpoint to strand a
+        // working payout flow.
+        $balance_check = $this->get_virtual_wallet_balance(
+            $user_wallet->wallet_id,
+            $user_wallet->account_number,
+            $user_wallet->customer_id ?? null
+        );
+        if (!is_wp_error($balance_check) && isset($balance_check['available_balance']) && is_numeric($balance_check['available_balance'])) {
+            $available = floatval($balance_check['available_balance']);
+            if ($available < $amount) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        /* translators: 1: currency symbol, 2: available balance, 3: requested amount */
+                        __('Insufficient Fintava wallet balance: you have %1$s%2$s available, but the payout requires %1$s%3$s. Note: your Fintava virtual wallet is separate from your Matrix wallet — funds must already be on Fintava\'s side for bank payouts. Refresh the balance on your dashboard and verify your Fintava wallet is funded.', 'matrix-mlm'),
+                        $currency_symbol,
+                        number_format($available, 2),
+                        number_format($amount, 2)
+                    ),
+                ]);
+            }
+        }
+
         $reference = $this->generate_reference();
 
         global $wpdb;
@@ -3745,6 +3780,18 @@ class Matrix_MLM_Fintava {
                 if ($snippet !== '') {
                     $error_message .= sprintf(' [body=%s]', $snippet);
                 }
+            }
+
+            // For HTTP 5xx specifically, append a sanitized list of the
+            // request keys we sent. 5xx means Fintava's server crashed
+            // before it could return field-level detail in `errors`, so
+            // the most useful diagnostic we can add is "did we send all
+            // the fields the endpoint expects?" Keys only — no values,
+            // no PII. Stays in the WP_Error message (and therefore the
+            // failure_reason column in the payout history) so the
+            // operator can review later when triaging recurring 500s.
+            if ($status_code >= 500 && is_array($body) && !empty($body)) {
+                $error_message .= sprintf(' [sent_keys=%s]', implode(',', array_keys($body)));
             }
             return new WP_Error('fintava_api_error', $error_message);
         }
