@@ -25,47 +25,71 @@ class Matrix_MLM_Wallet {
      * Credit user wallet.
      *
      * Returns the new balance on success, or `false` if the underlying
-     * persistence step failed. Two failure modes are covered explicitly:
+     * persistence step failed.
      *
-     *   1. The matrix_user_meta UPDATE returned false (SQL error) or 0
-     *      (no row matched — i.e. the user has no matrix_user_meta row
-     *      yet). In both cases the displayed balance hasn't actually
-     *      persisted, so it would be wrong to log the credit row or
-     *      tell the caller "all done".
+     * Implementation: a single atomic SQL UPDATE with arithmetic
+     * (`SET balance = balance + N`) instead of the previous
+     * read-then-`$wpdb->update` pattern. This rewrite addresses three
+     * concrete failure modes that surfaced as the "transfer reports
+     * success but no money moves" bug on the consolidated Wallet page:
      *
-     *   2. The matrix_wallet INSERT returned false. The displayed
-     *      balance has updated but the audit-trail row is missing, so
-     *      the caller still has a recovery decision to make.
+     *   1. TOCTOU race. The previous flow read $current_balance via
+     *      a SELECT and then issued a separate UPDATE that wrote
+     *      $current_balance ± $amount. A concurrent debit/credit
+     *      between those two queries (e.g., a withdrawal handler
+     *      firing on the same user, or two transfers landing on the
+     *      same recipient at once) would silently overwrite each
+     *      other and one of the two amounts would be lost. SQL
+     *      arithmetic (`balance + %f`) is computed by the server
+     *      against the row at the moment of UPDATE, so the two
+     *      writes serialize correctly.
      *
-     * The previous revision ignored both return values and always
-     * returned the new balance, which is what allowed the legacy
-     * process_transfer() flow to silently no-op on a missing
-     * matrix_user_meta row but still report "Transfer completed
-     * successfully" to the user. The wallet-to-wallet bug report on
-     * the consolidated Wallet page (sender saw the success alert and
-     * a page-reload, but their Matrix balance and transaction history
-     * were unchanged) traces directly back to here.
+     *   2. Misreading $wpdb->update's return value. wpdb returns the
+     *      number of *changed* rows (mysqli affected_rows without
+     *      the FOUND_ROWS client flag), not the number of *matched*
+     *      rows. With a SET to a precomputed PHP float, edge cases
+     *      where the float collapsed back to the same DECIMAL(12,2)
+     *      value (post-rounding parity, or 0+0 etc.) reported 0
+     *      rows changed — which the previous check (`$updated ===
+     *      0`) flagged as failure even though the row existed and
+     *      was correct, causing a spurious ROLLBACK from the
+     *      transfer envelope. Arithmetic UPDATE never has this
+     *      problem: with $amount > 0, the new value always differs
+     *      from the old, so 0 rows changed is reliably synonymous
+     *      with "no row matched the WHERE clause".
+     *
+     *   3. PHP float precision. Bookkeeping math should happen in
+     *      DECIMAL semantics, not PHP floats. Doing the addition in
+     *      SQL preserves the column's full precision.
+     *
+     * On success, returns the post-credit balance read back from the
+     * row (a fresh SELECT after the UPDATE) so the auditor row's
+     * post_balance column matches what the user will see on their
+     * next dashboard reload.
      */
     public function credit($user_id, $amount, $transaction_type, $description = '', $reference = null) {
         global $wpdb;
 
-        $current_balance = $this->get_balance($user_id);
-        $new_balance = $current_balance + $amount;
+        $table = $wpdb->prefix . 'matrix_user_meta';
 
-        // Update balance. $wpdb->update returns:
-        //   - integer (rows affected) on success — typically 1, but 0
-        //     means the WHERE clause matched nothing (e.g. missing
-        //     matrix_user_meta row).
-        //   - false on SQL error.
-        // Both 0 and false mean the balance hasn't actually persisted.
-        $updated = $wpdb->update(
-            $wpdb->prefix . 'matrix_user_meta',
-            ['balance' => $new_balance],
-            ['user_id' => $user_id]
-        );
-        if ($updated === false || $updated === 0) {
+        // Atomic arithmetic UPDATE. SQL-side `balance + %f` avoids
+        // the read-then-write TOCTOU race the previous revision had,
+        // and with $amount > 0 the new value always differs from the
+        // old so affected_rows == 0 is a reliable "no row matched"
+        // signal (rather than the ambiguous "value unchanged" case
+        // we used to mis-classify as failure).
+        $result = $wpdb->query($wpdb->prepare(
+            "UPDATE $table SET balance = balance + %f WHERE user_id = %d",
+            $amount, $user_id
+        ));
+        if ($result === false || $result === 0) {
             return false;
         }
+
+        // Read back the persisted balance so the auditor row records
+        // exactly what landed on disk (DECIMAL(12,2) precision, not
+        // a PHP-float-rounded value).
+        $new_balance = $this->get_balance($user_id);
 
         // Record transaction
         $logged = $wpdb->insert($wpdb->prefix . 'matrix_wallet', [
@@ -89,31 +113,45 @@ class Matrix_MLM_Wallet {
      * Debit user wallet.
      *
      * Returns the new balance on success, or `false` if the operation
-     * could not be persisted. Same return-value contract as credit() —
-     * see that docblock for the rationale and failure modes covered.
+     * could not be persisted. Same atomic-arithmetic-UPDATE rationale
+     * as credit() — see that docblock for the three failure modes the
+     * rewrite addresses.
+     *
+     * Additionally, debit folds the balance check into the WHERE
+     * clause (`AND balance >= %f`). This means insufficient-balance
+     * is no longer a separate read-then-decide step: the UPDATE
+     * itself only fires when the row has the funds. With $amount > 0
+     * the new value always differs from the old, so affected_rows
+     * == 0 reliably means "either no row OR insufficient balance" —
+     * either way a legitimate failure for the caller to surface.
+     * This also closes the race window where a concurrent debit
+     * between the previous read and write could let a user spend
+     * more than they had on file.
      */
     public function debit($user_id, $amount, $transaction_type, $description = '', $reference = null) {
         global $wpdb;
 
-        $current_balance = $this->get_balance($user_id);
-        if ($current_balance < $amount) {
+        $table = $wpdb->prefix . 'matrix_user_meta';
+
+        // Atomic conditional UPDATE: the balance check is folded into
+        // the WHERE clause so a concurrent debit can't slip in
+        // between a prior read and our write. $amount > 0 guarantees
+        // the value changes when the WHERE matches, so affected_rows
+        // == 0 unambiguously means "no row OR insufficient funds" —
+        // both are legitimate failure paths the caller should surface
+        // (the previous read-then-update pattern was the silent path
+        // that produced "transfer reports success but no money moves"
+        // when affected_rows came back 0 due to value-unchanged cases
+        // the check mis-classified as failure).
+        $result = $wpdb->query($wpdb->prepare(
+            "UPDATE $table SET balance = balance - %f WHERE user_id = %d AND balance >= %f",
+            $amount, $user_id, $amount
+        ));
+        if ($result === false || $result === 0) {
             return false;
         }
 
-        $new_balance = $current_balance - $amount;
-
-        // Update balance. See credit() for why we treat both false and
-        // 0 as failure here — a 0 rows-affected response means the
-        // matrix_user_meta row didn't exist, so the new balance never
-        // actually persisted and we mustn't pretend otherwise.
-        $updated = $wpdb->update(
-            $wpdb->prefix . 'matrix_user_meta',
-            ['balance' => $new_balance],
-            ['user_id' => $user_id]
-        );
-        if ($updated === false || $updated === 0) {
-            return false;
-        }
+        $new_balance = $this->get_balance($user_id);
 
         // Record transaction
         $logged = $wpdb->insert($wpdb->prefix . 'matrix_wallet', [

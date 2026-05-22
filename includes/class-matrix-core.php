@@ -580,10 +580,47 @@ class Matrix_MLM_Core {
 
         $wpdb->query('COMMIT');
 
+        // Post-COMMIT verification. Re-read both balances directly
+        // from matrix_user_meta and confirm they match what the
+        // debit/credit calls reported. If they don't, something
+        // outside this function (a shutdown hook, an HTTP-cached
+        // dashboard page, a HyperDB master/replica split, a MyISAM
+        // table that silently no-op'd the START TRANSACTION) ate
+        // our writes — we should NOT report success in that case,
+        // because the user will refresh and see balances that
+        // contradict the success message they just dismissed (the
+        // exact "transfer succeeds but no money moves" report this
+        // PR is fixing). Logging $wpdb->last_error and the
+        // before/after values gives support a forensic trail to
+        // chase the actual root cause if the symptom recurs.
+        $sender_balance_after    = $wallet->get_balance($user_id);
+        $recipient_balance_after = $wallet->get_balance($recipient->ID);
+
+        $sender_ok    = is_numeric($debit_result)  && abs($sender_balance_after    - floatval($debit_result))  < 0.01;
+        $recipient_ok = is_numeric($credit_result) && abs($recipient_balance_after - floatval($credit_result)) < 0.01;
+
+        if (!$sender_ok || !$recipient_ok) {
+            error_log(sprintf(
+                '[Matrix MLM] process_transfer: post-COMMIT balance mismatch. ' .
+                'sender_id=%d expected_after=%s actual_after=%s | ' .
+                'recipient_id=%d expected_after=%s actual_after=%s | ' .
+                'amount=%s charge=%s last_error=%s',
+                $user_id, $debit_result, $sender_balance_after,
+                $recipient->ID, $credit_result, $recipient_balance_after,
+                $amount, $charge, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Transfer could not be confirmed. Please refresh your wallet page and verify the balance before retrying. If the problem persists, contact support.', 'matrix-mlm')
+            ]);
+        }
+
         // Notify recipient about the incoming transfer. Done AFTER
-        // commit so a failing email send (downed SMTP, bad template,
-        // etc.) doesn't roll back the money movement — the user has
-        // already been debited and credited, the transfer is real.
+        // the verification check so a balance mismatch surfaces as a
+        // real error instead of an email-but-no-money outcome. Done
+        // AFTER commit so a failing email send (downed SMTP, bad
+        // template, etc.) doesn't roll back the money movement —
+        // the user has already been debited and credited, the
+        // transfer is real.
         Matrix_MLM_Notifications::send_transfer_notification($recipient->ID, $user_id, $amount);
 
         wp_send_json_success(['message' => __('Transfer completed successfully', 'matrix-mlm')]);
