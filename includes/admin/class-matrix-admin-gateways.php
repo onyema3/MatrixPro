@@ -312,6 +312,13 @@ class Matrix_MLM_Admin_Gateways {
                             </td>
                         </tr>
                         <tr>
+                            <th><?php _e('Operating Account Number', 'matrix-mlm'); ?></th>
+                            <td>
+                                <input type="text" name="fintava_operating_account" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_operating_account', '')); ?>" inputmode="numeric" pattern="[0-9]{6,20}" maxlength="20" autocomplete="off">
+                                <p class="description"><?php _e('NUBAN of the merchant Fintava wallet that funds Matrix &rarr; Virtual transfers. This is the <code>senderAccount</code> on Fintava\'s wallet-to-wallet endpoint &mdash; not the merchant UUID. Pre-fund this wallet so internal transfers can settle.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
                             <th><?php _e('Callback / Webhook URL', 'matrix-mlm'); ?></th>
                             <td>
                                 <input type="url" name="fintava_callback_url" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_fintava_callback_url', Matrix_MLM_Fintava::DEFAULT_CALLBACK_URL)); ?>">
@@ -799,6 +806,15 @@ class Matrix_MLM_Admin_Gateways {
     private function save_fintava_settings() {
         update_option('matrix_mlm_fintava_secret_key', sanitize_text_field($_POST['fintava_secret_key'] ?? ''));
         update_option('matrix_mlm_fintava_merchant_id', sanitize_text_field($_POST['fintava_merchant_id'] ?? ''));
+        // Operating account NUBAN — used as senderAccount on the
+        // /transaction/wallet-to-wallet endpoint that funds Matrix -> Virtual
+        // transfers. Mirrors the legacy Laravel `withdraw_from_account`
+        // global setting. Strip whitespace so a paste-with-trailing-space
+        // doesn't break the upstream NUBAN match.
+        update_option(
+            'matrix_mlm_fintava_operating_account',
+            preg_replace('/\s+/', '', sanitize_text_field($_POST['fintava_operating_account'] ?? ''))
+        );
         update_option('matrix_mlm_fintava_callback_url', esc_url_raw($_POST['fintava_callback_url'] ?? ''));
         update_option('matrix_mlm_fintava_webhook_secret', sanitize_text_field($_POST['fintava_webhook_secret'] ?? ''));
         update_option('matrix_mlm_fintava_status', intval($_POST['fintava_status'] ?? 0));
