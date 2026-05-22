@@ -333,28 +333,34 @@ class Matrix_MLM_Fintava {
      * versioned transient key so older raw-shape caches are bypassed.
      */
     public function get_banks() {
-        // Cache key is versioned (`_v2`) so any transient stored in the
-        // pre-normalization raw Fintava shape is bypassed on upgrade. Bump
-        // the suffix again if the normalized shape ever changes.
-        $cache_key = 'matrix_fintava_banks_list_v2';
+        // Cache key is versioned so any transient populated by an older
+        // code path (raw Fintava shape, or a normalized list cached against
+        // the wrong base URL) is bypassed on upgrade. Bump the suffix again
+        // if the normalized shape or the source host ever changes.
+        $cache_key = 'matrix_fintava_banks_list_v3';
         $cached = get_transient($cache_key);
 
         if ($cached !== false) {
             return $cached;
         }
 
-        $response = $this->make_request('GET', '/banks');
+        // Fintava only serves the bank list from the dev host
+        // (https://dev.fintavapay.com/api/dev/banks), regardless of which
+        // tier the merchant uses for wallets and payouts. Hard-route the
+        // call there so it works on installs configured for the live
+        // environment too. The same secret key authenticates both hosts.
+        $banks_base_url = self::DEV_BASE_URL;
+        $response = $this->make_request('GET', '/banks', null, $banks_base_url);
         if (is_wp_error($response)) {
-            // Decorate with environment + base URL so the operator can tell
-            // at a glance which tier was hit when reading the dropdown error.
+            // Decorate with the resolved base URL so the operator can tell
+            // at a glance which host was hit when reading the dropdown error.
             return new WP_Error(
                 $response->get_error_code(),
                 sprintf(
-                    /* translators: 1: original error, 2: environment label, 3: API base URL */
-                    __('%1$s [env=%2$s, base=%3$s]', 'matrix-mlm'),
+                    /* translators: 1: original error, 2: API base URL the call was routed to */
+                    __('%1$s [base=%2$s]', 'matrix-mlm'),
                     $response->get_error_message(),
-                    self::get_environment(),
-                    $this->base_url
+                    $banks_base_url
                 )
             );
         }
@@ -394,28 +400,26 @@ class Matrix_MLM_Fintava {
             return new WP_Error(
                 'fintava_banks_empty',
                 sprintf(
-                    /* translators: 1: env, 2: base URL, 3: short payload snippet */
-                    __('Fintava /banks returned no usable bank list [env=%1$s, base=%2$s, payload=%3$s]', 'matrix-mlm'),
-                    self::get_environment(),
-                    $this->base_url,
+                    /* translators: 1: API base URL the call was routed to, 2: short payload snippet */
+                    __('Fintava /banks returned no usable bank list [base=%1$s, payload=%2$s]', 'matrix-mlm'),
+                    $banks_base_url,
                     self::summarize_payload($response)
                 )
             );
         }
 
         // is_api_success() said no — surface the upstream message plus the
-        // env/base so we can tell whether it's auth, rate-limit, or path.
+        // base URL so we can tell whether it's auth, rate-limit, or path.
         return new WP_Error(
             'fintava_error',
             sprintf(
-                /* translators: 1: upstream message, 2: env, 3: base URL */
-                __('%1$s [env=%2$s, base=%3$s]', 'matrix-mlm'),
+                /* translators: 1: upstream message, 2: API base URL the call was routed to */
+                __('%1$s [base=%2$s]', 'matrix-mlm'),
                 self::normalize_api_message(
                     $response['message'] ?? null,
                     __('Failed to retrieve bank list', 'matrix-mlm')
                 ),
-                self::get_environment(),
-                $this->base_url
+                $banks_base_url
             )
         );
     }
@@ -2904,8 +2908,19 @@ class Matrix_MLM_Fintava {
 
     /**
      * Make HTTP request to Fintava API.
+     *
+     * @param string      $method            HTTP verb.
+     * @param string      $endpoint          Path beginning with '/'.
+     * @param array|null  $body              JSON body for POST/PUT/PATCH.
+     * @param string|null $base_url_override Optional alternate base URL. Used
+     *     by callers that need to bypass the environment-resolved
+     *     `$this->base_url` because a specific endpoint only exists on a
+     *     different Fintava host (e.g. `/banks` is only served from
+     *     `https://dev.fintavapay.com/api/dev`, regardless of which tier
+     *     the merchant otherwise uses for wallets and payouts). Pass with
+     *     no trailing slash; the endpoint is concatenated as-is.
      */
-    private function make_request($method, $endpoint, $body = null) {
+    private function make_request($method, $endpoint, $body = null, $base_url_override = null) {
         if (empty($this->secret_key)) {
             return new WP_Error(
                 'fintava_not_configured',
@@ -2913,7 +2928,10 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        $url = $this->base_url . $endpoint;
+        $base = $base_url_override !== null && $base_url_override !== ''
+            ? rtrim($base_url_override, '/')
+            : $this->base_url;
+        $url = $base . $endpoint;
 
         $args = [
             'method' => $method,
