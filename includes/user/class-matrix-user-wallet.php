@@ -614,6 +614,10 @@ class Matrix_MLM_User_Wallet {
             whenJQueryReady(function($) {
                 'use strict';
 
+                if (window.console && console.log) {
+                    console.log('[Matrix MLM] Wallet onboarding handlers binding (no-Fintava state).');
+                }
+
                 // -----------------------------------------------------------
                 // UI-only handlers (do NOT depend on matrixMLM).
                 //
@@ -621,6 +625,20 @@ class Matrix_MLM_User_Wallet {
                 // buttons + create-wallet CTA jump still work even
                 // when matrixMLM is missing (e.g., an optimizer
                 // dequeued matrix-mlm-public.js).
+                //
+                // IMPORTANT: handlers are bound via event delegation
+                // on document (.on with selector argument) rather than
+                // direct .on on matched elements. The previous
+                // revision used direct binding, which assumes the
+                // buttons exist in the DOM the moment whenJQueryReady
+                // fires. That assumption holds for first-time pageviews
+                // but breaks subtly if any of: a parent script
+                // throws and nudges the parser, the document-ready
+                // fires before our buttons get to the DOM, or jQuery's
+                // .data() gets cached against an earlier attribute
+                // state. Document delegation sidesteps all three —
+                // jQuery walks up from the click target each time
+                // and re-reads data-target fresh.
                 // -----------------------------------------------------------
 
                 // Action button → pane toggle. Same contract as the
@@ -628,18 +646,29 @@ class Matrix_MLM_User_Wallet {
                 // active button collapses its pane back to the overview
                 // state, clicking it from the overview state reveals
                 // the pane.
-                $('.matrix-wallet-action-btn').on('click', function() {
+                //
+                // Visibility is controlled via BOTH the [hidden]
+                // attribute AND an explicit inline display style.
+                // Some themes ship CSS like `section { display: block
+                // !important }` or scope `.matrix-wallet-pane` rules
+                // that compete with our `.matrix-wallet-pane[hidden]
+                // { display: none }` rule. Setting `style="display:
+                // ..."` directly wins on specificity (inline styles
+                // beat any non-!important selector), and removing
+                // [hidden] keeps the HTML semantics aligned with the
+                // visual state.
+                $(document).on('click', '.matrix-wallet-action-btn', function() {
                     var $btn    = $(this);
-                    var target  = $btn.data('target');
+                    var target  = $btn.attr('data-target');
                     var $pane   = $('.matrix-wallet-pane[data-pane="' + target + '"]');
                     var wasOpen = $btn.hasClass('is-active');
 
                     $('.matrix-wallet-action-btn').removeClass('is-active');
-                    $('.matrix-wallet-pane').attr('hidden', true);
+                    $('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
 
                     if (!wasOpen) {
                         $btn.addClass('is-active');
-                        $pane.removeAttr('hidden');
+                        $pane.removeAttr('hidden').css('display', '');
                         if (window.innerWidth < 900) {
                             var top = $pane.offset().top - 20;
                             $('html, body').animate({ scrollTop: top }, 250);
@@ -653,7 +682,7 @@ class Matrix_MLM_User_Wallet {
                 // teleported straight onto the canonical create form,
                 // preserving their "I want to move funds to my own
                 // wallet" intent.
-                $('#matrix-own-wallet-create-cta').on('click', function() {
+                $(document).on('click', '#matrix-own-wallet-create-cta', function() {
                     $('.matrix-wallet-action-btn[data-target="create-wallet"]').trigger('click');
                 });
 
