@@ -2325,8 +2325,21 @@ class Matrix_MLM_Fintava {
                 $data = isset($response['data']) && is_array($response['data']) ? $response['data'] : $response;
                 $cid = self::extract_customer_id($data);
                 if (!empty($cid)) {
-                    // Verify it matches our account number
-                    $wallet_in_response = isset($data['wallet']) && is_array($data['wallet']) ? $data['wallet'] : $data;
+                    // Verify it matches our account number.
+                    //
+                    // Fintava's /customers/details response actually nests
+                    // the wallet TWO levels deep: data.userInfo.wallet.
+                    // Older tiers / older docs sometimes had data.wallet,
+                    // and a few endpoints flatten the wallet fields onto
+                    // the root. Try in that order so the deepest, most
+                    // current shape wins.
+                    if (isset($data['userInfo']['wallet']) && is_array($data['userInfo']['wallet'])) {
+                        $wallet_in_response = $data['userInfo']['wallet'];
+                    } elseif (isset($data['wallet']) && is_array($data['wallet'])) {
+                        $wallet_in_response = $data['wallet'];
+                    } else {
+                        $wallet_in_response = $data;
+                    }
                     $remote_account = self::extract_account_number($wallet_in_response);
                     if (empty($remote_account) || trim($remote_account) === $account_number) {
                         $resolved_customer_id = $cid;
@@ -2355,11 +2368,19 @@ class Matrix_MLM_Fintava {
                         continue;
                     }
 
-                    // The customer list returns each entry with a nested
-                    // wallet object, or the wallet fields at the root level.
-                    $wallet_obj = isset($customer['wallet']) && is_array($customer['wallet'])
-                        ? $customer['wallet']
-                        : $customer;
+                    // The customer list returns each entry with the wallet
+                    // nested under userInfo (the actual current shape per
+                    // Fintava's API), or a flatter wallet at the root, or
+                    // — on older tiers — wallet fields directly on the
+                    // customer record. Try deepest-first so the canonical
+                    // shape wins.
+                    if (isset($customer['userInfo']['wallet']) && is_array($customer['userInfo']['wallet'])) {
+                        $wallet_obj = $customer['userInfo']['wallet'];
+                    } elseif (isset($customer['wallet']) && is_array($customer['wallet'])) {
+                        $wallet_obj = $customer['wallet'];
+                    } else {
+                        $wallet_obj = $customer;
+                    }
 
                     $remote_account = self::extract_account_number($wallet_obj);
                     if (empty($remote_account) || trim($remote_account) !== $account_number) {
