@@ -160,7 +160,20 @@ class Matrix_MLM_User_Bank_Payout {
         </style>
 
         <script>
-        (function($) {
+        // Defer to DOM-ready so the matrixMLM global (localized against the
+        // footer-loaded matrix-mlm-public.js handle) is guaranteed to exist
+        // before the bank-loading AJAX fires. The original IIFE
+        // `(function($){...})(jQuery)` ran synchronously while the body was
+        // still being parsed — at that point matrix-mlm-public.js had not
+        // been printed yet, so `matrixMLM` was undefined and reading
+        // `matrixMLM.ajaxUrl` threw a ReferenceError that aborted the IIFE
+        // before $.ajax() could be invoked. The result was a dropdown stuck
+        // on "-- Loading banks..." forever, with no `error:` handler firing
+        // because the throw preceded the ajax call. The other handlers in
+        // this script (resolve_account, initiate_transfer) are bound to user
+        // input and only fire after the footer has rendered, so they were
+        // never affected and the bug appeared isolated to the bank dropdown.
+        jQuery(function($) {
             'use strict';
 
             const currency = '<?php echo esc_js(get_option("matrix_mlm_currency_symbol", "₦")); ?>';
@@ -168,6 +181,21 @@ class Matrix_MLM_User_Bank_Payout {
             const chargeValue = <?php echo floatval($charge_value); ?>;
             const balance = <?php echo floatval($balance); ?>;
             let accountVerified = false;
+
+            // Defensive: surface a clear, debuggable failure mode if the
+            // matrixMLM global is somehow still missing when DOM-ready fires
+            // (e.g. another plugin dequeued matrix-mlm-public, or a JS error
+            // earlier in the page broke wp_footer). Without this the
+            // dropdown stays at "Loading banks..." with no console signal.
+            if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
+                $('#fintava-bank-select').empty().append(
+                    '<option value=""><?php _e("Cannot reach server (matrixMLM missing)", "matrix-mlm"); ?></option>'
+                );
+                if (window.console && console.error) {
+                    console.error('[Matrix MLM] matrixMLM global is not defined — matrix-mlm-public.js was not enqueued on this page.');
+                }
+                return;
+            }
 
             // Load banks on page load
             $.ajax({
@@ -177,16 +205,32 @@ class Matrix_MLM_User_Bank_Payout {
                 success: function(response) {
                     const select = $('#fintava-bank-select');
                     select.empty().append('<option value=""><?php _e("-- Select Bank --", "matrix-mlm"); ?></option>');
-                    if (response.success && response.data.banks) {
+                    if (response && response.success && response.data && Array.isArray(response.data.banks) && response.data.banks.length) {
                         response.data.banks.forEach(function(bank) {
-                            select.append('<option value="' + bank.code + '" data-name="' + bank.name + '">' + bank.name + '</option>');
+                            if (!bank || !bank.code || !bank.name) { return; }
+                            const opt = $('<option/>')
+                                .attr('value', bank.code)
+                                .attr('data-name', bank.name)
+                                .text(bank.name);
+                            select.append(opt);
                         });
                     } else {
-                        select.append('<option value=""><?php _e("Failed to load banks", "matrix-mlm"); ?></option>');
+                        const serverMsg = response && response.data && response.data.message
+                            ? response.data.message
+                            : '<?php echo esc_js(__("Failed to load banks", "matrix-mlm")); ?>';
+                        select.append($('<option/>').attr('value', '').text(serverMsg));
+                        if (window.console && console.warn) {
+                            console.warn('[Matrix MLM] Bank list load failed:', response);
+                        }
                     }
                 },
-                error: function() {
-                    $('#fintava-bank-select').empty().append('<option value=""><?php _e("Error loading banks", "matrix-mlm"); ?></option>');
+                error: function(xhr, status, err) {
+                    $('#fintava-bank-select').empty().append(
+                        '<option value=""><?php _e("Error loading banks", "matrix-mlm"); ?></option>'
+                    );
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] Bank list AJAX error:', status, err, xhr && xhr.responseText);
+                    }
                 }
             });
 
@@ -326,7 +370,7 @@ class Matrix_MLM_User_Bank_Payout {
                 });
             });
 
-        })(jQuery);
+        });
         </script>
         <?php
     }
