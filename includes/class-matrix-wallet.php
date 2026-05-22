@@ -118,12 +118,22 @@ class Matrix_MLM_Wallet {
         // movement later. The caller is expected to roll back the
         // surrounding transaction (or, for callers without a
         // transaction, alert support).
+        //
+        // transaction_type is coerced to '' on null because the column
+        // is varchar(50) NOT NULL. Every current caller passes a
+        // literal string ('plan_purchase', 'transfer_out', etc.), so
+        // this is preventive: a future caller that forgot to populate
+        // it would otherwise blow up the auditor INSERT here, the same
+        // shape of bug that #129 fixed for matrix_fintava_payouts. See
+        // the systemic guard in matrix-mlm.php (#130) for the reason
+        // we still want this defensive coercion despite that guard
+        // already preventing the JSON-corruption symptom.
         $logged = $wpdb->insert($wpdb->prefix . 'matrix_wallet', [
             'user_id' => $user_id,
             'amount' => $amount,
             'post_balance' => $new_balance,
             'type' => 'credit',
-            'transaction_type' => $transaction_type,
+            'transaction_type' => $transaction_type ?? '',
             'description' => $description,
             'reference' => $reference,
             'status' => 'completed'
@@ -192,12 +202,15 @@ class Matrix_MLM_Wallet {
         // Read back the persisted balance for the auditor row.
         $new_balance = $this->get_balance($user_id);
 
+        // Auditor row for the debit. transaction_type coerced to ''
+        // on null for the same reason as the credit() insert above —
+        // see that comment for the full rationale.
         $logged = $wpdb->insert($wpdb->prefix . 'matrix_wallet', [
             'user_id' => $user_id,
             'amount' => $amount,
             'post_balance' => $new_balance,
             'type' => 'debit',
-            'transaction_type' => $transaction_type,
+            'transaction_type' => $transaction_type ?? '',
             'description' => $description,
             'reference' => $reference,
             'status' => 'completed'
