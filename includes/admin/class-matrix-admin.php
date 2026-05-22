@@ -488,6 +488,9 @@ class Matrix_MLM_Admin {
             case 'fintava_backfill_wallet_ids':
                 $this->fintava_backfill_wallet_ids();
                 break;
+            case 'fintava_backfill_bank_codes':
+                $this->fintava_backfill_bank_codes();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -916,6 +919,50 @@ class Matrix_MLM_Admin {
             $report['mismatched'],
             $report['still_missing'],
             $report['total_missing_before']
+        );
+
+        wp_send_json_success([
+            'message' => $summary,
+            'report'  => $report,
+        ]);
+    }
+
+    /**
+     * Backfill missing bank_code values across all linked Fintava wallets.
+     *
+     * Delegates to the gateway's backfill_missing_bank_codes() orchestrator,
+     * which retries the same self-heal chain that ajax_transfer_matrix_to_virtual()
+     * exercises lazily on the first transfer (resolve_wallet_id_from_customer →
+     * enrich_partner_bank_metadata → derive_bank_code_from_name). Returns a
+     * structured per-row report so the migration page can render counts and a
+     * table indicating which step resolved each row, or — for rows that
+     * remain unresolvable — a precise reason the operator can act on.
+     */
+    private function fintava_backfill_bank_codes() {
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->is_active()) {
+            wp_send_json_error(['message' => __('Fintava is not configured. Add the live API key on the Gateways page first.', 'matrix-mlm')]);
+        }
+
+        // Per-row chain can fire up to 5 Fintava round-trips. 180s gives a
+        // 100-row batch headroom over the throttled inner loop.
+        @set_time_limit(180);
+
+        $report = $fintava->backfill_missing_bank_codes();
+        if (is_wp_error($report)) {
+            wp_send_json_error(['message' => $report->get_error_message()]);
+        }
+
+        $resolved_total = $report['resolved_via_wallet_details']
+                        + $report['resolved_via_customer_api']
+                        + $report['resolved_via_static_lookup'];
+
+        $summary = sprintf(
+            /* translators: 1: total resolved, 2: starting count, 3: still missing */
+            __('Bank-code backfill complete: %1$d resolved out of %2$d (%3$d still missing).', 'matrix-mlm'),
+            $resolved_total,
+            $report['total_missing_before'],
+            $report['still_missing']
         );
 
         wp_send_json_success([
