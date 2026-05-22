@@ -88,7 +88,7 @@ class Matrix_MLM_Fintava_Card {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true) {
+        if (Matrix_MLM_Fintava::is_api_success($response)) {
             return [
                 'success' => true,
                 'card_id' => $response['data']['id'] ?? $response['data']['card_id'] ?? null,
@@ -123,7 +123,7 @@ class Matrix_MLM_Fintava_Card {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (Matrix_MLM_Fintava::is_api_success($response) && isset($response['data'])) {
             return $response['data'];
         }
 
@@ -151,7 +151,7 @@ class Matrix_MLM_Fintava_Card {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true) {
+        if (Matrix_MLM_Fintava::is_api_success($response)) {
             return [
                 'success' => true,
                 'message' => $response['message'] ?? __('Card linked successfully', 'matrix-mlm'),
@@ -182,7 +182,7 @@ class Matrix_MLM_Fintava_Card {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true) {
+        if (Matrix_MLM_Fintava::is_api_success($response)) {
             return [
                 'success' => true,
                 'message' => $response['message'] ?? __('Card activated successfully', 'matrix-mlm'),
@@ -210,7 +210,7 @@ class Matrix_MLM_Fintava_Card {
             return $response;
         }
 
-        if (isset($response['status']) && $response['status'] === true && isset($response['data'])) {
+        if (Matrix_MLM_Fintava::is_api_success($response) && isset($response['data'])) {
             return $response['data'];
         }
 
