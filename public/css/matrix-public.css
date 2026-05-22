@@ -55,10 +55,20 @@
     border-top: 1px solid var(--matrix-border);
 }
 
+.matrix-auth-footer p {
+    color: #4b5563;
+    font-size: 14px;
+    margin: 6px 0;
+}
+
 .matrix-auth-footer a {
     color: var(--matrix-primary);
     text-decoration: none;
     font-weight: 500;
+}
+
+.matrix-auth-footer a:hover {
+    text-decoration: underline;
 }
 
 /* Forms */
@@ -94,6 +104,16 @@
     box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
 }
 
+/* Checkboxes and radios should not be stretched like text inputs */
+.matrix-form-group input[type="checkbox"],
+.matrix-form-group input[type="radio"] {
+    width: auto;
+    padding: 0;
+    margin: 0;
+    flex-shrink: 0;
+    box-shadow: none;
+}
+
 .matrix-form-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -101,10 +121,18 @@
 }
 
 .matrix-form-check label {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 8px;
     font-size: 13px;
+    font-weight: 400;
+    color: #374151;
+    cursor: pointer;
+    margin-bottom: 0;
+}
+
+.matrix-form-check {
+    margin-bottom: 20px;
 }
 
 /* Buttons */
