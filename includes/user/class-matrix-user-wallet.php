@@ -243,18 +243,22 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the three top-level action buttons.
+     * Render the four top-level action buttons.
      *
      * Buttons toggle the matching pane below (data-target → data-pane).
      * All panes are rendered server-side so the forms work even if the
      * tab-toggle JS fails to bind for any reason; only their visibility
      * is controlled client-side.
      *
-     * Order is "narrowest → widest reach":
+     * Order is "money-moving narrowest → widest, then read-only":
      *   own-wallet   — money stays under the same user (Matrix → Virtual)
      *   user-wallet  — money moves to another platform user, still on
      *                  the Matrix side (internal/wallet-to-wallet)
      *   bank         — money exits the platform entirely (external bank)
+     *   transactions — read-only ledger of every credit/debit on the
+     *                  Matrix wallet. Lives here (not in the sidebar)
+     *                  so the wallet page is the one canonical place
+     *                  to see and act on wallet activity.
      */
     private function render_action_buttons() {
         ?>
@@ -280,12 +284,19 @@ class Matrix_MLM_User_Wallet {
                     <small><?php esc_html_e('Send funds to any Nigerian bank account', 'matrix-mlm'); ?></small>
                 </span>
             </button>
+            <button type="button" class="matrix-wallet-action-btn" data-target="transactions">
+                <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Transaction History', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('View every credit and debit on your Matrix wallet', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
         </div>
         <?php
     }
 
     /**
-     * Render the three action panes (hidden by default; one is shown
+     * Render the four action panes (hidden by default; one is shown
      * when its matching action button is clicked).
      */
     private function render_panes($wallet, $user_id, $matrix_balance, $currency) {
@@ -310,6 +321,71 @@ class Matrix_MLM_User_Wallet {
             (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
             ?>
         </section>
+
+        <section class="matrix-wallet-pane" data-pane="transactions" hidden>
+            <?php $this->render_transaction_history($user_id, $currency); ?>
+        </section>
+        <?php
+    }
+
+    /**
+     * Render the Matrix-wallet ledger (Transaction History pane).
+     *
+     * This is the same data the dashboard's old standalone
+     * Transactions tab used to show: every credit/debit row on the
+     * user's Matrix wallet, ordered newest-first, capped at 50 rows
+     * to keep the pane light without paging. Lives on the wallet page
+     * because every entry in this table is the result of money moving
+     * into or out of the same Matrix wallet whose balance and
+     * transfer actions already live on this page; making the user
+     * navigate elsewhere just to read the receipt of an action they
+     * just performed here was the wrong split.
+     *
+     * If the cap of 50 rows starts feeling restrictive we can grow
+     * this into a paginated view; the underlying
+     * Matrix_MLM_Wallet::get_transactions() already accepts a limit,
+     * and adding offset/page params is a localized change that
+     * doesn't affect the rest of the wallet page.
+     */
+    private function render_transaction_history($user_id, $currency) {
+        $wallet       = new Matrix_MLM_Wallet();
+        $transactions = $wallet->get_transactions($user_id, 50);
+        ?>
+        <h3><?php esc_html_e('Transaction History', 'matrix-mlm'); ?></h3>
+        <div class="matrix-transfer-note">
+            <?php esc_html_e('Every credit and debit on your Matrix wallet — deposits, transfers, bank payouts, and commissions — newest first.', 'matrix-mlm'); ?>
+        </div>
+
+        <?php if (empty($transactions)): ?>
+            <div class="matrix-info-box">
+                <p><?php esc_html_e('No transactions yet. Your wallet activity will appear here once you make a deposit or earn a commission.', 'matrix-mlm'); ?></p>
+            </div>
+        <?php else: ?>
+            <table class="matrix-table">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e('Date', 'matrix-mlm'); ?></th>
+                        <th><?php esc_html_e('Type', 'matrix-mlm'); ?></th>
+                        <th><?php esc_html_e('Amount', 'matrix-mlm'); ?></th>
+                        <th><?php esc_html_e('Post Balance', 'matrix-mlm'); ?></th>
+                        <th><?php esc_html_e('Description', 'matrix-mlm'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($transactions as $tx): ?>
+                    <tr>
+                        <td><?php echo esc_html(date('M d, Y H:i', strtotime($tx->created_at))); ?></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($tx->type); ?>"><?php echo esc_html(ucfirst($tx->type)); ?></span></td>
+                        <td class="<?php echo $tx->type === 'credit' ? 'text-success' : 'text-danger'; ?>">
+                            <?php echo esc_html(($tx->type === 'credit' ? '+' : '-') . $currency . number_format($tx->amount, 2)); ?>
+                        </td>
+                        <td><?php echo esc_html($currency . number_format($tx->post_balance, 2)); ?></td>
+                        <td><?php echo esc_html($tx->description); ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
         <?php
     }
 

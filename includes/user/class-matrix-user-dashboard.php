@@ -30,7 +30,12 @@ class Matrix_MLM_User_Dashboard {
         // an orphaned form. The Matrix_MLM_User_Withdrawals class
         // is kept on disk because admin-side withdrawal management
         // and the bank-payout flow still depend on its helpers.
-        'transactions',
+        //
+        // 'transactions' was retired for the same reason: the wallet
+        // page now hosts a "Transaction History" pane (the only place
+        // that ledger lives), so a sidebar entry would be a second
+        // path to the same content. Legacy /matrix-dashboard/transactions/
+        // URLs fall through to overview.
         'referrals',
         'genealogy',
         'commissions',
@@ -144,7 +149,6 @@ class Matrix_MLM_User_Dashboard {
                     <a href="<?php echo self::tab_url('overview'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transaction History', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
@@ -188,9 +192,11 @@ class Matrix_MLM_User_Dashboard {
             // 'withdraw' / 'withdraw-history' cases removed — see the
             // comment on $valid_tabs. The "Transfer to Bank" pane on
             // the Wallet tab is the user-facing replacement.
-            case 'transactions':
-                $this->render_transactions($user_id);
-                break;
+            //
+            // 'transactions' case likewise removed: the ledger now
+            // lives in the "Transaction History" pane on the Wallet
+            // tab, which is the single canonical home for all wallet
+            // activity (balances, actions, and history together).
             case 'referrals':
                 (new Matrix_MLM_User_Referrals())->render($user_id);
                 break;
@@ -303,29 +309,6 @@ class Matrix_MLM_User_Dashboard {
                 </table>
             </div>
         </div>
-        <?php
-    }
-
-    private function render_transactions($user_id) {
-        $wallet = new Matrix_MLM_Wallet();
-        $transactions = $wallet->get_transactions($user_id, 50);
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        ?>
-        <h2><?php _e('Transaction History', 'matrix-mlm'); ?></h2>
-        <table class="matrix-table">
-            <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Post Balance', 'matrix-mlm'); ?></th><th><?php _e('Description', 'matrix-mlm'); ?></th></tr></thead>
-            <tbody>
-                <?php foreach ($transactions as $tx): ?>
-                <tr>
-                    <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
-                    <td><span class="matrix-badge matrix-badge-<?php echo $tx->type; ?>"><?php echo ucfirst($tx->type); ?></span></td>
-                    <td class="<?php echo $tx->type === 'credit' ? 'text-success' : 'text-danger'; ?>"><?php echo ($tx->type === 'credit' ? '+' : '-') . $currency . number_format($tx->amount, 2); ?></td>
-                    <td><?php echo $currency . number_format($tx->post_balance, 2); ?></td>
-                    <td><?php echo esc_html($tx->description); ?></td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
         <?php
     }
 
