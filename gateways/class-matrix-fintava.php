@@ -273,7 +273,7 @@ class Matrix_MLM_Fintava {
             amount decimal(12,2) NOT NULL,
             charge decimal(12,2) NOT NULL DEFAULT 0.00,
             total_debit decimal(12,2) NOT NULL,
-            bank_code varchar(20) NOT NULL,
+            bank_code varchar(20) DEFAULT NULL,
             bank_name varchar(100) NOT NULL,
             account_number varchar(20) NOT NULL,
             account_name varchar(255) NOT NULL,
@@ -351,6 +351,35 @@ class Matrix_MLM_Fintava {
         if ($col_exists !== null && intval($col_exists) === 0) {
             $wpdb->query("ALTER TABLE `$wallets_table` ADD COLUMN `customer_id` varchar(100) DEFAULT NULL AFTER `wallet_id`");
             $wpdb->query("ALTER TABLE `$wallets_table` ADD KEY `customer_id` (`customer_id`)");
+        }
+
+        // Self-healing: relax matrix_fintava_payouts.bank_code from NOT NULL
+        // to DEFAULT NULL on installs that ran the original CREATE TABLE.
+        //
+        // Why: the matrix→virtual transfer path documents (and the user-
+        // facing handler relies on) NULL bank_code being acceptable, because
+        // /transaction/wallet-to-wallet routes by NUBAN and does not need a
+        // CBN sortCode. Wallets created before the bank-code self-heal
+        // landed — or wallets where Fintava never returned a partner bank —
+        // legitimately carry NULL in matrix_fintava_wallets.bank_code, and
+        // the handler reads that value when staging a payout row. Leaving
+        // the payouts column NOT NULL meant any such wallet failed the
+        // INSERT with "Column 'bank_code' cannot be null" before the
+        // earlier defensive coercion (write '' instead of NULL) landed.
+        //
+        // The defensive coercion still stays in place — it's the runtime
+        // belt to this schema migration's suspenders, and it keeps existing
+        // payout rows readable on installs that haven't picked up this
+        // migration yet (e.g. Multisite networks where the activator runs
+        // per-site at different times).
+        $is_nullable = $wpdb->get_var($wpdb->prepare(
+            "SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'bank_code'",
+            DB_NAME,
+            $payouts_table
+        ));
+        if ($is_nullable !== null && strtoupper((string) $is_nullable) === 'NO') {
+            $wpdb->query("ALTER TABLE `$payouts_table` MODIFY COLUMN `bank_code` varchar(20) DEFAULT NULL");
         }
 
         return ['errors' => $errors];
