@@ -109,7 +109,45 @@ class Matrix_MLM_User_Bank_Payout {
             <p><strong><?php _e('Service Charge:', 'matrix-mlm'); ?></strong> <?php echo $charge_type === 'percent' ? $charge_value . '%' : $currency . number_format($charge_value, 2); ?></p>
         </div>
 
-        <div class="matrix-form-card">
+        <!--
+            "Transfer to Bank" CTA. The form below is hidden by default and
+            this button is the only thing the user sees in the form area on
+            initial page load. Clicking it hides the CTA and reveals the
+            form (see the small vanilla-JS toggle script at the bottom of
+            this template). Vanilla JS is used deliberately so this open/
+            close interaction works even when the jQuery-polling fallback
+            in the main script block hasn't satisfied yet — the toggle is
+            UI-only and shouldn't depend on the Fintava AJAX layer being
+            ready.
+
+            The button label intentionally matches the in-form submit
+            button ("Transfer to Bank") because that's how users refer to
+            this action on the rest of the dashboard. They're never both
+            visible at the same time, so there's no visual duplication.
+        -->
+        <button type="button"
+                id="matrix-bank-payout-toggle"
+                class="matrix-btn matrix-btn-primary matrix-btn-block">
+            <?php _e('Transfer to Bank', 'matrix-mlm'); ?>
+        </button>
+
+        <div class="matrix-form-card" id="matrix-bank-payout-card" style="display:none;">
+            <!--
+                Cancel link inside the form so a user who opens the form
+                by mistake (or wants to stop and check their balance
+                again) can collapse it back to the CTA without having
+                to refresh the whole page. Styled as a plain link, not
+                a button, so it doesn't compete visually with the
+                primary submit button at the bottom of the form.
+            -->
+            <div class="matrix-bank-payout-form-header">
+                <button type="button"
+                        id="matrix-bank-payout-cancel"
+                        class="matrix-bank-payout-cancel-link"
+                        aria-label="<?php esc_attr_e('Cancel bank transfer', 'matrix-mlm'); ?>">
+                    &times; <?php _e('Cancel', 'matrix-mlm'); ?>
+                </button>
+            </div>
             <form id="matrix-bank-payout-form" class="matrix-form">
                 <!-- Bank Selection -->
                 <div class="matrix-form-group">
@@ -333,7 +371,71 @@ class Matrix_MLM_User_Bank_Payout {
         .matrix-payout-reason { margin-top:6px; padding:6px 8px; background:#fef2f2; border-left:3px solid #dc2626; border-radius:3px; font-size:11px; line-height:1.4; color:#991b1b; word-break:break-word; max-width:280px; }
         .matrix-submit-status { margin-top:8px; min-height:18px; font-size:13px; line-height:1.4; color:#92400e; text-align:center; }
         .matrix-submit-status:empty { display:none; }
+        /* Spacing between the "Transfer to Bank" CTA and the info-box / history above. */
+        #matrix-bank-payout-toggle { margin: 12px 0 16px; }
+        /* Cancel link sits at the top-right of the form card so it's
+           reachable but visually de-emphasised. Plain text + hover
+           underline so it reads as a "back out" affordance, not a
+           secondary action that competes with the submit button. */
+        .matrix-bank-payout-form-header { display:flex; justify-content:flex-end; margin-bottom:8px; }
+        .matrix-bank-payout-cancel-link {
+            background:none; border:0; padding:4px 6px; cursor:pointer;
+            color:#6b7280; font-size:13px; line-height:1; font-family:inherit;
+        }
+        .matrix-bank-payout-cancel-link:hover { color:#111827; text-decoration:underline; }
+        .matrix-bank-payout-cancel-link:focus { outline:2px solid #4f46e5; outline-offset:2px; border-radius:3px; }
         </style>
+
+        <script>
+        // Vanilla-JS open/close toggle for the bank-payout form. Runs
+        // independently of the jQuery-polling block below so the user
+        // can always show/hide the form even if jQuery is delayed (or
+        // the form is in its disabled "matrixMLM missing" state). All
+        // it does is flip two `display` properties — no AJAX, no form
+        // state changes — so it's safe to bind unconditionally.
+        (function() {
+            var toggle = document.getElementById('matrix-bank-payout-toggle');
+            var card   = document.getElementById('matrix-bank-payout-card');
+            var cancel = document.getElementById('matrix-bank-payout-cancel');
+            if (!toggle || !card) { return; }
+
+            toggle.addEventListener('click', function() {
+                toggle.style.display = 'none';
+                card.style.display   = '';
+
+                // Move keyboard focus into the form so a user who
+                // opened it via Enter/Space keeps a sensible focus
+                // target. The bank <select> is the first thing they
+                // need to interact with, so prefer that; fall back to
+                // the first focusable element in the card if the
+                // select isn't there for some reason.
+                var firstField = card.querySelector('#fintava-bank-select')
+                    || card.querySelector('select, input, textarea, button');
+                if (firstField) {
+                    try { firstField.focus({ preventScroll: true }); } catch (e) { /* older browsers */ }
+                }
+
+                // Smooth-scroll the newly-revealed form into view —
+                // helpful on smaller screens where the form would
+                // otherwise expand below the fold and look like
+                // nothing happened.
+                if (typeof card.scrollIntoView === 'function') {
+                    try { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) { /* older browsers */ }
+                }
+            });
+
+            if (cancel) {
+                cancel.addEventListener('click', function() {
+                    card.style.display   = 'none';
+                    toggle.style.display = '';
+                    if (typeof toggle.scrollIntoView === 'function') {
+                        try { toggle.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) { /* older browsers */ }
+                    }
+                    try { toggle.focus({ preventScroll: true }); } catch (e) { /* older browsers */ }
+                });
+            }
+        })();
+        </script>
 
         <script>
         // Wait for jQuery to load before binding the DOM-ready handler.
