@@ -17,7 +17,8 @@
  *
  * Endpoints used:
  * - GET  /merchant/balance                    - Get merchant wallet balance
- * - POST /bank/credit/merchant                - Credit a bank account (payout from merchant)
+ * - POST /bank/credit                         - Bank payout (user's Fintava wallet -> external bank)
+ * - POST /bank/credit/merchant                - Credit a bank account from merchant wallet (legacy / not on bank-payout path)
  * - POST /virtual-wallet/generate             - Generate virtual wallet for user
  * - GET  /customer/wallet/balance/{walletId}  - Get virtual wallet balance (fast path)
  * - GET  /customers                           - List customers (wallet lookup fallback)
@@ -25,8 +26,13 @@
  * - GET  /name/enquiry?accountNumber=...&sortCode=... - External name enquiry (3rd-party banks)
  * - GET  /banks                               - List supported banks
  *
- * /banks fallback host:
- * - GET  https://api.fintavapay.com/api/v1/banks - Public/unified list
+ * Per-endpoint host routing (overrides the env-specific dev/live host):
+ * - POST /bank/credit       -> https://api.fintavapay.com (BANK_CREDIT_BASE_URL).
+ *   Bank payouts source funds from the user's own Fintava virtual wallet,
+ *   not from the merchant wallet, and live on the unified public host
+ *   regardless of merchant tier. Override via the
+ *   MATRIX_FINTAVA_BANK_CREDIT_URL constant in wp-config.php.
+ * - GET  /banks fallback    -> https://api.fintavapay.com/api/v1 (PUBLIC_BANKS_URL),
  *   tried after the configured environment host and its opposite when
  *   both reject the request, since the env-specific hosts have been
  *   observed to fail with "Invalid API Key" on at least one tier.
@@ -58,6 +64,18 @@ class Matrix_MLM_Fintava {
      * /api/dev convention the env-specific hosts use.
      */
     const PUBLIC_BANKS_URL = 'https://api.fintavapay.com/api/v1';
+
+    /**
+     * Base host for bank payouts (POST /bank/credit). Distinct from the
+     * env-specific dev/live host because /bank/credit is a user-wallet ->
+     * external-bank transfer that lives on the unified public surface
+     * regardless of merchant tier — Fintava deducts its own fee from the
+     * user's Fintava wallet, no merchant wallet involvement, no plugin-
+     * side Matrix wallet debit. Override the full base via the
+     * MATRIX_FINTAVA_BANK_CREDIT_URL constant in wp-config.php if Fintava
+     * ever relocates the endpoint.
+     */
+    const BANK_CREDIT_BASE_URL = 'https://api.fintavapay.com';
 
     /**
      * Default base URL when no environment option is set yet. Intentionally
@@ -732,12 +750,14 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * POST /transfer — initiate a transfer.
+     * POST /transfer — initiate a generic transfer.
      *
      * NOTE: Currently has no callers — the live AJAX path
-     * `ajax_initiate_transfer()` calls `merchant_bank_credit()` instead.
-     * Kept for completeness / future use of the generic /transfer endpoint.
-     * Same wire-format rules apply: Fintava's validator expects camelCase
+     * `ajax_initiate_transfer()` calls `bank_credit()` (POST /bank/credit on
+     * the unified public host) for user bank payouts. This /transfer method
+     * is kept for completeness / future use of Fintava's generic transfer
+     * endpoint if the gateway ever exposes a flow that needs it. Same
+     * wire-format rules apply: Fintava's validator expects camelCase
      * (`accountNumber`, `sortCode`, `accountName`, `bankName`); the
      * internal $transfer_data contract stays snake_case.
      */
@@ -879,6 +899,16 @@ class Matrix_MLM_Fintava {
     /**
      * POST /bank/credit/merchant — payout from merchant wallet to bank account.
      *
+     * USAGE NOTE: This is NOT the user-facing bank-payout endpoint anymore.
+     * `bank_credit()` (POST /bank/credit on the unified public host) replaced
+     * it for that flow because Fintava's bank payouts source funds from the
+     * user's own Fintava virtual wallet, not from the merchant wallet — and
+     * /bank/credit/merchant kept failing with "account balance insufficient"
+     * when the merchant wallet wasn't pre-funded. This method is kept for
+     * the internal "matrix -> fintava" flow (where the merchant intentionally
+     * funds a user's virtual wallet by debiting the merchant wallet),
+     * currently uncalled from any AJAX path.
+     *
      * Wire-format note: Fintava's class-validator on this endpoint expects
      * camelCase (`accountNumber`, `sortCode`, `accountName`, `bankName`) and
      * also requires `sortCode` to be coerceable to a number. Sending the
@@ -938,6 +968,109 @@ class Matrix_MLM_Fintava {
             'fintava_merchant_transfer_error',
             $response['message'] ?? __('Merchant transfer failed', 'matrix-mlm')
         );
+    }
+
+    /**
+     * POST /bank/credit — bank payout from user's Fintava virtual wallet to
+     * an external bank account.
+     *
+     * Distinct from /bank/credit/merchant on three axes:
+     *
+     *   1. Source of funds. /bank/credit debits the user's own Fintava
+     *      virtual wallet (the same wallet that receives deposits via the
+     *      virtual NUBAN). /bank/credit/merchant debits the merchant's
+     *      Fintava wallet, which has to be pre-funded by the operator.
+     *      For MatrixPro user-initiated payouts the user's wallet is
+     *      always the right source — using /bank/credit/merchant kept
+     *      failing with "account balance insufficient" whenever the
+     *      merchant wallet ran low, even though the user had enough.
+     *
+     *   2. Host. /bank/credit lives on Fintava's unified public host
+     *      (https://api.fintavapay.com), not the env-specific dev/live
+     *      host. Override the base via the MATRIX_FINTAVA_BANK_CREDIT_URL
+     *      constant in wp-config.php if Fintava ever moves it.
+     *
+     *   3. Fees. Fintava deducts its own transfer fee directly from the
+     *      user's Fintava wallet — there is no plugin-side fee added on
+     *      top, and `ajax_initiate_transfer()` no longer charges the
+     *      Matrix wallet for it.
+     *
+     * Same wire-format rules as /bank/credit/merchant: Fintava's class-
+     * validator expects camelCase (accountNumber, sortCode, accountName,
+     * bankName) and snake_case keys cause the four-line "should not be
+     * empty / must be a number" error stack. Our internal $transfer_data
+     * contract stays snake_case; only the outbound payload is renamed.
+     */
+    public function bank_credit($transfer_data) {
+        $required_fields = ['amount', 'account_number', 'bank_code'];
+        foreach ($required_fields as $field) {
+            if (empty($transfer_data[$field])) {
+                return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
+            }
+        }
+
+        $payload = [
+            'amount'        => floatval($transfer_data['amount']),
+            'accountNumber' => sanitize_text_field($transfer_data['account_number']),
+            'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
+        ];
+
+        // Map our snake_case optionals to the camelCase keys Fintava expects.
+        // `narration`, `reference`, `currency` retain their names because
+        // those are already lowercase single tokens on both sides.
+        $optional_map = [
+            'narration'    => 'narration',
+            'reference'    => 'reference',
+            'currency'     => 'currency',
+            'account_name' => 'accountName',
+            'bank_name'    => 'bankName',
+        ];
+        foreach ($optional_map as $local_key => $api_key) {
+            if (!empty($transfer_data[$local_key])) {
+                $payload[$api_key] = sanitize_text_field($transfer_data[$local_key]);
+            }
+        }
+
+        $base = $this->get_bank_credit_base_url();
+        $response = $this->make_request('POST', '/bank/credit', $payload, $base);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        if (self::is_api_success($response)) {
+            return [
+                'success'     => true,
+                'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
+                'reference'   => $response['data']['reference'] ?? ($transfer_data['reference'] ?? ''),
+                'status'      => $response['data']['status'] ?? 'pending',
+                'message'     => self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Bank transfer initiated successfully', 'matrix-mlm')
+                ),
+            ];
+        }
+
+        return new WP_Error(
+            'fintava_bank_credit_error',
+            self::normalize_api_message(
+                $response['message'] ?? null,
+                __('Bank transfer failed', 'matrix-mlm')
+            )
+        );
+    }
+
+    /**
+     * Resolve the base URL for /bank/credit calls. Honours the
+     * MATRIX_FINTAVA_BANK_CREDIT_URL wp-config constant when defined, falling
+     * back to BANK_CREDIT_BASE_URL otherwise. Override accepts a base URL
+     * (no trailing slash); the `/bank/credit` path is appended in
+     * bank_credit().
+     */
+    private function get_bank_credit_base_url() {
+        if (defined('MATRIX_FINTAVA_BANK_CREDIT_URL') && MATRIX_FINTAVA_BANK_CREDIT_URL) {
+            return rtrim(MATRIX_FINTAVA_BANK_CREDIT_URL, '/');
+        }
+        return self::BANK_CREDIT_BASE_URL;
     }
 
     // =========================================================================
@@ -1077,78 +1210,76 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Bank account details are required', 'matrix-mlm')]);
         }
 
-        $charge_type = get_option('matrix_mlm_fintava_charge_type', 'fixed');
-        $charge_value = floatval(get_option('matrix_mlm_fintava_charge_value', 50));
-        $charge = $charge_type === 'percent'
-            ? round($amount * $charge_value / 100, 2)
-            : $charge_value;
-        $total_debit = $amount + $charge;
-
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
-
-        if ($balance < $total_debit) {
-            wp_send_json_error(['message' => sprintf(
-                __('Insufficient balance. You need %s%s (Amount: %s%s + Charge: %s%s)', 'matrix-mlm'),
-                $currency_symbol, number_format($total_debit, 2),
-                $currency_symbol, number_format($amount, 2),
-                $currency_symbol, number_format($charge, 2)
-            )]);
+        // Bank payouts source funds from the user's own Fintava virtual
+        // wallet, NOT the merchant wallet and NOT the Matrix internal
+        // wallet. Three things follow from that:
+        //
+        //   - We require the user to have a linked Fintava virtual wallet,
+        //     since otherwise there is no source of funds. (The wallet row
+        //     is created when the user generates their virtual wallet via
+        //     the dashboard.)
+        //
+        //   - We do NOT debit the Matrix wallet. The Matrix wallet only
+        //     gets debited on the separate "matrix -> fintava" flow, where
+        //     the operator/admin moves credits from a user's Matrix
+        //     balance into their Fintava virtual wallet (which on Fintava's
+        //     side is the merchant_bank_credit endpoint that debits the
+        //     merchant wallet to fund the user's wallet). Bank payouts
+        //     skip both sides of that.
+        //
+        //   - We do NOT add a plugin-side charge on top of $amount.
+        //     Fintava deducts its own transfer fee directly from the
+        //     user's Fintava wallet at the gateway level. The legacy
+        //     `matrix_mlm_fintava_charge_value` option is now ignored on
+        //     the bank-payout path; the `charge` / `total_debit` columns
+        //     stay on the schema for backwards-compat with old payout
+        //     rows but get written as 0 / amount for new ones.
+        $user_wallet = $this->get_user_wallet($user_id);
+        if (!$user_wallet) {
+            wp_send_json_error(['message' => __('You do not have a Fintava wallet yet. Generate one before you can pay out.', 'matrix-mlm')]);
         }
 
         $reference = $this->generate_reference();
-
-        $wallet->debit(
-            $user_id,
-            $total_debit,
-            'fintava_payout',
-            sprintf(__('Bank transfer to %s (%s) - Ref: %s', 'matrix-mlm'), $account_name, $bank_name, $reference),
-            $reference
-        );
 
         global $wpdb;
         $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
         $wpdb->insert(
             $payouts_table,
             [
-                'user_id' => $user_id,
-                'reference' => $reference,
-                'amount' => $amount,
-                'charge' => $charge,
-                'total_debit' => $total_debit,
-                'bank_code' => $bank_code,
-                'bank_name' => $bank_name,
+                'user_id'        => $user_id,
+                'reference'      => $reference,
+                'amount'         => $amount,
+                'charge'         => 0,
+                'total_debit'    => $amount,
+                'bank_code'      => $bank_code,
+                'bank_name'      => $bank_name,
                 'account_number' => $account_number,
-                'account_name' => $account_name,
-                'narration' => $narration,
-                'currency' => 'NGN',
-                'status' => 'pending',
-                'created_at' => current_time('mysql'),
+                'account_name'   => $account_name,
+                'narration'      => $narration,
+                'currency'       => 'NGN',
+                'status'         => 'pending',
+                'created_at'     => current_time('mysql'),
             ],
             ['%d', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
         );
         $payout_id = $wpdb->insert_id;
 
-        $result = $this->merchant_bank_credit([
-            'amount' => $amount,
+        $result = $this->bank_credit([
+            'amount'         => $amount,
             'account_number' => $account_number,
-            'bank_code' => $bank_code,
-            'bank_name' => $bank_name,
-            'account_name' => $account_name,
-            'narration' => $narration,
-            'reference' => $reference,
-            'currency' => 'NGN',
+            'bank_code'      => $bank_code,
+            'bank_name'      => $bank_name,
+            'account_name'   => $account_name,
+            'narration'      => $narration,
+            'reference'      => $reference,
+            'currency'       => 'NGN',
         ]);
 
         if (is_wp_error($result)) {
-            $wallet->credit(
-                $user_id,
-                $total_debit,
-                'fintava_payout_refund',
-                sprintf(__('Refund: Bank transfer failed - %s', 'matrix-mlm'), $result->get_error_message()),
-                $reference
-            );
-
+            // No Matrix wallet refund needed — we never debited it. Just
+            // mark the payout row failed and surface Fintava's error to
+            // the user. (Common cause now: insufficient balance on the
+            // user's own Fintava virtual wallet, surfaced verbatim.)
             $wpdb->update(
                 $payouts_table,
                 ['status' => 'failed', 'failure_reason' => $result->get_error_message(), 'updated_at' => current_time('mysql')],
@@ -1165,8 +1296,8 @@ class Matrix_MLM_Fintava {
             $payouts_table,
             [
                 'transfer_id' => $result['transfer_id'] ?? '',
-                'status' => $result['status'] ?? 'processing',
-                'updated_at' => current_time('mysql'),
+                'status'      => $result['status'] ?? 'processing',
+                'updated_at'  => current_time('mysql'),
             ],
             ['id' => $payout_id],
             ['%s', '%s', '%s'],
@@ -1187,7 +1318,7 @@ class Matrix_MLM_Fintava {
                 $currency_symbol, number_format($amount, 2), $account_name, $bank_name
             ),
             'reference' => $reference,
-            'status' => $result['status'] ?? 'processing',
+            'status'    => $result['status'] ?? 'processing',
         ]);
     }
 

@@ -518,7 +518,8 @@ class Matrix_MLM_Admin_Settings {
             <thead><tr><th><?php _e('Action', 'matrix-mlm'); ?></th><th><?php _e('Endpoint', 'matrix-mlm'); ?></th></tr></thead>
             <tbody>
                 <tr><td><?php _e('Merchant Balance', 'matrix-mlm'); ?></td><td><code>GET /merchant/balance</code></td></tr>
-                <tr><td><?php _e('Bank Credit (Payout)', 'matrix-mlm'); ?></td><td><code>POST /bank/credit/merchant</code></td></tr>
+                <tr><td><?php _e('Bank Payout (User Fintava Wallet → Bank)', 'matrix-mlm'); ?></td><td><code>POST /bank/credit</code> @ <code>api.fintavapay.com</code></td></tr>
+                <tr><td><?php _e('Merchant Bank Credit (legacy / unused on bank-payout path)', 'matrix-mlm'); ?></td><td><code>POST /bank/credit/merchant</code></td></tr>
                 <tr><td><?php _e('Generate Virtual Wallet', 'matrix-mlm'); ?></td><td><code>POST /virtual-wallet/generate</code></td></tr>
                 <tr><td><?php _e('Request Physical Card', 'matrix-mlm'); ?></td><td><code>POST /cards/physical/request</code></td></tr>
                 <tr><td><?php _e('Card Status', 'matrix-mlm'); ?></td><td><code>GET /cards/status</code></td></tr>
