@@ -439,6 +439,41 @@ class Matrix_MLM_Core {
         wp_send_json_success(['message' => __('Withdrawal request submitted successfully. Funds have been held from your Matrix wallet and will be credited to your Fintava wallet upon admin approval.', 'matrix-mlm')]);
     }
 
+    /**
+     * Process a user-to-user (Matrix wallet → Matrix wallet) transfer.
+     *
+     * Atomicity contract: either ALL three persistence steps succeed
+     * (sender debit, recipient credit, matrix_transfers audit row) or
+     * the whole thing rolls back and the user sees a real error. The
+     * previous revision called debit/credit/insert in sequence without
+     * checking any return value and unconditionally returned
+     * "Transfer completed successfully", which is the bug behind the
+     * "wallet-to-wallet says success but my balance is unchanged"
+     * report on the consolidated Wallet page: a silent $wpdb->update
+     * no-op (e.g. missing matrix_user_meta row) presented to the user
+     * as a successful transfer that didn't actually move any money.
+     *
+     * The fix has three layers:
+     *
+     *   1. Matrix_MLM_Wallet::debit()/credit() now return false when
+     *      the underlying $wpdb->update or $wpdb->insert fails or
+     *      affects zero rows. (See those docblocks for the failure
+     *      modes covered.)
+     *
+     *   2. This method checks every return value and bails with a
+     *      real wp_send_json_error() — instead of pretending success —
+     *      whenever any persistence step fails. The error_log() lines
+     *      capture $wpdb->last_error so the next time this fires we
+     *      can see exactly which DB op failed and why.
+     *
+     *   3. The whole flow runs inside a $wpdb->query('START
+     *      TRANSACTION') / COMMIT / ROLLBACK envelope so partial
+     *      failures don't leave the system in an inconsistent state
+     *      (sender debited but recipient un-credited, or money moved
+     *      but no matrix_transfers row to reconcile against). InnoDB
+     *      is the WordPress default engine and dbDelta uses it without
+     *      ENGINE= override, so the transaction is honoured.
+     */
     private function process_transfer() {
         $user_id = get_current_user_id();
         $amount = floatval($_POST['amount'] ?? 0);
@@ -465,20 +500,90 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
         }
 
-        // Process transfer
-        $wallet->debit($user_id, $total, 'transfer_out', sprintf(__('Transfer to %s', 'matrix-mlm'), $recipient_username));
-        $wallet->credit($recipient->ID, $amount, 'transfer_in', sprintf(__('Transfer from %s', 'matrix-mlm'), wp_get_current_user()->user_login));
-
         global $wpdb;
-        $wpdb->insert($wpdb->prefix . 'matrix_transfers', [
+
+        // All three persistence steps below are part of the same
+        // logical operation; either they all commit or none of them
+        // do. Wrapping in START TRANSACTION + COMMIT/ROLLBACK gives
+        // us that guarantee on InnoDB tables (the WordPress default
+        // and the engine dbDelta uses for our matrix_* tables).
+        $wpdb->query('START TRANSACTION');
+
+        // Sender debit — the only step that can legitimately fail on
+        // a balance check at this point (the early `if ($balance <
+        // $total)` above only narrows the window; a concurrent
+        // transfer from the same user could still race past it). A
+        // false return here means either insufficient balance OR a
+        // $wpdb->update no-op (missing user_meta row, schema
+        // mismatch, read-only DB connection, etc.) — surface the
+        // failure to the user instead of pretending the money moved.
+        $debit_result = $wallet->debit(
+            $user_id,
+            $total,
+            'transfer_out',
+            sprintf(__('Transfer to %s', 'matrix-mlm'), $recipient_username)
+        );
+        if ($debit_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] process_transfer: debit() returned false for user_id=%d, total=%s, last_error=%s',
+                $user_id, $total, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Could not debit your wallet. Please refresh and try again, or contact support if the problem persists.', 'matrix-mlm')
+            ]);
+        }
+
+        // Recipient credit. Same false-return contract as debit: a
+        // false here means the recipient's user_meta row is missing
+        // or the insert/update failed. Don't ship the money via the
+        // matrix_transfers audit row if the credit didn't actually
+        // land.
+        $credit_result = $wallet->credit(
+            $recipient->ID,
+            $amount,
+            'transfer_in',
+            sprintf(__('Transfer from %s', 'matrix-mlm'), wp_get_current_user()->user_login)
+        );
+        if ($credit_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] process_transfer: credit() returned false for recipient_id=%d, amount=%s, last_error=%s',
+                $recipient->ID, $amount, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Could not credit the recipient. Your wallet was not debited. Please contact support if the recipient should exist.', 'matrix-mlm')
+            ]);
+        }
+
+        // Audit row. Treated as required: if we can't write the
+        // matrix_transfers row, we don't have a way to reconcile this
+        // movement later, so roll back the whole thing rather than
+        // leave a silent debit/credit pair with no transfer record.
+        $insert_result = $wpdb->insert($wpdb->prefix . 'matrix_transfers', [
             'from_user_id' => $user_id,
             'to_user_id' => $recipient->ID,
             'amount' => $amount,
             'charge' => $charge,
             'status' => 'completed'
         ]);
+        if ($insert_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] process_transfer: matrix_transfers insert failed; from=%d, to=%d, amount=%s, last_error=%s',
+                $user_id, $recipient->ID, $amount, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Could not record the transfer. Please try again or contact support.', 'matrix-mlm')
+            ]);
+        }
 
-        // Notify recipient about the incoming transfer
+        $wpdb->query('COMMIT');
+
+        // Notify recipient about the incoming transfer. Done AFTER
+        // commit so a failing email send (downed SMTP, bad template,
+        // etc.) doesn't roll back the money movement — the user has
+        // already been debited and credited, the transfer is real.
         Matrix_MLM_Notifications::send_transfer_notification($recipient->ID, $user_id, $amount);
 
         wp_send_json_success(['message' => __('Transfer completed successfully', 'matrix-mlm')]);
