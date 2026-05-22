@@ -340,6 +340,62 @@ class Matrix_MLM_Admin_Gateways {
                     </table>
                     <p><input type="submit" name="save_fintava_gateway" class="button button-primary" value="<?php _e('Save Fintava Settings', 'matrix-mlm'); ?>"></p>
                 </form>
+
+                <?php
+                // TEMPORARY admin-only diagnostic. Renders the raw
+                // /merchant/balance and /banks responses Fintava is currently
+                // returning so an operator can confirm exactly which fields
+                // exist and what they contain — without needing access to
+                // server logs. Pairs with
+                // Matrix_MLM_Fintava::debug_merchant_balance_raw() and
+                // ::debug_banks_raw(). Gated to manage_matrix_mlm so it
+                // never leaks for ordinary admins.
+                //
+                // Hidden behind ?fintava_diag=1 so the call is opt-in (each
+                // dump fires a real Fintava API request, costing one round
+                // trip per page render). When the link is followed the
+                // <details> element renders open by default so the operator
+                // doesn't have to expand twice.
+                if (current_user_can('manage_matrix_mlm') && !empty(get_option('matrix_mlm_fintava_secret_key', ''))):
+                    $diag_requested = !empty($_GET['fintava_diag']);
+                    $diag_url = add_query_arg('fintava_diag', '1', remove_query_arg('fintava_diag'));
+                    $fintava_for_diag = new Matrix_MLM_Fintava();
+                ?>
+                <div style="margin-top: 24px; padding: 16px; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 6px;">
+                    <h3 style="margin: 0 0 8px; color: #92400e; font-size: 14px;">
+                        <?php _e('Fintava Diagnostics (admin-only)', 'matrix-mlm'); ?>
+                    </h3>
+                    <p style="margin: 0 0 8px; font-size: 12px; color: #78350f;">
+                        <?php _e('Use these dumps to confirm the exact response shape Fintava is returning today, then send the output to support if balances or the bank list look wrong.', 'matrix-mlm'); ?>
+                    </p>
+                    <p style="margin: 0;">
+                        <a href="<?php echo esc_url($diag_url); ?>" class="button button-secondary">
+                            <?php echo $diag_requested ? esc_html__('Refresh diagnostics', 'matrix-mlm') : esc_html__('Run diagnostics', 'matrix-mlm'); ?>
+                        </a>
+                    </p>
+
+                    <?php if ($diag_requested): ?>
+                        <?php
+                        $balance_raw = $fintava_for_diag->debug_merchant_balance_raw();
+                        $banks_raw   = $fintava_for_diag->debug_banks_raw();
+                        $balance_json = wp_json_encode($balance_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                        $banks_json   = wp_json_encode($banks_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                        ?>
+                        <details open style="margin-top: 12px;">
+                            <summary style="cursor:pointer;font-weight:600;color:#92400e;font-size:13px;">
+                                <?php esc_html_e('GET /merchant/balance — raw response', 'matrix-mlm'); ?>
+                            </summary>
+                            <pre style="margin:8px 0 0;padding:10px;background:#fff;border:1px solid #fcd34d;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:11px;color:#1f2937;line-height:1.4;"><?php echo esc_html($balance_json); ?></pre>
+                        </details>
+                        <details style="margin-top: 12px;">
+                            <summary style="cursor:pointer;font-weight:600;color:#92400e;font-size:13px;">
+                                <?php esc_html_e('GET /banks — raw response', 'matrix-mlm'); ?>
+                            </summary>
+                            <pre style="margin:8px 0 0;padding:10px;background:#fff;border:1px solid #fcd34d;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:11px;color:#1f2937;line-height:1.4;"><?php echo esc_html($banks_json); ?></pre>
+                        </details>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
             </div>
         </div>
         <?php
