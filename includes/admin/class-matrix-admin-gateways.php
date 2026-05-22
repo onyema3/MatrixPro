@@ -394,6 +394,60 @@ class Matrix_MLM_Admin_Gateways {
                             <pre style="margin:8px 0 0;padding:10px;background:#fff;border:1px solid #fcd34d;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:11px;color:#1f2937;line-height:1.4;"><?php echo esc_html($banks_json); ?></pre>
                         </details>
                     <?php endif; ?>
+
+                    <?php
+                    // /name/enquiry test panel. Decoupled from the
+                    // ?fintava_diag=1 toggle above because this one needs
+                    // operator input (account number + bank code) — the
+                    // balance/banks dump only needs a click. Submitting
+                    // this form re-renders the page with the dump open
+                    // and the inputs preserved, so the operator can
+                    // iterate without losing what they typed.
+                    $ne_acct      = isset($_POST['matrix_ne_account']) ? sanitize_text_field(wp_unslash($_POST['matrix_ne_account'])) : '';
+                    $ne_bank      = isset($_POST['matrix_ne_bank'])    ? sanitize_text_field(wp_unslash($_POST['matrix_ne_bank']))    : '';
+                    $ne_submitted = isset($_POST['matrix_run_name_enquiry'])
+                        && check_admin_referer('matrix_fintava_name_enquiry_diag', 'matrix_ne_nonce');
+                    ?>
+                    <div style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed #f59e0b;">
+                        <h4 style="margin: 0 0 8px; color: #92400e; font-size: 13px;">
+                            <?php esc_html_e('GET /name/enquiry — test bank account verification', 'matrix-mlm'); ?>
+                        </h4>
+                        <p style="margin: 0 0 8px; font-size: 12px; color: #78350f;">
+                            <?php esc_html_e('Paste a real 10-digit Nigerian bank account number and the matching bank code (3-digit CBN like 044 = Access, or the 6-digit NIBSS sortCode Fintava returns from /banks). Submitting will hit Fintava once and dump the raw response. This is the same call the bank-payout form makes when verifying an account.', 'matrix-mlm'); ?>
+                        </p>
+                        <form method="post" style="margin-bottom: 12px;">
+                            <?php wp_nonce_field('matrix_fintava_name_enquiry_diag', 'matrix_ne_nonce'); ?>
+                            <input type="text" name="matrix_ne_account" maxlength="10" pattern="\d{10}" required
+                                   value="<?php echo esc_attr($ne_acct); ?>"
+                                   placeholder="<?php esc_attr_e('10-digit account number', 'matrix-mlm'); ?>"
+                                   style="width: 200px; margin-right: 8px;">
+                            <input type="text" name="matrix_ne_bank" maxlength="10" required
+                                   value="<?php echo esc_attr($ne_bank); ?>"
+                                   placeholder="<?php esc_attr_e('Bank code (e.g. 044)', 'matrix-mlm'); ?>"
+                                   style="width: 180px; margin-right: 8px;">
+                            <input type="submit" name="matrix_run_name_enquiry" class="button button-secondary"
+                                   value="<?php esc_attr_e('Run name enquiry', 'matrix-mlm'); ?>">
+                        </form>
+                        <?php if ($ne_submitted && $ne_acct !== '' && $ne_bank !== ''): ?>
+                            <?php
+                            $ne_raw  = $fintava_for_diag->debug_name_enquiry_raw($ne_acct, $ne_bank);
+                            $ne_json = wp_json_encode($ne_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                            ?>
+                            <details open>
+                                <summary style="cursor:pointer;font-weight:600;color:#92400e;font-size:13px;">
+                                    <?php
+                                    printf(
+                                        /* translators: 1: account number, 2: bank code */
+                                        esc_html__('GET /name/enquiry — raw response (account=%1$s, sortCode=%2$s)', 'matrix-mlm'),
+                                        esc_html($ne_acct),
+                                        esc_html($ne_bank)
+                                    );
+                                    ?>
+                                </summary>
+                                <pre style="margin:8px 0 0;padding:10px;background:#fff;border:1px solid #fcd34d;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:11px;color:#1f2937;line-height:1.4;"><?php echo esc_html($ne_json); ?></pre>
+                            </details>
+                        <?php endif; ?>
+                    </div>
                 </div>
                 <?php endif; ?>
             </div>

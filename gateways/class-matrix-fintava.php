@@ -350,7 +350,12 @@ class Matrix_MLM_Fintava {
         // call there so it works on installs configured for the live
         // environment too. The same secret key authenticates both hosts.
         $banks_base_url = self::DEV_BASE_URL;
-        $response = $this->make_request('GET', '/banks', null, $banks_base_url);
+        // Use lean headers (Authorization + Accept only) so the request
+        // shape matches the public Fintava documentation exactly. The
+        // dev /banks endpoint has been observed to 401 live-tier
+        // merchants when the request also carries a `Merchant-Id`
+        // header, even with an otherwise valid bearer token.
+        $response = $this->make_request('GET', '/banks', null, $banks_base_url, true);
         if (is_wp_error($response)) {
             // Decorate with the resolved base URL so the operator can tell
             // at a glance which host was hit when reading the dropdown error.
@@ -617,7 +622,13 @@ class Matrix_MLM_Fintava {
             'sortCode'      => $bank_code,
         ]);
 
-        $response = $this->make_request('GET', '/name/enquiry?' . $query);
+        // Use lean headers (Authorization + Accept only) for the same
+        // reason `/banks` does — Fintava's `/name/enquiry` lives under the
+        // same dev-tier umbrella and has been observed to reject the full
+        // header set on at least some merchant tiers. Matching the
+        // documented two-header shape rules out header mismatch as a
+        // cause for "Unable to resolve account information" failures.
+        $response = $this->make_request('GET', '/name/enquiry?' . $query, null, null, true);
 
         if (is_wp_error($response)) {
             return new WP_Error(
@@ -3172,8 +3183,44 @@ class Matrix_MLM_Fintava {
         }
         // /banks is dev-host-only; mirror get_banks() routing so the
         // diagnostic exercises the exact same call path the real bank
-        // dropdown uses.
-        return $this->debug_raw_request('GET', self::DEV_BASE_URL . '/banks');
+        // dropdown uses. Lean headers match production behaviour after
+        // the Merchant-Id-on-/banks fix.
+        return $this->debug_raw_request('GET', self::DEV_BASE_URL . '/banks', true);
+    }
+
+    /**
+     * TEMPORARY admin diagnostic — fetch GET /name/enquiry against the
+     * environment-resolved Fintava host with the operator-provided
+     * account number and bank code. Used by the Gateways admin page
+     * when a user reports "accounts cannot be verified" — the operator
+     * can paste a known-good account number from their own bank and
+     * see Fintava's exact response (HTTP code, body, error message)
+     * without having to read PHP error logs.
+     *
+     * Mirrors resolve_account()'s call shape exactly (lean headers,
+     * sortCode + accountNumber as query params) so the diagnostic
+     * surfaces the same failure mode the live form would hit.
+     *
+     * @param string $account_number 10-digit NUBAN.
+     * @param string $bank_code      Bank sort code (3-digit CBN or 6-digit NIBSS).
+     * @return array Diagnostic payload (never a WP_Error).
+     */
+    public function debug_name_enquiry_raw($account_number, $bank_code) {
+        if (empty($this->secret_key)) {
+            return ['note' => 'no secret_key on the gateway instance', 'has_key' => false];
+        }
+        if (empty($account_number) || empty($bank_code)) {
+            return ['note' => 'account_number and bank_code are both required'];
+        }
+        $query = http_build_query([
+            'accountNumber' => $account_number,
+            'sortCode'      => $bank_code,
+        ]);
+        // Hits the same host the real resolve_account() call uses
+        // (i.e. whichever environment the admin selected on the Gateways
+        // page), so the diagnostic and the production failure mode
+        // share a request path.
+        return $this->debug_raw_request('GET', $this->base_url . '/name/enquiry?' . $query, true);
     }
 
     /**
@@ -3181,30 +3228,44 @@ class Matrix_MLM_Fintava {
      * Fintava-authenticated request and returns a uniform diagnostic
      * envelope (url, http_code, body_raw, body_decoded — or wp_error on
      * transport failure).
+     *
+     * @param string $method       HTTP verb.
+     * @param string $url          Full URL (already includes base + path + query).
+     * @param bool   $lean_headers Mirror make_request()'s lean-header mode so
+     *     the diagnostic exercises the same request shape as the production
+     *     code path. Without this, the diagnostic could falsely succeed
+     *     against an endpoint that the real call fails against (or vice
+     *     versa) when Fintava's server-side validation depends on which
+     *     headers are present.
      */
-    private function debug_raw_request($method, $url) {
+    private function debug_raw_request($method, $url, $lean_headers = false) {
+        $headers = [
+            'Authorization' => 'Bearer ' . $this->secret_key,
+            'Accept'        => 'application/json',
+        ];
+        if (!$lean_headers) {
+            $headers['Content-Type'] = 'application/json';
+            $headers['Merchant-Id']  = $this->merchant_id;
+        }
         $args = [
             'method'  => $method,
-            'headers' => [
-                'Authorization' => 'Bearer ' . $this->secret_key,
-                'Content-Type'  => 'application/json',
-                'Accept'        => 'application/json',
-                'Merchant-Id'   => $this->merchant_id,
-            ],
+            'headers' => $headers,
             'timeout' => 30,
         ];
 
         $response = wp_remote_request($url, $args);
         if (is_wp_error($response)) {
             return [
-                'url'      => $url,
-                'wp_error' => $response->get_error_message(),
+                'url'           => $url,
+                'lean_headers'  => $lean_headers,
+                'wp_error'      => $response->get_error_message(),
             ];
         }
 
         $raw = wp_remote_retrieve_body($response);
         return [
             'url'          => $url,
+            'lean_headers' => $lean_headers,
             'http_code'    => wp_remote_retrieve_response_code($response),
             'body_raw'     => is_string($raw) && strlen($raw) > 4000 ? substr($raw, 0, 4000) . '... [truncated]' : $raw,
             'body_decoded' => json_decode($raw, true),
@@ -3224,8 +3285,17 @@ class Matrix_MLM_Fintava {
      *     `https://dev.fintavapay.com/api/dev`, regardless of which tier
      *     the merchant otherwise uses for wallets and payouts). Pass with
      *     no trailing slash; the endpoint is concatenated as-is.
+     * @param bool        $lean_headers      When true, send only the two
+     *     headers Fintava's public docs require for read-only endpoints
+     *     (Authorization + Accept). Defaults to false (full header set with
+     *     Content-Type and Merchant-Id) so existing wallet/transfer call
+     *     paths are unchanged. Used by `/banks` and `/name/enquiry` to match
+     *     the documented request shape exactly — some Fintava tiers reject
+     *     unrecognised headers on the dev-only endpoints, and Merchant-Id is
+     *     the leading suspect when a live-tier merchant gets a generic 401
+     *     from /banks despite a valid Authorization header.
      */
-    private function make_request($method, $endpoint, $body = null, $base_url_override = null) {
+    private function make_request($method, $endpoint, $body = null, $base_url_override = null, $lean_headers = false) {
         if (empty($this->secret_key)) {
             return new WP_Error(
                 'fintava_not_configured',
@@ -3238,18 +3308,39 @@ class Matrix_MLM_Fintava {
             : $this->base_url;
         $url = $base . $endpoint;
 
+        // Headers: lean mode mirrors the two-header shape Fintava documents
+        // for read-only endpoints (`Authorization` + `accept`). Full mode
+        // adds `Content-Type` (needed by JSON body endpoints) and
+        // `Merchant-Id` (sent on transfer/wallet endpoints that look it up
+        // for routing). Mixing the two on every call has historically been
+        // safe, but at least one Fintava tier has been observed to reject
+        // /banks when Merchant-Id is present — so we now opt into lean
+        // headers for endpoints that don't need the extras.
+        $headers = [
+            'Authorization' => 'Bearer ' . $this->secret_key,
+            'Accept'        => 'application/json',
+        ];
+        if (!$lean_headers) {
+            $headers['Content-Type'] = 'application/json';
+            $headers['Merchant-Id']  = $this->merchant_id;
+        }
+
         $args = [
-            'method' => $method,
-            'headers' => [
-                'Authorization' => 'Bearer ' . $this->secret_key,
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
-                'Merchant-Id' => $this->merchant_id,
-            ],
+            'method'  => $method,
+            'headers' => $headers,
             'timeout' => 30,
         ];
 
         if ($body && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+            // Re-attach Content-Type when there's a body to send, even on
+            // lean-header calls, so the server still parses JSON correctly.
+            // No current call path triggers this branch (lean mode is only
+            // used on GET endpoints), but guarding here keeps lean mode
+            // safe to extend to POST endpoints if Fintava ever adds a
+            // public lookup that takes a body.
+            if ($lean_headers && empty($args['headers']['Content-Type'])) {
+                $args['headers']['Content-Type'] = 'application/json';
+            }
             $args['body'] = json_encode($body);
         }
 
