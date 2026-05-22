@@ -491,6 +491,9 @@ class Matrix_MLM_Admin {
             case 'fintava_backfill_bank_codes':
                 $this->fintava_backfill_bank_codes();
                 break;
+            case 'update_fintava_wallet_bank':
+                $this->update_fintava_wallet_bank();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -968,6 +971,79 @@ class Matrix_MLM_Admin {
         wp_send_json_success([
             'message' => $summary,
             'report'  => $report,
+        ]);
+    }
+
+    /**
+     * Update the partner-bank metadata (bank_name + bank_code) on a single
+     * user's Fintava virtual wallet row. Used by the "Fintava Virtual Wallet"
+     * card on the user detail page when none of the auto-resolve steps in
+     * ajax_transfer_matrix_to_virtual()'s self-heal chain landed bank_code —
+     * e.g., wallets stuck on the schema-default placeholder bank_name=Fintava
+     * with no partner-bank info available from any Fintava endpoint.
+     *
+     * Validates that bank_code matches Fintava's accepted sortCode shape
+     * (3-digit CBN or 5-6 digit NIBSS-issued institution codes); other
+     * values are rejected on the upstream side anyway and would just fail
+     * the next /bank/credit/merchant call silently.
+     */
+    private function update_fintava_wallet_bank() {
+        global $wpdb;
+
+        $user_id   = intval($_POST['user_id'] ?? 0);
+        $bank_name = sanitize_text_field($_POST['bank_name'] ?? '');
+        $bank_code = sanitize_text_field($_POST['bank_code'] ?? '');
+
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+        if ($bank_name === '' || $bank_code === '') {
+            wp_send_json_error(['message' => __('Both bank name and bank code are required.', 'matrix-mlm')]);
+        }
+        // Reject the schema-default placeholder. Saving "Fintava" as the
+        // bank_name puts the row right back into the failing state every
+        // self-heal step explicitly skips — let the operator know up
+        // front instead of writing it and silently breaking transfers.
+        if (strcasecmp($bank_name, 'Fintava') === 0) {
+            wp_send_json_error(['message' => __('"Fintava" is the schema placeholder, not a CBN bank. Pick the real partner bank Fintava issued the NUBAN through (e.g., Globus, Wema, Providus).', 'matrix-mlm')]);
+        }
+        // Fintava's /bank/credit/merchant validator coerces sortCode to a
+        // numeric, and the CBN/NIBSS registry uses 3-6 digit codes.
+        if (!preg_match('/^\d{3,6}$/', $bank_code)) {
+            wp_send_json_error(['message' => __('Bank code must be 3-6 numeric digits (CBN or NIBSS sortCode).', 'matrix-mlm')]);
+        }
+
+        $wallet = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, bank_name, bank_code FROM {$wpdb->prefix}matrix_fintava_wallets WHERE user_id = %d",
+            $user_id
+        ));
+        if (!$wallet) {
+            wp_send_json_error(['message' => __('User has no Fintava wallet row to update. Use Migration → Link Single User to create one first.', 'matrix-mlm')]);
+        }
+
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            [
+                'bank_name'  => $bank_name,
+                'bank_code'  => $bank_code,
+                'updated_at' => current_time('mysql'),
+            ],
+            ['id' => $wallet->id],
+            ['%s', '%s', '%s'],
+            ['%d']
+        );
+
+        if ($updated === false) {
+            wp_send_json_error(['message' => __('Database update failed.', 'matrix-mlm')]);
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: 1: bank name, 2: bank code */
+                __('Bank details saved: %1$s (%2$s). Matrix→virtual transfers are unblocked for this wallet.', 'matrix-mlm'),
+                $bank_name,
+                $bank_code
+            ),
         ]);
     }
 

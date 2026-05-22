@@ -455,6 +455,169 @@ class Matrix_MLM_Admin_Users {
             }
             </script>
             <?php endif; ?>
+
+            <!-- Fintava Virtual Wallet -->
+            <?php
+            $fintava_wallet = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}matrix_fintava_wallets WHERE user_id = %d",
+                $user_id
+            ));
+            ?>
+            <div class="matrix-admin-card">
+                <h2><?php _e('Fintava Virtual Wallet', 'matrix-mlm'); ?></h2>
+                <?php if (!$fintava_wallet): ?>
+                    <p class="description"><?php _e('This user has no Fintava virtual wallet row. Use Fintava Migration → Link Single User to create one before editing bank details.', 'matrix-mlm'); ?></p>
+                <?php else: ?>
+                    <p class="description"><?php _e('Edit the partner-bank metadata recorded for this wallet. The plugin reads <code>bank_code</code> from this row when calling Fintava\'s <code>/bank/credit/merchant</code> on matrix→virtual transfers — the wallet cannot accept matrix transfers without a valid sortCode here.', 'matrix-mlm'); ?></p>
+
+                    <?php
+                    $banks_list      = Matrix_MLM_Fintava::get_static_banks_fallback();
+                    $current_code    = (string) ($fintava_wallet->bank_code ?? '');
+                    $current_name    = (string) ($fintava_wallet->bank_name ?? '');
+                    $is_known_code   = false;
+                    foreach ($banks_list as $b) {
+                        if ($b['code'] === $current_code) {
+                            $is_known_code = true;
+                            break;
+                        }
+                    }
+                    // Treat the schema-default placeholder bank_name=Fintava
+                    // the same as empty for "preselect a real bank" purposes,
+                    // but never overwrite the row silently — the operator
+                    // still has to pick.
+                    $is_placeholder_name = $current_name === '' || strcasecmp($current_name, 'Fintava') === 0;
+                    $needs_attention     = $current_code === '' || $is_placeholder_name;
+                    ?>
+
+                    <?php if ($needs_attention): ?>
+                    <div class="notice notice-warning inline" style="padding:10px 14px;margin:10px 0;">
+                        <strong>⚠ <?php _e('Bank metadata incomplete.', 'matrix-mlm'); ?></strong>
+                        <?php if ($current_code === ''): ?>
+                            <?php _e('This wallet is missing <code>bank_code</code> and will trigger "missing a bank code we couldn\'t auto-resolve" on matrix→virtual transfers. Pick the partner bank below.', 'matrix-mlm'); ?>
+                        <?php elseif ($is_placeholder_name): ?>
+                            <?php _e('<code>bank_name</code> is still the schema default placeholder. Set the real partner bank Fintava issued the NUBAN through.', 'matrix-mlm'); ?>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
+
+                    <table class="form-table">
+                        <tr>
+                            <th><?php _e('Account Number', 'matrix-mlm'); ?></th>
+                            <td><code><?php echo esc_html($fintava_wallet->account_number); ?></code></td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Account Name', 'matrix-mlm'); ?></th>
+                            <td><?php echo esc_html($fintava_wallet->account_name); ?></td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Wallet ID', 'matrix-mlm'); ?></th>
+                            <td><code style="font-size:11px;"><?php echo esc_html($fintava_wallet->wallet_id ?: '—'); ?></code></td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Customer ID', 'matrix-mlm'); ?></th>
+                            <td><code style="font-size:11px;"><?php echo esc_html($fintava_wallet->customer_id ?: '—'); ?></code></td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Currency / Status', 'matrix-mlm'); ?></th>
+                            <td><?php echo esc_html(($fintava_wallet->currency ?: 'NGN') . ' / ' . ($fintava_wallet->status ?: '—')); ?></td>
+                        </tr>
+                        <tr>
+                            <th><label for="fintava_bank_select"><?php _e('Partner Bank', 'matrix-mlm'); ?></label></th>
+                            <td>
+                                <select id="fintava_bank_select" style="min-width:320px;">
+                                    <option value=""><?php _e('— Select partner bank —', 'matrix-mlm'); ?></option>
+                                    <?php foreach ($banks_list as $bank): ?>
+                                        <option value="<?php echo esc_attr($bank['code']); ?>"
+                                                data-name="<?php echo esc_attr($bank['name']); ?>"
+                                                <?php selected($is_known_code && $bank['code'] === $current_code); ?>>
+                                            <?php echo esc_html($bank['name'] . ' (' . $bank['code'] . ')'); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                    <option value="__custom__" <?php selected(!$is_known_code && $current_code !== ''); ?>>
+                                        <?php _e('Other (enter manually)', 'matrix-mlm'); ?>
+                                    </option>
+                                </select>
+                                <p class="description">
+                                    <?php _e('Pick the bank Fintava issued the virtual NUBAN through. The full list is the CBN/NIBSS sortCode registry the gateway uses for static-list lookups. Pick "Other" only if the bank isn\'t listed (e.g., a new MFB).', 'matrix-mlm'); ?>
+                                </p>
+                            </td>
+                        </tr>
+                        <tr id="fintava_custom_name_row" style="<?php echo (!$is_known_code && $current_code !== '') ? '' : 'display:none;'; ?>">
+                            <th><label for="fintava_bank_name_input"><?php _e('Bank Name (custom)', 'matrix-mlm'); ?></label></th>
+                            <td>
+                                <input type="text" id="fintava_bank_name_input" class="regular-text"
+                                       value="<?php echo esc_attr(!$is_known_code ? $current_name : ''); ?>"
+                                       placeholder="<?php esc_attr_e('e.g., Globus Bank', 'matrix-mlm'); ?>">
+                            </td>
+                        </tr>
+                        <tr id="fintava_custom_code_row" style="<?php echo (!$is_known_code && $current_code !== '') ? '' : 'display:none;'; ?>">
+                            <th><label for="fintava_bank_code_input"><?php _e('Bank Code (custom)', 'matrix-mlm'); ?></label></th>
+                            <td>
+                                <input type="text" id="fintava_bank_code_input" class="small-text" maxlength="6"
+                                       value="<?php echo esc_attr(!$is_known_code ? $current_code : ''); ?>"
+                                       placeholder="<?php esc_attr_e('3-6 digit sortCode', 'matrix-mlm'); ?>">
+                                <p class="description"><?php _e('CBN sortCode (3 digits) or NIBSS-issued institution code (5-6 digits). Anything else will be rejected.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                    </table>
+                    <p>
+                        <button class="button button-primary" onclick="matrixSaveFintavaWalletBank(<?php echo $user_id; ?>)"><?php _e('Save Bank Details', 'matrix-mlm'); ?></button>
+                        <?php if ($current_code !== ''): ?>
+                            <span style="margin-left:10px;color:#6b7280;font-size:12px;">
+                                <?php printf(
+                                    /* translators: 1: current bank name, 2: current bank code */
+                                    esc_html__('Currently saved: %1$s (%2$s)', 'matrix-mlm'),
+                                    esc_html($current_name ?: '—'),
+                                    esc_html($current_code)
+                                ); ?>
+                            </span>
+                        <?php endif; ?>
+                    </p>
+                    <script>
+                    (function() {
+                        var sel       = document.getElementById('fintava_bank_select');
+                        var nameRow   = document.getElementById('fintava_custom_name_row');
+                        var codeRow   = document.getElementById('fintava_custom_code_row');
+                        if (!sel) return;
+                        sel.addEventListener('change', function() {
+                            var custom = sel.value === '__custom__';
+                            nameRow.style.display = custom ? '' : 'none';
+                            codeRow.style.display = custom ? '' : 'none';
+                        });
+                    })();
+                    function matrixSaveFintavaWalletBank(userId) {
+                        var sel        = document.getElementById('fintava_bank_select');
+                        var bankCode   = sel.value;
+                        var bankName   = '';
+                        if (bankCode === '__custom__') {
+                            bankName = document.getElementById('fintava_bank_name_input').value.trim();
+                            bankCode = document.getElementById('fintava_bank_code_input').value.trim();
+                        } else if (bankCode !== '') {
+                            bankName = sel.options[sel.selectedIndex].getAttribute('data-name') || '';
+                        }
+                        if (!bankCode || !bankName) {
+                            alert('<?php echo esc_js(__('Pick a bank from the list, or choose "Other" and fill in both name and code.', 'matrix-mlm')); ?>');
+                            return;
+                        }
+                        if (!/^\d{3,6}$/.test(bankCode)) {
+                            alert('<?php echo esc_js(__('Bank code must be 3-6 numeric digits (CBN or NIBSS sortCode).', 'matrix-mlm')); ?>');
+                            return;
+                        }
+                        jQuery.post(matrixMLMAdmin.ajaxUrl, {
+                            action: 'matrix_admin_action',
+                            nonce: matrixMLMAdmin.nonce,
+                            matrix_action: 'update_fintava_wallet_bank',
+                            user_id: userId,
+                            bank_name: bankName,
+                            bank_code: bankCode
+                        }, function(res) {
+                            alert(res.success ? res.data.message : ((res.data && res.data.message) || '<?php echo esc_js(__('Error', 'matrix-mlm')); ?>'));
+                            if (res.success) location.reload();
+                        });
+                    }
+                    </script>
+                <?php endif; ?>
+            </div>
         </div>
         <?php
     }
