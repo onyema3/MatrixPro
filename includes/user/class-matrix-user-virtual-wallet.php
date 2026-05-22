@@ -154,18 +154,32 @@ class Matrix_MLM_User_Virtual_Wallet {
         $is_admin_viewing = current_user_can('manage_matrix_mlm');
 
         // TEMPORARY admin-only diagnostic. Renders the raw Fintava balance
-        // response in an HTML comment so an operator can compare what Fintava
-        // actually returns against what we display, without exposing the
-        // payload to non-admins. Visible via right-click → "View Page Source"
-        // on the Virtual Wallet tab. Remove once the displayed balance is
-        // verified correct in production. Pairs with
-        // Matrix_MLM_Fintava::debug_balance_raw().
+        // response in a visible-on-page collapsible block so an operator can
+        // compare what Fintava actually returns against what we display.
+        //
+        // We deliberately use a <details>/<pre> element instead of an HTML
+        // comment because aggressive caching/minification plugins (LiteSpeed
+        // Cache, Autoptimize, WP Rocket) strip HTML comments by default —
+        // which would silently swallow our diagnostic. A real DOM element
+        // survives every HTML minifier we've seen.
+        //
+        // Gating on capability + wallet_id keeps the payload out of the
+        // public source for ordinary users, and the <details> is closed by
+        // default so admins viewing their own dashboard aren't visually
+        // disrupted. Remove once the displayed balance is verified correct
+        // in production. Pairs with Matrix_MLM_Fintava::debug_balance_raw().
         if ($is_admin_viewing && !empty($wallet->wallet_id)) {
             $debug_raw  = $fintava->debug_balance_raw($wallet->wallet_id);
             $debug_json = wp_json_encode($debug_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            // Defensive: neutralize any '-->' that could close the comment early.
-            $debug_json = str_replace('-->', '--&gt;', (string) $debug_json);
-            echo "\n<!-- FINTAVA_BALANCE_DEBUG_BEGIN\n" . $debug_json . "\nFINTAVA_BALANCE_DEBUG_END -->\n";
+            ?>
+            <details class="matrix-fintava-balance-debug" style="margin:16px 0;padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;font-size:12px;color:#92400e;">
+                <summary style="cursor:pointer;font-weight:600;"><?php esc_html_e('FINTAVA_BALANCE_DEBUG (admin only — temporary diagnostic)', 'matrix-mlm'); ?></summary>
+                <p style="margin:8px 0 4px;font-size:11px;color:#78350f;">
+                    <?php esc_html_e('Raw response from GET /customer/wallet/balance/{walletId}. Copy this entire block and send it to support so we can correct the displayed balance.', 'matrix-mlm'); ?>
+                </p>
+                <pre id="matrix-fintava-balance-debug-pre" style="margin:8px 0 0;padding:10px;background:#fff;border:1px solid #fcd34d;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-family:Menlo,Consolas,monospace;font-size:11px;color:#1f2937;line-height:1.4;"><?php echo esc_html($debug_json); ?></pre>
+            </details>
+            <?php
         }
         ?>
 
