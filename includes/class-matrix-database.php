@@ -10,12 +10,74 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Database {
 
     /**
+     * The complete set of tables this plugin owns, by short name (without the
+     * site's $wpdb->prefix). Used for the schema-status probe in
+     * maybe_upgrade(), the admin "Repair Database Schema" tool, and as the
+     * single source of truth when adding new tables — append the short name
+     * here and add a corresponding dbDelta block in create_tables() (or, for
+     * Fintava-extension tables, an entry in the relevant gateway's
+     * ensure_tables_exist() / create_table()).
+     *
+     * Includes the gateway-extension tables (matrix_fintava_payouts,
+     * matrix_fintava_wallets, matrix_fintava_cards, matrix_billing_transactions,
+     * matrix_subscriptions) on purpose: they are bootstrapped automatically by
+     * Matrix_MLM_Core::run() on every pageload, so any of them missing is just
+     * as much a schema drift as a core table missing, and the operator-facing
+     * Repair tool needs to surface and heal them with the same one click.
+     */
+    const CRITICAL_TABLES = [
+        // Core tables — created by self::create_tables() via dbDelta.
+        'matrix_plans',
+        'matrix_positions',
+        'matrix_wallet',
+        'matrix_deposits',
+        'matrix_withdrawals',
+        'matrix_commissions',
+        'matrix_epins',
+        'matrix_tickets',
+        'matrix_ticket_messages',
+        'matrix_gateways',
+        'matrix_user_meta',
+        'matrix_transfers',
+        'matrix_subscribers',
+        'matrix_pages',
+        'matrix_fintava_webhook_logs',
+        // Fintava gateway tables — created by Matrix_MLM_Fintava::ensure_tables_exist()
+        // (payouts, wallets) and by the *_Card / *_Billing / Subscription helpers.
+        'matrix_fintava_payouts',
+        'matrix_fintava_wallets',
+        'matrix_fintava_cards',
+        'matrix_billing_transactions',
+        'matrix_subscriptions',
+    ];
+
+    /**
      * Run schema migrations on every load if the stored DB version is older
-     * than the constant. Safe to call repeatedly — dbDelta is idempotent.
+     * than the constant — OR if any expected table is missing on disk even
+     * when the version stamp claims we're up to date. Safe to call
+     * repeatedly: dbDelta is idempotent and the gateway helpers all use
+     * CREATE TABLE IF NOT EXISTS.
+     *
+     * Why the missing-table probe matters even when the version stamp is
+     * current: a previous activation (or a past maybe_upgrade run) may
+     * have written `matrix_mlm_db_version` to wp_options successfully
+     * while one of the table CREATE statements silently failed on the
+     * same request — this happens in the wild when the DB user lost
+     * CREATE privilege between activations, when a DB restore was loaded
+     * from a snapshot taken before a table was added, or when dbDelta's
+     * fuzzy SQL parser rejects a particular CREATE on certain MySQL
+     * collation/strict-mode combinations. The version-stamp short
+     * circuit alone would let those installs stay in a broken state
+     * indefinitely; the cheap INFORMATION_SCHEMA probe (one query that
+     * MySQL caches internally) is the suspenders to its belt and is the
+     * specific reason wp_matrix_fintava_webhook_logs went missing on
+     * the install that prompted this code to be written.
      */
     public static function maybe_upgrade() {
         $installed = get_option('matrix_mlm_db_version');
-        if ($installed === MATRIX_MLM_DB_VERSION) {
+
+        // Fast path — stamp matches and every expected table is on disk.
+        if ($installed === MATRIX_MLM_DB_VERSION && self::critical_tables_present()) {
             return;
         }
 
@@ -36,6 +98,102 @@ class Matrix_MLM_Database {
         }
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
+        update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
+    }
+
+    /**
+     * Return per-table existence status for the schema probe, broken into
+     * a present/missing pair so callers can branch on whether anything is
+     * out of sync without a second pass.
+     *
+     * @return array{present: string[], missing: string[]} Fully-prefixed
+     *     table names so the result is render-ready for the admin UI.
+     */
+    public static function get_schema_status() {
+        global $wpdb;
+        $present = [];
+        $missing = [];
+        foreach (self::CRITICAL_TABLES as $name) {
+            $full = $wpdb->prefix . $name;
+            $exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                DB_NAME,
+                $full
+            ));
+            if ($exists > 0) {
+                $present[] = $full;
+            } else {
+                $missing[] = $full;
+            }
+        }
+        return ['present' => $present, 'missing' => $missing];
+    }
+
+    /**
+     * Convenience wrapper — true iff every critical table is on disk.
+     */
+    public static function critical_tables_present() {
+        $status = self::get_schema_status();
+        return empty($status['missing']);
+    }
+
+    /**
+     * Force-re-run every schema bootstrap path the activator runs (core
+     * dbDelta + every gateway extension's CREATE TABLE IF NOT EXISTS),
+     * regardless of the stored version stamp. Returns a structured report
+     * so the admin "Repair Database Schema" UI can render exactly which
+     * tables existed before, which exist after, what was created on this
+     * call, and any DB errors emitted along the way.
+     *
+     * Idempotent: if everything is already healthy, the report shows zero
+     * created tables and zero errors. Safe to expose to admins as a
+     * one-click recovery tool.
+     */
+    public static function repair() {
+        $errors = [];
+        $before = self::get_schema_status();
+
+        // Core schema. dbDelta absorbs already-existing tables silently.
+        self::create_tables();
+
+        // Fintava gateway tables (payouts, wallets, webhook_logs). The helper
+        // collects per-table CREATE errors and returns them so we can surface
+        // them in the report instead of swallowing them.
+        if (class_exists('Matrix_MLM_Fintava')) {
+            $fintava_result = Matrix_MLM_Fintava::ensure_tables_exist();
+            if (!empty($fintava_result['errors'])) {
+                foreach ($fintava_result['errors'] as $err) {
+                    $errors[] = 'fintava: ' . $err;
+                }
+            }
+        }
+
+        // Optional extension tables — each helper uses CREATE TABLE IF NOT
+        // EXISTS internally, so calling them when the table is already
+        // present is a no-op.
+        if (class_exists('Matrix_MLM_Fintava_Card')) {
+            Matrix_MLM_Fintava_Card::create_table();
+        }
+        if (class_exists('Matrix_MLM_Fintava_Billing')) {
+            Matrix_MLM_Fintava_Billing::create_table();
+        }
+        if (class_exists('Matrix_MLM_Subscription')) {
+            Matrix_MLM_Subscription::create_table();
+        }
+
+        update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
+        update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
+
+        $after   = self::get_schema_status();
+        $created = array_values(array_diff($after['present'], $before['present']));
+
+        return [
+            'before'  => $before,
+            'after'   => $after,
+            'created' => $created,
+            'errors'  => $errors,
+        ];
     }
 
     /**

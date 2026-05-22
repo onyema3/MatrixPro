@@ -154,6 +154,7 @@ class Matrix_MLM_Admin_Migration {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=link'); ?>" class="nav-tab <?php echo $tab === 'link' ? 'nav-tab-active' : ''; ?>"><?php _e('Link Single User', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=backfill'); ?>" class="nav-tab <?php echo $tab === 'backfill' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Wallet IDs', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=bank_codes'); ?>" class="nav-tab <?php echo $tab === 'bank_codes' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Bank Codes', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=schema'); ?>" class="nav-tab <?php echo $tab === 'schema' ? 'nav-tab-active' : ''; ?>"><?php _e('Database Schema', 'matrix-mlm'); ?></a>
             </nav>
 
             <?php
@@ -163,6 +164,7 @@ class Matrix_MLM_Admin_Migration {
                 case 'link': $this->render_link_tab(); break;
                 case 'backfill': $this->render_backfill_tab(); break;
                 case 'bank_codes': $this->render_bank_codes_backfill_tab(); break;
+                case 'schema': $this->render_schema_repair_tab(); break;
             }
             ?>
         </div>
@@ -766,6 +768,205 @@ class Matrix_MLM_Admin_Migration {
                     btn.disabled = false;
                     btn.textContent = originalLabel;
                     statusEl.textContent = '<?php echo esc_js(__('Network error or timeout.', 'matrix-mlm')); ?> (' + textStatus + ')';
+                    statusEl.style.color = '#b91c1c';
+                });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "Database Schema" admin tab.
+     *
+     * Surfaces, in plain English, which Matrix MLM tables exist on disk and
+     * which are missing — then exposes a one-click "Run Schema Repair"
+     * button that re-runs every CREATE path (dbDelta on the core schema +
+     * each gateway extension's CREATE TABLE IF NOT EXISTS) and reports
+     * back which tables were created on this call.
+     *
+     * Why this exists: maybe_upgrade() already self-heals on every pageload
+     * when it detects either a stale version stamp or a missing critical
+     * table, so a healthy install will see "Schema is up to date" here and
+     * never need to click anything. The button is the operator-facing
+     * escape hatch for the cases where the auto-heal cannot recover —
+     * e.g. when the DB user lacks CREATE privilege at pageload time but
+     * regains it later, when an operator restored a partial DB snapshot,
+     * or when an extension table's helper has been bypassed (Multisite
+     * mass-activation paths historically skip per-site bootstrap).
+     */
+    private function render_schema_repair_tab() {
+        $status      = Matrix_MLM_Database::get_schema_status();
+        $present     = $status['present'];
+        $missing     = $status['missing'];
+        $total       = count($present) + count($missing);
+        $last_sync   = get_option('matrix_mlm_last_schema_sync', '');
+        $db_version  = get_option('matrix_mlm_db_version', '');
+        $code_db_ver = defined('MATRIX_MLM_DB_VERSION') ? MATRIX_MLM_DB_VERSION : '';
+        ?>
+        <div class="matrix-admin-card">
+            <h2><?php _e('Database Schema Health', 'matrix-mlm'); ?></h2>
+            <p><?php _e('Verifies that every table this plugin owns exists on disk, and re-runs the schema bootstrap for any that are missing. Safe to run at any time — every CREATE path is idempotent.', 'matrix-mlm'); ?></p>
+
+            <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:14px 18px;margin:14px 0;">
+                <p style="margin:0 0 6px;font-size:13px;color:#374151;"><strong><?php _e('Why a table can go missing', 'matrix-mlm'); ?></strong></p>
+                <ul style="margin:0 0 0 20px;font-size:13px;color:#4b5563;">
+                    <li><?php _e('A new table was added to the plugin in a release that landed after this site was last activated, and the version-stamp short-circuit prevented the migration from running.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('A database user temporarily lost <code>CREATE TABLE</code> privilege when the activator ran, so dbDelta failed silently for one row of the schema while saving the version stamp.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('A partial DB restore loaded a snapshot taken before the table was added.', 'matrix-mlm'); ?></li>
+                </ul>
+                <p style="margin:8px 0 0;font-size:12px;color:#6b7280;">
+                    <?php _e('Most pages will repair themselves on the next admin pageload now — this tool is the manual override for cases where they don\'t.', 'matrix-mlm'); ?>
+                </p>
+            </div>
+
+            <div class="matrix-admin-stats" style="margin-bottom:20px;">
+                <div class="stat-card stat-primary"><h3><?php echo number_format($total); ?></h3><p><?php _e('Expected Tables', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-success"><h3><?php echo number_format(count($present)); ?></h3><p><?php _e('Present', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-<?php echo empty($missing) ? 'success' : 'danger'; ?>"><h3><?php echo number_format(count($missing)); ?></h3><p><?php _e('Missing', 'matrix-mlm'); ?></p></div>
+            </div>
+
+            <table class="wp-list-table widefat striped" style="margin-bottom:20px;">
+                <thead>
+                    <tr>
+                        <th><?php _e('Table', 'matrix-mlm'); ?></th>
+                        <th style="width:100px;"><?php _e('Status', 'matrix-mlm'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    global $wpdb;
+                    foreach (Matrix_MLM_Database::CRITICAL_TABLES as $short) {
+                        $full = $wpdb->prefix . $short;
+                        $exists = in_array($full, $present, true);
+                        ?>
+                        <tr>
+                            <td><code style="font-size:12px;"><?php echo esc_html($full); ?></code></td>
+                            <td>
+                                <?php if ($exists): ?>
+                                    <span style="color:#059669;font-weight:500;">✓ <?php _e('present', 'matrix-mlm'); ?></span>
+                                <?php else: ?>
+                                    <span style="color:#b91c1c;font-weight:500;">✗ <?php _e('missing', 'matrix-mlm'); ?></span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php
+                    }
+                    ?>
+                </tbody>
+            </table>
+
+            <p style="font-size:12px;color:#6b7280;">
+                <?php
+                printf(
+                    /* translators: 1: stored DB version stamp, 2: code DB version constant, 3: last successful schema sync timestamp */
+                    esc_html__('DB version stamp: %1$s · Code expects: %2$s · Last schema sync: %3$s', 'matrix-mlm'),
+                    esc_html($db_version ?: '—'),
+                    esc_html($code_db_ver ?: '—'),
+                    esc_html($last_sync ?: __('never', 'matrix-mlm'))
+                );
+                ?>
+            </p>
+
+            <p>
+                <button type="button" class="button button-primary" id="btn_repair_schema">
+                    <?php _e('Run Schema Repair', 'matrix-mlm'); ?>
+                </button>
+                <span id="repair_schema_status" style="margin-left:12px;font-size:13px;color:#6b7280;"></span>
+            </p>
+
+            <div id="repair_schema_results" style="display:none;margin-top:24px;"></div>
+        </div>
+
+        <script>
+        (function() {
+            var btn       = document.getElementById('btn_repair_schema');
+            var statusEl  = document.getElementById('repair_schema_status');
+            var resultsEl = document.getElementById('repair_schema_results');
+            if (!btn) return;
+
+            function escapeHtml(s) {
+                if (s === null || s === undefined) return '';
+                return String(s)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function renderReport(report) {
+                var createdCount = (report.created || []).length;
+                var missingCount = (report.after && report.after.missing || []).length;
+                var errorCount   = (report.errors || []).length;
+
+                var html = '';
+                html += '<div class="matrix-admin-stats" style="margin-bottom:16px;">';
+                html += '<div class="stat-card stat-success"><h3>' + createdCount + '</h3><p><?php echo esc_js(__('Newly created', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-' + (missingCount === 0 ? 'success' : 'danger') + '"><h3>' + missingCount + '</h3><p><?php echo esc_js(__('Still missing', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-' + (errorCount === 0 ? 'success' : 'warning') + '"><h3>' + errorCount + '</h3><p><?php echo esc_js(__('DB errors', 'matrix-mlm')); ?></p></div>';
+                html += '</div>';
+
+                if (createdCount > 0) {
+                    html += '<h3 style="margin-top:16px;"><?php echo esc_js(__('Tables created on this run', 'matrix-mlm')); ?></h3><ul style="margin:0 0 0 20px;">';
+                    report.created.forEach(function(t) {
+                        html += '<li><code>' + escapeHtml(t) + '</code></li>';
+                    });
+                    html += '</ul>';
+                }
+
+                if (missingCount > 0) {
+                    html += '<div class="notice notice-error inline" style="padding:12px 16px;margin:12px 0;">';
+                    html += '<p style="margin:0 0 6px;"><strong><?php echo esc_js(__('These tables could not be created — investigate DB privileges or the error list below:', 'matrix-mlm')); ?></strong></p>';
+                    html += '<ul style="margin:0 0 0 20px;">';
+                    report.after.missing.forEach(function(t) {
+                        html += '<li><code>' + escapeHtml(t) + '</code></li>';
+                    });
+                    html += '</ul></div>';
+                }
+
+                if (errorCount > 0) {
+                    html += '<h3 style="margin-top:16px;"><?php echo esc_js(__('DB errors during repair', 'matrix-mlm')); ?></h3>';
+                    html += '<pre style="background:#fef2f2;border:1px solid #fecaca;padding:12px;font-size:12px;color:#991b1b;white-space:pre-wrap;">';
+                    report.errors.forEach(function(e) { html += escapeHtml(e) + '\n'; });
+                    html += '</pre>';
+                }
+
+                if (createdCount === 0 && missingCount === 0 && errorCount === 0) {
+                    html += '<div class="notice notice-success inline" style="padding:12px 16px;margin:12px 0;"><p style="margin:0;"><strong><?php echo esc_js(__('Schema is up to date.', 'matrix-mlm')); ?></strong> <?php echo esc_js(__('Every expected table was already on disk. Reload the page to refresh the table list above.', 'matrix-mlm')); ?></p></div>';
+                }
+
+                resultsEl.innerHTML = html;
+                resultsEl.style.display = 'block';
+            }
+
+            btn.addEventListener('click', function() {
+                btn.disabled = true;
+                var originalLabel = btn.textContent;
+                btn.textContent = '<?php echo esc_js(__('Running…', 'matrix-mlm')); ?>';
+                statusEl.textContent = '<?php echo esc_js(__('Running schema sync — this is a fast call.', 'matrix-mlm')); ?>';
+                statusEl.style.color = '#6b7280';
+
+                jQuery.post(matrixMLMAdmin.ajaxUrl, {
+                    action: 'matrix_admin_action',
+                    nonce: matrixMLMAdmin.nonce,
+                    matrix_action: 'repair_database_schema'
+                }).done(function(res) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    if (!res || !res.success) {
+                        var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Repair failed.', 'matrix-mlm')); ?>';
+                        statusEl.textContent = '✗ ' + err;
+                        statusEl.style.color = '#b91c1c';
+                        return;
+                    }
+                    statusEl.textContent = '✓ ' + res.data.message;
+                    statusEl.style.color = '#059669';
+                    if (res.data.report) renderReport(res.data.report);
+                }).fail(function(xhr, textStatus) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    statusEl.textContent = '<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?> (' + textStatus + ')';
                     statusEl.style.color = '#b91c1c';
                 });
             });
