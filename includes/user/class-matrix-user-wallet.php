@@ -243,12 +243,18 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the two top-level action buttons.
+     * Render the three top-level action buttons.
      *
      * Buttons toggle the matching pane below (data-target → data-pane).
-     * Both panes are rendered server-side so the forms work even if the
+     * All panes are rendered server-side so the forms work even if the
      * tab-toggle JS fails to bind for any reason; only their visibility
      * is controlled client-side.
+     *
+     * Order is "narrowest → widest reach":
+     *   own-wallet   — money stays under the same user (Matrix → Virtual)
+     *   user-wallet  — money moves to another platform user, still on
+     *                  the Matrix side (internal/wallet-to-wallet)
+     *   bank         — money exits the platform entirely (external bank)
      */
     private function render_action_buttons() {
         ?>
@@ -258,6 +264,13 @@ class Matrix_MLM_User_Wallet {
                 <span class="matrix-wallet-action-text">
                     <strong><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></strong>
                     <small><?php esc_html_e('Move funds from your Matrix wallet to your Virtual account', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <button type="button" class="matrix-wallet-action-btn" data-target="user-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-share"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Wallet to Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Send funds to another user\'s Matrix wallet (internal transfer)', 'matrix-mlm'); ?></small>
                 </span>
             </button>
             <button type="button" class="matrix-wallet-action-btn" data-target="bank">
@@ -272,13 +285,17 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the two action panes (hidden by default; one is shown when
-     * its matching action button is clicked).
+     * Render the three action panes (hidden by default; one is shown
+     * when its matching action button is clicked).
      */
     private function render_panes($wallet, $user_id, $matrix_balance, $currency) {
         ?>
         <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
             <?php $this->render_transfer_to_own_wallet_form($wallet, $user_id, $matrix_balance, $currency); ?>
+        </section>
+
+        <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
+            <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
         </section>
 
         <section class="matrix-wallet-pane" data-pane="bank" hidden>
@@ -383,6 +400,147 @@ class Matrix_MLM_User_Wallet {
                     <td><?php echo esc_html($currency . number_format($p->charge, 2)); ?></td>
                     <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($p->status); ?>"><?php echo esc_html(ucfirst($p->status)); ?></span></td>
                     <td><small><code><?php echo esc_html($p->reference); ?></code></small></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php endif; ?>
+        <?php
+    }
+
+    /**
+     * Render the user-to-user (Matrix wallet → Matrix wallet) transfer
+     * form + history. AKA "internal transfer" / "wallet to wallet".
+     *
+     * Reuses the existing public-facing AJAX action that the legacy
+     * Balance Transfer page used:
+     *
+     *   - Action:  matrix_mlm_action  (POST)
+     *   - Branch:  matrix_action=transfer
+     *   - Handler: Matrix_MLM_Core::process_transfer()
+     *
+     * The handler validates min amount, looks up the recipient by
+     * username, computes the charge, debits the sender's Matrix wallet
+     * (debit($user_id, total)), credits the recipient's Matrix wallet
+     * (credit($recipient_id, amount), no charge on receiver), inserts a
+     * row into {prefix}matrix_transfers, and fires
+     * Matrix_MLM_Notifications::send_transfer_notification() so the
+     * recipient gets the inbound-transfer email.
+     *
+     * Form ID is intentionally NOT #matrix-transfer-form: the legacy
+     * Balance Transfer page used that ID and matrix-public.js binds a
+     * delegated submit handler to it on document. If we kept the same
+     * ID, both that global handler AND our inline handler would fire
+     * on submit, sending the AJAX request twice. Using a fresh ID
+     * (#matrix-w2w-form) and routing through our own handler gives us
+     * a richer confirmation dialog (recipient + amount + charge spelled
+     * out) without the double-fire risk.
+     */
+    private function render_wallet_to_wallet_form($user_id, $matrix_balance, $currency) {
+        global $wpdb;
+
+        $min_transfer = floatval(get_option('matrix_mlm_min_transfer', 500));
+        $charge_type  = get_option('matrix_mlm_transfer_charge_type', 'fixed');
+        $charge_value = floatval(get_option('matrix_mlm_transfer_charge', 100));
+
+        // Compute the practical ceiling so the user can't type a value
+        // that would silently fail the server-side balance check. Same
+        // logic as the bank/own-wallet ceilings: balance / (1+rate) for
+        // percent charges, balance - charge for fixed.
+        if ($charge_type === 'percent') {
+            $rate            = $charge_value / 100;
+            $balance_ceiling = (1 + $rate) > 0 ? $matrix_balance / (1 + $rate) : $matrix_balance;
+        } else {
+            $balance_ceiling = max(0, $matrix_balance - $charge_value);
+        }
+        $effective_max = floor($balance_ceiling * 100) / 100;
+
+        // History (incoming + outgoing). Same query the legacy
+        // Balance Transfer page used; just trimmed to 10 rows so the
+        // pane stays compact when stacked under the form.
+        $transfers = $wpdb->get_results($wpdb->prepare(
+            "SELECT t.*,
+                    u1.user_login as from_username,
+                    u2.user_login as to_username
+             FROM {$wpdb->prefix}matrix_transfers t
+             LEFT JOIN {$wpdb->users} u1 ON t.from_user_id = u1.ID
+             LEFT JOIN {$wpdb->users} u2 ON t.to_user_id   = u2.ID
+             WHERE t.from_user_id = %d OR t.to_user_id = %d
+             ORDER BY t.created_at DESC LIMIT 10",
+            $user_id, $user_id
+        ));
+        ?>
+        <h3><?php esc_html_e('Wallet to Wallet Transfer', 'matrix-mlm'); ?></h3>
+
+        <div class="matrix-transfer-note">
+            <?php esc_html_e('Send funds from your Matrix wallet to another user\'s Matrix wallet by entering their username. The recipient will be notified by email.', 'matrix-mlm'); ?>
+        </div>
+
+        <div class="matrix-info-box">
+            <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
+            <p><strong><?php esc_html_e('Minimum Transfer:', 'matrix-mlm'); ?></strong> <?php echo esc_html($currency . number_format($min_transfer, 2)); ?></p>
+            <p><strong><?php esc_html_e('Service Charge:', 'matrix-mlm'); ?></strong> <?php echo esc_html($charge_type === 'percent' ? $charge_value . '%' : $currency . number_format($charge_value, 2)); ?></p>
+        </div>
+
+        <div class="matrix-form-card">
+            <form id="matrix-w2w-form" class="matrix-form">
+                <div class="matrix-form-group">
+                    <label><?php esc_html_e('Recipient Username', 'matrix-mlm'); ?></label>
+                    <input type="text" name="recipient" id="matrix-w2w-recipient"
+                           required autocomplete="off"
+                           placeholder="<?php esc_attr_e('Enter the recipient\'s username', 'matrix-mlm'); ?>">
+                </div>
+
+                <div class="matrix-form-group">
+                    <label><?php esc_html_e('Amount', 'matrix-mlm'); ?> (<?php echo esc_html($currency); ?>)</label>
+                    <input type="number" name="amount" id="matrix-w2w-amount"
+                           min="<?php echo esc_attr($min_transfer); ?>"
+                           max="<?php echo esc_attr($effective_max); ?>"
+                           step="0.01" required
+                           placeholder="<?php echo esc_attr(sprintf(__('Min %s, Max %s', 'matrix-mlm'), number_format($min_transfer), number_format($effective_max, 2))); ?>">
+                    <div id="matrix-w2w-charge-info" class="matrix-charge-info" style="display:none;">
+                        <small>
+                            <?php esc_html_e('Charge:', 'matrix-mlm'); ?> <span id="matrix-w2w-charge">-</span> |
+                            <?php esc_html_e('Total Debit:', 'matrix-mlm'); ?> <span id="matrix-w2w-total">-</span> |
+                            <?php esc_html_e('Recipient Receives:', 'matrix-mlm'); ?> <span id="matrix-w2w-receive">-</span>
+                        </small>
+                    </div>
+                </div>
+
+                <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="matrix-w2w-submit-btn">
+                    <?php esc_html_e('Send Transfer', 'matrix-mlm'); ?>
+                </button>
+            </form>
+        </div>
+
+        <?php if (!empty($transfers)): ?>
+        <h4 class="matrix-wallet-history-heading"><?php esc_html_e('Recent Wallet Transfers', 'matrix-mlm'); ?></h4>
+        <table class="matrix-table">
+            <thead>
+                <tr>
+                    <th><?php esc_html_e('Date', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Direction', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('User', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Amount', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Charge', 'matrix-mlm'); ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($transfers as $t):
+                    $is_sender = ((int) $t->from_user_id === (int) $user_id);
+                ?>
+                <tr>
+                    <td><?php echo esc_html(date('M d, Y H:i', strtotime($t->created_at))); ?></td>
+                    <td>
+                        <?php if ($is_sender): ?>
+                            <span class="matrix-badge matrix-badge-debit"><?php esc_html_e('Sent', 'matrix-mlm'); ?></span>
+                        <?php else: ?>
+                            <span class="matrix-badge matrix-badge-credit"><?php esc_html_e('Received', 'matrix-mlm'); ?></span>
+                        <?php endif; ?>
+                    </td>
+                    <td><?php echo esc_html($is_sender ? ($t->to_username ?? '—') : ($t->from_username ?? '—')); ?></td>
+                    <td><?php echo esc_html($currency . number_format($t->amount, 2)); ?></td>
+                    <td><?php echo esc_html($is_sender ? $currency . number_format($t->charge, 2) : '—'); ?></td>
                 </tr>
                 <?php endforeach; ?>
             </tbody>
@@ -600,11 +758,11 @@ class Matrix_MLM_User_Wallet {
 
         .matrix-wallet-actions {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(3, 1fr);
             gap: 16px;
             margin-bottom: 24px;
         }
-        @media (max-width: 600px) {
+        @media (max-width: 900px) {
             .matrix-wallet-actions { grid-template-columns: 1fr; }
         }
         .matrix-wallet-action-btn {
@@ -914,6 +1072,106 @@ class Matrix_MLM_User_Wallet {
                     error: function() {
                         alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
+                    }
+                });
+            });
+
+            // -----------------------------------------------------------
+            // Wallet → Wallet transfer (internal user-to-user).
+            //
+            // Hits the same matrix_mlm_action endpoint the legacy
+            // Balance Transfer page used, with matrix_action=transfer.
+            // The server-side handler (Matrix_MLM_Core::process_transfer)
+            // does the username lookup, balance check, debit/credit,
+            // matrix_transfers row insert, and recipient email
+            // notification — we don't replicate any of that here.
+            //
+            // Form ID is #matrix-w2w-form (not the legacy
+            // #matrix-transfer-form) so the global delegated submit
+            // handler in public/js/matrix-public.js does NOT also fire.
+            // The legacy handler binds to '#matrix-transfer-form' on
+            // document; sharing that ID would double-submit every
+            // transfer.
+            // -----------------------------------------------------------
+            var w2wMin         = <?php echo floatval(get_option('matrix_mlm_min_transfer', 500)); ?>;
+            var w2wChargeType  = '<?php echo esc_js(get_option('matrix_mlm_transfer_charge_type', 'fixed')); ?>';
+            var w2wChargeValue = <?php echo floatval(get_option('matrix_mlm_transfer_charge', 100)); ?>;
+            var w2wBalance     = <?php echo floatval($matrix_balance); ?>;
+
+            // Live charge preview as the user types the amount. Same
+            // visual contract as the other two transfer forms on this
+            // page — Charge | Total Debit | Recipient Receives.
+            $('#matrix-w2w-amount').on('input', function() {
+                var amount = parseFloat($(this).val()) || 0;
+                if (amount > 0) {
+                    var charge = w2wChargeType === 'percent'
+                        ? (amount * w2wChargeValue / 100)
+                        : w2wChargeValue;
+                    charge = Math.round(charge * 100) / 100;
+                    var total = amount + charge;
+                    $('#matrix-w2w-charge').text(ownCurrency + charge.toLocaleString());
+                    $('#matrix-w2w-total').text(ownCurrency + total.toLocaleString());
+                    $('#matrix-w2w-receive').text(ownCurrency + amount.toLocaleString());
+                    $('#matrix-w2w-charge-info').show();
+                } else {
+                    $('#matrix-w2w-charge-info').hide();
+                }
+            });
+
+            $('#matrix-w2w-form').on('submit', function(e) {
+                e.preventDefault();
+
+                var recipient = ($('#matrix-w2w-recipient').val() || '').trim();
+                var amount    = parseFloat($('#matrix-w2w-amount').val());
+
+                if (!recipient) {
+                    alert('<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
+                    return;
+                }
+                if (!amount || amount < w2wMin) {
+                    alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                    return;
+                }
+
+                var charge = w2wChargeType === 'percent'
+                    ? (amount * w2wChargeValue / 100)
+                    : w2wChargeValue;
+                charge = Math.round(charge * 100) / 100;
+                var total = amount + charge;
+                if (total > w2wBalance) {
+                    alert('<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
+                    return;
+                }
+
+                if (!confirm('<?php echo esc_js(__('Send', 'matrix-mlm')); ?> ' + ownCurrency + amount.toLocaleString() + ' <?php echo esc_js(__('to', 'matrix-mlm')); ?> ' + recipient + '?\n\n<?php echo esc_js(__('Charge:', 'matrix-mlm')); ?> ' + ownCurrency + charge.toFixed(2) + '\n<?php echo esc_js(__('Total Debit:', 'matrix-mlm')); ?> ' + ownCurrency + total.toFixed(2))) {
+                    return;
+                }
+
+                var $btn = $('#matrix-w2w-submit-btn');
+                $btn.prop('disabled', true).text('<?php echo esc_js(__('Processing…', 'matrix-mlm')); ?>');
+
+                $.ajax({
+                    url:  matrixMLM.ajaxUrl,
+                    type: 'POST',
+                    data: {
+                        action:        'matrix_mlm_action',
+                        nonce:         matrixMLM.nonce,
+                        matrix_action: 'transfer',
+                        recipient:     recipient,
+                        amount:        amount
+                    },
+                    success: function(res) {
+                        if (res && res.success) {
+                            alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
+                            location.reload();
+                        } else {
+                            alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
+                            $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
+                        }
+                    },
+                    error: function() {
+                        alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                        $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                     }
                 });
             });
