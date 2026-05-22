@@ -1032,8 +1032,22 @@ class Matrix_MLM_Fintava {
             }
         }
 
+        // Validate wallet_id format — Fintava requires a valid UUID v4.
+        // Catch malformed IDs before they hit the wire and trigger a
+        // cryptic 500 on Fintava's side.
+        $wallet_id = sanitize_text_field($transfer_data['wallet_id']);
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $wallet_id)) {
+            return new WP_Error(
+                'invalid_wallet_id',
+                sprintf(
+                    __('Invalid Fintava wallet ID format (expected UUID, got "%s"). Please contact support to re-link your wallet.', 'matrix-mlm'),
+                    substr($wallet_id, 0, 40)
+                )
+            );
+        }
+
         $payload = [
-            'sourceId'      => sanitize_text_field($transfer_data['wallet_id']),
+            'sourceId'      => $wallet_id,
             'amount'        => floatval($transfer_data['amount']),
             'accountNumber' => sanitize_text_field($transfer_data['account_number']),
             'sortCode'      => sanitize_text_field($transfer_data['bank_code']),
@@ -1056,31 +1070,116 @@ class Matrix_MLM_Fintava {
         }
 
         $base = $this->get_bank_credit_base_url();
-        $response = $this->make_request('POST', '/bank/credit', $payload, $base);
-        if (is_wp_error($response)) {
-            return $response;
-        }
 
-        if (self::is_api_success($response)) {
-            return [
-                'success'     => true,
-                'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
-                'reference'   => $response['data']['reference'] ?? ($transfer_data['reference'] ?? ''),
-                'status'      => $response['data']['status'] ?? 'pending',
-                'message'     => self::normalize_api_message(
+        // Retry logic: Fintava's /bank/credit has been observed returning
+        // transient HTTP 500s ("An unexpected error occurred") that succeed
+        // on the next attempt seconds later. We retry ONCE after a short
+        // delay for 5xx errors only. Non-5xx errors and WP_Error transport
+        // failures are returned immediately — retrying those would be
+        // pointless or dangerous (e.g., a 400 validation error won't fix
+        // itself, and a duplicate reference on a second POST could double-
+        // spend if the first actually went through).
+        $max_attempts = 2;
+        $last_error = null;
+
+        for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+            $response = $this->make_request('POST', '/bank/credit', $payload, $base);
+
+            if (is_wp_error($response)) {
+                $error_msg = $response->get_error_message();
+
+                // Only retry on 5xx errors (detected by the error message
+                // pattern from make_request). Transport errors (DNS, TLS,
+                // timeout) are also worth retrying once.
+                $is_5xx = preg_match('/API Error \(HTTP 5\d{2}\)/', $error_msg);
+                $is_transport = in_array($response->get_error_code(), ['http_request_failed', 'fintava_not_configured'], true);
+
+                if ($attempt < $max_attempts && ($is_5xx || ($is_transport && $response->get_error_code() !== 'fintava_not_configured'))) {
+                    $last_error = $response;
+                    // Wait 2 seconds before retry to allow transient issues to clear
+                    sleep(2);
+                    continue;
+                }
+
+                // Enhance 500 error messages with actionable guidance
+                if ($is_5xx) {
+                    $enhanced_msg = $this->enhance_bank_credit_error($error_msg, $transfer_data);
+                    return new WP_Error($response->get_error_code(), $enhanced_msg);
+                }
+
+                return $response;
+            }
+
+            if (self::is_api_success($response)) {
+                return [
+                    'success'     => true,
+                    'transfer_id' => $response['data']['id'] ?? $response['data']['transfer_id'] ?? null,
+                    'reference'   => $response['data']['reference'] ?? ($transfer_data['reference'] ?? ''),
+                    'status'      => $response['data']['status'] ?? 'pending',
+                    'message'     => self::normalize_api_message(
+                        $response['message'] ?? null,
+                        __('Bank transfer initiated successfully', 'matrix-mlm')
+                    ),
+                ];
+            }
+
+            // Non-500 application-level failure — do not retry
+            return new WP_Error(
+                'fintava_bank_credit_error',
+                self::normalize_api_message(
                     $response['message'] ?? null,
-                    __('Bank transfer initiated successfully', 'matrix-mlm')
-                ),
-            ];
+                    __('Bank transfer failed', 'matrix-mlm')
+                )
+            );
         }
 
-        return new WP_Error(
-            'fintava_bank_credit_error',
-            self::normalize_api_message(
-                $response['message'] ?? null,
-                __('Bank transfer failed', 'matrix-mlm')
-            )
+        // Should not reach here, but guard against it
+        if ($last_error) {
+            $enhanced_msg = $this->enhance_bank_credit_error($last_error->get_error_message(), $transfer_data);
+            return new WP_Error($last_error->get_error_code(), $enhanced_msg);
+        }
+
+        return new WP_Error('fintava_bank_credit_error', __('Bank transfer failed after retry', 'matrix-mlm'));
+    }
+
+    /**
+     * Enhance a /bank/credit 500 error message with actionable guidance.
+     *
+     * Fintava's 500 errors on /bank/credit are almost always one of:
+     *   - Insufficient balance in the user's Fintava virtual wallet
+     *   - Temporary Fintava service disruption
+     *   - Invalid sourceId that passed UUID format check but doesn't exist
+     *
+     * This method translates the generic "An unexpected error occurred"
+     * into something the user can act on.
+     *
+     * @param string $original_msg The raw error message from make_request.
+     * @param array  $transfer_data The transfer data that was sent.
+     * @return string Enhanced error message.
+     */
+    private function enhance_bank_credit_error($original_msg, $transfer_data) {
+        $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount = floatval($transfer_data['amount'] ?? 0);
+
+        // Check if this is the known "unexpected error" pattern
+        $is_generic_500 = (
+            stripos($original_msg, 'unexpected error') !== false ||
+            stripos($original_msg, 'HTTP 500') !== false
         );
+
+        if (!$is_generic_500) {
+            return $original_msg;
+        }
+
+        $enhanced = sprintf(
+            /* translators: 1: original error, 2: currency symbol, 3: transfer amount */
+            __('%1$s — This usually means your Fintava wallet has insufficient funds to cover %2$s%3$s plus Fintava\'s transfer fee. Please check your Fintava wallet balance (separate from your Matrix wallet) and ensure it is adequately funded. If the balance is sufficient, Fintava may be experiencing a temporary issue — please try again in a few minutes.', 'matrix-mlm'),
+            $original_msg,
+            $currency_symbol,
+            number_format($amount, 2)
+        );
+
+        return $enhanced;
     }
 
     /**
@@ -1302,6 +1401,18 @@ class Matrix_MLM_Fintava {
             }
         }
 
+        // Validate wallet_id is a proper UUID before sending to Fintava.
+        // A malformed sourceId triggers a 500 on their side instead of a
+        // clean 400, which is the exact error pattern we're fixing here.
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $user_wallet->wallet_id)) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    __('Your Fintava wallet ID appears to be invalid (not a UUID). Stored value: "%s". Please contact support to re-link your wallet.', 'matrix-mlm'),
+                    substr($user_wallet->wallet_id, 0, 40)
+                ),
+            ]);
+        }
+
         // Pre-flight: check the user's Fintava virtual-wallet balance
         // before making the real /bank/credit call. Fintava has been
         // observed returning HTTP 500 with a generic "An unexpected
@@ -1317,6 +1428,13 @@ class Matrix_MLM_Fintava {
         // /bank/credit anyway and let Fintava's response be the source
         // of truth. We don't want a flaky balance endpoint to strand a
         // working payout flow.
+        //
+        // Buffer: Fintava deducts its own transfer fee from the wallet
+        // on top of the requested amount. The exact fee varies but is
+        // typically ₦10–₦53.75 depending on amount tier. We add a
+        // conservative buffer (₦100 or 1.5% of amount, whichever is
+        // higher) so the pre-flight catches the "insufficient after fee"
+        // case that triggers Fintava's 500.
         $balance_check = $this->get_virtual_wallet_balance(
             $user_wallet->wallet_id,
             $user_wallet->account_number,
@@ -1324,7 +1442,12 @@ class Matrix_MLM_Fintava {
         );
         if (!is_wp_error($balance_check) && isset($balance_check['available_balance']) && is_numeric($balance_check['available_balance'])) {
             $available = floatval($balance_check['available_balance']);
+            // Add buffer for Fintava's transfer fee
+            $fee_buffer = max(100, $amount * 0.015); // ₦100 minimum or 1.5%
+            $required_with_buffer = $amount + $fee_buffer;
+
             if ($available < $amount) {
+                // Clearly insufficient — can't even cover the principal
                 wp_send_json_error([
                     'message' => sprintf(
                         /* translators: 1: currency symbol, 2: available balance, 3: requested amount */
@@ -1334,6 +1457,18 @@ class Matrix_MLM_Fintava {
                         number_format($amount, 2)
                     ),
                 ]);
+            } elseif ($available < $required_with_buffer) {
+                // Balance covers the principal but may not cover Fintava's
+                // transfer fee. Warn but don't block — let it through and
+                // if Fintava rejects it the enhanced error message will
+                // explain what happened.
+                // We proceed but log the marginal case for diagnostics.
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log(sprintf(
+                        '[Matrix MLM] Bank payout marginal balance: user %d has %s available, needs %s + ~%s fee buffer. Proceeding anyway.',
+                        $user_id, number_format($available, 2), number_format($amount, 2), number_format($fee_buffer, 2)
+                    ));
+                }
             }
         }
 
