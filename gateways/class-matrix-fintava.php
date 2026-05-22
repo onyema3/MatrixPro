@@ -2681,6 +2681,68 @@ class Matrix_MLM_Fintava {
     // =========================================================================
 
     /**
+     * TEMPORARY admin diagnostic — fetch a wallet's balance endpoint and
+     * return the raw, unparsed Fintava response so an operator can see exactly
+     * which fields the API exposes and in what units. Bypasses
+     * normalize_balance_payload() and the details fallback chain so we
+     * observe the API as-is.
+     *
+     * Output shape:
+     *   - On WP HTTP layer error: ['url' => ..., 'wp_error' => ...]
+     *   - On success or HTTP error from Fintava:
+     *       ['url' => ..., 'http_code' => int, 'body_raw' => string,
+     *        'body_decoded' => mixed]
+     *
+     * This method exists solely to support a one-shot field-mapping
+     * investigation when the displayed balance disagrees with the real
+     * balance shown in the Fintava dashboard. Callers (currently just
+     * Matrix_MLM_User_Virtual_Wallet) gate it on capability and render the
+     * output in an HTML comment visible only via View Page Source. Once the
+     * mapping is confirmed in production this method and its caller should
+     * be removed.
+     *
+     * @param string $wallet_id The Fintava virtual wallet UUID.
+     * @return array Diagnostic payload (never a WP_Error).
+     */
+    public function debug_balance_raw($wallet_id) {
+        if (empty($wallet_id) || empty($this->secret_key)) {
+            return [
+                'note'        => 'no wallet_id or no secret_key on the gateway instance',
+                'has_wallet'  => !empty($wallet_id),
+                'has_key'     => !empty($this->secret_key),
+            ];
+        }
+
+        $url = $this->base_url . '/customer/wallet/balance/' . rawurlencode($wallet_id);
+        $args = [
+            'method'  => 'GET',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $this->secret_key,
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json',
+                'Merchant-Id'   => $this->merchant_id,
+            ],
+            'timeout' => 30,
+        ];
+
+        $response = wp_remote_request($url, $args);
+        if (is_wp_error($response)) {
+            return [
+                'url'      => $url,
+                'wp_error' => $response->get_error_message(),
+            ];
+        }
+
+        $raw = wp_remote_retrieve_body($response);
+        return [
+            'url'          => $url,
+            'http_code'    => wp_remote_retrieve_response_code($response),
+            'body_raw'     => $raw,
+            'body_decoded' => json_decode($raw, true),
+        ];
+    }
+
+    /**
      * Make HTTP request to Fintava API.
      */
     private function make_request($method, $endpoint, $body = null) {
