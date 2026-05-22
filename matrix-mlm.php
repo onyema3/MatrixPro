@@ -102,9 +102,52 @@ register_activation_hook(__FILE__, ['Matrix_MLM_Activator', 'activate']);
 register_deactivation_hook(__FILE__, ['Matrix_MLM_Deactivator', 'deactivate']);
 
 /**
+ * Suppress wpdb's automatic <div id="error"><p class="wpdberror">...</p></div>
+ * HTML emission for AJAX requests targeting one of this plugin's own actions.
+ *
+ * Without this, any DB write that fails on an AJAX path (UNIQUE collision,
+ * NOT NULL violation, deadlock, etc.) prepends an HTML block to the response
+ * stream. The handler then emits its JSON via wp_send_json_*, but jQuery's
+ * parser sees the leading `<` from the wpdberror div and fails with
+ * `parsererror` — masking the real DB error and surfacing in the browser as
+ * the generic "Network error. Please try again." alert. The earlier matrix-
+ * to-virtual transfer fix patched one instance of this symptom; this guard
+ * is the systemic version so the same failure mode doesn't re-emerge in any
+ * other AJAX handler the plugin ships now or in the future.
+ *
+ * Errors are still captured: $wpdb->last_error stays populated, the existing
+ * error_log() calls in each handler continue to record them, and operators
+ * with WP_DEBUG_LOG on still see the full stack in wp-content/debug.log —
+ * we only suppress the inline HTML emission that corrupts JSON responses.
+ *
+ * Scoped to the plugin's own actions by matching the `matrix_` prefix on
+ * $_REQUEST['action'], so other plugins' AJAX handlers retain their own
+ * error-display behaviour. Every wp_ajax_* action registered by this plugin
+ * uses that prefix (matrix_fintava_*, matrix_mlm_action, matrix_admin_action,
+ * matrix_transfer_matrix_to_virtual, matrix_accept_cookies, etc.).
+ */
+function matrix_mlm_harden_ajax_response() {
+    if (!function_exists('wp_doing_ajax') || !wp_doing_ajax()) {
+        return;
+    }
+    $action = isset($_REQUEST['action']) ? (string) $_REQUEST['action'] : '';
+    if ($action === '' || strpos($action, 'matrix_') !== 0) {
+        return;
+    }
+    global $wpdb;
+    if (isset($wpdb) && is_object($wpdb) && method_exists($wpdb, 'hide_errors')) {
+        $wpdb->hide_errors();
+    }
+}
+
+/**
  * Initialize the plugin
  */
 function matrix_mlm_init() {
+    // Run before any AJAX handler so the suppression is in place by the time
+    // a wp_ajax_matrix_* callback executes.
+    matrix_mlm_harden_ajax_response();
+
     $plugin = new Matrix_MLM_Core();
     $plugin->run();
 }
