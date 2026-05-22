@@ -764,7 +764,7 @@ class Matrix_MLM_User_Bank_Payout {
                     success: function(response) {
                         if (response.success) {
                             alert(response.data.message);
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             alert(response.data.message || '<?php _e("Transfer failed", "matrix-mlm"); ?>');
                             btn.prop('disabled', false).text('<?php _e("Transfer to Bank", "matrix-mlm"); ?>');
@@ -812,7 +812,7 @@ class Matrix_MLM_User_Bank_Payout {
                             // Reload so the table re-renders without the
                             // cleared rows AND the toolbar button hides
                             // itself (server-side $failed_count drops to 0).
-                            location.reload();
+                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
                         } else {
                             var msg = (response && response.data && response.data.message)
                                 ? response.data.message
