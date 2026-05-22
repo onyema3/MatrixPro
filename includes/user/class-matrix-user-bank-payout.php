@@ -325,12 +325,34 @@ class Matrix_MLM_User_Bank_Payout {
                         // fully usable in this state, but if a transfer
                         // later fails with an unknown-bank error the
                         // notice points the operator to the cause.
+                        //
+                        // The reason string carries Fintava's actual
+                        // upstream message (e.g. "Invalid API Key
+                        // [base=https://dev.fintavapay.com/api/dev]") and
+                        // is the single most useful signal for
+                        // diagnosing why the live /banks call failed.
+                        // Render it inline so an operator without
+                        // DevTools open can read it directly.
                         if (response.data.fallback) {
-                            const note = $('<small/>')
-                                .css({ display: 'block', marginTop: '6px', color: '#92400e' })
-                                .text('<?php echo esc_js(__("Note: using built-in Nigerian banks list. Fintava /banks is unreachable from your account.", "matrix-mlm")); ?>');
                             select.parent().find('.matrix-bank-fallback-note').remove();
-                            select.parent().append(note.addClass('matrix-bank-fallback-note'));
+                            const wrap = $('<div/>')
+                                .addClass('matrix-bank-fallback-note')
+                                .css({ marginTop: '6px', fontSize: '12px', lineHeight: '1.4', color: '#92400e' });
+
+                            wrap.append(
+                                $('<div/>')
+                                    .text('<?php echo esc_js(__("Note: using built-in Nigerian banks list. Fintava /banks is unreachable from your account.", "matrix-mlm")); ?>')
+                            );
+
+                            if (response.data.reason) {
+                                wrap.append(
+                                    $('<div/>')
+                                        .css({ marginTop: '4px', fontStyle: 'italic', wordBreak: 'break-word' })
+                                        .text('<?php echo esc_js(__("Reason:", "matrix-mlm")); ?> ' + response.data.reason)
+                                );
+                            }
+
+                            select.parent().append(wrap);
                             if (window.console && console.info) {
                                 console.info('[Matrix MLM] Bank list fallback engaged. Reason:', response.data.reason || '(unspecified)');
                             }
