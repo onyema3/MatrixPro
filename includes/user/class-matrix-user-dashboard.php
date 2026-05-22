@@ -9,6 +9,111 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_User_Dashboard {
 
+    /**
+     * Whitelist of tab slugs accepted by the dashboard. Used both to drive
+     * the pretty-URL builder in self::tab_url() and to defend the resolver
+     * in self::resolve_active_tab() from arbitrary query input. Keep this
+     * in sync with the switch in render_tab().
+     *
+     * @var string[]
+     */
+    private static $valid_tabs = [
+        'overview',
+        'deposits',
+        'deposit-history',
+        'withdraw',
+        'withdraw-history',
+        'transactions',
+        'referrals',
+        'genealogy',
+        'commissions',
+        'plans',
+        'epin',
+        'transfer',
+        'bank-payout',
+        'virtual-wallet',
+        'card',
+        'billing',
+        'tickets',
+        'profile',
+        'security',
+    ];
+
+    /**
+     * Resolve the active dashboard tab from the request.
+     *
+     * Earlier versions used the second-argument default of get_query_var(),
+     * which is a known WordPress trap: WP only falls through to the default
+     * when the query var is *not in the parsed query_vars array at all*. As
+     * soon as a query var is registered with add_query_var(), WP often
+     * parses it as an empty string for unrelated requests on the same
+     * page — and an empty string counts as "set", so the default never
+     * fires. The result was $tab = '', the switch in render_tab() fell
+     * through to default:, and the user saw the overview tab even though
+     * the URL clearly carried ?tab=bank-payout.
+     *
+     * Resolve order (first non-empty wins):
+     *   1. matrix_tab query var (set by the /matrix-dashboard/{tab}/ rewrite).
+     *   2. ?tab=... query string (legacy / direct URL form).
+     *   3. 'overview' default.
+     *
+     * The result is whitelisted against self::$valid_tabs so an attacker
+     * can't drive the renderer down an unintended branch by passing a
+     * crafted slug.
+     *
+     * @return string A safe tab slug.
+     */
+    private function resolve_active_tab() {
+        $candidate = trim((string) get_query_var('matrix_tab', ''));
+        if ($candidate === '' && isset($_GET['tab'])) {
+            $candidate = trim(sanitize_text_field(wp_unslash($_GET['tab'])));
+        }
+        if ($candidate === '' || !in_array($candidate, self::$valid_tabs, true)) {
+            $candidate = 'overview';
+        }
+        return $candidate;
+    }
+
+    /**
+     * Build a sidebar nav URL for the given tab.
+     *
+     * Uses the pretty form /matrix-dashboard/{tab}/ which the rewrite rule
+     * registered in Matrix_MLM_Core::add_rewrite_rules() routes to
+     * matrix_tab=<tab>. Each tab therefore has a distinct URL path, which
+     * is the difference that makes page-cache layers (Cloudflare, LiteSpeed,
+     * WP Rocket, etc.) treat them as separate cache entries instead of
+     * collapsing every ?tab=X variant into one cached copy of the
+     * dashboard page — the failure mode that caused Bank Payout (and any
+     * other tab the cache had already captured as a different tab's
+     * content) to render the wrong panel after a sidebar click while a
+     * direct URL hit produced the right panel.
+     *
+     * The 'overview' tab is the only one that must NOT carry a slug; it
+     * lives at the bare /matrix-dashboard/ URL because the pretty-URL
+     * rewrite rule requires a non-empty segment after the slash.
+     *
+     * Falls back to ?tab=<tab> on installs running with the "Plain"
+     * permalink structure (empty permalink_structure option), since the
+     * rewrite rule is inert when WP isn't doing pretty URLs and a
+     * /bank-payout/ path would 404. The cache-collapse problem this fix
+     * targets doesn't apply to Plain permalink installs anyway, since
+     * those are typically not behind aggressive page caches.
+     *
+     * @param string $tab Tab slug.
+     * @return string Absolute URL.
+     */
+    public static function tab_url($tab) {
+        $base = home_url('/matrix-dashboard/');
+        if ($tab === 'overview' || $tab === '') {
+            return $base;
+        }
+        $structure = (string) get_option('permalink_structure', '');
+        if ($structure === '') {
+            return add_query_arg('tab', $tab, $base);
+        }
+        return home_url('/matrix-dashboard/' . $tab . '/');
+    }
+
     public function render_dashboard($atts) {
         if (!is_user_logged_in()) {
             return '<script>window.location.href="' . home_url('/matrix-login') . '";</script>';
@@ -19,7 +124,7 @@ class Matrix_MLM_User_Dashboard {
             return '<div class="matrix-alert matrix-alert-danger">' . __('Your account has been suspended. Please contact support.', 'matrix-mlm') . '</div>';
         }
 
-        $tab = get_query_var('matrix_tab', isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'overview');
+        $tab = $this->resolve_active_tab();
 
         ob_start();
         ?>
@@ -31,25 +136,25 @@ class Matrix_MLM_User_Dashboard {
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
                 </div>
                 <nav class="matrix-dashboard-nav">
-                    <a href="<?php echo home_url('/matrix-dashboard/'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw'); ?>" class="<?php echo $tab === 'withdraw' ? 'active' : ''; ?>"><span class="dashicons dashicons-upload"></span> <?php _e('Withdraw', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=withdraw-history'); ?>" class="<?php echo $tab === 'withdraw-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-media-spreadsheet"></span> <?php _e('Withdraw History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transactions', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=epin'); ?>" class="<?php echo $tab === 'epin' ? 'active' : ''; ?>"><span class="dashicons dashicons-tickets-alt"></span> <?php _e('E-Pin Recharge', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=transfer'); ?>" class="<?php echo $tab === 'transfer' ? 'active' : ''; ?>"><span class="dashicons dashicons-randomize"></span> <?php _e('Balance Transfer', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=bank-payout'); ?>" class="<?php echo $tab === 'bank-payout' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Bank Payout', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=virtual-wallet'); ?>" class="<?php echo $tab === 'virtual-wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-id-alt"></span> <?php _e('Virtual Wallet', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=card'); ?>" class="<?php echo $tab === 'card' ? 'active' : ''; ?>"><span class="dashicons dashicons-credit-card"></span> <?php _e('Verve Card', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=billing'); ?>" class="<?php echo $tab === 'billing' ? 'active' : ''; ?>"><span class="dashicons dashicons-smartphone"></span> <?php _e('Bill Payments', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=profile'); ?>" class="<?php echo $tab === 'profile' ? 'active' : ''; ?>"><span class="dashicons dashicons-admin-users"></span> <?php _e('Profile', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo home_url('/matrix-dashboard/?tab=security'); ?>" class="<?php echo $tab === 'security' ? 'active' : ''; ?>"><span class="dashicons dashicons-shield"></span> <?php _e('2FA Security', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('overview'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('withdraw'); ?>" class="<?php echo $tab === 'withdraw' ? 'active' : ''; ?>"><span class="dashicons dashicons-upload"></span> <?php _e('Withdraw', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('withdraw-history'); ?>" class="<?php echo $tab === 'withdraw-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-media-spreadsheet"></span> <?php _e('Withdraw History', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transactions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('epin'); ?>" class="<?php echo $tab === 'epin' ? 'active' : ''; ?>"><span class="dashicons dashicons-tickets-alt"></span> <?php _e('E-Pin Recharge', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('transfer'); ?>" class="<?php echo $tab === 'transfer' ? 'active' : ''; ?>"><span class="dashicons dashicons-randomize"></span> <?php _e('Balance Transfer', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('bank-payout'); ?>" class="<?php echo $tab === 'bank-payout' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Bank Payout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('virtual-wallet'); ?>" class="<?php echo $tab === 'virtual-wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-id-alt"></span> <?php _e('Virtual Wallet', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('card'); ?>" class="<?php echo $tab === 'card' ? 'active' : ''; ?>"><span class="dashicons dashicons-credit-card"></span> <?php _e('Verve Card', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('billing'); ?>" class="<?php echo $tab === 'billing' ? 'active' : ''; ?>"><span class="dashicons dashicons-smartphone"></span> <?php _e('Bill Payments', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('profile'); ?>" class="<?php echo $tab === 'profile' ? 'active' : ''; ?>"><span class="dashicons dashicons-admin-users"></span> <?php _e('Profile', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('security'); ?>" class="<?php echo $tab === 'security' ? 'active' : ''; ?>"><span class="dashicons dashicons-shield"></span> <?php _e('2FA Security', 'matrix-mlm'); ?></a>
                     <a href="<?php echo wp_logout_url(home_url()); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>

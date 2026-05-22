@@ -723,6 +723,27 @@ class Matrix_MLM_Core {
 
     public function add_rewrite_rules() {
         add_rewrite_rule('^matrix-dashboard/([^/]+)/?$', 'index.php?pagename=matrix-dashboard&matrix_tab=$matches[1]', 'top');
+
+        // Self-heal: if the persisted rewrite_rules cache predates this rule
+        // (e.g. the plugin was upgraded without re-activation, or a third
+        // party plugin called flush_rewrite_rules() between our register
+        // and persist), add_rewrite_rule() alone won't make the route
+        // resolvable — WP would 404 the pretty /matrix-dashboard/{tab}/
+        // URLs that Matrix_MLM_User_Dashboard::tab_url() now emits. Detect
+        // that state and trigger one flush, then mark a flag so we don't
+        // flush on every page load forever after.
+        //
+        // Skipped on Plain-permalink installs (empty permalink_structure)
+        // because rewrite rules are inert in that mode; tab_url() falls
+        // back to ?tab=X on those sites and the flush would be a no-op.
+        if ((string) get_option('permalink_structure', '') !== '' &&
+            (int) get_option('matrix_mlm_rewrite_rules_v2_flushed', 0) !== 1) {
+            $persisted = get_option('rewrite_rules');
+            if (!is_array($persisted) || !isset($persisted['^matrix-dashboard/([^/]+)/?$'])) {
+                flush_rewrite_rules(false);
+            }
+            update_option('matrix_mlm_rewrite_rules_v2_flushed', 1, false);
+        }
     }
 
     public function add_query_vars($vars) {
