@@ -1749,6 +1749,26 @@ class Matrix_MLM_Fintava {
             $this->resolve_wallet_id_from_customer($user_wallet);
             $user_wallet = $this->get_user_wallet($user_id);
 
+            // Step 1b: customer-endpoint enrichment. /wallet/details
+            // is unavailable on some Fintava live tiers (the
+            // negative-cache flag in get_virtual_wallet_details() is
+            // already documented), and even when reachable a few
+            // tiers don't include the partner-bank field. The
+            // customer endpoints (/customers/{id}, /customers/list,
+            // /customers/details) all return the wallet object with
+            // the partner bank populated, so they're the most
+            // reliable source — same chain the bank-payout flow's
+            // resolve_customer_id() already exercises. Only kicks in
+            // when bank_name is still the "Fintava" placeholder OR
+            // bank_code is still missing after Step 1; idempotent
+            // when both are already populated.
+            if (empty($user_wallet->bank_code)
+                || empty($user_wallet->bank_name)
+                || strcasecmp((string) $user_wallet->bank_name, 'Fintava') === 0) {
+                $this->enrich_partner_bank_metadata($user_wallet);
+                $user_wallet = $this->get_user_wallet($user_id);
+            }
+
             // Step 2: derive bank_code from bank_name. Fintava's
             // /wallet/details on some tiers returns `bank: "Globus
             // Bank"` but no `bankCode`/`bank_code` field. Looking up
@@ -2780,6 +2800,192 @@ class Matrix_MLM_Fintava {
         }
 
         return $resolved_wallet_id;
+    }
+
+    /**
+     * Enrich a wallet row's bank_name (and bank_code, when available) by
+     * consulting Fintava's customer endpoints. Used by the matrix→virtual
+     * transfer self-heal as a follow-up to resolve_wallet_id_from_customer()
+     * for tiers where /wallet/details either doesn't carry a bank name
+     * or isn't available at all.
+     *
+     * Fallback chain (first hit wins):
+     *
+     *   1. GET /customers/{customer_id} — if customer_id is on the row,
+     *      this is a single round-trip and returns the wallet object
+     *      under `data.wallet` (or `wallet`) with the partner bank name.
+     *
+     *   2. GET /customers/list + match by account_number — works
+     *      universally on tiers that expose the list (per the existing
+     *      diagnostic in get_customer_list()'s call sites). Each
+     *      customer's wallet is nested under `userInfo.wallet`.
+     *
+     *   3. GET /customers/details?phone=... — last resort when neither
+     *      customer_id nor a working list endpoint is available; uses
+     *      the phone on file. Same wallet-shape extraction as the list.
+     *
+     * Persistence rules mirror resolve_wallet_id_from_customer():
+     *   - bank_name overwrites only the empty string or the literal
+     *     "Fintava" placeholder. A real bank name on the row is
+     *     never clobbered (operators occasionally fix these by hand).
+     *   - bank_code is persisted when the local row is empty.
+     *
+     * Returns true when at least one field was persisted, false otherwise.
+     * Caller is expected to re-read the wallet row after.
+     *
+     * @param object $wallet_row The local matrix_fintava_wallets row.
+     * @return bool Whether any update was persisted.
+     */
+    private function enrich_partner_bank_metadata($wallet_row) {
+        if (empty($wallet_row->account_number)) {
+            return false;
+        }
+
+        $account_number = trim($wallet_row->account_number);
+
+        // Only run when there's something to enrich. If the row already
+        // has a real (non-"Fintava") bank_name AND a bank_code, every
+        // step below would be a no-op.
+        $has_real_bank_name =
+            !empty($wallet_row->bank_name)
+            && strcasecmp((string) $wallet_row->bank_name, 'Fintava') !== 0;
+        if ($has_real_bank_name && !empty($wallet_row->bank_code)) {
+            return false;
+        }
+
+        $resolved_bank_name = '';
+        $resolved_bank_code = '';
+
+        // Helper closure: pull bank_name + bank_code out of a wallet
+        // object regardless of which envelope shape Fintava sent.
+        $extract = function ($wallet_obj) use (&$resolved_bank_name, &$resolved_bank_code) {
+            if (!is_array($wallet_obj)) {
+                return;
+            }
+            if ($resolved_bank_name === '') {
+                $candidate = self::extract_bank_name($wallet_obj);
+                if ($candidate !== '' && strcasecmp(trim($candidate), 'Fintava') !== 0) {
+                    $resolved_bank_name = $candidate;
+                }
+            }
+            if ($resolved_bank_code === '') {
+                foreach (['bank_code', 'bankCode', 'sortCode', 'sort_code'] as $k) {
+                    if (!empty($wallet_obj[$k]) && is_scalar($wallet_obj[$k])) {
+                        $resolved_bank_code = (string) $wallet_obj[$k];
+                        break;
+                    }
+                }
+                // bank_code can also live nested under bank.code on
+                // the same tiers that nest the bank name there.
+                if ($resolved_bank_code === '' && isset($wallet_obj['bank']) && is_array($wallet_obj['bank'])) {
+                    foreach (['code', 'sortCode', 'sort_code', 'bankCode'] as $k) {
+                        if (!empty($wallet_obj['bank'][$k]) && is_scalar($wallet_obj['bank'][$k])) {
+                            $resolved_bank_code = (string) $wallet_obj['bank'][$k];
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Strategy 1: /customers/{customer_id}.
+        if (!empty($wallet_row->customer_id)) {
+            $customer = $this->get_customer($wallet_row->customer_id);
+            if (!is_wp_error($customer) && is_array($customer)) {
+                if (isset($customer['wallet']) && is_array($customer['wallet'])) {
+                    $extract($customer['wallet']);
+                }
+                if (isset($customer['userInfo']['wallet']) && is_array($customer['userInfo']['wallet'])) {
+                    $extract($customer['userInfo']['wallet']);
+                }
+                // Some tiers flatten the wallet fields onto the
+                // customer object itself.
+                $extract($customer);
+            }
+        }
+
+        // Strategy 2: /customers/list — match by account_number.
+        if ($resolved_bank_name === '' || $resolved_bank_code === '') {
+            $list = $this->get_customer_list();
+            if (!is_wp_error($list) && is_array($list)) {
+                foreach ($list as $customer) {
+                    if (!is_array($customer)) {
+                        continue;
+                    }
+                    // Same wallet-shape unwrap order as
+                    // resolve_customer_id() so the match logic stays
+                    // consistent across the gateway.
+                    if (isset($customer['userInfo']['wallet']) && is_array($customer['userInfo']['wallet'])) {
+                        $wallet_obj = $customer['userInfo']['wallet'];
+                    } elseif (isset($customer['wallet']) && is_array($customer['wallet'])) {
+                        $wallet_obj = $customer['wallet'];
+                    } else {
+                        $wallet_obj = $customer;
+                    }
+                    $remote_account = self::extract_account_number($wallet_obj);
+                    if ($remote_account === '' || trim($remote_account) !== $account_number) {
+                        continue;
+                    }
+                    $extract($wallet_obj);
+                    break;
+                }
+            }
+        }
+
+        // Strategy 3: /customers/details?phone=... — last resort.
+        if (($resolved_bank_name === '' || $resolved_bank_code === '') && !empty($wallet_row->customer_phone)) {
+            $phone = trim($wallet_row->customer_phone);
+            $response = $this->make_request('GET', '/customers/details?phone=' . urlencode($phone), null, null, true);
+            if (!is_wp_error($response)) {
+                $data = isset($response['data']) && is_array($response['data']) ? $response['data'] : $response;
+                $candidate_obj = null;
+                if (isset($data['userInfo']['wallet']) && is_array($data['userInfo']['wallet'])) {
+                    $candidate_obj = $data['userInfo']['wallet'];
+                } elseif (isset($data['wallet']) && is_array($data['wallet'])) {
+                    $candidate_obj = $data['wallet'];
+                } else {
+                    $candidate_obj = $data;
+                }
+                $remote_account = self::extract_account_number($candidate_obj);
+                if (empty($remote_account) || trim($remote_account) === $account_number) {
+                    $extract($candidate_obj);
+                }
+            }
+        }
+
+        // Persist whatever we resolved, respecting the same overwrite
+        // rules used by resolve_wallet_id_from_customer().
+        $update_data    = [];
+        $update_formats = [];
+
+        if ($resolved_bank_name !== ''
+            && (empty($wallet_row->bank_name)
+                || strcasecmp((string) $wallet_row->bank_name, 'Fintava') === 0)) {
+            $update_data['bank_name'] = $resolved_bank_name;
+            $update_formats[]         = '%s';
+        }
+
+        if ($resolved_bank_code !== '' && empty($wallet_row->bank_code)) {
+            $update_data['bank_code'] = $resolved_bank_code;
+            $update_formats[]         = '%s';
+        }
+
+        if (empty($update_data)) {
+            return false;
+        }
+
+        global $wpdb;
+        $update_data['updated_at'] = current_time('mysql');
+        $update_formats[]          = '%s';
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            $update_data,
+            ['id' => $wallet_row->id],
+            $update_formats,
+            ['%d']
+        );
+
+        return true;
     }
 
     /**
@@ -4897,16 +5103,96 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Extract the bank name from a Fintava payload (Fintava uses `bank` as a
-     * plain string in their virtual wallet response).
+     * Extract the bank name from a Fintava payload.
+     *
+     * Tolerated shapes:
+     *   - Scalar string under `bank` / `bank_name` / `bankName` — the
+     *     baseline shape Fintava's /virtual-wallet/generate returns.
+     *   - Nested object under any of the above keys, OR under
+     *     `partnerBank` / `partner_bank` / `bankInfo` / `bank_info`. On
+     *     at least one Fintava live tier the partner bank is sent as
+     *     `{ "bank": { "name": "Globus Bank", "code": "103" } }` — the
+     *     scalar-only check returned the array cast to "Array" and
+     *     downstream code stored that as the literal bank_name. Now we
+     *     drill into `name` / `bankName` / `displayName` / `institution`
+     *     / `institutionName` to find the actual string.
+     *   - As a last resort, we also walk one level into `wallet` /
+     *     `data` / `userInfo.wallet` so callers that pass an
+     *     un-unwrapped envelope (the customer endpoint, or the raw
+     *     /customers/list row) still get a hit without each call site
+     *     having to unwrap manually.
      */
     public static function extract_bank_name($obj) {
         if (!is_array($obj)) {
             return '';
         }
-        foreach (['bank', 'bank_name', 'bankName'] as $key) {
-            if (isset($obj[$key]) && $obj[$key] !== '') {
-                return (string) $obj[$key];
+
+        $direct_keys = ['bank', 'bank_name', 'bankName', 'partnerBank', 'partner_bank', 'bankInfo', 'bank_info'];
+        $nested_name_keys = ['name', 'bankName', 'displayName', 'institutionName', 'institution', 'fullName'];
+
+        foreach ($direct_keys as $key) {
+            if (!isset($obj[$key]) || $obj[$key] === '') {
+                continue;
+            }
+            $value = $obj[$key];
+            if (is_string($value) && trim($value) !== '') {
+                return $value;
+            }
+            if (is_scalar($value)) {
+                return (string) $value;
+            }
+            if (is_array($value)) {
+                foreach ($nested_name_keys as $sub) {
+                    if (isset($value[$sub]) && is_string($value[$sub]) && trim($value[$sub]) !== '') {
+                        return $value[$sub];
+                    }
+                }
+            }
+        }
+
+        // One-level envelope walk: try the same direct keys against
+        // each known wrapper. We stop at one level deep — Fintava
+        // never nests deeper than this for the partner-bank field.
+        foreach (['wallet', 'data', 'walletDetails', 'wallet_details'] as $wrap) {
+            if (isset($obj[$wrap]) && is_array($obj[$wrap])) {
+                $found = self::extract_bank_name_inner($obj[$wrap], $direct_keys, $nested_name_keys);
+                if ($found !== '') {
+                    return $found;
+                }
+            }
+        }
+        if (isset($obj['userInfo']['wallet']) && is_array($obj['userInfo']['wallet'])) {
+            $found = self::extract_bank_name_inner($obj['userInfo']['wallet'], $direct_keys, $nested_name_keys);
+            if ($found !== '') {
+                return $found;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Helper for extract_bank_name's one-level envelope walk. Kept
+     * separate so the recursive lookup logic isn't duplicated.
+     */
+    private static function extract_bank_name_inner(array $wallet_obj, array $direct_keys, array $nested_name_keys) {
+        foreach ($direct_keys as $key) {
+            if (!isset($wallet_obj[$key]) || $wallet_obj[$key] === '') {
+                continue;
+            }
+            $value = $wallet_obj[$key];
+            if (is_string($value) && trim($value) !== '') {
+                return $value;
+            }
+            if (is_scalar($value)) {
+                return (string) $value;
+            }
+            if (is_array($value)) {
+                foreach ($nested_name_keys as $sub) {
+                    if (isset($value[$sub]) && is_string($value[$sub]) && trim($value[$sub]) !== '') {
+                        return $value[$sub];
+                    }
+                }
             }
         }
         return '';
