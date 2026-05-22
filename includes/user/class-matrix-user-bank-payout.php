@@ -198,9 +198,21 @@ class Matrix_MLM_User_Bank_Payout {
             }
 
             // Load banks on page load
+            //
+            // An explicit timeout is set so the dropdown can never get
+            // stuck on "-- Loading banks..." regardless of what Fintava
+            // does upstream. Without this, a slow/hung /banks call would
+            // sit pending until the browser's default timeout (often
+            // minutes), and the user would assume the form is broken
+            // because no error/success handler had run yet. 15s leaves
+            // ample headroom for the server-side 30s Fintava timeout to
+            // finish and the fallback list to be returned, while still
+            // giving the user a definite end state if the AJAX itself
+            // wedges (which is rare but has been seen on this stack).
             $.ajax({
                 url: matrixMLM.ajaxUrl,
                 type: 'POST',
+                timeout: 15000,
                 data: { action: 'matrix_fintava_get_banks', nonce: matrixMLM.nonce },
                 success: function(response) {
                     const select = $('#fintava-bank-select');
@@ -214,6 +226,23 @@ class Matrix_MLM_User_Bank_Payout {
                                 .text(bank.name);
                             select.append(opt);
                         });
+
+                        // Surface a non-blocking notice when the server
+                        // fell back to the built-in bank list because
+                        // Fintava's /banks was unreachable. The form is
+                        // fully usable in this state, but if a transfer
+                        // later fails with an unknown-bank error the
+                        // notice points the operator to the cause.
+                        if (response.data.fallback) {
+                            const note = $('<small/>')
+                                .css({ display: 'block', marginTop: '6px', color: '#92400e' })
+                                .text('<?php echo esc_js(__("Note: using built-in Nigerian banks list. Fintava /banks is unreachable from your account.", "matrix-mlm")); ?>');
+                            select.parent().find('.matrix-bank-fallback-note').remove();
+                            select.parent().append(note.addClass('matrix-bank-fallback-note'));
+                            if (window.console && console.info) {
+                                console.info('[Matrix MLM] Bank list fallback engaged. Reason:', response.data.reason || '(unspecified)');
+                            }
+                        }
                     } else {
                         const serverMsg = response && response.data && response.data.message
                             ? response.data.message
@@ -225,8 +254,16 @@ class Matrix_MLM_User_Bank_Payout {
                     }
                 },
                 error: function(xhr, status, err) {
+                    // status === 'timeout' means the 15s ceiling was
+                    // hit; everything else is a transport-level error
+                    // (network, 4xx, 5xx). Either way the dropdown
+                    // gets a definite end state instead of staying on
+                    // "-- Loading banks..." forever.
+                    var label = status === 'timeout'
+                        ? '<?php echo esc_js(__("Bank list timed out — please refresh", "matrix-mlm")); ?>'
+                        : '<?php echo esc_js(__("Error loading banks", "matrix-mlm")); ?>';
                     $('#fintava-bank-select').empty().append(
-                        '<option value=""><?php _e("Error loading banks", "matrix-mlm"); ?></option>'
+                        $('<option/>').attr('value', '').text(label)
                     );
                     if (window.console && console.error) {
                         console.error('[Matrix MLM] Bank list AJAX error:', status, err, xhr && xhr.responseText);

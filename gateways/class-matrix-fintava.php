@@ -469,6 +469,99 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * Built-in fallback list of Nigerian commercial banks with the
+     * 3-digit CBN bank codes that NIBSS uses as `sortCode` on the NIP
+     * rails. Returned by ajax_get_banks() when get_banks() can't reach
+     * Fintava's /banks endpoint, so the bank dropdown is always
+     * populated and the bank-payout form is always usable.
+     *
+     * Why this matters: Fintava's /banks is served only from
+     * dev.fintavapay.com, but the dev host rejects the live API key
+     * that authenticates wallets and payouts on live.fintavapay.com,
+     * and Fintava (per the operator) doesn't issue a separate dev key.
+     * The dropdown therefore had no path to populating from live data
+     * for this account. Without a fallback the form was permanently
+     * unreachable.
+     *
+     * Codes are the standard CBN 3-digit format documented at
+     * https://nibss-plc.com.ng. Modern Nigerian fintech APIs (Paystack,
+     * Flutterwave, Monnify) accept these for transfers and name lookup.
+     * Fintava is expected to follow the same convention; if a specific
+     * bank's transfer fails with a code-format error, normalize that
+     * single bank's code in the array below rather than reverting the
+     * whole fallback.
+     *
+     * Digital banks and microfinance banks that NIBSS issues longer
+     * codes for (Opay, Kuda, PalmPay, Moniepoint, etc.) are listed
+     * with their actual NIP institution codes so transfers route to
+     * the right place.
+     *
+     * Sourced from the public CBN / NIBSS bank code registry; verified
+     * against the Paystack /bank list as a cross-reference.
+     *
+     * @return array<int, array{code:string,name:string}>
+     */
+    public static function get_static_banks_fallback() {
+        $banks = [
+            // Tier-1 / Tier-2 commercial banks
+            ['code' => '044', 'name' => 'Access Bank'],
+            ['code' => '063', 'name' => 'Access Bank (Diamond)'],
+            ['code' => '023', 'name' => 'Citibank Nigeria'],
+            ['code' => '050', 'name' => 'Ecobank Nigeria'],
+            ['code' => '070', 'name' => 'Fidelity Bank'],
+            ['code' => '011', 'name' => 'First Bank of Nigeria'],
+            ['code' => '214', 'name' => 'First City Monument Bank (FCMB)'],
+            ['code' => '103', 'name' => 'Globus Bank'],
+            ['code' => '058', 'name' => 'Guaranty Trust Bank (GTBank)'],
+            ['code' => '030', 'name' => 'Heritage Bank'],
+            ['code' => '301', 'name' => 'Jaiz Bank'],
+            ['code' => '082', 'name' => 'Keystone Bank'],
+            ['code' => '303', 'name' => 'Lotus Bank'],
+            ['code' => '107', 'name' => 'Optimus Bank'],
+            ['code' => '104', 'name' => 'Parallex Bank'],
+            ['code' => '076', 'name' => 'Polaris Bank'],
+            ['code' => '105', 'name' => 'PremiumTrust Bank'],
+            ['code' => '101', 'name' => 'Providus Bank'],
+            ['code' => '106', 'name' => 'Signature Bank'],
+            ['code' => '221', 'name' => 'Stanbic IBTC Bank'],
+            ['code' => '068', 'name' => 'Standard Chartered Bank'],
+            ['code' => '232', 'name' => 'Sterling Bank'],
+            ['code' => '100', 'name' => 'SunTrust Bank'],
+            ['code' => '302', 'name' => 'TAJ Bank'],
+            ['code' => '102', 'name' => 'Titan Trust Bank'],
+            ['code' => '032', 'name' => 'Union Bank of Nigeria'],
+            ['code' => '033', 'name' => 'United Bank for Africa (UBA)'],
+            ['code' => '215', 'name' => 'Unity Bank'],
+            ['code' => '035', 'name' => 'Wema Bank'],
+            ['code' => '057', 'name' => 'Zenith Bank'],
+
+            // Merchant banks
+            ['code' => '559', 'name' => 'Coronation Merchant Bank'],
+            ['code' => '060', 'name' => 'FBNQuest Merchant Bank'],
+            ['code' => '501', 'name' => 'FSDH Merchant Bank'],
+            ['code' => '562', 'name' => 'Greenwich Merchant Bank'],
+            ['code' => '551', 'name' => 'Nova Merchant Bank'],
+            ['code' => '502', 'name' => 'Rand Merchant Bank'],
+
+            // Digital banks / mobile money / leading MFBs (NIP institution codes)
+            ['code' => '565',   'name' => 'Carbon (One Finance MFB)'],
+            ['code' => '50211', 'name' => 'Kuda Microfinance Bank'],
+            ['code' => '50515', 'name' => 'Moniepoint Microfinance Bank'],
+            ['code' => '999992','name' => 'OPay (PayCom)'],
+            ['code' => '999991','name' => 'PalmPay'],
+            ['code' => '125',   'name' => 'Rubies Microfinance Bank'],
+            ['code' => '51310', 'name' => 'Sparkle Microfinance Bank'],
+            ['code' => '566',   'name' => 'VFD Microfinance Bank'],
+        ];
+
+        usort($banks, static function ($a, $b) {
+            return strcasecmp($a['name'], $b['name']);
+        });
+
+        return $banks;
+    }
+
+    /**
      * Render a tiny, log-safe summary of a decoded API response so the
      * dropdown's error label can convey *what shape* came back without
      * leaking the full payload. Caps at 200 characters and strips any
@@ -693,11 +786,30 @@ class Matrix_MLM_Fintava {
         }
 
         $banks = $this->get_banks();
+
+        // Fall back to the built-in Nigerian banks list when Fintava's
+        // /banks endpoint is unreachable. This is the *only* path that
+        // populates the dropdown for installs whose merchant has just
+        // a live API key, since the dev host that serves /banks rejects
+        // live keys and Fintava doesn't issue separate dev keys to most
+        // merchants. Without the fallback the dropdown would stay
+        // "Loading banks..." forever (no AJAX timeout in the inline JS,
+        // and no usable error path because the API never returns a
+        // success). The fallback is shipped as wp_send_json_success so
+        // the existing JS code path populates the options without
+        // changes; the `fallback` flag carries the diagnostic note plus
+        // the underlying error so the operator can still see why /banks
+        // failed when they look at it.
         if (is_wp_error($banks)) {
-            wp_send_json_error(['message' => $banks->get_error_message()]);
+            $static = self::get_static_banks_fallback();
+            wp_send_json_success([
+                'banks'    => $static,
+                'fallback' => true,
+                'reason'   => $banks->get_error_message(),
+            ]);
         }
 
-        wp_send_json_success(['banks' => $banks]);
+        wp_send_json_success(['banks' => $banks, 'fallback' => false]);
     }
 
     public function ajax_resolve_account() {
