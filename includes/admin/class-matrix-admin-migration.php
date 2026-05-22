@@ -15,6 +15,137 @@ class Matrix_MLM_Admin_Migration {
         add_action('admin_init', [$this, 'handle_export']);
     }
 
+    /**
+     * Admin notice surfacing the count of Fintava virtual wallets whose
+     * `bank_code` is NULL or empty, with a one-click link to the existing
+     * Backfill Bank Codes page.
+     *
+     * Lifecycle: registered globally from Matrix_MLM_Admin so it fires on
+     * every admin pageload (not just when the migration screen itself
+     * renders). Static so the registrar doesn't have to instantiate the
+     * full migration class — no point bootstrapping the import/export
+     * handlers just to render a single notice.
+     *
+     * Why this notice exists: PR #129 patched the runtime symptom (the
+     * "Network error" alert on Matrix → Virtual transfers), and #131
+     * relaxed the schema so NULL bank_code is no longer a hard write
+     * failure. But wallets that legitimately carry NULL bank_code still
+     * indicate that Fintava's self-heal chain didn't fully populate the
+     * partner-bank metadata at wallet-creation time. Other features that
+     * depend on bank_code (legacy /bank/credit/merchant calls, admin
+     * reports breaking down payouts by partner bank, future flows) may
+     * see incomplete data on those rows. The backfill page runs the same
+     * self-heal chain in bulk, so this notice exists to nudge operators
+     * to clean up legacy state without waiting for a user to hit an edge
+     * case.
+     *
+     * Scope:
+     *   - Capability gate: manage_matrix_mlm.
+     *   - Only renders on Matrix MLM admin screens (screen->id contains
+     *     'matrix-mlm') so the notice doesn't pollute unrelated admin
+     *     pages like Posts, Plugins, or third-party plugins' screens.
+     *   - Skipped on the migration screen itself, because the
+     *     bank_codes tab there already shows this count in a stat card
+     *     plus the action button — duplicating it as a notice on top of
+     *     the same page is noise.
+     *   - The count is transient-cached for 5 minutes so this query
+     *     does not run on every admin pageload. After a successful
+     *     backfill the count drops naturally on next refresh.
+     *   - is-dismissible so admins who want to defer the action can
+     *     close the notice for the current pageload. It will reappear
+     *     on the next pageload until the count actually reaches zero —
+     *     intentional, since "I dismissed this" should not be confused
+     *     with "I fixed the underlying issue."
+     */
+    public static function render_bank_code_admin_notice() {
+        if (!current_user_can('manage_matrix_mlm')) {
+            return;
+        }
+
+        // Skip the migration page itself — the dedicated tab there
+        // surfaces the same count in a stat card with an action button.
+        if (isset($_GET['page']) && $_GET['page'] === 'matrix-mlm-migration') {
+            return;
+        }
+
+        // Only render on Matrix MLM admin screens. get_current_screen()
+        // can be null very early in admin bootstrap (before the screen
+        // is decided), so bail in that case rather than rendering on
+        // every page.
+        if (!function_exists('get_current_screen')) {
+            return;
+        }
+        $screen = get_current_screen();
+        if (!$screen || strpos((string) $screen->id, 'matrix-mlm') === false) {
+            return;
+        }
+
+        $cache_key = 'matrix_mlm_null_bank_code_count';
+        $count = get_transient($cache_key);
+
+        if ($count === false) {
+            global $wpdb;
+            $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
+
+            // Defensive: on a fresh install the table may not exist yet
+            // (the activator hasn't run, or the schema bootstrap is on a
+            // later request). Skip silently rather than emitting a SQL
+            // error that the wpdberror suppression in matrix-mlm.php
+            // handles for AJAX but does not for regular admin pages.
+            $table_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                DB_NAME,
+                $wallets_table
+            ));
+            if ($table_exists === 0) {
+                return;
+            }
+
+            $count = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wallets_table}
+                  WHERE (bank_code IS NULL OR bank_code = '')
+                    AND account_number IS NOT NULL
+                    AND account_number <> ''"
+            );
+
+            // Cache short — long enough to spare admin pageloads from
+            // repeating the COUNT, short enough that the count drops
+            // off the notice quickly after a successful backfill.
+            set_transient($cache_key, $count, 5 * MINUTE_IN_SECONDS);
+        }
+
+        $count = (int) $count;
+        if ($count <= 0) {
+            return;
+        }
+
+        $url = admin_url('admin.php?page=matrix-mlm-migration&mtab=bank_codes');
+
+        echo '<div class="notice notice-warning is-dismissible">';
+        echo '<p>';
+        echo '<strong>' . esc_html__('Matrix MLM:', 'matrix-mlm') . '</strong> ';
+        printf(
+            wp_kses(
+                /* translators: 1: number of affected wallets, 2: URL to the bank-codes backfill page */
+                _n(
+                    '%1$d Fintava virtual wallet has incomplete partner-bank metadata (NULL <code>bank_code</code>). Matrix → Virtual transfers still work (Fintava routes them by NUBAN, no sortCode required), but the row is missing partner-bank information that other features may rely on. <a href="%2$s">Run the bulk backfill &rarr;</a>',
+                    '%1$d Fintava virtual wallets have incomplete partner-bank metadata (NULL <code>bank_code</code>). Matrix → Virtual transfers still work (Fintava routes them by NUBAN, no sortCode required), but the rows are missing partner-bank information that other features may rely on. <a href="%2$s">Run the bulk backfill &rarr;</a>',
+                    $count,
+                    'matrix-mlm'
+                ),
+                [
+                    'a'    => ['href' => []],
+                    'code' => [],
+                ]
+            ),
+            $count,
+            esc_url($url)
+        );
+        echo '</p>';
+        echo '</div>';
+    }
+
     public function render() {
         $tab = isset($_GET['mtab']) ? sanitize_text_field($_GET['mtab']) : 'import';
         ?>
