@@ -311,6 +311,26 @@ class Matrix_MLM_Fintava {
 
     /**
      * GET /banks
+     *
+     * Fetch and normalize the supported-bank list from Fintava. Resilient to
+     * three classes of upstream variation:
+     *
+     *   1. Envelope shape — different Fintava tiers and endpoint versions
+     *      have returned the array under `data` (current), `data.banks`,
+     *      `data.items`, `data.results`, or directly at the root. We try
+     *      each in order and return whichever yields a non-empty list.
+     *
+     *   2. Bank-object field names — historical responses have used
+     *      `sortCode`/`bankName`, `bankCode`/`bankName`, or plain
+     *      `code`/`name`. normalize_banks_list() accepts all three.
+     *
+     *   3. Outright failure — when nothing parses, the WP_Error message
+     *      includes the resolved environment label, the API base URL, and
+     *      a short payload snippet, so the failure mode is visible in the
+     *      dropdown itself without DevTools.
+     *
+     * On success the normalized array is cached for 24 hours under a
+     * versioned transient key so older raw-shape caches are bypassed.
      */
     public function get_banks() {
         // Cache key is versioned (`_v2`) so any transient stored in the
@@ -325,19 +345,79 @@ class Matrix_MLM_Fintava {
 
         $response = $this->make_request('GET', '/banks');
         if (is_wp_error($response)) {
-            return $response;
+            // Decorate with environment + base URL so the operator can tell
+            // at a glance which tier was hit when reading the dropdown error.
+            return new WP_Error(
+                $response->get_error_code(),
+                sprintf(
+                    /* translators: 1: original error, 2: environment label, 3: API base URL */
+                    __('%1$s [env=%2$s, base=%3$s]', 'matrix-mlm'),
+                    $response->get_error_message(),
+                    self::get_environment(),
+                    $this->base_url
+                )
+            );
         }
 
-        if (self::is_api_success($response) && isset($response['data'])) {
-            $normalized = self::normalize_banks_list($response['data']);
-            set_transient($cache_key, $normalized, DAY_IN_SECONDS);
-            return $normalized;
+        if (self::is_api_success($response)) {
+            // Try every shape Fintava has been observed to use. The first
+            // candidate that yields a non-empty normalized list wins.
+            $candidates = [];
+            if (isset($response['data'])) {
+                $candidates[] = $response['data'];
+                if (is_array($response['data'])) {
+                    foreach (['banks', 'items', 'results', 'list'] as $sub) {
+                        if (isset($response['data'][$sub])) {
+                            $candidates[] = $response['data'][$sub];
+                        }
+                    }
+                }
+            }
+            // Bare-array root shape ("data" is itself the list, or the API
+            // returned an unwrapped list).
+            $candidates[] = $response;
+            if (isset($response['banks'])) {
+                $candidates[] = $response['banks'];
+            }
+
+            foreach ($candidates as $candidate) {
+                $normalized = self::normalize_banks_list($candidate);
+                if (!empty($normalized)) {
+                    set_transient($cache_key, $normalized, DAY_IN_SECONDS);
+                    return $normalized;
+                }
+            }
+
+            // Endpoint returned 200 + success envelope, but none of the
+            // shapes we know about yielded a non-empty list. Surface a
+            // diagnostic the operator can act on without DevTools.
+            return new WP_Error(
+                'fintava_banks_empty',
+                sprintf(
+                    /* translators: 1: env, 2: base URL, 3: short payload snippet */
+                    __('Fintava /banks returned no usable bank list [env=%1$s, base=%2$s, payload=%3$s]', 'matrix-mlm'),
+                    self::get_environment(),
+                    $this->base_url,
+                    self::summarize_payload($response)
+                )
+            );
         }
 
-        return new WP_Error('fintava_error', self::normalize_api_message(
-            $response['message'] ?? null,
-            __('Failed to retrieve bank list', 'matrix-mlm')
-        ));
+        // is_api_success() said no — surface the upstream message plus the
+        // env/base so we can tell whether it's auth, rate-limit, or path.
+        return new WP_Error(
+            'fintava_error',
+            sprintf(
+                /* translators: 1: upstream message, 2: env, 3: base URL */
+                __('%1$s [env=%2$s, base=%3$s]', 'matrix-mlm'),
+                self::normalize_api_message(
+                    $response['message'] ?? null,
+                    __('Failed to retrieve bank list', 'matrix-mlm')
+                ),
+                self::get_environment(),
+                $this->base_url
+            )
+        );
     }
 
     /**
@@ -366,8 +446,8 @@ class Matrix_MLM_Fintava {
             if (!is_array($bank)) {
                 continue;
             }
-            $code = $bank['sortCode'] ?? $bank['bankCode'] ?? $bank['code'] ?? '';
-            $name = $bank['bankName'] ?? $bank['name']     ?? $bank['bank'] ?? '';
+            $code = $bank['sortCode'] ?? $bank['bankCode'] ?? $bank['code'] ?? $bank['nipCode'] ?? $bank['cbnCode'] ?? '';
+            $name = $bank['bankName'] ?? $bank['name']     ?? $bank['bank'] ?? $bank['institutionName'] ?? '';
             $code = is_scalar($code) ? trim((string) $code) : '';
             $name = is_scalar($name) ? trim((string) $name) : '';
             if ($code === '' || $name === '') {
@@ -382,6 +462,38 @@ class Matrix_MLM_Fintava {
         });
 
         return $out;
+    }
+
+    /**
+     * Render a tiny, log-safe summary of a decoded API response so the
+     * dropdown's error label can convey *what shape* came back without
+     * leaking the full payload. Caps at 200 characters and strips any
+     * embedded credentials/tokens by being JSON-encoded against an array
+     * of just the top-level keys plus the value type for each.
+     */
+    private static function summarize_payload($payload) {
+        if (!is_array($payload)) {
+            $type = gettype($payload);
+            return $type;
+        }
+        $shape = [];
+        foreach ($payload as $key => $value) {
+            if (is_array($value)) {
+                $shape[$key] = isset($value[0]) || empty($value)
+                    ? sprintf('array[%d]', count($value))
+                    : 'object{' . implode(',', array_slice(array_keys($value), 0, 5)) . '}';
+            } else {
+                $shape[$key] = gettype($value);
+            }
+        }
+        $json = wp_json_encode($shape);
+        if ($json === false) {
+            return 'unencodable';
+        }
+        if (strlen($json) > 200) {
+            $json = substr($json, 0, 197) . '...';
+        }
+        return $json;
     }
 
     /**
@@ -2821,17 +2933,39 @@ class Matrix_MLM_Fintava {
         $response = wp_remote_request($url, $args);
 
         if (is_wp_error($response)) {
-            return $response;
+            // Decorate transport errors (DNS, TLS, timeout) with the URL we
+            // were trying to hit so callers can tell whether the WordPress
+            // host has outbound connectivity to Fintava at all.
+            return new WP_Error(
+                $response->get_error_code(),
+                sprintf(
+                    /* translators: 1: original transport error, 2: target URL */
+                    __('%1$s (url=%2$s)', 'matrix-mlm'),
+                    $response->get_error_message(),
+                    $url
+                )
+            );
         }
 
         $status_code = wp_remote_retrieve_response_code($response);
-        $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
+        $raw_body = wp_remote_retrieve_body($response);
+        $body_decoded = json_decode($raw_body, true);
 
         if ($status_code >= 400) {
             $error_message = self::normalize_api_message(
-                $body_decoded['message'] ?? null,
+                is_array($body_decoded) ? ($body_decoded['message'] ?? null) : null,
                 sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint)
             );
+            // Include a short body snippet so non-JSON or HTML error pages
+            // (Cloudflare interstitials, WAF blocks, gateway 502s) are
+            // identifiable from the dropdown alone.
+            $snippet = '';
+            if (!is_array($body_decoded) && is_string($raw_body) && $raw_body !== '') {
+                $snippet = substr(trim(preg_replace('/\s+/', ' ', wp_strip_all_tags($raw_body))), 0, 120);
+                if ($snippet !== '') {
+                    $error_message .= sprintf(' [body=%s]', $snippet);
+                }
+            }
             return new WP_Error('fintava_api_error', $error_message);
         }
 
