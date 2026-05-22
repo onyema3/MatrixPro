@@ -21,8 +21,15 @@ class Matrix_MLM_User_Dashboard {
         'overview',
         'deposits',
         'deposit-history',
-        'withdraw',
-        'withdraw-history',
+        // 'withdraw' and 'withdraw-history' were retired when the
+        // Withdraw form was folded into the consolidated Wallet page
+        // ("Transfer to Bank") — the standalone tabs duplicated UI
+        // and history that the Wallet page already surfaces. Slugs
+        // are intentionally absent from the whitelist so any legacy
+        // bookmark falls through to overview rather than rendering
+        // an orphaned form. The Matrix_MLM_User_Withdrawals class
+        // is kept on disk because admin-side withdrawal management
+        // and the bank-payout flow still depend on its helpers.
         'transactions',
         'referrals',
         'genealogy',
@@ -137,9 +144,7 @@ class Matrix_MLM_User_Dashboard {
                     <a href="<?php echo self::tab_url('overview'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('withdraw'); ?>" class="<?php echo $tab === 'withdraw' ? 'active' : ''; ?>"><span class="dashicons dashicons-upload"></span> <?php _e('Withdraw', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('withdraw-history'); ?>" class="<?php echo $tab === 'withdraw-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-media-spreadsheet"></span> <?php _e('Withdraw History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transactions', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo self::tab_url('transactions'); ?>" class="<?php echo $tab === 'transactions' ? 'active' : ''; ?>"><span class="dashicons dashicons-money-alt"></span> <?php _e('Transaction History', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
@@ -180,12 +185,9 @@ class Matrix_MLM_User_Dashboard {
             case 'deposit-history':
                 (new Matrix_MLM_User_Deposits())->render_history($user_id);
                 break;
-            case 'withdraw':
-                (new Matrix_MLM_User_Withdrawals())->render_form($user_id);
-                break;
-            case 'withdraw-history':
-                (new Matrix_MLM_User_Withdrawals())->render_history($user_id);
-                break;
+            // 'withdraw' / 'withdraw-history' cases removed — see the
+            // comment on $valid_tabs. The "Transfer to Bank" pane on
+            // the Wallet tab is the user-facing replacement.
             case 'transactions':
                 $this->render_transactions($user_id);
                 break;
@@ -309,7 +311,7 @@ class Matrix_MLM_User_Dashboard {
         $transactions = $wallet->get_transactions($user_id, 50);
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         ?>
-        <h2><?php _e('Transaction Logs', 'matrix-mlm'); ?></h2>
+        <h2><?php _e('Transaction History', 'matrix-mlm'); ?></h2>
         <table class="matrix-table">
             <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Post Balance', 'matrix-mlm'); ?></th><th><?php _e('Description', 'matrix-mlm'); ?></th></tr></thead>
             <tbody>
