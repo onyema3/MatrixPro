@@ -477,11 +477,20 @@ class Matrix_MLM_Admin_Settings {
         if ($fintava->is_active()):
             $balance = $fintava->get_merchant_balance();
             if (!is_wp_error($balance)):
+                // Defense-in-depth: get_merchant_balance() should always
+                // hand back scalar floats, but a legacy/edge response shape
+                // could still leave a nested array here. number_format()
+                // throws a fatal TypeError on PHP 8+ when handed an array,
+                // so coerce to a numeric value before formatting.
+                $balance_value = $balance['available_balance'] ?? $balance['balance'] ?? 0;
+                if (!is_scalar($balance_value) || !is_numeric($balance_value)) {
+                    $balance_value = 0;
+                }
         ?>
         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 16px 20px; margin: 15px 0 25px;">
             <h3 style="margin: 0 0 8px; color: #065f46;"><?php _e('Merchant Wallet Balance', 'matrix-mlm'); ?></h3>
             <p style="font-size: 28px; font-weight: 700; color: #059669; margin: 0;">
-                <?php echo esc_html($currency_symbol . number_format($balance['available_balance'] ?? $balance['balance'] ?? 0, 2)); ?>
+                <?php echo esc_html($currency_symbol . number_format((float) $balance_value, 2)); ?>
             </p>
             <small style="color: #065f46;"><?php _e('Available for payouts', 'matrix-mlm'); ?></small>
         </div>

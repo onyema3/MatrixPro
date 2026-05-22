@@ -728,6 +728,18 @@ class Matrix_MLM_Fintava {
 
     /**
      * GET /merchant/balance — current merchant wallet balance.
+     *
+     * Fintava's merchant balance endpoint has been observed in three shapes
+     * depending on the tier and whether the response was wrapped in `data`:
+     *
+     *   1. { status: true, data: { balance: 1000, available_balance: 1000 } }
+     *   2. { status: true, data: { balance: { available_balance: 1000 } } }
+     *   3. { balance: 1000, available_balance: 1000 }                  (legacy)
+     *
+     * We funnel every shape through normalize_balance_payload() so callers
+     * always receive a flat array of scalar floats. This prevents downstream
+     * formatters (number_format, sprintf %f) from receiving an array — which
+     * is a fatal TypeError on PHP 8+.
      */
     public function get_merchant_balance() {
         $response = $this->make_request('GET', '/merchant/balance');
@@ -735,18 +747,38 @@ class Matrix_MLM_Fintava {
             return $response;
         }
 
-        if (self::is_api_success($response) && isset($response['data'])) {
-            return $response['data'];
+        // Pick the best candidate payload:
+        //  - prefer the wrapped 'data' object on a successful response
+        //  - fall back to the root for legacy unwrapped responses
+        $payload = null;
+        if (self::is_api_success($response) && isset($response['data']) && is_array($response['data'])) {
+            $payload = $response['data'];
+        } elseif (is_array($response)) {
+            $payload = $response;
         }
 
-        // Some response shapes return balance fields directly at the root.
-        if (isset($response['balance'])) {
-            return [
-                'balance' => floatval($response['balance']),
-                'currency' => $response['currency'] ?? 'NGN',
-                'available_balance' => floatval($response['available_balance'] ?? $response['balance']),
-                'ledger_balance' => floatval($response['ledger_balance'] ?? $response['balance']),
-            ];
+        if (is_array($payload)) {
+            // Try the payload at its current level first. If no balance fields
+            // are present, drill one level into the most common nesting keys
+            // ('balance', 'wallet', 'merchant') to handle shape #2 above.
+            $normalized = $this->normalize_balance_payload($payload);
+            if ($normalized === null) {
+                foreach (['balance', 'wallet', 'merchant', 'merchantWallet', 'merchant_wallet'] as $key) {
+                    if (isset($payload[$key]) && is_array($payload[$key])) {
+                        $normalized = $this->normalize_balance_payload($payload[$key]);
+                        if ($normalized !== null) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if ($normalized !== null) {
+                // Backwards-compatible 'balance' key for callers that look it
+                // up before 'available_balance' (e.g. the admin settings tab).
+                $normalized['balance'] = $normalized['available_balance'];
+                return $normalized;
+            }
         }
 
         return new WP_Error(
