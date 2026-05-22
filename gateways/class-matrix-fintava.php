@@ -337,94 +337,127 @@ class Matrix_MLM_Fintava {
         // code path (raw Fintava shape, or a normalized list cached against
         // the wrong base URL) is bypassed on upgrade. Bump the suffix again
         // if the normalized shape or the source host ever changes.
-        $cache_key = 'matrix_fintava_banks_list_v3';
+        //
+        // Bumped to v4 when /banks routing changed from "always dev" to
+        // "configured env first, other env as fallback" - old v3 caches
+        // were keyed against responses from the wrong host for live-tier
+        // installs and would otherwise persist after this rollout.
+        $cache_key = 'matrix_fintava_banks_list_v4';
         $cached = get_transient($cache_key);
 
         if ($cached !== false) {
             return $cached;
         }
 
-        // Fintava only serves the bank list from the dev host
-        // (https://dev.fintavapay.com/api/dev/banks), regardless of which
-        // tier the merchant uses for wallets and payouts. Hard-route the
-        // call there so it works on installs configured for the live
-        // environment too. The same secret key authenticates both hosts.
-        $banks_base_url = self::DEV_BASE_URL;
-        // Use lean headers (Authorization + Accept only) so the request
-        // shape matches the public Fintava documentation exactly. The
-        // dev /banks endpoint has been observed to 401 live-tier
-        // merchants when the request also carries a `Merchant-Id`
-        // header, even with an otherwise valid bearer token.
-        $response = $this->make_request('GET', '/banks', null, $banks_base_url, true);
-        if (is_wp_error($response)) {
-            // Decorate with the resolved base URL so the operator can tell
-            // at a glance which host was hit when reading the dropdown error.
-            return new WP_Error(
-                $response->get_error_code(),
-                sprintf(
-                    /* translators: 1: original error, 2: API base URL the call was routed to */
-                    __('%1$s [base=%2$s]', 'matrix-mlm'),
-                    $response->get_error_message(),
-                    $banks_base_url
-                )
-            );
+        // Try /banks against the configured environment first, then fall
+        // back to the OTHER environment if that fails. Older code hard-
+        // routed every /banks call to the dev host on the assumption that
+        // Fintava only served the bank list from there - which broke
+        // production installs configured for live with a live-only API
+        // key, since the dev host returned "Invalid API Key" for those
+        // (confirmed via the admin diagnostic on at least one merchant).
+        //
+        // The new order:
+        //   1. $this->base_url (whatever the admin selected - usually live).
+        //      Live-tier merchants with live keys hit live /banks first
+        //      and almost always succeed.
+        //   2. The opposite environment as a fallback. Covers the
+        //      historical case where /banks was only served from the dev
+        //      host, and the rare reverse case (a dev-tier install where
+        //      the live host happens to serve the list).
+        //
+        // Both attempts use lean headers (Authorization + Accept only) so
+        // the request shape matches Fintava's public docs exactly - the
+        // extra Merchant-Id header that goes on wallet/transfer calls has
+        // been observed to cause 401s on /banks on at least one tier.
+        $primary_base  = $this->base_url;
+        $fallback_base = $primary_base === self::LIVE_BASE_URL ? self::DEV_BASE_URL : self::LIVE_BASE_URL;
+        $bases_to_try  = [$primary_base];
+        if ($fallback_base !== $primary_base) {
+            $bases_to_try[] = $fallback_base;
         }
 
-        if (self::is_api_success($response)) {
-            // Try every shape Fintava has been observed to use. The first
-            // candidate that yields a non-empty normalized list wins.
-            $candidates = [];
-            if (isset($response['data'])) {
-                $candidates[] = $response['data'];
-                if (is_array($response['data'])) {
-                    foreach (['banks', 'items', 'results', 'list'] as $sub) {
-                        if (isset($response['data'][$sub])) {
-                            $candidates[] = $response['data'][$sub];
+        // Per-host error breakdown. Populated only when a host fails so
+        // the aggregated error message at the bottom can name every
+        // host that was tried and what each one returned - the single
+        // most useful diagnostic for the "Invalid API Key on dev,
+        // succeeds on live" pattern.
+        $errors_per_base = [];
+
+        foreach ($bases_to_try as $banks_base_url) {
+            $response = $this->make_request('GET', '/banks', null, $banks_base_url, true);
+
+            if (is_wp_error($response)) {
+                $errors_per_base[$banks_base_url] = $response->get_error_message();
+                continue;
+            }
+
+            if (self::is_api_success($response)) {
+                // Try every shape Fintava has been observed to use. The
+                // first candidate that yields a non-empty normalized list
+                // wins.
+                $candidates = [];
+                if (isset($response['data'])) {
+                    $candidates[] = $response['data'];
+                    if (is_array($response['data'])) {
+                        foreach (['banks', 'items', 'results', 'list'] as $sub) {
+                            if (isset($response['data'][$sub])) {
+                                $candidates[] = $response['data'][$sub];
+                            }
                         }
                     }
                 }
-            }
-            // Bare-array root shape ("data" is itself the list, or the API
-            // returned an unwrapped list).
-            $candidates[] = $response;
-            if (isset($response['banks'])) {
-                $candidates[] = $response['banks'];
-            }
-
-            foreach ($candidates as $candidate) {
-                $normalized = self::normalize_banks_list($candidate);
-                if (!empty($normalized)) {
-                    set_transient($cache_key, $normalized, DAY_IN_SECONDS);
-                    return $normalized;
+                // Bare-array root shape ("data" is itself the list, or
+                // the API returned an unwrapped list).
+                $candidates[] = $response;
+                if (isset($response['banks'])) {
+                    $candidates[] = $response['banks'];
                 }
+
+                foreach ($candidates as $candidate) {
+                    $normalized = self::normalize_banks_list($candidate);
+                    if (!empty($normalized)) {
+                        set_transient($cache_key, $normalized, DAY_IN_SECONDS);
+                        return $normalized;
+                    }
+                }
+
+                // Endpoint returned 200 + success envelope, but none of
+                // the shapes we know about yielded a non-empty list.
+                // Treat as a "soft" failure for this host - record the
+                // diagnostic and try the next host. If every host
+                // produces this same shape, the aggregated error below
+                // gives the operator a payload sketch per host.
+                $errors_per_base[$banks_base_url] = sprintf(
+                    /* translators: %s: short payload-shape snippet */
+                    __('returned 200 but no usable bank list (payload=%s)', 'matrix-mlm'),
+                    self::summarize_payload($response)
+                );
+                continue;
             }
 
-            // Endpoint returned 200 + success envelope, but none of the
-            // shapes we know about yielded a non-empty list. Surface a
-            // diagnostic the operator can act on without DevTools.
-            return new WP_Error(
-                'fintava_banks_empty',
-                sprintf(
-                    /* translators: 1: API base URL the call was routed to, 2: short payload snippet */
-                    __('Fintava /banks returned no usable bank list [base=%1$s, payload=%2$s]', 'matrix-mlm'),
-                    $banks_base_url,
-                    self::summarize_payload($response)
-                )
+            // is_api_success() said no - record the upstream message and
+            // try the next host. Live keys against the dev host typically
+            // surface here as "Invalid API Key".
+            $errors_per_base[$banks_base_url] = self::normalize_api_message(
+                $response['message'] ?? null,
+                __('Failed to retrieve bank list', 'matrix-mlm')
             );
         }
 
-        // is_api_success() said no — surface the upstream message plus the
-        // base URL so we can tell whether it's auth, rate-limit, or path.
+        // Every host failed. Build a single WP_Error that names every
+        // host we tried and what each one returned, so the dropdown
+        // fallback note shows the per-host breakdown verbatim.
+        $parts = [];
+        foreach ($errors_per_base as $base => $msg) {
+            $parts[] = sprintf('%s: %s', $base, $msg);
+        }
         return new WP_Error(
             'fintava_error',
             sprintf(
-                /* translators: 1: upstream message, 2: API base URL the call was routed to */
-                __('%1$s [base=%2$s]', 'matrix-mlm'),
-                self::normalize_api_message(
-                    $response['message'] ?? null,
-                    __('Failed to retrieve bank list', 'matrix-mlm')
-                ),
-                $banks_base_url
+                /* translators: %s: per-host failure breakdown ("base: message | base: message") */
+                __('Fintava /banks failed on every host tried. %s', 'matrix-mlm'),
+                implode(' | ', $parts)
             )
         );
     }
@@ -3167,13 +3200,20 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * TEMPORARY admin diagnostic — fetch GET /banks (against the dev host
-     * that actually serves it) and return the raw response. Lets an
-     * operator confirm whether the bank list endpoint is reachable from
-     * this WordPress install at all, and what envelope shape Fintava is
-     * returning today.
+     * TEMPORARY admin diagnostic - exercise the same configured-env-first
+     * /banks routing the production get_banks() uses, and return the raw
+     * response from whichever host won (or, if every host failed, the
+     * combined per-host diagnostic). Lets an operator confirm whether the
+     * bank list endpoint is reachable from this WordPress install at all,
+     * and what envelope shape Fintava is returning today, without having
+     * to crack open server logs.
      *
-     * Output shape mirrors debug_balance_raw().
+     * Output shape extends debug_balance_raw() with:
+     *   - 'tried':    array<string,string|array> per-host breakdown when
+     *                 multiple bases were probed before a winner was found.
+     *   - 'winning_base': string|null, the base URL whose response is
+     *                 returned in body_raw / body_decoded (null if every
+     *                 host failed).
      *
      * @return array Diagnostic payload (never a WP_Error).
      */
@@ -3181,11 +3221,42 @@ class Matrix_MLM_Fintava {
         if (empty($this->secret_key)) {
             return ['note' => 'no secret_key on the gateway instance', 'has_key' => false];
         }
-        // /banks is dev-host-only; mirror get_banks() routing so the
-        // diagnostic exercises the exact same call path the real bank
-        // dropdown uses. Lean headers match production behaviour after
-        // the Merchant-Id-on-/banks fix.
-        return $this->debug_raw_request('GET', self::DEV_BASE_URL . '/banks', true);
+
+        // Mirror get_banks() routing exactly: configured env first, other
+        // env as fallback. Surface the per-host breakdown so the operator
+        // can see at a glance which host succeeded (and therefore which
+        // tier their key is good for) and which host returned what error.
+        $primary_base  = $this->base_url;
+        $fallback_base = $primary_base === self::LIVE_BASE_URL ? self::DEV_BASE_URL : self::LIVE_BASE_URL;
+        $bases_to_try  = [$primary_base];
+        if ($fallback_base !== $primary_base) {
+            $bases_to_try[] = $fallback_base;
+        }
+
+        $tried = [];
+        foreach ($bases_to_try as $base) {
+            $result = $this->debug_raw_request('GET', $base . '/banks', true);
+            $tried[$base] = $result;
+
+            // 2xx wins immediately - return the raw result decorated
+            // with the per-host trail and the winning base URL.
+            if (isset($result['http_code']) && $result['http_code'] >= 200 && $result['http_code'] < 300) {
+                $result['tried']         = $tried;
+                $result['winning_base']  = $base;
+                return $result;
+            }
+        }
+
+        // Every host failed. Return the last attempt's envelope (so the
+        // operator still gets a body_raw / http_code to look at) plus
+        // the per-host breakdown.
+        $last = end($tried);
+        if (!is_array($last)) {
+            $last = [];
+        }
+        $last['tried']        = $tried;
+        $last['winning_base'] = null;
+        return $last;
     }
 
     /**

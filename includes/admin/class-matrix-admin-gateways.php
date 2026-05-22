@@ -578,6 +578,16 @@ class Matrix_MLM_Admin_Gateways {
         // that still read it stay aligned with the toggle on this page.
         update_option('matrix_mlm_fintava_enabled', intval($_POST['fintava_status'] ?? 0));
 
+        // Bust the cached Fintava /banks list so a key/env change takes
+        // effect on the very next page load instead of being shadowed by a
+        // 24-hour transient. Without this, an operator who fixes the API
+        // key would still see the stale "fallback engaged" note for up to
+        // a day. Both versioned keys are deleted so we cover the rollout
+        // window where some installs may still hold a v3 transient and
+        // others have moved to v4.
+        delete_transient('matrix_fintava_banks_list_v3');
+        delete_transient('matrix_fintava_banks_list_v4');
+
         echo '<div class="notice notice-success"><p>' . __('Fintava Pay settings saved successfully!', 'matrix-mlm') . '</p></div>';
     }
 }
