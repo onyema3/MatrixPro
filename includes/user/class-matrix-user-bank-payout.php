@@ -159,11 +159,35 @@ class Matrix_MLM_User_Bank_Payout {
                 <!-- Amount -->
                 <div class="matrix-form-group">
                     <label><?php _e('Amount', 'matrix-mlm'); ?> (<?php echo $currency; ?>)</label>
+                    <?php
+                    // Compute the practical ceiling for the amount field
+                    // up-front so the charge is already subtracted from
+                    // what the user is allowed to type. The previous
+                    // ceiling was min($max_payout, $balance), which
+                    // looked right but actually let the user type
+                    // exactly the available balance — at which point
+                    // (amount + charge) > balance and the submit button
+                    // silently stayed disabled with no visible reason.
+                    // This was the most common "transfer button is not
+                    // active" scenario reported.
+                    //
+                    // For percent charges the upper bound is balance/(1+rate);
+                    // for fixed it's balance - charge. Floor to two
+                    // decimals to stay aligned with step="0.01".
+                    if ($charge_type === 'percent') {
+                        $rate = floatval($charge_value) / 100;
+                        $balance_ceiling = (1 + $rate) > 0 ? floatval($balance) / (1 + $rate) : floatval($balance);
+                    } else {
+                        $balance_ceiling = max(0, floatval($balance) - floatval($charge_value));
+                    }
+                    $balance_ceiling = floor($balance_ceiling * 100) / 100;
+                    $effective_max   = min($max_payout, $balance_ceiling);
+                    ?>
                     <input type="number" name="amount" id="fintava-amount"
-                           min="<?php echo $min_payout; ?>" 
-                           max="<?php echo min($max_payout, $balance); ?>" 
+                           min="<?php echo $min_payout; ?>"
+                           max="<?php echo $effective_max; ?>"
                            step="0.01" required
-                           placeholder="<?php echo sprintf(__('Min %s, Max %s', 'matrix-mlm'), number_format($min_payout), number_format($max_payout)); ?>">
+                           placeholder="<?php echo sprintf(__('Min %s, Max %s', 'matrix-mlm'), number_format($min_payout), number_format($effective_max, 2)); ?>">
                     <div class="matrix-charge-info" id="fintava-charge-info" style="display:none;">
                         <small>
                             <?php _e('Charge:', 'matrix-mlm'); ?> <span id="fintava-charge-amount">-</span> | 
@@ -185,6 +209,22 @@ class Matrix_MLM_User_Bank_Payout {
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="fintava-submit-btn" disabled>
                     <?php _e('Transfer to Bank', 'matrix-mlm'); ?>
                 </button>
+                <!--
+                    Hint slot: when the submit button is disabled, the JS
+                    populates this with the specific reason (no bank
+                    picked, no 10-digit account, account not verified,
+                    no amount, amount + charge > balance, etc.). Without
+                    this slot users had no way to tell which of the four
+                    submit-gate conditions was failing, which led to the
+                    "transfer button is not active" reports — the form
+                    silently waited on a verification step or balance
+                    check the user couldn't see.
+
+                    Always present in the DOM (no display:none) so the
+                    JS can render it without reflows; it stays visually
+                    empty whenever the button is enabled.
+                -->
+                <div id="fintava-submit-status" class="matrix-submit-status" role="status" aria-live="polite"></div>
             </form>
         </div>
 
@@ -271,6 +311,8 @@ class Matrix_MLM_User_Bank_Payout {
         .matrix-badge-processing { background: #eff6ff; color: #1e40af; }
         .matrix-badge-refunded { background: #f5f3ff; color: #7c3aed; }
         .matrix-payout-reason { margin-top:6px; padding:6px 8px; background:#fef2f2; border-left:3px solid #dc2626; border-radius:3px; font-size:11px; line-height:1.4; color:#991b1b; word-break:break-word; max-width:280px; }
+        .matrix-submit-status { margin-top:8px; min-height:18px; font-size:13px; line-height:1.4; color:#92400e; text-align:center; }
+        .matrix-submit-status:empty { display:none; }
         </style>
 
         <script>
@@ -405,6 +447,12 @@ class Matrix_MLM_User_Bank_Payout {
 
                 if (accNum.length === 10 && bankCode) {
                     clearTimeout(resolveTimeout);
+                    // Render an interim "Waiting on account verification…"
+                    // hint immediately so the 500ms debounce doesn't leave
+                    // the status line stuck on the previous reason (e.g.
+                    // "Enter a 10-digit account number." right after the
+                    // user types the 10th digit).
+                    updateSubmitButton();
                     resolveTimeout = setTimeout(function() {
                         resolveAccount(accNum, bankCode);
                     }, 500);
@@ -426,7 +474,14 @@ class Matrix_MLM_User_Bank_Payout {
             $('#fintava-bank-select').on('change', function() {
                 $('#fintava-bank-name').val($(this).find(':selected').data('name') || '');
                 tryResolveAccount();
-            });            function resolveAccount(accountNumber, bankCode) {
+            });
+
+            // Render the initial hint so the user sees "Select a bank to
+            // continue." immediately on page load instead of staring at a
+            // disabled button with no explanation. updateSubmitButton()
+            // is also called from every state-changing handler below, so
+            // this is the only "initial" call needed.
+            updateSubmitButton();            function resolveAccount(accountNumber, bankCode) {
                 $('#fintava-resolving').show();
                 $('#fintava-verify-failed').hide();
                 $('#fintava-account-name-group').hide();
@@ -600,15 +655,57 @@ class Matrix_MLM_User_Bank_Payout {
                 updateSubmitButton();
             });
 
-            // Enable/disable submit button
+            // Enable/disable submit button + render the "why disabled?"
+            // hint. The four gate conditions are checked in order from
+            // top-of-form to bottom so the message points to the field
+            // the user should fix next, rather than e.g. shouting about
+            // amount when no bank is even picked yet. Once everything
+            // passes, the hint clears and the button enables.
             function updateSubmitButton() {
-                const amount = parseFloat($('#fintava-amount').val()) || 0;
+                const amount   = parseFloat($('#fintava-amount').val()) || 0;
                 const bankCode = $('#fintava-bank-select').val();
-                const charge = chargeType === 'percent' ? (amount * chargeValue / 100) : chargeValue;
-                const total = amount + charge;
+                const charge   = chargeType === 'percent' ? (amount * chargeValue / 100) : chargeValue;
+                const total    = amount + charge;
+                const accNum   = ($('#fintava-account-number').val() || '').trim();
 
-                const enabled = accountVerified && amount > 0 && bankCode && total <= balance;
-                $('#fintava-submit-btn').prop('disabled', !enabled);
+                const $status = $('#fintava-submit-status');
+                let reason = '';
+
+                if (!bankCode) {
+                    reason = '<?php echo esc_js(__("Select a bank to continue.", "matrix-mlm")); ?>';
+                } else if (accNum.length !== 10) {
+                    reason = '<?php echo esc_js(__("Enter a 10-digit account number.", "matrix-mlm")); ?>';
+                } else if (!accountVerified) {
+                    // Two distinct sub-states here, surfaced separately
+                    // because the recovery action is different. If the
+                    // manual-entry box is open the user just needs to
+                    // type a name; if it isn't, verification is either
+                    // still in flight or the inline notice with the
+                    // override button is already showing above.
+                    if (manualOverride) {
+                        reason = '<?php echo esc_js(__("Type the account holder name to continue.", "matrix-mlm")); ?>';
+                    } else if ($('#fintava-resolving').is(':visible')) {
+                        reason = '<?php echo esc_js(__("Verifying account…", "matrix-mlm")); ?>';
+                    } else if ($('#fintava-verify-failed').is(':visible')) {
+                        reason = '<?php echo esc_js(__("Click \"Continue without verification\" above to proceed.", "matrix-mlm")); ?>';
+                    } else {
+                        reason = '<?php echo esc_js(__("Waiting on account verification…", "matrix-mlm")); ?>';
+                    }
+                } else if (amount <= 0) {
+                    reason = '<?php echo esc_js(__("Enter the amount to transfer.", "matrix-mlm")); ?>';
+                } else if (total > balance) {
+                    // The most common silent-disable path — user types
+                    // exactly their balance, and (amount + charge) ties
+                    // up just over the available number. The amount
+                    // input's max attribute now subtracts the charge
+                    // upfront so this should rarely fire, but it's kept
+                    // as a runtime guard for typed-into-place values
+                    // that bypass the max attribute (e.g., paste).
+                    reason = '<?php echo esc_js(__("Amount + charge exceeds your available balance.", "matrix-mlm")); ?>';
+                }
+
+                $status.text(reason);
+                $('#fintava-submit-btn').prop('disabled', reason !== '');
             }
 
             // Submit transfer
