@@ -269,17 +269,21 @@ class Matrix_MLM_User_Wallet {
      * by render_transaction_history() in render()) because it's a
      * read-only ledger, not an action.
      *
-     * The "Transfer to Bank" button gets the .is-active class server-
-     * side and its matching pane (see render_panes()) is rendered
-     * without the [hidden] attribute. This makes Bank Payout the
-     * default-open action on page load — it's the action users
-     * actually came here to take ("get my money out to my bank"),
-     * so showing the form upfront saves a click. The other two
-     * buttons stay collapsed and the existing toggle JS continues
-     * to handle switching between them; clicking the active Bank
-     * button still collapses its pane (the wasOpen branch in the
-     * click handler), so we haven't broken the "click again to
-     * close" affordance.
+     * No button starts in the .is-active state and all three panes
+     * (see render_panes()) are rendered with the [hidden] attribute,
+     * so the wallet page lands in a clean overview state on page
+     * load: balance cards on top, three action buttons below them,
+     * transaction history at the bottom, and no form competing for
+     * attention. Clicking any of the three buttons reveals its
+     * matching pane (see the click handler in render_scripts());
+     * clicking the active button again collapses the pane back to
+     * the overview state. An earlier revision marked "Transfer to
+     * Bank" .is-active server-side to save users a click, but that
+     * left the bank-payout form expanded by default below the
+     * overview cards (and below the *button* labelled "Transfer to
+     * Bank"), which read as duplicate UI — so we're back to the
+     * symmetric "all collapsed" default that the other two actions
+     * already used.
      */
     private function render_action_buttons() {
         ?>
@@ -298,7 +302,7 @@ class Matrix_MLM_User_Wallet {
                     <small><?php esc_html_e('Send funds to another user\'s Matrix wallet (internal transfer)', 'matrix-mlm'); ?></small>
                 </span>
             </button>
-            <button type="button" class="matrix-wallet-action-btn is-active" data-target="bank">
+            <button type="button" class="matrix-wallet-action-btn" data-target="bank">
                 <span class="matrix-wallet-action-icon dashicons dashicons-bank"></span>
                 <span class="matrix-wallet-action-text">
                     <strong><?php esc_html_e('Transfer to Bank', 'matrix-mlm'); ?></strong>
@@ -323,7 +327,7 @@ class Matrix_MLM_User_Wallet {
             <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
         </section>
 
-        <section class="matrix-wallet-pane" data-pane="bank">
+        <section class="matrix-wallet-pane" data-pane="bank" hidden>
             <?php
             // Embed the existing Bank Payout flow body (form + history +
             // its own JS). $skip_header=true suppresses the legacy H2
@@ -333,14 +337,16 @@ class Matrix_MLM_User_Wallet {
             // submit-status hint, and "Clear failed transactions"
             // toolbar — none of which need to be re-implemented here.
             //
-            // No [hidden] attribute on this pane: Bank Payout is the
-            // default-open action on page load. See the docblock on
-            // render_action_buttons() for the rationale (matched with
-            // .is-active on the corresponding button). The existing
-            // toggle JS keeps "click to close" working: clicking the
-            // already-active Bank button reads wasOpen=true from the
-            // is-active class and re-hides the pane, exactly as if it
-            // had been opened by user click.
+            // [hidden] by default, like the other two panes. The form
+            // only appears when the user clicks the "Transfer to Bank"
+            // action button above (see the click handler in
+            // render_scripts() — it removes [hidden] from the matching
+            // pane and adds .is-active to the matching button). An
+            // earlier revision left this pane visible on page load with
+            // .is-active on the matching button, but that read as a
+            // duplicated "Transfer to Bank" UI (the action button label
+            // is identical to the pane's own submit button label), so
+            // we're back to the symmetric "all collapsed" default.
             (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
             ?>
         </section>
