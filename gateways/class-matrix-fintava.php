@@ -1737,6 +1737,23 @@ class Matrix_MLM_Fintava {
         // older installs reasonably have NULLs here that no prior
         // flow surfaced.
         if (empty($user_wallet->bank_code)) {
+            // Capture per-step outcomes for the diagnostic log emitted by
+            // the final guard below. The log line tells support _which_
+            // self-heal step regressed when bank_code can't be resolved —
+            // without it the only signal is the user-facing error string,
+            // which doesn't tell us whether /wallet/details returned an
+            // unexpected shape, the customer endpoints are gated off, or
+            // the row's bank_name simply isn't in get_static_banks_fallback().
+            $diag = [
+                'user_id'           => (int) $user_id,
+                'wallet_row_id'     => (int) $user_wallet->id,
+                'account_number'    => (string) $user_wallet->account_number,
+                'wallet_id_present' => !empty($user_wallet->wallet_id),
+                'customer_id_present' => !empty($user_wallet->customer_id),
+                'bank_name_initial' => (string) $user_wallet->bank_name,
+                'bank_code_initial' => (string) $user_wallet->bank_code,
+            ];
+
             // Step 1: GET /wallet/details?accountNumber=... — also
             // backfills wallet_id, customer_id, and (importantly for
             // older rows) bank_name when Fintava returns the partner
@@ -1746,8 +1763,13 @@ class Matrix_MLM_Fintava {
             // wallet_id miss it may have updated bank_name from the
             // schema-default "Fintava" placeholder to the real
             // partner bank, which is what Step 2 below needs.
-            $this->resolve_wallet_id_from_customer($user_wallet);
-            $user_wallet = $this->get_user_wallet($user_id);
+            $step1_result = $this->resolve_wallet_id_from_customer($user_wallet);
+            $user_wallet  = $this->get_user_wallet($user_id);
+            $diag['step1_wallet_details'] = is_wp_error($step1_result)
+                ? 'err:' . $step1_result->get_error_code()
+                : 'ok';
+            $diag['step1_bank_name'] = (string) $user_wallet->bank_name;
+            $diag['step1_bank_code'] = (string) $user_wallet->bank_code;
 
             // Step 1b: customer-endpoint enrichment. /wallet/details
             // is unavailable on some Fintava live tiers (the
@@ -1762,11 +1784,15 @@ class Matrix_MLM_Fintava {
             // when bank_name is still the "Fintava" placeholder OR
             // bank_code is still missing after Step 1; idempotent
             // when both are already populated.
+            $diag['step1b_enrich'] = 'skipped_already_resolved';
             if (empty($user_wallet->bank_code)
                 || empty($user_wallet->bank_name)
                 || strcasecmp((string) $user_wallet->bank_name, 'Fintava') === 0) {
-                $this->enrich_partner_bank_metadata($user_wallet);
-                $user_wallet = $this->get_user_wallet($user_id);
+                $enrich_changed = $this->enrich_partner_bank_metadata($user_wallet);
+                $user_wallet    = $this->get_user_wallet($user_id);
+                $diag['step1b_enrich']    = $enrich_changed ? 'persisted' : 'noop';
+                $diag['step1b_bank_name'] = (string) $user_wallet->bank_name;
+                $diag['step1b_bank_code'] = (string) $user_wallet->bank_code;
             }
 
             // Step 2: derive bank_code from bank_name. Fintava's
@@ -1778,20 +1804,45 @@ class Matrix_MLM_Fintava {
             // uses for sortCode validation, so a name-match here is
             // safe to persist. Persist on success so subsequent
             // transfers skip the derivation entirely.
+            $diag['step2_derive'] = 'skipped_already_resolved';
             if (empty($user_wallet->bank_code) && !empty($user_wallet->bank_name)) {
-                $candidate = $this->derive_bank_code_from_name($user_wallet->bank_name);
-                if ($candidate !== '') {
-                    global $wpdb;
-                    $wpdb->update(
-                        $wpdb->prefix . 'matrix_fintava_wallets',
-                        ['bank_code' => $candidate, 'updated_at' => current_time('mysql')],
-                        ['id' => $user_wallet->id],
-                        ['%s', '%s'],
-                        ['%d']
-                    );
-                    $user_wallet = $this->get_user_wallet($user_id);
+                $bank_name_for_lookup = (string) $user_wallet->bank_name;
+                $diag['step2_input']  = $bank_name_for_lookup;
+                if (strcasecmp($bank_name_for_lookup, 'Fintava') === 0) {
+                    // The placeholder is intentionally never a valid
+                    // sortCode-lookup key (Fintava is a fintech, not a
+                    // CBN bank). Surface that explicitly in the log so
+                    // support knows the chain stalled because Steps 1
+                    // and 1b never resolved a real partner bank.
+                    $diag['step2_derive']    = 'skipped_placeholder_name';
+                    $diag['step2_candidate'] = '';
+                } else {
+                    $candidate = $this->derive_bank_code_from_name($bank_name_for_lookup);
+                    $diag['step2_candidate'] = (string) $candidate;
+                    if ($candidate !== '') {
+                        global $wpdb;
+                        $wpdb->update(
+                            $wpdb->prefix . 'matrix_fintava_wallets',
+                            ['bank_code' => $candidate, 'updated_at' => current_time('mysql')],
+                            ['id' => $user_wallet->id],
+                            ['%s', '%s'],
+                            ['%d']
+                        );
+                        $user_wallet = $this->get_user_wallet($user_id);
+                        $diag['step2_derive'] = 'persisted';
+                    } else {
+                        $diag['step2_derive'] = 'no_static_match';
+                    }
                 }
+            } elseif (empty($user_wallet->bank_code)) {
+                // bank_code still empty AND bank_name empty — nothing to
+                // look up. Distinct from "no_static_match" because the
+                // operator's recovery is different (set bank_name first).
+                $diag['step2_derive'] = 'skipped_empty_name';
             }
+
+            $diag['bank_name_final'] = (string) $user_wallet->bank_name;
+            $diag['bank_code_final'] = (string) $user_wallet->bank_code;
         }
 
         // Final guard: Fintava's /bank/credit/merchant validator
@@ -1805,6 +1856,17 @@ class Matrix_MLM_Fintava {
         // jump straight to "the wallet is on $bank_name, look up its
         // sortCode" without round-tripping the user.
         if (empty($user_wallet->bank_code)) {
+            // Structured diagnostic. Single grep-friendly prefix
+            // ('matrix-mlm[fintava] missing_bank_code_after_self_heal')
+            // and the rest is JSON so it survives unchanged through
+            // error_log shipping pipelines. Emitted only on the
+            // failure path; the success path stays silent. Guarded
+            // by isset() because the self-heal block is skipped
+            // entirely when bank_code was already populated at entry
+            // (and we should never reach this point in that case).
+            if (isset($diag)) {
+                error_log('matrix-mlm[fintava] missing_bank_code_after_self_heal ' . wp_json_encode($diag));
+            }
             wp_send_json_error([
                 'message' => sprintf(
                     /* translators: %s: bank name on the wallet row, e.g., "Globus Bank" */
