@@ -2167,12 +2167,29 @@ class Matrix_MLM_Fintava {
             );
         }
 
-        // Persist wallet_id back to the local row
+        // Extract customer_id from the response — Fintava may return it as
+        // userInfo.id, customerId, or customer_id depending on the endpoint.
+        $resolved_customer_id = '';
+        if (isset($details['userInfo']['id'])) {
+            $resolved_customer_id = $details['userInfo']['id'];
+        } elseif (isset($details['customerId'])) {
+            $resolved_customer_id = $details['customerId'];
+        } elseif (isset($details['customer_id'])) {
+            $resolved_customer_id = $details['customer_id'];
+        }
+
+        // Persist wallet_id (and customer_id if found) back to the local row
         $update_data = [
             'wallet_id'  => $resolved_wallet_id,
             'updated_at' => current_time('mysql'),
         ];
         $update_formats = ['%s', '%s'];
+
+        // Save customer_id if available and not already on the row
+        if (!empty($resolved_customer_id) && empty($wallet_row->customer_id)) {
+            $update_data['customer_id'] = $resolved_customer_id;
+            $update_formats[] = '%s';
+        }
 
         // Save bank_code if available
         $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? null;
