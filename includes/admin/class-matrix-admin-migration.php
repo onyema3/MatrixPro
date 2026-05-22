@@ -41,15 +41,18 @@ class Matrix_MLM_Admin_Migration {
      *
      * Scope:
      *   - Capability gate: manage_matrix_mlm.
-     *   - Only renders on Matrix MLM admin screens (screen->id contains
-     *     'matrix-mlm') so the notice doesn't pollute unrelated admin
-     *     pages like Posts, Plugins, or third-party plugins' screens.
-     *   - Skipped on the migration screen itself, because the
-     *     bank_codes tab there already shows this count in a stat card
-     *     plus the action button — duplicating it as a notice on top of
-     *     the same page is noise.
+     *   - Only renders on the Matrix MLM Dashboard
+     *     (admin.php?page=matrix-mlm). Previously this fired on every
+     *     Matrix MLM admin screen, which made operators see the same
+     *     advisory while doing unrelated work (managing users, plans,
+     *     reviewing tickets, etc.). The Dashboard is the natural home
+     *     for cross-cutting "things you should know about your
+     *     install" notices, and the Migration > Backfill Bank Codes
+     *     tab already surfaces the same count inline as a stat card
+     *     plus action button, so operators who navigate there directly
+     *     don't lose visibility.
      *   - The count is transient-cached for 5 minutes so this query
-     *     does not run on every admin pageload. After a successful
+     *     does not run on every Dashboard pageload. After a successful
      *     backfill the count drops naturally on next refresh.
      *   - is-dismissible so admins who want to defer the action can
      *     close the notice for the current pageload. It will reappear
@@ -62,21 +65,13 @@ class Matrix_MLM_Admin_Migration {
             return;
         }
 
-        // Skip the migration page itself — the dedicated tab there
-        // surfaces the same count in a stat card with an action button.
-        if (isset($_GET['page']) && $_GET['page'] === 'matrix-mlm-migration') {
-            return;
-        }
-
-        // Only render on Matrix MLM admin screens. get_current_screen()
-        // can be null very early in admin bootstrap (before the screen
-        // is decided), so bail in that case rather than rendering on
-        // every page.
-        if (!function_exists('get_current_screen')) {
-            return;
-        }
-        $screen = get_current_screen();
-        if (!$screen || strpos((string) $screen->id, 'matrix-mlm') === false) {
+        // Scope to the Matrix MLM Dashboard only. The Dashboard is
+        // registered via add_menu_page() with slug 'matrix-mlm', so a
+        // simple page-slug check is more robust than inspecting the
+        // screen ID (which differs between the top-level menu page and
+        // its submenus). Also avoids running get_current_screen() too
+        // early in admin bootstrap.
+        if (!isset($_GET['page']) || $_GET['page'] !== 'matrix-mlm') {
             return;
         }
 
