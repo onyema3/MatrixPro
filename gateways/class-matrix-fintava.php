@@ -2005,9 +2005,20 @@ class Matrix_MLM_Fintava {
      * @return array|WP_Error Array of customer records on success.
      */
     public function get_customer_list() {
-        // Try multiple endpoint paths — Fintava uses /customers on some tiers
-        // and /merchant/customers on others.
-        $paths = ['/customers', '/merchant/customers'];
+        // Path candidates, in priority order:
+        //   1. /customers/list   — current Fintava live endpoint, confirmed
+        //      via the admin "system endpoints" diagnostic. This is the one
+        //      that actually returns the customer array on this tier.
+        //   2. /customers        — older / alternate spelling, kept for
+        //      back-compat in case a different tier exposes only this.
+        //   3. /merchant/customers — historic spelling on a few tiers.
+        //
+        // Earlier the gateway only tried #2 and #3, neither of which is
+        // served on the current live tier — so resolve_customer_id()
+        // Strategy 2 was effectively dead code, and the user-facing error
+        // misleadingly claimed "/customers/list" had been searched even
+        // though it never was.
+        $paths = ['/customers/list', '/customers', '/merchant/customers'];
         $response = null;
         $last_error = null;
 
@@ -2032,9 +2043,35 @@ class Matrix_MLM_Fintava {
             return $last_error ?: new WP_Error('fintava_customer_list_error', __('Could not retrieve customer list', 'matrix-mlm'));
         }
 
-        // Fintava wraps the list in { data: [...], status: 200, message: "successful" }
-        if (isset($response['data']) && is_array($response['data'])) {
-            return $response['data'];
+        // Envelope shapes seen across Fintava tiers:
+        //   - { data: [ ...customers... ], status, message }
+        //   - { data: { items:    [...] }, status, message }
+        //   - { data: { customers:[...] }, status, message }
+        //   - { data: { results:  [...] }, status, message }
+        //   - { data: { data:     [...] }, status, message }   (double-wrap)
+        //   - bare array at root
+        if (isset($response['data'])) {
+            $data = $response['data'];
+            if (is_array($data)) {
+                // Pure list (numerically indexed at offset 0).
+                if (isset($data[0]) || empty($data)) {
+                    return $data;
+                }
+                // Object envelope — drill into each known key in turn.
+                foreach (['items', 'customers', 'results', 'list', 'data'] as $sub) {
+                    if (isset($data[$sub]) && is_array($data[$sub])) {
+                        return $data[$sub];
+                    }
+                }
+                // Last resort: data is an associative object but no known
+                // sub-key matched. Treat its values as the list (Fintava
+                // has been observed returning a map keyed by customer ID
+                // on at least one tier).
+                $values = array_values($data);
+                if (!empty($values) && is_array($values[0])) {
+                    return $values;
+                }
+            }
         }
 
         // Bare array fallback
