@@ -24,6 +24,12 @@
  * - GET  /wallet/details?accountNumber=...    - Internal: look up our virtual wallet by account number
  * - GET  /name/enquiry?accountNumber=...&sortCode=... - External name enquiry (3rd-party banks)
  * - GET  /banks                               - List supported banks
+ *
+ * /banks fallback host:
+ * - GET  https://api.fintavapay.com/api/v1/banks - Public/unified list
+ *   tried after the configured environment host and its opposite when
+ *   both reject the request, since the env-specific hosts have been
+ *   observed to fail with "Invalid API Key" on at least one tier.
  */
 
 if (!defined('ABSPATH')) {
@@ -40,6 +46,18 @@ class Matrix_MLM_Fintava {
      */
     const LIVE_BASE_URL = 'https://live.fintavapay.com/api/dev';
     const DEV_BASE_URL  = 'https://dev.fintavapay.com/api/dev';
+
+    /**
+     * Unified public host for the bank list. Used only as a fallback in
+     * get_banks() when both the live and dev env-specific hosts reject
+     * the configured API key (the "Invalid API Key on dev, no live key
+     * issued" pattern documented on get_static_banks_fallback()).
+     *
+     * Versioned at /api/v1 rather than /api/dev because this host is the
+     * public, environment-agnostic surface — it does not follow the
+     * /api/dev convention the env-specific hosts use.
+     */
+    const PUBLIC_BANKS_URL = 'https://api.fintavapay.com/api/v1';
 
     /**
      * Default base URL when no environment option is set yet. Intentionally
@@ -342,7 +360,13 @@ class Matrix_MLM_Fintava {
         // "configured env first, other env as fallback" - old v3 caches
         // were keyed against responses from the wrong host for live-tier
         // installs and would otherwise persist after this rollout.
-        $cache_key = 'matrix_fintava_banks_list_v4';
+        //
+        // Bumped to v5 when the unified PUBLIC_BANKS_URL host
+        // (https://api.fintavapay.com/api/v1) was added as a third
+        // fallback. v4 caches could hold the negative WP_Error result
+        // from the previous two-host chain on installs where both env
+        // hosts rejected the live key, masking the new host's success.
+        $cache_key = 'matrix_fintava_banks_list_v5';
         $cached = get_transient($cache_key);
 
         if ($cached !== false) {
@@ -365,16 +389,30 @@ class Matrix_MLM_Fintava {
         //      historical case where /banks was only served from the dev
         //      host, and the rare reverse case (a dev-tier install where
         //      the live host happens to serve the list).
+        //   3. PUBLIC_BANKS_URL (https://api.fintavapay.com/api/v1) as a
+        //      last network attempt. This is the unified, environment-
+        //      agnostic host; tried last because it's only useful for the
+        //      narrow case where both env hosts reject the merchant's
+        //      key. If it succeeds, the per-host error breakdown below
+        //      isn't surfaced - we just cache the result and return.
         //
-        // Both attempts use lean headers (Authorization + Accept only) so
-        // the request shape matches Fintava's public docs exactly - the
-        // extra Merchant-Id header that goes on wallet/transfer calls has
-        // been observed to cause 401s on /banks on at least one tier.
+        // All three attempts use lean headers (Authorization + Accept
+        // only) so the request shape matches Fintava's public docs
+        // exactly - the extra Merchant-Id header that goes on
+        // wallet/transfer calls has been observed to cause 401s on
+        // /banks on at least one tier.
         $primary_base  = $this->base_url;
         $fallback_base = $primary_base === self::LIVE_BASE_URL ? self::DEV_BASE_URL : self::LIVE_BASE_URL;
         $bases_to_try  = [$primary_base];
         if ($fallback_base !== $primary_base) {
             $bases_to_try[] = $fallback_base;
+        }
+        // Public unified host. Guarded against duplication in case a
+        // future MATRIX_FINTAVA_API_BASE_URL override happens to point
+        // at the same host - de-duping keeps the per-host error log
+        // unambiguous if the call fails.
+        if (!in_array(self::PUBLIC_BANKS_URL, $bases_to_try, true)) {
+            $bases_to_try[] = self::PUBLIC_BANKS_URL;
         }
 
         // Per-host error breakdown. Populated only when a host fails so
