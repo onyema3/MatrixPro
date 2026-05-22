@@ -484,9 +484,20 @@ class Matrix_MLM_User_Virtual_Wallet {
     }
 
     /**
-     * Render create wallet form
+     * Render create wallet form.
+     *
+     * Public so the consolidated Wallet page (Matrix_MLM_User_Wallet)
+     * can delegate to this same first-time-onboarding flow without
+     * forking the markup. The legacy /virtual-wallet/ tab is gone from
+     * the sidebar but the create form's HTML, JS handler, and AJAX
+     * action (matrix_fintava_create_virtual_wallet) all still live
+     * here as the canonical implementation. Visibility is the only
+     * change — there are no callers passing extra args, and no
+     * security-relevant side effects in this method (it just renders
+     * markup; the actual create call is gated server-side in
+     * Matrix_MLM_Fintava::ajax_create_virtual_wallet).
      */
-    private function render_create_form($user, $meta) {
+    public function render_create_form($user, $meta) {
         ?>
         <div class="matrix-create-wallet-intro">
             <h3><?php _e('Create Your Fintava Wallet', 'matrix-mlm'); ?></h3>

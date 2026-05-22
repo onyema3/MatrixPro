@@ -93,6 +93,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-transfer.p
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-tickets.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-bank-payout.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-virtual-wallet.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-card.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-billing.php';
 

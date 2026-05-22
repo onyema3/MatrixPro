@@ -29,7 +29,7 @@ class Matrix_MLM_User_Card {
         <?php elseif (!$has_wallet): ?>
         <div class="matrix-alert matrix-alert-info">
             <?php _e('You need to create a Fintava wallet before requesting a card.', 'matrix-mlm'); ?>
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=virtual-wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Wallet', 'matrix-mlm'); ?></a>
+            <a href="<?php echo Matrix_MLM_User_Dashboard::tab_url('wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Wallet', 'matrix-mlm'); ?></a>
         </div>
         <?php else: ?>
             <?php $this->render_request_form($user_id); ?>
