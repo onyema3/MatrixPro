@@ -141,9 +141,9 @@ class Matrix_MLM_Admin_Healthcare {
                         <th style="width:60px;"><?php _e('ID', 'matrix-mlm'); ?></th>
                         <th><?php _e('User', 'matrix-mlm'); ?></th>
                         <th><?php _e('Applicant', 'matrix-mlm'); ?></th>
-                        <th style="width:110px;"><?php _e('Plan', 'matrix-mlm'); ?></th>
-                        <th style="width:110px;"><?php _e('Coverage', 'matrix-mlm'); ?></th>
-                        <th style="width:80px;"><?php _e('Deps.', 'matrix-mlm'); ?></th>
+                        <th style="width:100px;"><?php _e('Type', 'matrix-mlm'); ?></th>
+                        <th style="width:130px;"><?php _e('Hospital State', 'matrix-mlm'); ?></th>
+                        <th><?php _e('Hospital', 'matrix-mlm'); ?></th>
                         <th style="width:120px;"><?php _e('Status', 'matrix-mlm'); ?></th>
                         <th style="width:160px;"><?php _e('Submitted', 'matrix-mlm'); ?></th>
                         <th style="width:90px;"><?php _e('Actions', 'matrix-mlm'); ?></th>
@@ -167,6 +167,11 @@ class Matrix_MLM_Admin_Healthcare {
                         <?php foreach ($rows as $row):
                             $view_url = add_query_arg(['action' => 'view', 'id' => $row->id], $base_url);
                             $name     = trim((string) $row->first_name . ' ' . (string) $row->last_name);
+                            $type     = isset($row->applicant_type) && $row->applicant_type !== ''
+                                ? (string) $row->applicant_type
+                                : 'adult';
+                            $hospital = (string) ($row->preferred_hospital ?? '');
+                            $hstate   = (string) ($row->hospital_state ?? '');
                         ?>
                         <tr>
                             <td><?php echo intval($row->id); ?></td>
@@ -182,9 +187,13 @@ class Matrix_MLM_Admin_Healthcare {
                                 <?php endif; ?>
                             </td>
                             <td><?php echo esc_html($name); ?></td>
-                            <td><?php echo esc_html(self::format_enum($row->plan_tier)); ?></td>
-                            <td><?php echo esc_html(self::format_enum($row->coverage_type)); ?></td>
-                            <td><?php echo intval($row->dependants_count); ?></td>
+                            <td>
+                                <span class="matrix-badge matrix-badge-<?php echo esc_attr($type); ?>">
+                                    <?php echo esc_html(self::format_enum($type)); ?>
+                                </span>
+                            </td>
+                            <td><?php echo $hstate !== '' ? esc_html($hstate) : '<em style="color:#9ca3af;">—</em>'; ?></td>
+                            <td><?php echo $hospital !== '' ? esc_html($hospital) : '<em style="color:#9ca3af;">—</em>'; ?></td>
                             <td>
                                 <span class="matrix-badge matrix-badge-<?php echo esc_attr($row->status); ?>">
                                     <?php echo esc_html(self::format_enum($row->status)); ?>
@@ -280,12 +289,27 @@ class Matrix_MLM_Admin_Healthcare {
             <div style="display:grid;grid-template-columns:2fr 1fr;gap:24px;margin-top:16px;align-items:start;">
                 <div>
                     <?php
+                    self::render_applicant_type_card($row);
                     self::render_personal_card($row);
-                    self::render_identification_card($row);
-                    self::render_plan_card($row);
-                    self::render_medical_card($row);
-                    self::render_nok_card($row);
-                    self::render_documents_card($row);
+                    if (self::has_parent_info($row)) {
+                        self::render_parent_card($row);
+                    }
+                    self::render_hospital_card($row);
+                    if (self::has_identification($row)) {
+                        self::render_identification_card($row);
+                    }
+                    if (self::has_plan_info($row)) {
+                        self::render_plan_card($row);
+                    }
+                    if (self::has_medical_info($row)) {
+                        self::render_medical_card($row);
+                    }
+                    if (self::has_nok_info($row)) {
+                        self::render_nok_card($row);
+                    }
+                    if (self::has_documents($row)) {
+                        self::render_documents_card($row);
+                    }
                     ?>
                 </div>
 
@@ -395,24 +419,187 @@ class Matrix_MLM_Admin_Healthcare {
     }
 
     private static function render_personal_card($row) {
+        $type = isset($row->applicant_type) && $row->applicant_type !== ''
+            ? (string) $row->applicant_type
+            : 'adult';
+        $is_dependant = $type === 'dependant';
         ?>
         <div class="matrix-admin-card" style="margin-bottom:16px;">
-            <h2 style="margin-top:0;"><?php _e('Personal Information', 'matrix-mlm'); ?></h2>
+            <h2 style="margin-top:0;"><?php
+                echo $is_dependant
+                    ? esc_html__("Child's Information", 'matrix-mlm')
+                    : esc_html__('Personal Information', 'matrix-mlm');
+            ?></h2>
             <table class="form-table" role="presentation">
-                <tr><th><?php _e('First Name', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->first_name); ?></td></tr>
-                <tr><th><?php _e('Last Name', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->last_name); ?></td></tr>
-                <tr><th><?php _e('Middle Name', 'matrix-mlm'); ?></th><td><?php echo $row->middle_name !== null && $row->middle_name !== '' ? esc_html($row->middle_name) : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>'; ?></td></tr>
+                <tr><th><?php echo $is_dependant ? esc_html__('Child First Name', 'matrix-mlm') : esc_html__('First Name', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->first_name); ?></td></tr>
+                <tr><th><?php echo $is_dependant ? esc_html__('Child Last Name', 'matrix-mlm') : esc_html__('Last Name', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->last_name); ?></td></tr>
+                <?php if (!empty($row->middle_name)): ?>
+                <tr><th><?php _e('Middle Name', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->middle_name); ?></td></tr>
+                <?php endif; ?>
                 <tr><th><?php _e('Email', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->email); ?></td></tr>
-                <tr><th><?php _e('Phone', 'matrix-mlm'); ?></th><td><code><?php echo esc_html($row->phone); ?></code></td></tr>
+                <tr><th><?php _e('Phone', 'matrix-mlm'); ?></th><td><?php
+                    echo !empty($row->phone)
+                        ? '<code>' . esc_html($row->phone) . '</code>'
+                        : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                ?></td></tr>
+                <tr><th><?php _e('WhatsApp', 'matrix-mlm'); ?></th><td><?php
+                    echo !empty($row->whatsapp)
+                        ? '<code>' . esc_html($row->whatsapp) . '</code>'
+                        : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                ?></td></tr>
                 <tr><th><?php _e('Date of Birth', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_date($row->date_of_birth)); ?></td></tr>
-                <tr><th><?php _e('Gender', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_enum($row->gender)); ?></td></tr>
+                <tr><th><?php echo $is_dependant ? esc_html__('Sex', 'matrix-mlm') : esc_html__('Gender', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_enum($row->gender)); ?></td></tr>
+                <?php if (!empty($row->marital_status)): ?>
                 <tr><th><?php _e('Marital Status', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_enum($row->marital_status)); ?></td></tr>
+                <?php endif; ?>
                 <tr><th><?php _e('Address', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_address(
                     $row->address_line1, $row->address_line2, $row->city, $row->state, $row->zip_code, $row->country
                 )); ?></td></tr>
             </table>
         </div>
         <?php
+    }
+
+    /**
+     * Top-of-detail summary card showing whether the application
+     * is for the member themselves (Adult) or for a dependant.
+     * Always rendered — every row has an applicant_type, defaulting
+     * to 'adult' for legacy pre-1.0.7 rows.
+     */
+    private static function render_applicant_type_card($row) {
+        $type = isset($row->applicant_type) && $row->applicant_type !== ''
+            ? (string) $row->applicant_type
+            : 'adult';
+        ?>
+        <div class="matrix-admin-card" style="margin-bottom:16px;">
+            <h2 style="margin-top:0;"><?php _e('Application Type', 'matrix-mlm'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th><?php _e('Applying as', 'matrix-mlm'); ?></th>
+                    <td>
+                        <span class="matrix-badge matrix-badge-<?php echo esc_attr($type); ?>">
+                            <?php echo esc_html(self::format_enum($type)); ?>
+                        </span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+        <?php
+    }
+
+    /**
+     * Parent's Information card — only shown for dependant
+     * applications and only when at least one parent field is
+     * populated (dependant applications submitted via the new
+     * 1.0.7 form will always have all four set).
+     */
+    private static function render_parent_card($row) {
+        ?>
+        <div class="matrix-admin-card" style="margin-bottom:16px;">
+            <h2 style="margin-top:0;"><?php _e("Parent's Information", 'matrix-mlm'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr><th><?php _e('First Name', 'matrix-mlm'); ?></th><td><?php echo esc_html((string) ($row->parent_first_name ?? '')); ?></td></tr>
+                <tr><th><?php _e('Last Name', 'matrix-mlm'); ?></th><td><?php echo esc_html((string) ($row->parent_last_name ?? '')); ?></td></tr>
+                <tr><th><?php _e('Phone', 'matrix-mlm'); ?></th><td><?php
+                    echo !empty($row->parent_phone)
+                        ? '<code>' . esc_html($row->parent_phone) . '</code>'
+                        : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                ?></td></tr>
+                <tr><th><?php _e('WhatsApp', 'matrix-mlm'); ?></th><td><?php
+                    echo !empty($row->parent_whatsapp)
+                        ? '<code>' . esc_html($row->parent_whatsapp) . '</code>'
+                        : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                ?></td></tr>
+            </table>
+        </div>
+        <?php
+    }
+
+    /**
+     * Hospital Selection card — shows the state and the hospital
+     * name (snapshotted into preferred_hospital at submit-time so
+     * a later admin-side delete of the hospital row doesn't blank
+     * the application).
+     */
+    private static function render_hospital_card($row) {
+        $hospital_state = (string) ($row->hospital_state ?? '');
+        $hospital_name  = (string) ($row->preferred_hospital ?? '');
+        $hospital_id    = (int) ($row->hospital_id ?? 0);
+        ?>
+        <div class="matrix-admin-card" style="margin-bottom:16px;">
+            <h2 style="margin-top:0;"><?php _e('Hospital Selection', 'matrix-mlm'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr><th><?php _e('Hospital State', 'matrix-mlm'); ?></th><td><?php
+                    echo $hospital_state !== ''
+                        ? esc_html($hospital_state)
+                        : '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                ?></td></tr>
+                <tr><th><?php _e('Hospital of Choice', 'matrix-mlm'); ?></th><td><?php
+                    if ($hospital_name !== '') {
+                        echo esc_html($hospital_name);
+                        if ($hospital_id > 0) {
+                            echo ' <span style="color:#6b7280;font-size:11px;">(#' . intval($hospital_id) . ')</span>';
+                        }
+                    } else {
+                        echo '<em style="color:#9ca3af;">' . esc_html__('not provided', 'matrix-mlm') . '</em>';
+                    }
+                ?></td></tr>
+                <?php if (!empty($row->policy_number)): ?>
+                <tr><th><?php _e('Policy Number', 'matrix-mlm'); ?></th><td><code><?php echo esc_html($row->policy_number); ?></code></td></tr>
+                <?php endif; ?>
+            </table>
+        </div>
+        <?php
+    }
+
+    // ============================================================
+    // Conditional-render guards for legacy cards. Pre-1.0.7 rows
+    // had a wider form (medical profile, NOK, plan tiers, document
+    // uploads) — those columns are still on the table so historical
+    // applications continue to render correctly, but we hide the
+    // empty cards on rows submitted by the new Adult/Dependant form.
+    // ============================================================
+
+    private static function has_parent_info($row) {
+        return !empty($row->parent_first_name)
+            || !empty($row->parent_last_name)
+            || !empty($row->parent_phone)
+            || !empty($row->parent_whatsapp);
+    }
+
+    private static function has_identification($row) {
+        return !empty($row->nin) || !empty($row->occupation);
+    }
+
+    private static function has_plan_info($row) {
+        return !empty($row->plan_tier)
+            || !empty($row->coverage_type)
+            || (int) ($row->dependants_count ?? 0) > 0;
+    }
+
+    private static function has_medical_info($row) {
+        $blood = (string) ($row->blood_group ?? 'unknown');
+        $geno  = (string) ($row->genotype ?? 'unknown');
+        return ($blood !== '' && $blood !== 'unknown')
+            || ($geno !== '' && $geno !== 'unknown')
+            || !empty($row->height_cm)
+            || !empty($row->weight_kg)
+            || !empty($row->pre_existing_conditions)
+            || !empty($row->allergies)
+            || !empty($row->current_medications)
+            || (int) ($row->is_smoker ?? 0) === 1
+            || (int) ($row->is_pregnant ?? 0) === 1;
+    }
+
+    private static function has_nok_info($row) {
+        return !empty($row->nok_name) || !empty($row->nok_relationship) || !empty($row->nok_phone);
+    }
+
+    private static function has_documents($row) {
+        return !empty($row->passport_photo_url)
+            || !empty($row->nin_slip_url)
+            || !empty($row->utility_bill_url)
+            || !empty($row->medical_history_url);
     }
 
     private static function render_identification_card($row) {
@@ -430,16 +617,21 @@ class Matrix_MLM_Admin_Healthcare {
     private static function render_plan_card($row) {
         ?>
         <div class="matrix-admin-card" style="margin-bottom:16px;">
-            <h2 style="margin-top:0;"><?php _e('Plan &amp; Coverage', 'matrix-mlm'); ?></h2>
+            <h2 style="margin-top:0;"><?php _e('Plan &amp; Coverage', 'matrix-mlm'); ?> <span style="font-size:11px;color:#6b7280;font-weight:400;">(<?php esc_html_e('legacy', 'matrix-mlm'); ?>)</span></h2>
             <table class="form-table" role="presentation">
+                <?php if (!empty($row->plan_tier)): ?>
                 <tr><th><?php _e('Plan Tier', 'matrix-mlm'); ?></th><td><strong><?php echo esc_html(self::format_enum($row->plan_tier)); ?></strong></td></tr>
+                <?php endif; ?>
+                <?php if (!empty($row->coverage_type)): ?>
                 <tr><th><?php _e('Coverage Type', 'matrix-mlm'); ?></th><td><?php echo esc_html(self::format_enum($row->coverage_type)); ?></td></tr>
-                <tr><th><?php _e('Preferred Hospital', 'matrix-mlm'); ?></th><td><?php echo esc_html($row->preferred_hospital); ?></td></tr>
+                <?php endif; ?>
+                <?php if ((int) ($row->dependants_count ?? 0) > 0): ?>
                 <tr><th><?php _e('Dependants', 'matrix-mlm'); ?></th><td><?php echo intval($row->dependants_count); ?></td></tr>
-                <?php if (!empty($row->policy_number)): ?>
-                <tr><th><?php _e('Policy Number', 'matrix-mlm'); ?></th><td><code><?php echo esc_html($row->policy_number); ?></code></td></tr>
                 <?php endif; ?>
             </table>
+            <p style="margin:8px 0 0;font-size:12px;color:#6b7280;">
+                <?php _e('These fields were collected by the pre-1.0.7 healthcare form and are kept here so historical applications still display in full.', 'matrix-mlm'); ?>
+            </p>
         </div>
         <?php
     }
