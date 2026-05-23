@@ -154,6 +154,7 @@ class Matrix_MLM_Admin_Migration {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=link'); ?>" class="nav-tab <?php echo $tab === 'link' ? 'nav-tab-active' : ''; ?>"><?php _e('Link Single User', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=backfill'); ?>" class="nav-tab <?php echo $tab === 'backfill' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Wallet IDs', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=bank_codes'); ?>" class="nav-tab <?php echo $tab === 'bank_codes' ? 'nav-tab-active' : ''; ?>"><?php _e('Backfill Bank Codes', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=referral_codes'); ?>" class="nav-tab <?php echo $tab === 'referral_codes' ? 'nav-tab-active' : ''; ?>"><?php _e('Referral Codes', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-migration&mtab=schema'); ?>" class="nav-tab <?php echo $tab === 'schema' ? 'nav-tab-active' : ''; ?>"><?php _e('Database Schema', 'matrix-mlm'); ?></a>
             </nav>
 
@@ -164,6 +165,7 @@ class Matrix_MLM_Admin_Migration {
                 case 'link': $this->render_link_tab(); break;
                 case 'backfill': $this->render_backfill_tab(); break;
                 case 'bank_codes': $this->render_bank_codes_backfill_tab(); break;
+                case 'referral_codes': $this->render_referral_codes_backfill_tab(); break;
                 case 'schema': $this->render_schema_repair_tab(); break;
             }
             ?>
@@ -751,6 +753,172 @@ class Matrix_MLM_Admin_Migration {
                         action: 'matrix_admin_action',
                         nonce: matrixMLMAdmin.nonce,
                         matrix_action: 'fintava_backfill_bank_codes'
+                    }
+                }).done(function(res) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    if (!res || !res.success) {
+                        var err = (res && res.data && res.data.message) ? res.data.message : '<?php echo esc_js(__('Backfill failed.', 'matrix-mlm')); ?>';
+                        statusEl.textContent = '✗ ' + err;
+                        statusEl.style.color = '#b91c1c';
+                        return;
+                    }
+                    statusEl.textContent = '✓ ' + res.data.message;
+                    statusEl.style.color = '#059669';
+                    if (res.data.report) renderReport(res.data.report);
+                }).fail(function(xhr, textStatus) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                    statusEl.textContent = '<?php echo esc_js(__('Network error or timeout.', 'matrix-mlm')); ?> (' + textStatus + ')';
+                    statusEl.style.color = '#b91c1c';
+                });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "Referral Codes" admin tab.
+     *
+     * Counts users whose matrix_user_meta.referral_code is NULL or empty,
+     * shows a button that runs the bulk backfill, and renders a per-row
+     * report once it's done. This was originally an importer bug — the
+     * Laravel importer wrote `referral_code = NULL` with a comment that
+     * a later phase would generate one, but no such phase was ever wired
+     * up. The button is the operator's one-click recovery for installs
+     * already running with the broken data.
+     *
+     * Future imports get a code at insert time via the same shared helper
+     * (Matrix_MLM_User::generate_unique_referral_code), so this tool
+     * eventually trends toward "Nothing to backfill" on a healthy install.
+     */
+    private function render_referral_codes_backfill_tab() {
+        global $wpdb;
+        $meta_table = $wpdb->prefix . 'matrix_user_meta';
+
+        $total         = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$meta_table}");
+        $missing_count = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$meta_table}
+              WHERE referral_code IS NULL OR referral_code = ''"
+        );
+        ?>
+        <div class="matrix-admin-card">
+            <h2><?php _e('Backfill Missing Referral Codes', 'matrix-mlm'); ?></h2>
+            <p><?php _e('The Laravel importer historically left <code>referral_code</code> blank on imported users, which left the "Referral Code" column empty in Manage Users and broke the referral-link share UI. This tool assigns each affected user a freshly generated unique code so the column populates and their referral link works again.', 'matrix-mlm'); ?></p>
+
+            <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:14px 18px;margin:14px 0;">
+                <p style="margin:0 0 6px;font-size:13px;color:#374151;"><strong><?php _e('How it works', 'matrix-mlm'); ?></strong></p>
+                <ol style="margin:0 0 0 20px;font-size:13px;color:#4b5563;">
+                    <li><?php _e('Selects every <code>matrix_user_meta</code> row where <code>referral_code</code> is NULL or empty.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('Generates an 8-character code per row using <code>Matrix_MLM_User::generate_unique_referral_code()</code> — the same helper registration uses, with retry-on-collision against the UNIQUE index.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('Writes the code back to the row via a single targeted UPDATE. Rows that already have a code are never touched.', 'matrix-mlm'); ?></li>
+                </ol>
+                <p style="margin:8px 0 0;font-size:12px;color:#6b7280;">
+                    <?php _e('Idempotent — re-running on a healthy install is a no-op that just confirms every user has a code.', 'matrix-mlm'); ?>
+                </p>
+            </div>
+
+            <div class="matrix-admin-stats" style="margin-bottom:20px;">
+                <div class="stat-card stat-primary"><h3><?php echo number_format($total); ?></h3><p><?php _e('Total Users', 'matrix-mlm'); ?></p></div>
+                <div class="stat-card stat-warning"><h3><?php echo number_format($missing_count); ?></h3><p><?php _e('Missing Referral Code', 'matrix-mlm'); ?></p></div>
+            </div>
+
+            <?php if ($missing_count === 0): ?>
+                <p style="color:#059669;font-weight:500;">✓ <?php _e('Every user already has a referral code. Nothing to backfill.', 'matrix-mlm'); ?></p>
+            <?php else: ?>
+                <p>
+                    <button type="button" class="button button-primary" id="btn_run_ref_backfill">
+                        <?php printf(
+                            /* translators: %d: count of users needing backfill */
+                            esc_html__('Run Referral-Code Backfill (%d users)', 'matrix-mlm'),
+                            $missing_count
+                        ); ?>
+                    </button>
+                    <span id="ref_backfill_status" style="margin-left:12px;font-size:13px;color:#6b7280;"></span>
+                </p>
+            <?php endif; ?>
+
+            <div id="ref_backfill_results" style="display:none;margin-top:24px;"></div>
+        </div>
+
+        <script>
+        (function() {
+            var btn       = document.getElementById('btn_run_ref_backfill');
+            var statusEl  = document.getElementById('ref_backfill_status');
+            var resultsEl = document.getElementById('ref_backfill_results');
+            if (!btn) return;
+
+            function escapeHtml(s) {
+                if (s === null || s === undefined) return '';
+                return String(s)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#39;');
+            }
+
+            function renderReport(report) {
+                var html = '';
+                html += '<div class="matrix-admin-stats" style="margin-bottom:16px;">';
+                html += '<div class="stat-card stat-success"><h3>' + report.updated + '</h3><p><?php echo esc_js(__('updated', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-danger"><h3>' + report.failed + '</h3><p><?php echo esc_js(__('failed', 'matrix-mlm')); ?></p></div>';
+                html += '<div class="stat-card stat-primary"><h3>' + report.total_missing_before + '</h3><p><?php echo esc_js(__('processed', 'matrix-mlm')); ?></p></div>';
+                html += '</div>';
+
+                if (report.details && report.details.length) {
+                    // Cap the on-screen table at 200 rows so a 10k+ user
+                    // backfill doesn't lock the browser. The summary at
+                    // the top still shows the full counts.
+                    var rows = report.details.slice(0, 200);
+                    var truncated = report.details.length - rows.length;
+
+                    html += '<h3 style="margin-top:18px;"><?php echo esc_js(__('Per-user outcomes', 'matrix-mlm')); ?>';
+                    if (truncated > 0) {
+                        html += ' <span style="font-weight:normal;color:#6b7280;font-size:13px;">';
+                        html += '(<?php echo esc_js(__('showing first 200 of', 'matrix-mlm')); ?> ' + report.details.length + ')';
+                        html += '</span>';
+                    }
+                    html += '</h3>';
+                    html += '<table class="wp-list-table widefat striped"><thead><tr>';
+                    html += '<th><?php echo esc_js(__('User ID', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Referral Code', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Status', 'matrix-mlm')); ?></th>';
+                    html += '<th><?php echo esc_js(__('Detail', 'matrix-mlm')); ?></th>';
+                    html += '</tr></thead><tbody>';
+                    rows.forEach(function(d) {
+                        html += '<tr>';
+                        html += '<td>' + escapeHtml(d.user_id || '') + '</td>';
+                        html += '<td><code style="font-size:12px;">' + escapeHtml(d.code || '') + '</code></td>';
+                        html += '<td>' + escapeHtml(d.status || '') + '</td>';
+                        html += '<td>' + escapeHtml(d.reason || '') + '</td>';
+                        html += '</tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+
+                resultsEl.innerHTML = html;
+                resultsEl.style.display = 'block';
+            }
+
+            btn.addEventListener('click', function() {
+                if (!confirm('<?php echo esc_js(__('Generate referral codes for every user that\'s currently missing one?', 'matrix-mlm')); ?>')) return;
+
+                btn.disabled = true;
+                var originalLabel = btn.textContent;
+                btn.textContent = '<?php echo esc_js(__('Working…', 'matrix-mlm')); ?>';
+                statusEl.textContent = '<?php echo esc_js(__('Generating codes — this may take a moment for large user bases.', 'matrix-mlm')); ?>';
+                statusEl.style.color = '#6b7280';
+
+                jQuery.ajax({
+                    url: matrixMLMAdmin.ajaxUrl,
+                    type: 'POST',
+                    timeout: 180000,
+                    data: {
+                        action: 'matrix_admin_action',
+                        nonce: matrixMLMAdmin.nonce,
+                        matrix_action: 'backfill_referral_codes'
                     }
                 }).done(function(res) {
                     btn.disabled = false;

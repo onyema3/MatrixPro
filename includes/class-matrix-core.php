@@ -381,8 +381,12 @@ class Matrix_MLM_Core {
             'last_name' => $last_name,
         ]);
 
-        // Create matrix user meta
-        $ref_code = strtoupper(substr(md5($user_id . time()), 0, 8));
+        // Create matrix user meta. generate_unique_referral_code()
+        // retries on collision against the UNIQUE index on
+        // matrix_user_meta.referral_code — same helper the importer
+        // and the admin "Backfill Referral Codes" tool use, so all
+        // three paths share one algorithm and one uniqueness story.
+        $ref_code = Matrix_MLM_User::generate_unique_referral_code($user_id);
 
         $wpdb->insert($wpdb->prefix . 'matrix_user_meta', [
             'user_id' => $user_id,
