@@ -49,6 +49,7 @@ class Matrix_MLM_Database {
         'matrix_fintava_cards',
         'matrix_billing_transactions',
         'matrix_subscriptions',
+        'matrix_benefits',
     ];
 
     /**
@@ -496,6 +497,33 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_pages);
 
+        // Member Benefits — admin-managed cards rendered on the user
+        // dashboard's Benefits tab. Gated to users with at least one
+        // active position; see Matrix_MLM_User_Benefits::render() for
+        // the entry point and class-matrix-admin-benefits.php for the
+        // CRUD UI. The icon column accepts either a Dashicons class
+        // (e.g. "dashicons-phone") or a fully-qualified image URL —
+        // the renderer detects which based on the leading characters.
+        $table_benefits = $wpdb->prefix . 'matrix_benefits';
+        $sql_benefits = "CREATE TABLE $table_benefits (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            title varchar(255) NOT NULL,
+            slug varchar(100) NOT NULL,
+            icon varchar(500) DEFAULT NULL,
+            short_description text,
+            long_description longtext,
+            cta_label varchar(100) DEFAULT NULL,
+            cta_url varchar(500) DEFAULT NULL,
+            display_order int(11) NOT NULL DEFAULT 0,
+            status enum('active','inactive') NOT NULL DEFAULT 'active',
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY slug (slug),
+            KEY status_order (status, display_order)
+        ) $charset_collate;";
+        dbDelta($sql_benefits);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -509,7 +537,8 @@ class Matrix_MLM_Database {
             'matrix_deposits', 'matrix_withdrawals', 'matrix_commissions',
             'matrix_epins', 'matrix_tickets', 'matrix_ticket_messages',
             'matrix_gateways', 'matrix_user_meta', 'matrix_transfers',
-            'matrix_subscribers', 'matrix_pages', 'matrix_fintava_webhook_logs'
+            'matrix_subscribers', 'matrix_pages', 'matrix_fintava_webhook_logs',
+            'matrix_benefits',
         ];
 
         foreach ($tables as $table) {
@@ -609,6 +638,44 @@ class Matrix_MLM_Database {
 
         // Create default root user for referral system
         self::create_default_user();
+
+        // Seed the two starter benefits — only when the table is
+        // empty so we don't clobber rows the operator has already
+        // edited or extended through Matrix MLM → Benefits. The
+        // copy is intentionally generic and editable; the icons use
+        // Dashicons classes so they render without requiring an
+        // image upload on first install.
+        $benefits_table = $wpdb->prefix . 'matrix_benefits';
+        $existing_benefits = (int) $wpdb->get_var("SELECT COUNT(*) FROM $benefits_table");
+        if ($existing_benefits === 0) {
+            $now = current_time('mysql');
+            $wpdb->insert($benefits_table, [
+                'title'             => 'CUG',
+                'slug'              => 'cug',
+                'icon'              => 'dashicons-phone',
+                'short_description' => __('Closed User Group calls — talk to fellow members at preferential rates.', 'matrix-mlm'),
+                'long_description'  => __('Members enrolled in the Closed User Group benefit get reduced-rate (or free) on-net calls and SMS to other CUG members. Activation details and the supported telco are configured by the administrator.', 'matrix-mlm'),
+                'cta_label'         => '',
+                'cta_url'           => '',
+                'display_order'     => 10,
+                'status'            => 'active',
+                'created_at'        => $now,
+                'updated_at'        => $now,
+            ]);
+            $wpdb->insert($benefits_table, [
+                'title'             => 'Health Insurance',
+                'slug'              => 'health-insurance',
+                'icon'              => 'dashicons-heart',
+                'short_description' => __('Comprehensive health cover for you and your immediate family.', 'matrix-mlm'),
+                'long_description'  => __('Active members are entitled to enrol in our partner Health Insurance scheme. Coverage includes outpatient consultations, emergency care, and selected inpatient procedures. The administrator will publish the partner provider, eligible plans, and enrolment instructions on this page.', 'matrix-mlm'),
+                'cta_label'         => '',
+                'cta_url'           => '',
+                'display_order'     => 20,
+                'status'            => 'active',
+                'created_at'        => $now,
+                'updated_at'        => $now,
+            ]);
+        }
 
         // Default settings
         $defaults = [

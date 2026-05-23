@@ -1,0 +1,299 @@
+<?php
+/**
+ * User Dashboard — Benefits tab
+ *
+ * Renders the admin-managed wp_matrix_benefits rows as a responsive
+ * card grid for users who have at least one active position. Users
+ * without an active plan see a friendly upsell pointing them at the
+ * Plans tab instead of a blank screen.
+ *
+ * Design choices:
+ *   - The whole panel is server-rendered HTML; the only client-side
+ *     code is the lightweight inline modal that expands the long
+ *     description on "Read more". No external JS dependencies, so
+ *     this works whether or not the dashboard's main JS bundle has
+ *     loaded.
+ *   - Icon dispatch (Dashicons class vs image URL) is shared with
+ *     the admin via Matrix_MLM_Admin_Benefits::render_icon_preview
+ *     so the operator sees exactly what users will see.
+ *   - The active-plan gate uses Matrix_MLM_User::get_active_plans()
+ *     — the same helper that drives the "My Plans" tab — so a row
+ *     in matrix_positions with status='active' is the source of
+ *     truth, not e.g. matrix_user_meta.status.
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Matrix_MLM_User_Benefits {
+
+    /**
+     * Render the Benefits tab for the given user.
+     *
+     * @param int $user_id Current user.
+     */
+    public function render($user_id) {
+        $user_id = intval($user_id);
+        if ($user_id <= 0) {
+            return;
+        }
+
+        // Active-plan gate. An empty array means the user has no
+        // active position in any matrix plan — they get the upsell.
+        $active_plans = class_exists('Matrix_MLM_User')
+            ? Matrix_MLM_User::get_active_plans($user_id)
+            : [];
+
+        ?>
+        <div class="matrix-benefits-panel">
+            <h2><?php _e('Member Benefits', 'matrix-mlm'); ?></h2>
+
+            <?php if (empty($active_plans)): ?>
+                <?php $this->render_upsell(); ?>
+            <?php else: ?>
+                <?php $this->render_grid(); ?>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the upsell shown to users without an active plan.
+     * Links to the Plans tab so they're one click from the fix.
+     */
+    private function render_upsell() {
+        $plans_url = Matrix_MLM_User_Dashboard::tab_url('plans');
+        ?>
+        <div class="matrix-alert matrix-alert-info">
+            <strong><?php _e('Subscribe to a plan to unlock member benefits.', 'matrix-mlm'); ?></strong><br>
+            <span style="font-size:14px;">
+                <?php _e('Member benefits like CUG calls and Health Insurance are available to members with at least one active matrix plan.', 'matrix-mlm'); ?>
+            </span>
+            <p style="margin-top:14px;">
+                <a href="<?php echo esc_url($plans_url); ?>" class="matrix-btn matrix-btn-primary">
+                    <?php _e('View Plans', 'matrix-mlm'); ?>
+                </a>
+            </p>
+        </div>
+        <?php
+    }
+
+    /**
+     * Render the active-benefit card grid + the long-description
+     * modal scaffold. Even with zero rows (operator hasn't created
+     * any yet) we render the explanatory empty state instead of a
+     * blank panel — same pattern as the other dashboard tabs.
+     */
+    private function render_grid() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_benefits';
+
+        // INFORMATION_SCHEMA probe so a missing-table install (older
+        // schema, repair pending) doesn't bomb the dashboard with a
+        // SQL error. This mirrors the defensive check used by the
+        // bank-code admin notice — the maybe_upgrade() self-heal
+        // should have created the table on the previous pageload,
+        // but rendering safely is cheap and the test (one cached
+        // INFORMATION_SCHEMA query) is effectively free.
+        $exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME,
+            $table
+        ));
+        if ($exists === 0) {
+            echo '<div class="matrix-alert matrix-alert-info">'
+                . esc_html__('Benefits will appear here shortly. The administrator is finalising setup.', 'matrix-mlm')
+                . '</div>';
+            return;
+        }
+
+        $rows = $wpdb->get_results(
+            "SELECT id, title, slug, icon, short_description, long_description, cta_label, cta_url
+               FROM {$table}
+               WHERE status = 'active'
+               ORDER BY display_order ASC, id ASC"
+        );
+
+        if (empty($rows)) {
+            echo '<div class="matrix-alert matrix-alert-info">'
+                . esc_html__('No benefits are available right now. Check back soon.', 'matrix-mlm')
+                . '</div>';
+            return;
+        }
+
+        ?>
+        <p class="matrix-benefits-intro">
+            <?php _e('Here\'s what comes with your active plan. Click any card to read more.', 'matrix-mlm'); ?>
+        </p>
+
+        <div class="matrix-benefits-grid">
+            <?php foreach ($rows as $row): ?>
+                <?php $this->render_card($row); ?>
+            <?php endforeach; ?>
+        </div>
+
+        <?php $this->render_modal_scaffold(); ?>
+        <?php
+    }
+
+    /**
+     * Render a single benefit card. The "Read more" link is bound
+     * via a data-attribute that the modal JS picks up; no per-card
+     * inline event handlers, which keeps the markup compact and
+     * works whether or not jQuery is on the page.
+     */
+    private function render_card($row) {
+        $title       = $row->title ?: '';
+        $short       = $row->short_description ?: '';
+        $long        = $row->long_description ?: '';
+        $cta_label   = trim((string) $row->cta_label);
+        $cta_url     = trim((string) $row->cta_url);
+        $has_cta     = $cta_label !== '' && $cta_url !== '';
+        $has_long    = trim(wp_strip_all_tags($long)) !== '';
+        $card_id     = 'matrix-benefit-' . intval($row->id);
+        ?>
+        <article class="matrix-benefit-card" id="<?php echo esc_attr($card_id); ?>">
+            <div class="benefit-icon">
+                <?php
+                // Reuse the admin's preview helper so the user sees
+                // the same icon the operator saw at edit time.
+                if (class_exists('Matrix_MLM_Admin_Benefits')) {
+                    echo Matrix_MLM_Admin_Benefits::render_icon_preview($row->icon, 56);
+                } else {
+                    echo self::render_icon_fallback($row->icon, 56);
+                }
+                ?>
+            </div>
+            <h3 class="benefit-title"><?php echo esc_html($title); ?></h3>
+            <?php if ($short !== ''): ?>
+                <p class="benefit-short"><?php echo esc_html($short); ?></p>
+            <?php endif; ?>
+            <div class="benefit-actions">
+                <?php if ($has_long): ?>
+                    <button type="button" class="matrix-btn matrix-btn-sm matrix-benefit-readmore"
+                            data-benefit-id="<?php echo intval($row->id); ?>"
+                            data-benefit-title="<?php echo esc_attr($title); ?>">
+                        <?php _e('Read more', 'matrix-mlm'); ?>
+                    </button>
+                    <template id="matrix-benefit-long-<?php echo intval($row->id); ?>"><?php
+                        // wp_kses_post on output so links + paragraphs
+                        // come through but unsafe markup (script/style)
+                        // is stripped. The operator-side store already
+                        // passes through wp_kses_post on save, so this
+                        // is belt-and-braces.
+                        echo wp_kses_post($long);
+                    ?></template>
+                <?php endif; ?>
+                <?php if ($has_cta): ?>
+                    <a href="<?php echo esc_url($cta_url); ?>"
+                       class="matrix-btn matrix-btn-sm matrix-btn-primary"
+                       target="_blank" rel="noopener noreferrer">
+                        <?php echo esc_html($cta_label); ?>
+                    </a>
+                <?php endif; ?>
+            </div>
+        </article>
+        <?php
+    }
+
+    /**
+     * Render the modal scaffold + its JS once per page (after the
+     * grid). The modal is hidden by default and populated client-side
+     * from the matching <template> when a card's "Read more" is
+     * clicked. Using <template> rather than data-* attributes keeps
+     * the long_description's HTML intact (paragraph breaks, lists,
+     * links) without needing to escape and unescape it.
+     */
+    private function render_modal_scaffold() {
+        ?>
+        <div class="matrix-benefit-modal" id="matrix-benefit-modal" aria-hidden="true" role="dialog" aria-modal="true">
+            <div class="matrix-benefit-modal-backdrop" data-benefit-modal-close></div>
+            <div class="matrix-benefit-modal-dialog" role="document">
+                <button type="button" class="matrix-benefit-modal-close" data-benefit-modal-close aria-label="<?php esc_attr_e('Close', 'matrix-mlm'); ?>">&times;</button>
+                <h3 class="matrix-benefit-modal-title"></h3>
+                <div class="matrix-benefit-modal-body"></div>
+            </div>
+        </div>
+
+        <script>
+        (function() {
+            var modal     = document.getElementById('matrix-benefit-modal');
+            if (!modal) return;
+            var titleEl   = modal.querySelector('.matrix-benefit-modal-title');
+            var bodyEl    = modal.querySelector('.matrix-benefit-modal-body');
+            var triggers  = document.querySelectorAll('.matrix-benefit-readmore');
+
+            function openModal(id, title) {
+                var tpl = document.getElementById('matrix-benefit-long-' + id);
+                if (!tpl) return;
+                titleEl.textContent = title;
+                // Use innerHTML from the <template>'s content so the
+                // already-sanitized HTML (paragraphs, links) renders
+                // properly — wp_kses_post on the server side stripped
+                // anything dangerous, and the template element's
+                // contents are inert until copied into the modal.
+                bodyEl.innerHTML = tpl.innerHTML;
+                modal.classList.add('is-open');
+                modal.setAttribute('aria-hidden', 'false');
+                document.body.classList.add('matrix-benefit-modal-lock');
+            }
+
+            function closeModal() {
+                modal.classList.remove('is-open');
+                modal.setAttribute('aria-hidden', 'true');
+                document.body.classList.remove('matrix-benefit-modal-lock');
+                bodyEl.innerHTML = '';
+            }
+
+            triggers.forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                    openModal(btn.getAttribute('data-benefit-id'), btn.getAttribute('data-benefit-title') || '');
+                });
+            });
+
+            modal.querySelectorAll('[data-benefit-modal-close]').forEach(function(el) {
+                el.addEventListener('click', closeModal);
+            });
+
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape' && modal.classList.contains('is-open')) {
+                    closeModal();
+                }
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Last-resort icon renderer in case the admin class is somehow
+     * not loaded (shouldn't happen because matrix-mlm.php requires
+     * it, but defending against partial deploys is cheap).
+     */
+    private static function render_icon_fallback($icon, $size) {
+        $icon = (string) $icon;
+        if ($icon === '') {
+            return '';
+        }
+        if (preg_match('#^https?://#i', $icon)) {
+            return sprintf(
+                '<img src="%s" alt="" style="width:%dpx;height:%dpx;object-fit:contain;">',
+                esc_url($icon),
+                intval($size),
+                intval($size)
+            );
+        }
+        if (preg_match('/^dashicons-[a-z0-9\-]+$/i', $icon)) {
+            return sprintf(
+                '<span class="dashicons %s" style="font-size:%dpx;width:%dpx;height:%dpx;"></span>',
+                esc_attr($icon),
+                intval($size),
+                intval($size),
+                intval($size)
+            );
+        }
+        return '';
+    }
+}
