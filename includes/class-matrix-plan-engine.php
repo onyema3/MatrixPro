@@ -387,6 +387,106 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Compute per-level fill status for the subtree rooted at $position_id.
+     *
+     * In a forced W×D matrix the canonical capacity at depth L (relative to the
+     * subtree root, with the root itself at depth 0) is W^L positions. A level
+     * counts as "complete" when every one of those W^L slots is occupied by an
+     * active member. This helper returns one entry per level 1..D in ascending
+     * order so callers can render a badge per level — the "level completion
+     * badge" affordance — without having to walk the tree themselves.
+     *
+     * Implementation note: a single BFS pass collects the level frontier, then
+     * one COUNT(*) per level resolves how many of those frontier nodes have
+     * the expected number of children. We count via the parent_id IN (...)
+     * predicate so the work scales with the *frontier* size (worst case W^L)
+     * rather than with the global table size — and the parent_id index on
+     * matrix_positions makes that lookup cheap. Status is intentionally
+     * filtered to 'active' to match verify_matrix_complete()'s definition of
+     * a "filled" slot; positions marked 'completed' or 'inactive' don't
+     * count, which keeps the badge in sync with the completion-bonus logic.
+     *
+     * The early-exit on the first level that has fewer than W^L positions
+     * matters for big matrices: if level 2 isn't full, level 3 cannot be full
+     * either, so we mark every deeper level as 'in progress' with zero filled
+     * and stop querying. Saves one DB round trip per uncompleted deep level
+     * on the common case where the user is still building out the upper
+     * levels of their downline.
+     *
+     * @param int $position_id Subtree root position id (the user's own
+     *                         position in the plan).
+     * @param int $plan_id     Plan id (used as a sanity filter so a stray
+     *                         position that's been re-parented across plans
+     *                         can't poison the count).
+     * @param int $width       Matrix width — the W in W^L.
+     * @param int $depth       Matrix depth — number of levels to enumerate.
+     * @return array<int, array{level:int, filled:int, expected:int, complete:bool}>
+     *         Indexed 1..depth in ascending level order.
+     */
+    public function get_level_completion_status($position_id, $plan_id, $width, $depth) {
+        global $wpdb;
+
+        $position_id = (int) $position_id;
+        $plan_id     = (int) $plan_id;
+        $width       = max(1, (int) $width);
+        $depth       = max(1, (int) $depth);
+
+        $status = [];
+        // The "frontier" is the set of position IDs at the current depth
+        // whose children form the next level. We start with the subtree
+        // root (depth 0) and descend one level per iteration.
+        $frontier = [$position_id];
+
+        for ($level = 1; $level <= $depth; $level++) {
+            $expected = (int) pow($width, $level);
+
+            if (empty($frontier)) {
+                // Parent level had zero filled slots, so this level can't
+                // have any either. Record it as in-progress and skip the
+                // DB round trip.
+                $status[$level] = [
+                    'level'    => $level,
+                    'filled'   => 0,
+                    'expected' => $expected,
+                    'complete' => false,
+                ];
+                continue;
+            }
+
+            // %d-only IN clause: every value comes from $wpdb->get_col on
+            // the previous iteration (or the typed $position_id seed), so
+            // it's safe to interpolate after intval-ing each element.
+            $placeholders = implode(',', array_fill(0, count($frontier), '%d'));
+            $params       = array_map('intval', $frontier);
+            $params[]     = $plan_id;
+
+            $children = $wpdb->get_col($wpdb->prepare(
+                "SELECT id FROM {$wpdb->prefix}matrix_positions
+                  WHERE parent_id IN ($placeholders)
+                    AND plan_id = %d
+                    AND status = 'active'",
+                $params
+            ));
+
+            $filled            = count($children);
+            $status[$level]    = [
+                'level'    => $level,
+                'filled'   => $filled,
+                'expected' => $expected,
+                'complete' => ($filled >= $expected),
+            ];
+
+            // Descend if and only if this level is fully built. A partially
+            // filled level cannot have any complete children below it, so
+            // we let the loop's early-exit branch fill the remaining levels
+            // with zeroed-out entries.
+            $frontier = ($filled >= $expected) ? array_map('intval', $children) : [];
+        }
+
+        return $status;
+    }
+
+    /**
      * Verify if a matrix tree is fully complete
      */
     private function verify_matrix_complete($position_id, $plan_id, $width, $depth) {
