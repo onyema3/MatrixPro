@@ -921,7 +921,6 @@ class Matrix_MLM_User_Loan {
                     <input type="text" name="business_state" value="<?php echo esc_attr($f('business_state')); ?>" maxlength="100" required>
                 </div>
             </div>
-    // === PROJECT_CONT ===
             <div class="matrix-form-row">
                 <div class="matrix-form-group">
                     <label><?php _e('Zip Code', 'matrix-mlm'); ?></label>
@@ -961,7 +960,6 @@ class Matrix_MLM_User_Loan {
                 <label><?php _e('Have you previously been financed?', 'matrix-mlm'); ?> <span aria-hidden="true">*</span></label>
                 <?php self::render_yes_no('previously_financed', $prev_fin); ?>
             </div>
-    // === PROJECT_CONT2 ===
             <div class="matrix-form-group">
                 <label><?php _e('Loan Reason', 'matrix-mlm'); ?> <span aria-hidden="true">*</span></label>
                 <div class="matrix-loan-radios">
