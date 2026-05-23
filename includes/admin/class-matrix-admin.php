@@ -522,6 +522,9 @@ class Matrix_MLM_Admin {
             case 'update_user_profile':
                 $this->update_user_profile();
                 break;
+            case 'change_user_password':
+                $this->change_user_password();
+                break;
             case 'move_user_position':
                 $this->move_user_position();
                 break;
@@ -681,6 +684,88 @@ class Matrix_MLM_Admin {
         $wpdb->update($wpdb->prefix . 'matrix_user_meta', $meta_data, ['user_id' => $user_id]);
 
         wp_send_json_success(['message' => __('User profile updated successfully', 'matrix-mlm')]);
+    }
+
+    /**
+     * Admin: change a user's password
+     *
+     * Sets a new password on the WordPress account, ends all of the
+     * target user's existing login sessions so the old password can no
+     * longer be used, and (optionally) sends them the standard
+     * "password changed" confirmation email.
+     *
+     * Guard rails:
+     *   - Caller must already have manage_matrix_mlm (checked at the
+     *     dispatcher in handle_admin_ajax).
+     *   - Refuses to operate on accounts that out-rank the current
+     *     admin, so a non-super admin can't quietly reset a super
+     *     admin's password.
+     *   - Minimum length 8, must match the confirm field.
+     */
+    private function change_user_password() {
+        $user_id = intval($_POST['user_id'] ?? 0);
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+
+        $user = get_userdata($user_id);
+        if (!$user) {
+            wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+
+        // Don't allow editing yourself through this admin tool —
+        // admins should change their own password through the normal
+        // WP profile screen so the standard re-auth flow runs.
+        if ($user_id === get_current_user_id()) {
+            wp_send_json_error(['message' => __('Use your WordPress profile page to change your own password.', 'matrix-mlm')]);
+        }
+
+        // Block lowering a super admin's password from a non-super
+        // admin account on multisite.
+        if (is_multisite() && is_super_admin($user_id) && !is_super_admin()) {
+            wp_send_json_error(['message' => __('You do not have permission to change a super admin\'s password.', 'matrix-mlm')]);
+        }
+
+        // On single site, block changing the password of any user
+        // whose role we don't have edit_user permission for. This is
+        // the same gate WordPress core uses on the user-edit screen.
+        if (!current_user_can('edit_user', $user_id)) {
+            wp_send_json_error(['message' => __('You do not have permission to edit this user.', 'matrix-mlm')]);
+        }
+
+        // Read raw — passwords MUST NOT be sanitized through
+        // sanitize_text_field, which strips characters and silently
+        // mutates what the admin typed.
+        $new_password     = isset($_POST['new_password']) ? (string) wp_unslash($_POST['new_password']) : '';
+        $confirm_password = isset($_POST['confirm_password']) ? (string) wp_unslash($_POST['confirm_password']) : '';
+        $notify           = !empty($_POST['notify']);
+
+        if (strlen($new_password) < 8) {
+            wp_send_json_error(['message' => __('Password must be at least 8 characters long.', 'matrix-mlm')]);
+        }
+        if ($new_password !== $confirm_password) {
+            wp_send_json_error(['message' => __('Passwords do not match.', 'matrix-mlm')]);
+        }
+
+        // wp_set_password() hashes the password, writes it, AND clears
+        // the user's auth cookies / session tokens — which is exactly
+        // what we want when an admin force-resets a password.
+        wp_set_password($new_password, $user_id);
+
+        // wp_set_password destroys sessions for the target user, but
+        // be explicit so this still holds if WP changes that behavior.
+        $sessions = WP_Session_Tokens::get_instance($user_id);
+        $sessions->destroy_all();
+
+        if ($notify && class_exists('Matrix_MLM_Notifications')) {
+            Matrix_MLM_Notifications::send_password_changed_email($user_id);
+        }
+
+        wp_send_json_success([
+            'message' => $notify
+                ? __('Password changed and the user has been notified by email.', 'matrix-mlm')
+                : __('Password changed.', 'matrix-mlm'),
+        ]);
     }
 
     /**
