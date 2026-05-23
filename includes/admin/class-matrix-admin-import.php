@@ -22,6 +22,19 @@
  * matrix_fintava_cards, support tickets, subscribers, and the
  * post-import bank-code backfill auto-trigger.
  *
+ * PR 3 scope (this file): a single new phase, `referrals`, slotted
+ * between `recalc_downline` and the PR 2 block. PR 1 created
+ * wp_matrix_user_meta rows with referred_by=NULL and noted the
+ * value would be "resolved in a later phase via map" — that phase
+ * never landed and every imported member showed 0 referrals on
+ * day one. The new phase joins staging users on themselves
+ * (sponsor.id = me.ref_by) to translate Laravel ref_by → WP user
+ * id, and writes the result into both wp_matrix_user_meta.referred_by
+ * (drives the user-facing referrals UI and the admin referrals
+ * report) and wp_matrix_positions.sponsor_id (drives the admin
+ * Move-in-Genealogy tool and any future commission attribution
+ * that walks position.sponsor_id rather than user-meta).
+ *
  * Architecture
  *  - All hooks register via init() so cron/AJAX/admin-post wire up
  *    on every request. Every method is static; there is no
@@ -101,6 +114,7 @@ class Matrix_MLM_Admin_Import {
     const CHUNK_POSITIONS = 300;
     const CHUNK_PARENTS   = 500;
     const CHUNK_RECALC    = 500;
+    const CHUNK_REFERRALS = 500;
     // PR 2 phase chunks. Smaller for INSERT-heavy phases; larger for
     // pure UPDATE/lookup phases.
     const CHUNK_FINTAVA_W = 200;
@@ -1105,6 +1119,13 @@ class Matrix_MLM_Admin_Import {
             'parents',
             'recalc_levels',
             'recalc_downline',
+            // PR 3: sponsor/referral graph backfill. Sits between the
+            // tree recompute (which only touches matrix_positions
+            // structure, not the sponsor pointer) and the PR 2 block
+            // (which doesn't depend on referred_by today, but if any
+            // future PR 2 phase ever did, having the pointer set
+            // before they run keeps the dependency direction sane).
+            'referrals',
             // PR 2: financials, Fintava wallets/cards, ticketing, subscribers.
             // fintava_wallets must run before fintava_cards (cards JOIN
             // staging card_holders to resolve the destination wallet) and
@@ -1140,6 +1161,8 @@ class Matrix_MLM_Admin_Import {
             case 'parents':            return self::process_parents($cursor);
             case 'recalc_levels':      return self::process_recalc_levels($cursor);
             case 'recalc_downline':    return self::process_recalc_downline($cursor);
+            // PR 3 phase
+            case 'referrals':          return self::process_referrals($cursor);
             // PR 2 phases
             case 'fintava_wallets':    return self::process_fintava_wallets($cursor);
             case 'fintava_cards':      return self::process_fintava_cards($cursor);
@@ -2013,6 +2036,168 @@ class Matrix_MLM_Admin_Import {
             'advance_phase'   => false,
             'next_phase'      => self::next_phase('recalc_downline'),
             'message'         => sprintf('Downline pass at level %d updated %d rows', $current_level, (int) $updated),
+        ];
+    }
+
+    /* ================================================================
+     * Phase: referrals
+     *
+     * Translate Laravel ref_by (sponsor) pointers into WP-side
+     * referred_by / sponsor_id values. Joins staging users on
+     * themselves: for each staging row whose ref_by points at
+     * another staging row, the sponsor's wp_user_id (back-filled
+     * by process_users() during either fresh insert or skip-
+     * collision lookup) is the value we want.
+     *
+     * Two writes per imported member:
+     *   - wp_matrix_user_meta.referred_by  — read by every "Referrals"
+     *     view in the plugin (Matrix_MLM_User::get_referral_count(),
+     *     get_referrals(), the admin Reports → Referrals tab).
+     *   - wp_matrix_positions.sponsor_id   — joined by the admin
+     *     Users → Move in Genealogy page and set by the plan engine
+     *     on fresh registrations. Keeping it consistent with
+     *     referred_by means imported members behave identically
+     *     to natively-registered members from the admin's POV.
+     *
+     * Idempotency
+     *   The cursor walks staging.id ascending. The chunk SELECT
+     *   filters to rows where the corresponding wp_matrix_user_meta
+     *   row still has referred_by IS NULL — so re-runs after a
+     *   completed pass cleanly find zero rows and advance. Manual
+     *   admin edits to referred_by post-import are preserved
+     *   because the IS NULL filter skips them.
+     *
+     * Orphan sponsors
+     *   When me.ref_by points to a Laravel id that wasn't imported
+     *   (already counted in the dry-run as orphan_sponsors), the
+     *   inner sponsor lookup returns NULL and we leave referred_by
+     *   alone — the same fall-back-to-root behaviour the spillover
+     *   placement uses for tree position.
+     * ================================================================ */
+
+    private static function process_referrals($cursor) {
+        global $wpdb;
+        $su  = self::staging_table('users');
+        $um  = $wpdb->prefix . 'matrix_user_meta';
+        $pos = $wpdb->prefix . 'matrix_positions';
+
+        // Pre-flight: if the staging users table got dropped between
+        // staging and this phase (operator cleanup, etc.), skip cleanly
+        // rather than crashing — same defensive pattern as the PR 2
+        // phases use for missing PR 2 staging tables.
+        if ($wpdb->get_var("SHOW TABLES LIKE '$su'") !== $su) {
+            return [
+                'done_in_chunk'   => 0,
+                'total_for_phase' => 0,
+                'cursor_after'    => 0,
+                'advance_phase'   => true,
+                'next_phase'      => self::next_phase('referrals'),
+                'message'         => 'No users staging table — skipping referrals backfill',
+            ];
+        }
+
+        // Rows still needing a referred_by write: imported member,
+        // had a Laravel sponsor, current referred_by is NULL.
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT me.id        AS lv_id,
+                    me.ref_by    AS lv_ref_by,
+                    me.wp_user_id AS my_wp_user_id
+             FROM `$su` me
+             INNER JOIN `$um` um ON um.user_id = me.wp_user_id
+             WHERE me.id > %d
+               AND me.wp_user_id IS NOT NULL
+               AND me.ref_by > 0
+               AND um.referred_by IS NULL
+             ORDER BY me.id ASC
+             LIMIT " . self::CHUNK_REFERRALS,
+            $cursor
+        ));
+
+        $total = (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM `$su` me
+             INNER JOIN `$um` um ON um.user_id = me.wp_user_id
+             WHERE me.wp_user_id IS NOT NULL
+               AND me.ref_by > 0
+               AND um.referred_by IS NULL"
+        );
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk'   => 0,
+                'total_for_phase' => $total,
+                'cursor_after'    => 0,
+                'advance_phase'   => true,
+                'next_phase'      => self::next_phase('referrals'),
+                'message'         => 'Referrals backfill complete',
+            ];
+        }
+
+        $done    = 0;
+        $orphan  = 0;
+        $last_id = $cursor;
+
+        foreach ($rows as $row) {
+            $last_id = (int) $row->lv_id;
+
+            // Resolve sponsor's WP user id via staging.
+            $sponsor_wp_id = $wpdb->get_var($wpdb->prepare(
+                "SELECT wp_user_id FROM `$su` WHERE id = %d",
+                (int) $row->lv_ref_by
+            ));
+
+            if (!$sponsor_wp_id) {
+                // Orphan sponsor — Laravel ref_by points outside
+                // the imported set. Already surfaced in the dry-
+                // run; nothing actionable here.
+                $orphan++;
+                continue;
+            }
+
+            $sponsor_wp_id = (int) $sponsor_wp_id;
+            $member_wp_id  = (int) $row->my_wp_user_id;
+
+            // 1) user-meta level pointer (drives referrals UI).
+            $wpdb->update(
+                $um,
+                ['referred_by' => $sponsor_wp_id],
+                ['user_id'     => $member_wp_id]
+            );
+
+            // 2) position-level pointer (drives admin genealogy
+            //    tooling). A member can in principle hold multiple
+            //    active positions on different plans; update them
+            //    all so genealogy never disagrees with user-meta.
+            $wpdb->query($wpdb->prepare(
+                "UPDATE `$pos` SET sponsor_id = %d
+                 WHERE user_id = %d AND sponsor_id IS NULL",
+                $sponsor_wp_id,
+                $member_wp_id
+            ));
+
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$su` me
+             INNER JOIN `$um` um ON um.user_id = me.wp_user_id
+             WHERE me.id > %d
+               AND me.wp_user_id IS NOT NULL
+               AND me.ref_by > 0
+               AND um.referred_by IS NULL",
+            $last_id
+        ));
+
+        return [
+            'done_in_chunk'   => $done,
+            'total_for_phase' => $total,
+            'cursor_after'    => $last_id,
+            'advance_phase'   => $remaining === 0,
+            'next_phase'      => self::next_phase('referrals'),
+            'message'         => sprintf(
+                'Linked %d sponsors%s',
+                $done,
+                $orphan > 0 ? sprintf(' (%d orphan refs skipped)', $orphan) : ''
+            ),
         ];
     }
 
