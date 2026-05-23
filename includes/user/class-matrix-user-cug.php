@@ -387,12 +387,35 @@ class Matrix_MLM_User_CUG {
             var form  = document.getElementById('matrix-cug-form');
             if (!modal || !form) return;
 
-            // matrixMLM is localized for every dashboard pageload by
-            // Matrix_MLM_Core::enqueue_public_assets, but we fall back
-            // to the per-form hidden nonce if the global isn't there
-            // for any reason (edge case: shortcode rendered outside
-            // the normal enqueue context).
-            var ajaxUrl = (window.matrixMLM && window.matrixMLM.ajaxUrl) || (window.ajaxurl || '');
+            // PHP-injected admin-ajax.php URL. Used in preference to
+            // window.matrixMLM because this IIFE runs inline in the
+            // body at parse time, but matrixMLM is localized via
+            // wp_localize_script attached to the matrix-mlm-public
+            // handle which is enqueued in_footer=true — meaning the
+            // var matrixMLM = {...}; output sits AFTER this script in
+            // the HTML and is therefore undefined when this code
+            // runs. The earlier revision captured ajaxUrl into a
+            // local var at IIFE creation time, so it always saw the
+            // empty fallback and every submit hit the "Cannot reach
+            // the server" branch without ever firing a network
+            // request. Fix is two-pronged: (a) inject the URL via
+            // PHP so we never depend on a window global at all, and
+            // (b) resolve it lazily inside the submit handler so any
+            // late-arriving matrixMLM (e.g. a plugin that filters the
+            // URL through admin_url) still wins. wp_json_encode
+            // produces a safe JS literal whether the URL contains
+            // single quotes, ampersands, or unicode.
+            var DEFAULT_AJAX_URL = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+
+            function getAjaxUrl() {
+                if (window.matrixMLM && window.matrixMLM.ajaxUrl) {
+                    return window.matrixMLM.ajaxUrl;
+                }
+                if (window.ajaxurl) {
+                    return window.ajaxurl;
+                }
+                return DEFAULT_AJAX_URL;
+            }
 
             var triggers = document.querySelectorAll('[data-cug-trigger]');
             var submit   = form.querySelector('.matrix-cug-submit');
@@ -475,6 +498,12 @@ class Matrix_MLM_User_CUG {
 
             form.addEventListener('submit', function(e) {
                 e.preventDefault();
+                // Resolve lazily — see DEFAULT_AJAX_URL note above.
+                // With the PHP-injected fallback this should never
+                // be empty, but keep the guard as defence in depth
+                // for the truly weird case (filter that returns null,
+                // mb-strict server returning false, etc.).
+                var ajaxUrl = getAjaxUrl();
                 if (!ajaxUrl) {
                     setFeedback('error', '<?php echo esc_js(__('Cannot reach the server. Please refresh the page and try again.', 'matrix-mlm')); ?>');
                     return;
