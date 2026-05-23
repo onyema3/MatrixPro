@@ -506,28 +506,25 @@
     gap: 20px;
 }
 
+/* Match the wallet-to-wallet transfer card (.matrix-form-card):
+ * white background, subtle border, 8px radius, flat 24px padding,
+ * left-aligned content, no hover lift. */
 .matrix-benefit-card {
     background: #fff;
     border: 1px solid var(--matrix-border);
-    border-radius: 12px;
-    padding: 24px 22px;
-    text-align: center;
+    border-radius: 8px;
+    padding: 24px;
+    text-align: left;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    transition: transform 0.18s ease, box-shadow 0.18s ease;
-}
-
-.matrix-benefit-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 18px 28px -10px rgba(0, 0, 0, 0.15);
 }
 
 .matrix-benefit-card .benefit-icon {
-    height: 64px;
+    height: 56px;
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     margin-bottom: 4px;
 }
 
@@ -536,8 +533,8 @@
 }
 
 .matrix-benefit-card .benefit-icon img {
-    max-width: 64px;
-    max-height: 64px;
+    max-width: 56px;
+    max-height: 56px;
     object-fit: contain;
 }
 
@@ -559,7 +556,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    justify-content: center;
+    justify-content: flex-start;
     margin-top: 8px;
 }
 
