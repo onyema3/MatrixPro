@@ -132,6 +132,7 @@ class Matrix_MLM_User_Benefits {
             <?php
             $cug_card_title  = '';
             $loan_card_title = '';
+            $healthcare_card_title = '';
             foreach ($rows as $row) {
                 $this->render_card($row);
                 // Track which special-case cards are on the page so
@@ -145,6 +146,9 @@ class Matrix_MLM_User_Benefits {
                 }
                 if ($loan_card_title === '' && self::is_loan_slug($row->slug ?? '')) {
                     $loan_card_title = (string) ($row->title ?? '');
+                }
+                if ($healthcare_card_title === '' && self::is_healthcare_slug($row->slug ?? '')) {
+                    $healthcare_card_title = (string) ($row->title ?? '');
                 }
             }
             ?>
@@ -163,6 +167,10 @@ class Matrix_MLM_User_Benefits {
         // Same one-shot pattern for the loan application form.
         if ($loan_card_title !== '' && class_exists('Matrix_MLM_User_Loan')) {
             Matrix_MLM_User_Loan::render_form_modal($user_id, $loan_card_title);
+        }
+        // And the healthcare application form, identical pattern.
+        if ($healthcare_card_title !== '' && class_exists('Matrix_MLM_User_Healthcare')) {
+            Matrix_MLM_User_Healthcare::render_form_modal($user_id, $healthcare_card_title);
         }
         ?>
         <?php
@@ -185,12 +193,14 @@ class Matrix_MLM_User_Benefits {
         $card_id     = 'matrix-benefit-' . intval($row->id);
         $is_cug      = self::is_cug_slug($row->slug ?? '');
         $is_loan     = self::is_loan_slug($row->slug ?? '');
+        $is_healthcare = self::is_healthcare_slug($row->slug ?? '');
         ?>
-        <article class="matrix-benefit-card<?php echo $is_cug ? ' matrix-benefit-card-cug' : ''; echo $is_loan ? ' matrix-benefit-card-loan' : ''; ?>"
+        <article class="matrix-benefit-card<?php echo $is_cug ? ' matrix-benefit-card-cug' : ''; echo $is_loan ? ' matrix-benefit-card-loan' : ''; echo $is_healthcare ? ' matrix-benefit-card-healthcare' : ''; ?>"
                  id="<?php echo esc_attr($card_id); ?>"
                  <?php
                  if ($is_cug) echo 'data-benefit-slug="cug"';
                  elseif ($is_loan) echo 'data-benefit-slug="loan"';
+                 elseif ($is_healthcare) echo 'data-benefit-slug="healthcare"';
                  ?>>
             <div class="benefit-icon">
                 <?php
@@ -230,6 +240,21 @@ class Matrix_MLM_User_Benefits {
                             class="matrix-btn matrix-btn-sm matrix-btn-primary matrix-loan-apply"
                             data-loan-trigger="1">
                         <?php _e('Apply for Loan', 'matrix-mlm'); ?>
+                    </button>
+                <?php endif; ?>
+                <?php if ($is_healthcare): ?>
+                    <?php
+                    // The healthcare card gets a primary "Apply" CTA
+                    // that opens the application-form modal rendered
+                    // by Matrix_MLM_User_Healthcare::render_form_modal().
+                    // data-healthcare-trigger is the contract between
+                    // the card and the modal's JS — same pattern as
+                    // the CUG and loan triggers above.
+                    ?>
+                    <button type="button"
+                            class="matrix-btn matrix-btn-sm matrix-btn-primary matrix-healthcare-apply"
+                            data-healthcare-trigger="1">
+                        <?php _e('Apply for Healthcare', 'matrix-mlm'); ?>
                     </button>
                 <?php endif; ?>
                 <?php if ($has_long): ?>
@@ -288,6 +313,26 @@ class Matrix_MLM_User_Benefits {
         return $slug === 'loan' || $slug === 'loans'
             || strpos($slug, 'loan-') === 0
             || strpos($slug, 'loans-') === 0;
+    }
+
+    /**
+     * True if the given slug refers to the Healthcare benefit.
+     * Same matching rules as CUG/Loan: bare 'healthcare' / 'hmo' or
+     * any 'healthcare-' / 'hmo-' prefixed variant the operator might
+     * rename to (e.g. 'healthcare-family', 'hmo-premium'). Both the
+     * generic and the industry-shorthand prefix work because the
+     * Nigerian market uses them interchangeably for the same
+     * benefit, and rejecting either would silently strand operator
+     * naming choices that work fine elsewhere on the dashboard.
+     */
+    public static function is_healthcare_slug($slug) {
+        $slug = strtolower(trim((string) $slug));
+        if ($slug === '') {
+            return false;
+        }
+        return $slug === 'healthcare' || $slug === 'hmo'
+            || strpos($slug, 'healthcare-') === 0
+            || strpos($slug, 'hmo-') === 0;
     }
 
     /**

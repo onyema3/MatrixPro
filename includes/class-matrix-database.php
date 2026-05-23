@@ -52,6 +52,7 @@ class Matrix_MLM_Database {
         'matrix_benefits',
         'matrix_cug_requests',
         'matrix_loan_applications',
+        'matrix_healthcare_applications',
     ];
 
     /**
@@ -635,6 +636,66 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_loans);
 
+        // Healthcare (HMO) enrolment applications — submitted from
+        // the Benefits-tab healthcare card. Mirrors the loan table
+        // shape (UNIQUE on user_id for UPSERT-on-resubmit, status
+        // enum + index, admin_notes column, both timestamps) but is
+        // shorter: no guarantor section, no T&Cs / agreed_terms, no
+        // bank account block. Adds a `policy_number` column the
+        // admin triage UI can stamp when status flips to 'approved'
+        // so the user-facing email can quote the issued policy ID.
+        $table_healthcare = $wpdb->prefix . 'matrix_healthcare_applications';
+        $sql_healthcare = "CREATE TABLE $table_healthcare (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            first_name varchar(60) NOT NULL,
+            last_name varchar(60) NOT NULL,
+            middle_name varchar(60) DEFAULT NULL,
+            email varchar(120) NOT NULL,
+            phone varchar(20) NOT NULL,
+            date_of_birth date NOT NULL,
+            gender enum('male','female','other') NOT NULL,
+            marital_status enum('single','married','divorced','widowed') NOT NULL,
+            address_line1 varchar(200) NOT NULL,
+            address_line2 varchar(200) DEFAULT NULL,
+            city varchar(100) NOT NULL,
+            state varchar(100) NOT NULL,
+            zip_code varchar(20) DEFAULT NULL,
+            country varchar(100) NOT NULL,
+            nin varchar(20) NOT NULL,
+            occupation varchar(120) DEFAULT NULL,
+            plan_tier enum('basic','standard','premium','family') NOT NULL,
+            coverage_type enum('individual','family') NOT NULL,
+            preferred_hospital varchar(200) NOT NULL,
+            dependants_count tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+            blood_group enum('A+','A-','B+','B-','AB+','AB-','O+','O-','unknown') NOT NULL DEFAULT 'unknown',
+            genotype enum('AA','AS','SS','AC','SC','unknown') NOT NULL DEFAULT 'unknown',
+            height_cm smallint(5) UNSIGNED DEFAULT NULL,
+            weight_kg smallint(5) UNSIGNED DEFAULT NULL,
+            pre_existing_conditions text,
+            allergies text,
+            current_medications text,
+            is_smoker tinyint(1) NOT NULL DEFAULT 0,
+            is_pregnant tinyint(1) NOT NULL DEFAULT 0,
+            nok_name varchar(120) NOT NULL,
+            nok_relationship varchar(50) NOT NULL,
+            nok_phone varchar(20) NOT NULL,
+            passport_photo_url varchar(500) DEFAULT NULL,
+            nin_slip_url varchar(500) DEFAULT NULL,
+            utility_bill_url varchar(500) DEFAULT NULL,
+            medical_history_url varchar(500) DEFAULT NULL,
+            status enum('pending','under_review','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
+            policy_number varchar(50) DEFAULT NULL,
+            admin_notes text,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY user_id (user_id),
+            KEY status (status),
+            KEY created_at (created_at)
+        ) $charset_collate;";
+        dbDelta($sql_healthcare);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -652,6 +713,7 @@ class Matrix_MLM_Database {
             'matrix_benefits',
             'matrix_cug_requests',
             'matrix_loan_applications',
+            'matrix_healthcare_applications',
         ];
 
         foreach ($tables as $table) {

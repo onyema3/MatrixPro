@@ -60,6 +60,11 @@ class Matrix_MLM_Admin {
         // permissions never get out of sync between the two
         // member-application surfaces.
         add_submenu_page('matrix-mlm', __('Loan Applications', 'matrix-mlm'), __('Loans', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-loans', [new Matrix_MLM_Admin_Loans(), 'render']);
+        // Healthcare Applications — sister page to CUG/Loans for the
+        // HMO enrolment benefit. Same capability so reviewer
+        // permissions stay in lockstep across all three application
+        // surfaces.
+        add_submenu_page('matrix-mlm', __('Healthcare Applications', 'matrix-mlm'), __('Healthcare', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-healthcare', [new Matrix_MLM_Admin_Healthcare(), 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
