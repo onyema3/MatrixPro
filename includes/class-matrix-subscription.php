@@ -144,7 +144,19 @@ class Matrix_MLM_Subscription {
                     ['user_id' => $user->user_id, 'billing_month' => $billing_month]
                 );
 
-                // Notify user
+                // Notify the user — this is the channel the user actually
+                // sees, and they need it to know why the dashboard
+                // suddenly refuses to load. The email lays out the cure
+                // (top up + click Pay Subscription on the dashboard) so
+                // the user can self-heal without contacting support.
+                Matrix_MLM_Notifications::send_subscription_deactivation_notification(
+                    (int) $user->user_id,
+                    $amount,
+                    $billing_month
+                );
+
+                // Notify admin too — kept from the original flow so
+                // operators don't lose visibility into who lapsed.
                 Matrix_MLM_Notifications::send_admin_notification(
                     'subscription_deactivation',
                     sprintf('User ID %d has been deactivated due to unpaid monthly subscription.', $user->user_id)
