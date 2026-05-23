@@ -65,6 +65,12 @@ class Matrix_MLM_Admin {
         // permissions stay in lockstep across all three application
         // surfaces.
         add_submenu_page('matrix-mlm', __('Healthcare Applications', 'matrix-mlm'), __('Healthcare', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-healthcare', [new Matrix_MLM_Admin_Healthcare(), 'render']);
+        // Hospitals — admin-managed list that backs the "Choice of
+        // Hospital" dropdown on the member-facing Healthcare form.
+        // Sits next to Healthcare Applications because the two are
+        // operationally paired: one defines the choices, the other
+        // triages the resulting applications.
+        add_submenu_page('matrix-mlm', __('Hospitals', 'matrix-mlm'), __('Hospitals', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-hospitals', [new Matrix_MLM_Admin_Hospitals(), 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 

@@ -53,6 +53,7 @@ class Matrix_MLM_Database {
         'matrix_cug_requests',
         'matrix_loan_applications',
         'matrix_healthcare_applications',
+        'matrix_hospitals',
     ];
 
     /**
@@ -99,6 +100,43 @@ class Matrix_MLM_Database {
         ));
         if ($col && strtoupper($col->IS_NULLABLE) === 'NO') {
             $wpdb->query("ALTER TABLE {$table} MODIFY plan_id BIGINT(20) UNSIGNED NULL DEFAULT NULL");
+        }
+
+        // Defensive ALTERs for the 1.0.7 healthcare-form rewrite.
+        // Several columns that used to be NOT NULL are now optional
+        // because the new Adult/Dependant form no longer collects
+        // them — but dbDelta cannot reliably drop NOT NULL on an
+        // already-existing column across MySQL versions, so we
+        // fix-up here. Idempotent: the IS_NULLABLE probe skips the
+        // ALTER once the column is already nullable.
+        $hc_table = $wpdb->prefix . 'matrix_healthcare_applications';
+        $hc_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $hc_table
+        ));
+        if ($hc_exists > 0) {
+            $relax = [
+                // column           => MODIFY clause
+                'phone'              => "MODIFY phone VARCHAR(20) NULL DEFAULT NULL",
+                'nin'                => "MODIFY nin VARCHAR(20) NULL DEFAULT NULL",
+                'marital_status'     => "MODIFY marital_status ENUM('single','married','divorced','widowed') NULL DEFAULT NULL",
+                'plan_tier'          => "MODIFY plan_tier ENUM('basic','standard','premium','family') NULL DEFAULT NULL",
+                'coverage_type'      => "MODIFY coverage_type ENUM('individual','family') NULL DEFAULT NULL",
+                'preferred_hospital' => "MODIFY preferred_hospital VARCHAR(200) NULL DEFAULT NULL",
+                'nok_name'           => "MODIFY nok_name VARCHAR(120) NULL DEFAULT NULL",
+                'nok_relationship'   => "MODIFY nok_relationship VARCHAR(50) NULL DEFAULT NULL",
+                'nok_phone'          => "MODIFY nok_phone VARCHAR(20) NULL DEFAULT NULL",
+            ];
+            foreach ($relax as $col_name => $modify) {
+                $info = $wpdb->get_row($wpdb->prepare(
+                    "SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS
+                      WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                    DB_NAME, $hc_table, $col_name
+                ));
+                if ($info && strtoupper($info->IS_NULLABLE) === 'NO') {
+                    $wpdb->query("ALTER TABLE {$hc_table} {$modify}");
+                }
+            }
         }
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
@@ -644,29 +682,50 @@ class Matrix_MLM_Database {
         // bank account block. Adds a `policy_number` column the
         // admin triage UI can stamp when status flips to 'approved'
         // so the user-facing email can quote the issued policy ID.
+        //
+        // The form was rewritten in 1.0.7 to a two-branch flow
+        // (Adult vs Dependant) so several columns that used to be
+        // NOT NULL are now nullable — they're no longer collected
+        // from new submissions but are kept on the table so existing
+        // pre-1.0.7 rows still render correctly in the admin triage
+        // UI. The new columns at the bottom of the definition
+        // (applicant_type, whatsapp, parent_*, hospital_state,
+        // hospital_id) carry the post-1.0.7 form's payload. See
+        // Matrix_MLM_User_Healthcare for the form, and the defensive
+        // MODIFY ... NULL ALTERs in self::maybe_upgrade() for why
+        // dbDelta alone can't be relied on to relax NOT NULL on an
+        // existing column across MySQL versions.
         $table_healthcare = $wpdb->prefix . 'matrix_healthcare_applications';
         $sql_healthcare = "CREATE TABLE $table_healthcare (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id bigint(20) UNSIGNED NOT NULL,
+            applicant_type enum('adult','dependant') NOT NULL DEFAULT 'adult',
             first_name varchar(60) NOT NULL,
             last_name varchar(60) NOT NULL,
             middle_name varchar(60) DEFAULT NULL,
             email varchar(120) NOT NULL,
-            phone varchar(20) NOT NULL,
+            phone varchar(20) DEFAULT NULL,
+            whatsapp varchar(20) DEFAULT NULL,
             date_of_birth date NOT NULL,
             gender enum('male','female','other') NOT NULL,
-            marital_status enum('single','married','divorced','widowed') NOT NULL,
+            marital_status enum('single','married','divorced','widowed') DEFAULT NULL,
             address_line1 varchar(200) NOT NULL,
             address_line2 varchar(200) DEFAULT NULL,
             city varchar(100) NOT NULL,
             state varchar(100) NOT NULL,
             zip_code varchar(20) DEFAULT NULL,
             country varchar(100) NOT NULL,
-            nin varchar(20) NOT NULL,
+            nin varchar(20) DEFAULT NULL,
             occupation varchar(120) DEFAULT NULL,
-            plan_tier enum('basic','standard','premium','family') NOT NULL,
-            coverage_type enum('individual','family') NOT NULL,
-            preferred_hospital varchar(200) NOT NULL,
+            parent_first_name varchar(60) DEFAULT NULL,
+            parent_last_name varchar(60) DEFAULT NULL,
+            parent_phone varchar(20) DEFAULT NULL,
+            parent_whatsapp varchar(20) DEFAULT NULL,
+            plan_tier enum('basic','standard','premium','family') DEFAULT NULL,
+            coverage_type enum('individual','family') DEFAULT NULL,
+            preferred_hospital varchar(200) DEFAULT NULL,
+            hospital_id bigint(20) UNSIGNED DEFAULT NULL,
+            hospital_state varchar(50) DEFAULT NULL,
             dependants_count tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
             blood_group enum('A+','A-','B+','B-','AB+','AB-','O+','O-','unknown') NOT NULL DEFAULT 'unknown',
             genotype enum('AA','AS','SS','AC','SC','unknown') NOT NULL DEFAULT 'unknown',
@@ -677,9 +736,9 @@ class Matrix_MLM_Database {
             current_medications text,
             is_smoker tinyint(1) NOT NULL DEFAULT 0,
             is_pregnant tinyint(1) NOT NULL DEFAULT 0,
-            nok_name varchar(120) NOT NULL,
-            nok_relationship varchar(50) NOT NULL,
-            nok_phone varchar(20) NOT NULL,
+            nok_name varchar(120) DEFAULT NULL,
+            nok_relationship varchar(50) DEFAULT NULL,
+            nok_phone varchar(20) DEFAULT NULL,
             passport_photo_url varchar(500) DEFAULT NULL,
             nin_slip_url varchar(500) DEFAULT NULL,
             utility_bill_url varchar(500) DEFAULT NULL,
@@ -692,9 +751,34 @@ class Matrix_MLM_Database {
             PRIMARY KEY (id),
             UNIQUE KEY user_id (user_id),
             KEY status (status),
-            KEY created_at (created_at)
+            KEY created_at (created_at),
+            KEY hospital_id (hospital_id)
         ) $charset_collate;";
         dbDelta($sql_healthcare);
+
+        // Hospitals — admin-managed list rendered as the "Choice of
+        // Hospital" dropdown on the user healthcare form. Each row
+        // is tagged with a Nigerian state so the form's Hospital
+        // dropdown can filter live as the applicant picks a state.
+        // Adding/editing/disabling is handled by
+        // Matrix_MLM_Admin_Hospitals; the form-side query lives in
+        // Matrix_MLM_User_Healthcare::get_hospitals_grouped().
+        $table_hospitals = $wpdb->prefix . 'matrix_hospitals';
+        $sql_hospitals = "CREATE TABLE $table_hospitals (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            name varchar(200) NOT NULL,
+            state varchar(50) NOT NULL,
+            address varchar(500) DEFAULT NULL,
+            notes text,
+            display_order int(11) NOT NULL DEFAULT 0,
+            status enum('active','inactive') NOT NULL DEFAULT 'active',
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY state_status (state, status),
+            KEY status_order (status, display_order)
+        ) $charset_collate;";
+        dbDelta($sql_hospitals);
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
@@ -714,6 +798,7 @@ class Matrix_MLM_Database {
             'matrix_cug_requests',
             'matrix_loan_applications',
             'matrix_healthcare_applications',
+            'matrix_hospitals',
         ];
 
         foreach ($tables as $table) {
