@@ -265,7 +265,19 @@ class Matrix_MLM_User_Benefits {
      */
     private function render_modal_scaffold() {
         ?>
-        <div class="matrix-benefit-modal" id="matrix-benefit-modal" aria-hidden="true" role="dialog" aria-modal="true">
+        <?php
+        // Same belt-and-braces hide pattern used by the CUG modal:
+        // hidden attribute + inline display:none + aria-hidden, all
+        // toggled together by the JS below. Protects against the
+        // exact failure mode the CUG modal hit in the wild — a
+        // cached matrix-public.css that predates the CSS rule
+        // hiding `.matrix-benefit-modal` and so renders the modal
+        // contents inline on the dashboard.
+        ?>
+        <div class="matrix-benefit-modal" id="matrix-benefit-modal"
+             hidden
+             style="display:none;"
+             aria-hidden="true" role="dialog" aria-modal="true">
             <div class="matrix-benefit-modal-backdrop" data-benefit-modal-close></div>
             <div class="matrix-benefit-modal-dialog" role="document">
                 <button type="button" class="matrix-benefit-modal-close" data-benefit-modal-close aria-label="<?php esc_attr_e('Close', 'matrix-mlm'); ?>">&times;</button>
@@ -292,6 +304,10 @@ class Matrix_MLM_User_Benefits {
                 // anything dangerous, and the template element's
                 // contents are inert until copied into the modal.
                 bodyEl.innerHTML = tpl.innerHTML;
+                // Remove every layer hiding the modal so it works
+                // even if the cached CSS predates the hide rule.
+                modal.hidden = false;
+                modal.style.display = '';
                 modal.classList.add('is-open');
                 modal.setAttribute('aria-hidden', 'false');
                 document.body.classList.add('matrix-benefit-modal-lock');
@@ -299,6 +315,11 @@ class Matrix_MLM_User_Benefits {
 
             function closeModal() {
                 modal.classList.remove('is-open');
+                // Reassert every hide layer on close, mirroring the
+                // CUG modal so a stale stylesheet can't leave the
+                // dialog visible after dismiss.
+                modal.hidden = true;
+                modal.style.display = 'none';
                 modal.setAttribute('aria-hidden', 'true');
                 document.body.classList.remove('matrix-benefit-modal-lock');
                 bodyEl.innerHTML = '';
