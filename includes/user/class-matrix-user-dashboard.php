@@ -137,8 +137,17 @@ class Matrix_MLM_User_Dashboard {
 
         $tab = $this->resolve_active_tab();
 
+        // Surface any unread level-completion milestones for this user
+        // as a top-of-page toast stack. Buffered output, since
+        // render_dashboard's caller wraps the whole shortcode in
+        // ob_start()/ob_get_clean() — emitting the toast HTML before
+        // the dashboard wrapper is what we want for a fixed-position
+        // overlay, but it also has to flow through the same buffer.
+        $level_toasts_html = $this->build_level_completion_toasts($user_id);
+
         ob_start();
         ?>
+        <?php echo $level_toasts_html; ?>
         <div class="matrix-dashboard">
             <div class="matrix-dashboard-sidebar">
                 <div class="matrix-user-info">
@@ -171,6 +180,166 @@ class Matrix_MLM_User_Dashboard {
         </div>
         <?php
         return ob_get_clean();
+    }
+
+    /**
+     * Build the inline toast stack rendered at the top of every
+     * dashboard page when the current user has level-completion
+     * milestones they haven't seen yet. Returns a string (the caller
+     * inlines it ahead of the dashboard wrapper) and is the only
+     * place toast_seen_at gets stamped — running this once per
+     * pageload means a milestone surfaces exactly once per user.
+     *
+     * Why a fully self-contained <style>+<script> block instead of
+     * reusing matrix-public.js's showNotification()? Two reasons:
+     *
+     *   1. showNotification() is declared inside an IIFE in
+     *      public/js/matrix-public.js, so it is *not* on window and
+     *      can't be called from inline markup without exposing it
+     *      first — and changing matrix-public.js is out of scope here.
+     *
+     *   2. Several existing dashboard surfaces (Bank Payout, Wallet,
+     *      CUG) already carry long defensive comments about caching
+     *      plugins / asset optimizers that strip matrix-public.js
+     *      from the page; they fall back to inline handlers for the
+     *      same reason. The level-completion toast must be visible
+     *      even on those installs, so it ships with its own CSS,
+     *      its own JS, and zero external dependencies (jQuery
+     *      included — pure DOM APIs).
+     *
+     * Auto-dismiss after 8s gives the user enough time to read a
+     * line of copy without the toast becoming sticky page furniture.
+     * A close (×) button stays available for users who want to
+     * dismiss it sooner. Either way, the row is marked seen *now*
+     * (server-side) — we don't wait for the user to acknowledge,
+     * because if they navigate away before doing so we still don't
+     * want to re-toast on the next load. The email is the durable
+     * record; the toast is just the nudge.
+     *
+     * @param int $user_id Current user id.
+     * @return string HTML to inline before the dashboard wrapper.
+     *                Empty string when there are no unread milestones.
+     */
+    private function build_level_completion_toasts($user_id) {
+        if (!class_exists('Matrix_MLM_Plan_Engine')) {
+            return '';
+        }
+        $rows = Matrix_MLM_Plan_Engine::get_unread_level_completions($user_id);
+        if (empty($rows)) {
+            return '';
+        }
+
+        $items = [];
+        $ids   = [];
+        foreach ($rows as $row) {
+            $ids[]    = (int) $row->id;
+            $level    = (int) $row->level;
+            $width    = (int) ($row->plan_width ?? 0);
+            $name     = (string) ($row->plan_name ?? '');
+            $positions = ($width > 0 && $level > 0) ? (int) pow($width, $level) : 0;
+
+            // No "Matrix Master" / final-level branch on the toast,
+            // for the same reason as the email path: the engine's
+            // existing matrix_completion bonus already announces the
+            // whole-matrix event with its own commission notification
+            // and wallet credit. Per-level toasts stay scoped to a
+            // single level so the two surfaces don't fight over the
+            // user's attention when the deepest level happens to also
+            // close out the matrix.
+            $title = sprintf(
+                /* translators: %d: level number */
+                __('Level %d Completed', 'matrix-mlm'),
+                $level
+            );
+            $body = sprintf(
+                /* translators: 1: position count, 2: plan name */
+                __('All %1$s positions at this depth of your %2$s matrix are filled.', 'matrix-mlm'),
+                number_format($positions),
+                $name
+            );
+
+            $items[] = sprintf(
+                '<div class="matrix-level-toast" role="status" aria-live="polite">'
+                . '<button type="button" class="matrix-level-toast-close" aria-label="%s">&times;</button>'
+                . '<div class="matrix-level-toast-icon" aria-hidden="true"><span class="dashicons dashicons-awards"></span></div>'
+                . '<div class="matrix-level-toast-body">'
+                . '<div class="matrix-level-toast-title">%s</div>'
+                . '<div class="matrix-level-toast-msg">%s</div>'
+                . '</div>'
+                . '</div>',
+                esc_attr__('Dismiss', 'matrix-mlm'),
+                esc_html($title),
+                esc_html($body)
+            );
+        }
+
+        // Mark seen *before* returning HTML — see method docblock for
+        // why we don't wait for the user to acknowledge.
+        Matrix_MLM_Plan_Engine::mark_level_completions_seen($ids);
+
+        $css = '<style>
+            .matrix-level-toast-stack {
+                position: fixed; top: 24px; right: 24px;
+                z-index: 99999; display: flex; flex-direction: column;
+                gap: 10px; max-width: calc(100vw - 48px); width: 360px;
+            }
+            .matrix-level-toast {
+                position: relative; display: flex; gap: 12px;
+                align-items: flex-start; padding: 14px 36px 14px 14px;
+                background: #fff; border: 1px solid #e5e7eb; border-left: 4px solid #8b5cf6;
+                border-radius: 10px; box-shadow: 0 18px 38px -12px rgba(0,0,0,0.25);
+                opacity: 0; transform: translateX(20px);
+                transition: opacity .25s ease, transform .25s ease;
+            }
+            .matrix-level-toast.is-visible { opacity: 1; transform: translateX(0); }
+            .matrix-level-toast-icon {
+                flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                background: #ddd6fe; color: #5b21b6;
+            }
+            .matrix-level-toast-icon .dashicons { font-size: 20px; width: 20px; height: 20px; }
+            .matrix-level-toast-body { flex: 1 1 auto; min-width: 0; }
+            .matrix-level-toast-title { font-weight: 700; font-size: 14px; color: #111827; line-height: 1.2; margin-bottom: 4px; }
+            .matrix-level-toast-msg { font-size: 13px; color: #4b5563; line-height: 1.4; }
+            .matrix-level-toast-close {
+                position: absolute; top: 8px; right: 8px; width: 24px; height: 24px;
+                display: flex; align-items: center; justify-content: center;
+                border: 0; background: transparent; cursor: pointer;
+                color: #9ca3af; font-size: 18px; line-height: 1; padding: 0;
+            }
+            .matrix-level-toast-close:hover { color: #4b5563; }
+        </style>';
+
+        // Pure-DOM JS, no jQuery. Animates each toast in on load and
+        // auto-dismisses after 8s; the close button is a simple
+        // remove(). All listeners are scoped to this fragment, so
+        // there is no risk of leaking handlers into the rest of the
+        // dashboard.
+        $js = '<script>(function(){
+            try {
+                var stack = document.getElementById("matrix-level-toast-stack");
+                if (!stack) return;
+                var toasts = stack.querySelectorAll(".matrix-level-toast");
+                var i = 0;
+                toasts.forEach(function(t){
+                    setTimeout(function(){ t.classList.add("is-visible"); }, 80 + (i * 120));
+                    setTimeout(function(){ dismiss(t); }, 8000 + (i * 120));
+                    var btn = t.querySelector(".matrix-level-toast-close");
+                    if (btn) { btn.addEventListener("click", function(){ dismiss(t); }); }
+                    i++;
+                });
+                function dismiss(t){
+                    t.classList.remove("is-visible");
+                    setTimeout(function(){ if (t && t.parentNode) t.parentNode.removeChild(t); }, 300);
+                }
+            } catch (e) { /* never let a toast break the dashboard */ }
+        })();</script>';
+
+        return $css
+            . '<div class="matrix-level-toast-stack" id="matrix-level-toast-stack">'
+            . implode('', $items)
+            . '</div>'
+            . $js;
     }
 
     private function render_tab($tab, $user_id) {

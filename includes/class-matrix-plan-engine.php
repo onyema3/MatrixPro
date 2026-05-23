@@ -145,6 +145,16 @@ class Matrix_MLM_Plan_Engine {
         // Pay level commissions to upline
         $this->pay_level_commissions($user_id, $plan);
 
+        // Record any level-completion milestones unlocked by this
+        // placement and fire the email-side notification for each new
+        // milestone. Runs *before* check_matrix_completion() because
+        // the deepest level becoming complete should record both a
+        // level-D milestone (this method) and the whole-matrix
+        // completion bonus (the next call) — they're independent
+        // events with independent persistence and independent
+        // notification surfaces.
+        $this->record_level_completions($placement, $plan);
+
         // Check for matrix completion
         $this->check_matrix_completion($plan_id, $plan->width, $plan->depth);
 
@@ -361,6 +371,262 @@ class Matrix_MLM_Plan_Engine {
             $current_parent_id = $parent_position->parent_id;
             $current_level++;
         }
+    }
+
+    /**
+     * Record per-level completion milestones unlocked by a placement,
+     * and fire the email-side notification for each newly recorded
+     * milestone. Called from join_plan() right after the new position
+     * has been inserted and the upline counts/commissions have been
+     * paid.
+     *
+     * "A level is complete" = every one of the W^L positions at depth L
+     * below an ancestor is filled by an active member (same definition
+     * used by verify_matrix_complete() and the badge panel). When a new
+     * member is placed, only one level changes for each ancestor — the
+     * level matching the relative depth between that ancestor and the
+     * new placement. So for each ancestor walking up the chain we ask
+     * exactly one question: "did *this* level you owned just hit its
+     * W^L target?".
+     *
+     * Idempotency is enforced at the storage layer via the
+     * (user_id, plan_id, level) UNIQUE key on
+     * wp_matrix_level_completions. We INSERT IGNORE and only fire the
+     * email when $wpdb->insert returns a positive row count — this
+     * means later joiners can't re-trigger the notification once the
+     * milestone has been recorded, even if the level remains complete
+     * forever.
+     *
+     * Walks the parent chain (not the sponsor chain), since matrix
+     * placement can spill recruits past their direct sponsor and we
+     * want to credit the ancestor whose tree actually fills, not the
+     * ancestor who recruited the joiner.
+     *
+     * @param array  $placement Output of self::find_placement() — must
+     *                          carry 'parent_id' and 'level' keys; the
+     *                          new position's depth in the global tree.
+     * @param object $plan      Row from wp_matrix_plans (provides id,
+     *                          width, depth, name).
+     * @return void
+     */
+    private function record_level_completions($placement, $plan) {
+        global $wpdb;
+
+        $parent_id = isset($placement['parent_id']) ? (int) $placement['parent_id'] : 0;
+        $new_level = isset($placement['level'])     ? (int) $placement['level']     : 0;
+        if ($parent_id <= 0 || $new_level <= 0 || empty($plan)) {
+            // No ancestor (we just inserted the very first position in
+            // this plan) or malformed placement — nothing to score.
+            return;
+        }
+
+        $width = (int) $plan->width;
+        $depth = (int) $plan->depth;
+        if ($width < 1 || $depth < 1) {
+            return;
+        }
+
+        $plan_id  = (int) $plan->id;
+        $table    = $wpdb->prefix . 'matrix_level_completions';
+
+        // Walk the placement's parent chain (not the sponsor chain —
+        // see method docblock). Cap the walk at the plan's depth so
+        // that an inconsistent tree (deeper than the plan claims)
+        // can't run away with this loop.
+        $current_id = $parent_id;
+        $hops       = 0;
+
+        while ($current_id && $hops <= $depth) {
+            $ancestor = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, user_id, parent_id, level
+                   FROM {$wpdb->prefix}matrix_positions
+                  WHERE id = %d
+                    AND plan_id = %d",
+                $current_id, $plan_id
+            ));
+            if (!$ancestor) {
+                break;
+            }
+
+            // Relative depth of the new placement under this ancestor.
+            // Always positive because the new placement is strictly
+            // deeper than any ancestor on its parent chain. Stops
+            // looking past the plan's configured depth — anything past
+            // that isn't a recordable level for this plan.
+            $relative_level = $new_level - (int) $ancestor->level;
+            if ($relative_level < 1 || $relative_level > $depth) {
+                $current_id = $ancestor->parent_id;
+                $hops++;
+                continue;
+            }
+
+            $expected = (int) pow($width, $relative_level);
+            $filled   = (int) $this->count_descendants_at_level(
+                (int) $ancestor->id, $plan_id, $relative_level
+            );
+
+            if ($filled >= $expected) {
+                // INSERT IGNORE keeps this idempotent: a subsequent
+                // joiner who lands under the same ancestor at the
+                // same relative level can't re-create the row.
+                $now = current_time('mysql');
+                $rows = $wpdb->query($wpdb->prepare(
+                    "INSERT IGNORE INTO {$table}
+                        (user_id, plan_id, position_id, level, completed_at, email_sent_at)
+                     VALUES (%d, %d, %d, %d, %s, %s)",
+                    (int) $ancestor->user_id,
+                    $plan_id,
+                    (int) $ancestor->id,
+                    $relative_level,
+                    $now,
+                    $now
+                ));
+
+                if ((int) $rows > 0) {
+                    // Fresh milestone — email goes out now. Toast is
+                    // surfaced on the user's next dashboard pageload
+                    // (see Matrix_MLM_User_Dashboard); we only stamp
+                    // email_sent_at here because the email is the only
+                    // synchronous channel.
+                    //
+                    // No "is final" / "Matrix Master" framing here on
+                    // purpose: the engine's existing complete_matrix()
+                    // already fires its own commission_notification of
+                    // type 'matrix_completion' when the whole matrix
+                    // is filled, and that notification is the
+                    // legitimate "you finished the matrix" message
+                    // (it's paired with the wallet credit for the
+                    // matrix_completion_bonus). Adding a second
+                    // "Matrix Master" hand-wave here would compete
+                    // with it. Per-level emails stay scoped to "you
+                    // completed level N", and the deepest level just
+                    // happens to coincide with the matrix-completion
+                    // event for the root — at which point the user
+                    // gets two emails (level milestone + completion
+                    // bonus), which is the correct behaviour because
+                    // they ARE two distinct events.
+                    Matrix_MLM_Notifications::send_level_completion_notification(
+                        (int) $ancestor->user_id,
+                        $plan,
+                        $relative_level,
+                        $width
+                    );
+                }
+            }
+
+            $current_id = $ancestor->parent_id;
+            $hops++;
+        }
+    }
+
+    /**
+     * Count how many active descendants of $position_id sit at exactly
+     * $target_level depth below it in $plan_id's tree. Uses the same
+     * level-by-level BFS as get_level_completion_status() but stops
+     * the moment it has the count it needs — record_level_completions()
+     * only needs one level per ancestor, so descending past it would
+     * be wasted DB work.
+     *
+     * Returns 0 for any non-positive target level (nothing to count
+     * above the ancestor itself).
+     */
+    private function count_descendants_at_level($position_id, $plan_id, $target_level) {
+        if ($target_level < 1) {
+            return 0;
+        }
+        global $wpdb;
+        $frontier = [(int) $position_id];
+        for ($L = 1; $L <= $target_level; $L++) {
+            if (empty($frontier)) {
+                return 0;
+            }
+            $placeholders = implode(',', array_fill(0, count($frontier), '%d'));
+            $params       = array_map('intval', $frontier);
+            $params[]     = (int) $plan_id;
+            $children = $wpdb->get_col($wpdb->prepare(
+                "SELECT id FROM {$wpdb->prefix}matrix_positions
+                  WHERE parent_id IN ($placeholders)
+                    AND plan_id = %d
+                    AND status = 'active'",
+                $params
+            ));
+            if ($L === $target_level) {
+                return count($children);
+            }
+            $frontier = array_map('intval', $children);
+        }
+        return 0;
+    }
+
+    /**
+     * Fetch level-completion rows whose toast_seen_at is still NULL
+     * for a given user. Used by the dashboard to surface a one-time
+     * toast on the user's next pageload after a level is reached.
+     * Returns rows enriched with the plan's width/depth/name so the
+     * caller doesn't need a second query to render the toast copy.
+     *
+     * @param int $user_id
+     * @param int $limit  Hard ceiling on how many toasts to render in
+     *                    one pageload (avoids a wall of 20 toasts on
+     *                    a member who just blew through several levels
+     *                    while logged out).
+     * @return array<int, object>
+     */
+    public static function get_unread_level_completions($user_id, $limit = 5) {
+        global $wpdb;
+        $user_id = (int) $user_id;
+        $limit   = max(1, min(20, (int) $limit));
+        if ($user_id <= 0) {
+            return [];
+        }
+        $table = $wpdb->prefix . 'matrix_level_completions';
+        // Defensive: if the table is missing on this install (e.g. a
+        // freshly-cloned site whose maybe_upgrade hasn't run yet),
+        // bail rather than throw a SQL error that would blank the
+        // dashboard.
+        $exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $table
+        ));
+        if ($exists <= 0) {
+            return [];
+        }
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT lc.*, pl.name AS plan_name, pl.width AS plan_width, pl.depth AS plan_depth
+               FROM {$table} lc
+               LEFT JOIN {$wpdb->prefix}matrix_plans pl ON pl.id = lc.plan_id
+              WHERE lc.user_id = %d
+                AND lc.toast_seen_at IS NULL
+              ORDER BY lc.completed_at ASC
+              LIMIT %d",
+            $user_id, $limit
+        ));
+    }
+
+    /**
+     * Mark a list of level-completion rows as toast-seen. Stamps
+     * toast_seen_at with the current MySQL time so a row can never
+     * resurface as an unread toast on the next pageload, even after
+     * a session restore. Silently no-ops on an empty id list.
+     */
+    public static function mark_level_completions_seen(array $ids) {
+        global $wpdb;
+        $ids = array_filter(array_map('intval', $ids), function ($v) { return $v > 0; });
+        if (empty($ids)) {
+            return;
+        }
+        $table        = $wpdb->prefix . 'matrix_level_completions';
+        $placeholders = implode(',', array_fill(0, count($ids), '%d'));
+        $params       = $ids;
+        array_unshift($params, current_time('mysql'));
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$table}
+                SET toast_seen_at = %s
+              WHERE id IN ($placeholders)
+                AND toast_seen_at IS NULL",
+            $params
+        ));
     }
 
     /**
