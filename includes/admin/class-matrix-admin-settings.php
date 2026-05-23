@@ -325,20 +325,61 @@ class Matrix_MLM_Admin_Settings {
 
     private function render_notifications_tab() {
         $admin_fallback = (string) get_option('admin_email');
-        $app_recipients = (string) get_option('matrix_mlm_application_notification_email', '');
+        $cug_recipients        = (string) get_option('matrix_mlm_cug_notification_email', '');
+        $loan_recipients       = (string) get_option('matrix_mlm_loan_notification_email', '');
+        $healthcare_recipients = (string) get_option('matrix_mlm_healthcare_notification_email', '');
+        $shared_recipients     = (string) get_option('matrix_mlm_application_notification_email', '');
         ?>
         <table class="form-table">
             <tr><th><?php _e('Email Verification', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_email_verification" value="1" <?php checked(get_option('matrix_mlm_email_verification', 1)); ?>> <?php _e('Require email verification on registration', 'matrix-mlm'); ?></label></td></tr>
             <tr><th><?php _e('SMS Verification', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_sms_verification" value="1" <?php checked(get_option('matrix_mlm_sms_verification', 0)); ?>> <?php _e('Require SMS verification', 'matrix-mlm'); ?></label></td></tr>
-            <tr><th><?php _e('Application Review Notifications', 'matrix-mlm'); ?></th>
+
+            <tr><td colspan="2" style="padding-top:24px;border-bottom:1px solid #e5e7eb;padding-bottom:8px;">
+                <h3 style="margin:0;color:#1f2937;"><?php _e('Application Review Notifications', 'matrix-mlm'); ?></h3>
+                <p class="description" style="margin-top:4px;">
+                    <?php _e('Each benefit can have its own reviewer email so different teams triage different applications. Leave a benefit-specific field blank to fall through to the Shared fallback below; leave that blank too and the WordPress admin email is used. Multiple addresses per field — separate with commas.', 'matrix-mlm'); ?>
+                </p>
+            </td></tr>
+
+            <tr><th><?php _e('CUG Reviewer', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="text" name="matrix_mlm_cug_notification_email" class="regular-text"
+                           value="<?php echo esc_attr($cug_recipients); ?>"
+                           placeholder="<?php echo esc_attr($shared_recipients !== '' ? $shared_recipients : $admin_fallback); ?>">
+                    <p class="description">
+                        <?php _e('Receives a full copy of every CUG application as soon as it is submitted.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Loan Reviewer', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="text" name="matrix_mlm_loan_notification_email" class="regular-text"
+                           value="<?php echo esc_attr($loan_recipients); ?>"
+                           placeholder="<?php echo esc_attr($shared_recipients !== '' ? $shared_recipients : $admin_fallback); ?>">
+                    <p class="description">
+                        <?php _e('Receives a full copy of every business-loan application as soon as it is submitted.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Healthcare Reviewer', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="text" name="matrix_mlm_healthcare_notification_email" class="regular-text"
+                           value="<?php echo esc_attr($healthcare_recipients); ?>"
+                           placeholder="<?php echo esc_attr($shared_recipients !== '' ? $shared_recipients : $admin_fallback); ?>">
+                    <p class="description">
+                        <?php _e('Receives a full copy of every Healthcare (HMO) enrolment application as soon as it is submitted.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Shared fallback', 'matrix-mlm'); ?></th>
                 <td>
                     <input type="text" name="matrix_mlm_application_notification_email" class="regular-text"
-                           value="<?php echo esc_attr($app_recipients); ?>"
+                           value="<?php echo esc_attr($shared_recipients); ?>"
                            placeholder="<?php echo esc_attr($admin_fallback); ?>">
                     <p class="description">
-                        <?php _e('Email address(es) that receive a full copy of every CUG and Loan application as soon as it is submitted, so reviewers can read the application before approving it from the admin triage pages. Separate multiple addresses with commas. Leave blank to use the WordPress admin email.', 'matrix-mlm'); ?>
+                        <?php _e('Used for any benefit whose own field above is blank. Useful when one team handles multiple benefits, or as a safety net during the migration from the old single-recipient setup. Leave blank to fall through to the WordPress admin email.', 'matrix-mlm'); ?>
                     </p>
                 </td></tr>
         </table>
@@ -562,7 +603,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer'];
                 break;
             case 'notifications':
-                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email'];
+                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email', 'matrix_mlm_cug_notification_email', 'matrix_mlm_loan_notification_email', 'matrix_mlm_healthcare_notification_email'];
                 break;
             case 'security':
                 $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
