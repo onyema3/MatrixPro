@@ -107,6 +107,36 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send loan-application status notification.
+     *
+     * Fired by the admin loan triage UI when an operator transitions
+     * a row to a user-visible decision state (approved / rejected /
+     * cancelled). Pending and under_review do not call this method —
+     * they're internal workflow noise from the applicant's POV.
+     *
+     * Subject prefix uses the formatted status ("Under Review" rather
+     * than "under_review") so the inbox preview reads naturally; the
+     * underscore-form is preserved in the body via the template's
+     * own status-aware copy.
+     */
+    public static function send_loan_notification($user_id, $amount, $status) {
+        $user = get_userdata($user_id);
+        if (!$user) return;
+
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $status_label = ucwords(str_replace('_', ' ', (string) $status));
+        $subject = sprintf(__('[%s] Loan Application %s', 'matrix-mlm'), get_bloginfo('name'), $status_label);
+        $message = self::get_email_template('loan', [
+            'username'  => $user->user_login,
+            'amount'    => $currency . number_format((float) $amount, 2),
+            'status'    => $status_label,
+            'site_name' => get_bloginfo('name')
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+    }
+
+    /**
      * Send welcome email after verification
      */
     public static function send_welcome_email($user_id) {
@@ -380,6 +410,13 @@ class Matrix_MLM_Notifications {
             case 'withdrawal':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('Your withdrawal of %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
+                break;
+            case 'loan':
+                // Inline fallback so installs without the dedicated
+                // public/templates/emails/loan.php still send a sensible
+                // email body when the admin triages a row.
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(__('Your loan application for %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
                 break;
             case 'transfer':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';

@@ -115,10 +115,10 @@
 .matrix-badge-active, .matrix-badge-completed, .matrix-badge-approved { background: #ecfdf5; color: #065f46; }
 .matrix-badge-pending, .matrix-badge-medium { background: #fffbeb; color: #92400e; }
 .matrix-badge-inactive, .matrix-badge-rejected, .matrix-badge-banned { background: #fef2f2; color: #991b1b; }
-.matrix-badge-open, .matrix-badge-info, .matrix-badge-low { background: #eff6ff; color: #1e40af; }
+.matrix-badge-open, .matrix-badge-info, .matrix-badge-low, .matrix-badge-under_review { background: #eff6ff; color: #1e40af; }
 .matrix-badge-high, .matrix-badge-urgent, .matrix-badge-customer_reply { background: #fff1f2; color: #9f1239; }
 .matrix-badge-answered { background: #ecfdf5; color: #065f46; }
-.matrix-badge-closed, .matrix-badge-unused { background: #f3f4f6; color: #6b7280; }
+.matrix-badge-closed, .matrix-badge-unused, .matrix-badge-cancelled { background: #f3f4f6; color: #6b7280; }
 .matrix-badge-used { background: #ecfdf5; color: #065f46; }
 .matrix-badge-expired { background: #f3f4f6; color: #6b7280; }
 

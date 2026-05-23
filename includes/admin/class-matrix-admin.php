@@ -55,6 +55,11 @@ class Matrix_MLM_Admin {
         // member-facing companion view: Benefits defines what
         // exists, CUG Requests triages who has applied.
         add_submenu_page('matrix-mlm', __('CUG Requests', 'matrix-mlm'), __('CUG Requests', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-cug', [new Matrix_MLM_Admin_CUG(), 'render']);
+        // Loan Applications — sister page to CUG Requests for the
+        // business-loan benefit. Same capability so an operator's
+        // permissions never get out of sync between the two
+        // member-application surfaces.
+        add_submenu_page('matrix-mlm', __('Loan Applications', 'matrix-mlm'), __('Loans', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-loans', [new Matrix_MLM_Admin_Loans(), 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
