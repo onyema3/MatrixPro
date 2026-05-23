@@ -74,6 +74,15 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-backup.php';
 Matrix_MLM_Admin_Backup::init();
 
+// Always loaded — the Laravel importer registers the bcrypt-compatible
+// check_password filter, which must run on every front-end login (not
+// just admin requests). The same class also registers the chunked
+// AJAX handler that drives the commit phase of an import, so it has
+// to be wired up for wp_ajax_* dispatch which happens before is_admin()
+// is meaningful in the request lifecycle.
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-import.php';
+Matrix_MLM_Admin_Import::init();
+
 // Admin
 if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin.php';

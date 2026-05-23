@@ -80,6 +80,13 @@ class Matrix_MLM_Admin {
         // touch infrequently and shouldn't expose to lower-privileged
         // staff who only manage day-to-day deposits/withdrawals.
         add_submenu_page('matrix-mlm', __('Backup & Restore', 'matrix-mlm'), __('Backup', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-backup', ['Matrix_MLM_Admin_Backup', 'render']);
+        // Import from Laravel — one-time migration tool that reads a
+        // ViserMLM-family SQL dump and rewrites it into MatrixPro's
+        // schema (users + matrix_user_meta + matrix_positions, plus
+        // plans and per-level commission JSON in PR 1). Same capability
+        // as Backup because committing an import overwrites live user
+        // and tree data on the destination.
+        add_submenu_page('matrix-mlm', __('Import from Laravel', 'matrix-mlm'), __('Import', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-import', ['Matrix_MLM_Admin_Import', 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
