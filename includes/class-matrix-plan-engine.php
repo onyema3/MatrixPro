@@ -888,6 +888,19 @@ class Matrix_MLM_Plan_Engine {
         $node = [
             'id' => $position->id,
             'user_id' => $position->user_id,
+            // sponsor_id is who actually *referred* this member, as opposed
+            // to parent_id which is where they sit structurally in the
+            // tree. The two diverge whenever a member was placed via
+            // spillover (someone else sponsored them but they ended up
+            // under a different upline because the sponsor's slot was
+            // full). The genealogy view uses this to badge each node as
+            // "Direct" (sponsor_id matches the tree-root user) vs
+            // "Spillover" (sponsor_id is some other member). Cast to int
+            // so the JS-side / template strict comparisons against the
+            // current user id behave consistently — sponsor_id can be
+            // NULL on the root and on legacy imported rows where the
+            // backfill couldn't resolve a sponsor.
+            'sponsor_id' => $position->sponsor_id !== null ? (int) $position->sponsor_id : null,
             'username' => $position->user_login,
             'level' => $current_depth,
             'total_downline' => $position->total_downline,

@@ -276,9 +276,76 @@
     background: linear-gradient(135deg, #eef2ff, #e0e7ff);
 }
 
-.matrix-tree-node-active {
+/*
+ * Direct referral: tree owner personally sponsored this member.
+ * Keeps the green "active" look the previous undifferentiated state
+ * used, so the visual change is opt-in — existing members who only
+ * have direct referrals see no regression. The legend dot below
+ * still points at the same colour for continuity.
+ */
+.matrix-tree-node-direct {
     border-color: var(--matrix-success);
     background: #f0fdf4;
+}
+
+/*
+ * Spillover: the member sits in the tree owner's downline because
+ * they were placed there structurally (the spillover BFS placement
+ * in the importer / plan engine), but a different upline member is
+ * their actual sponsor. Amber border + tinted fill makes the
+ * distinction obvious at a glance without screaming "warning" — red
+ * would feel punitive for what is in fact a positive event for the
+ * tree owner (a downline member is filling out their matrix).
+ */
+.matrix-tree-node-spillover {
+    border-color: #f59e0b;
+    background: #fffbeb;
+}
+
+/*
+ * Username row: needs to be flex so the relationship pill sits
+ * inline with the name without wrapping or overflowing on long
+ * usernames. min-width:0 on the strong allows the username to
+ * truncate (via the existing line-height rule) before the badge
+ * is pushed out of frame.
+ */
+.tree-node-name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.tree-node-name-row strong {
+    min-width: 0;
+}
+
+/*
+ * Relationship pill rendered next to the username on every non-root
+ * node. Compact (10px font, 1px/6px padding) so it doesn't push the
+ * card layout around — the existing tree-node-info block is sized
+ * for a single-line username + meta.
+ */
+.tree-node-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    line-height: 1.5;
+    white-space: nowrap;
+}
+
+.tree-node-badge-direct {
+    background: #d1fae5;
+    color: #047857;
+}
+
+.tree-node-badge-spillover {
+    background: #fef3c7;
+    color: #92400e;
 }
 
 .matrix-tree-node-empty {
@@ -407,8 +474,12 @@
     background: var(--matrix-primary);
 }
 
-.legend-active {
+.legend-direct {
     background: var(--matrix-success);
+}
+
+.legend-spillover {
+    background: #f59e0b;
 }
 
 .legend-empty {
