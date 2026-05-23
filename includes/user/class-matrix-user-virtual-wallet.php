@@ -90,7 +90,6 @@ class Matrix_MLM_User_Virtual_Wallet {
         .matrix-create-wallet-intro { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 20px 24px; margin-bottom: 24px; }
         .matrix-create-wallet-intro h3 { color: #1e40af; margin: 0 0 8px; }
         .matrix-create-wallet-intro p { color: #1e40af; font-size: 14px; margin: 4px 0; }
-        .matrix-bvn-note { background: #fefce8; border: 1px solid #fde68a; border-radius: 6px; padding: 10px 14px; margin-top: 8px; font-size: 12px; color: #92400e; }
         @media (max-width: 768px) {
             .matrix-two-wallets { grid-template-columns: 1fr; }
             .matrix-arrow-indicator { transform: rotate(90deg); }
@@ -534,25 +533,6 @@ class Matrix_MLM_User_Virtual_Wallet {
                         <input type="tel" name="phone" required value="<?php echo esc_attr($meta->phone ?? ''); ?>" placeholder="08012345678">
                     </div>
                 </div>
-                <div class="matrix-form-row">
-                    <div class="matrix-form-group">
-                        <label><?php _e('BVN (Bank Verification Number)', 'matrix-mlm'); ?></label>
-                        <input type="text" name="bvn" maxlength="11" pattern="\d{11}" placeholder="<?php _e('11-digit BVN', 'matrix-mlm'); ?>">
-                        <div class="matrix-bvn-note"><?php _e('Your BVN is required for KYC verification. It is securely processed and not stored in plain text.', 'matrix-mlm'); ?></div>
-                    </div>
-                    <div class="matrix-form-group">
-                        <label><?php _e('Date of Birth', 'matrix-mlm'); ?></label>
-                        <input type="date" name="date_of_birth" max="<?php echo date('Y-m-d', strtotime('-18 years')); ?>">
-                    </div>
-                </div>
-                <div class="matrix-form-group">
-                    <label><?php _e('Gender', 'matrix-mlm'); ?></label>
-                    <select name="gender">
-                        <option value=""><?php _e('-- Select --', 'matrix-mlm'); ?></option>
-                        <option value="male"><?php _e('Male', 'matrix-mlm'); ?></option>
-                        <option value="female"><?php _e('Female', 'matrix-mlm'); ?></option>
-                    </select>
-                </div>
 
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="create-wallet-btn">
                     <?php _e('Create Fintava Wallet', 'matrix-mlm'); ?>
@@ -618,10 +598,7 @@ class Matrix_MLM_User_Virtual_Wallet {
                         first_name: form.find('[name="first_name"]').val(),
                         last_name: form.find('[name="last_name"]').val(),
                         email: form.find('[name="email"]').val(),
-                        phone: form.find('[name="phone"]').val(),
-                        bvn: form.find('[name="bvn"]').val(),
-                        date_of_birth: form.find('[name="date_of_birth"]').val(),
-                        gender: form.find('[name="gender"]').val()
+                        phone: form.find('[name="phone"]').val()
                     },
                     success: function(response) {
                         if (response.success) {
