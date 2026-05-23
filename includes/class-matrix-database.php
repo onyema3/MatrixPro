@@ -145,6 +145,53 @@ class Matrix_MLM_Database {
             }
         }
 
+        // Defensive ALTER for the 1.0.9 user-meta status enum extension.
+        // The column was originally enum('active','banned','pending') but
+        // Matrix_MLM_Subscription::deactivate_unpaid_users() writes
+        // 'inactive' on lapsed-payment deactivation, and manual_pay()
+        // re-reads that value to flip the user back to 'active' when they
+        // catch up. With 'inactive' missing from the enum, MySQL behaves
+        // one of two bad ways depending on sql_mode:
+        //
+        //   - STRICT_TRANS_TABLES (default in MySQL 5.7+): the UPDATE
+        //     fails with a "Data truncated" warning and $wpdb->update()
+        //     returns false silently, so the user is never actually
+        //     deactivated. The admin gets the deactivation email but
+        //     the dashboard still loads for the non-paying user.
+        //
+        //   - non-strict mode: MySQL coerces 'inactive' to '' (empty
+        //     string), is_active() correctly reports the user as
+        //     inactive, but manual_pay()'s WHERE status = 'inactive'
+        //     reactivation clause never matches because the on-disk
+        //     value is '', so the user can never self-reactivate.
+        //
+        // dbDelta does not reliably extend enum values on an existing
+        // column across MySQL versions (the parser sometimes treats the
+        // enum spec as a no-op when the column already exists), so we
+        // probe COLUMN_TYPE directly and ALTER if 'inactive' is absent.
+        // Idempotent: the strpos() check skips the ALTER once the value
+        // is already part of the enum.
+        $um_table = $wpdb->prefix . 'matrix_user_meta';
+        $um_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $um_table
+        ));
+        if ($um_exists > 0) {
+            $um_status_col = $wpdb->get_row($wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'status'",
+                DB_NAME, $um_table
+            ));
+            if ($um_status_col && stripos((string) $um_status_col->COLUMN_TYPE, "'inactive'") === false) {
+                $wpdb->query(
+                    "ALTER TABLE {$um_table}
+                       MODIFY status ENUM('active','banned','pending','inactive')
+                              NOT NULL DEFAULT 'active'"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -469,7 +516,7 @@ class Matrix_MLM_Database {
             email_verified tinyint(1) NOT NULL DEFAULT 0,
             sms_verified tinyint(1) NOT NULL DEFAULT 0,
             kyc_verified tinyint(1) NOT NULL DEFAULT 0,
-            status enum('active','banned','pending') NOT NULL DEFAULT 'active',
+            status enum('active','banned','pending','inactive') NOT NULL DEFAULT 'active',
             last_login datetime DEFAULT NULL,
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),

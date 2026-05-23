@@ -10,6 +10,84 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Notifications {
 
     /**
+     * Send a "your account has been deactivated for non-payment of the
+     * monthly subscription" notification to the user. Fired from
+     * Matrix_MLM_Subscription::deactivate_unpaid_users() the moment the
+     * status flip lands.
+     *
+     * Distinct from the admin-facing send_admin_notification() that has
+     * always been part of that flow — admin keeps getting the
+     * subscription_deactivation alert, and now the user also gets a
+     * clear, actionable email so they don't discover the deactivation
+     * by trying to log in and finding the dashboard refusing to render
+     * with no explanation.
+     *
+     * The body explains the reason (unpaid subscription), the cure
+     * (top up the wallet and click "Pay subscription" on the dashboard),
+     * and the deep link to the dashboard's subscription page so the
+     * user doesn't have to hunt for it. SMS twin under the same
+     * matrix_mlm_sms_verification gate as commission_notification, so
+     * the channel mix matches the rest of the plugin.
+     *
+     * @param int   $user_id   The user whose account just flipped to inactive.
+     * @param float $amount    The monthly fee that went unpaid (already known
+     *                         to the caller — passed in to avoid a second
+     *                         get_option round trip and to keep this helper
+     *                         honest about exactly what was billed).
+     * @param string $billing_month  YYYY-MM of the missed period.
+     * @return void
+     */
+    public static function send_subscription_deactivation_notification($user_id, $amount, $billing_month) {
+        $user = get_userdata((int) $user_id);
+        if (!$user) {
+            return;
+        }
+
+        $currency   = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount_str = $currency . number_format((float) $amount, 2);
+        // Period label like "November 2026" rather than the raw "2026-11"
+        // so the inbox preview reads naturally.
+        $period_label = $billing_month;
+        $ts = strtotime($billing_month . '-01');
+        if ($ts) {
+            $period_label = date_i18n('F Y', $ts);
+        }
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: billing period, e.g. "November 2026" */
+            __('[%1$s] Your account has been deactivated — %2$s subscription unpaid', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $period_label
+        );
+
+        $dashboard_url = home_url('/matrix-dashboard/');
+
+        $message = self::get_email_template('subscription-deactivation', [
+            'username'      => $user->user_login,
+            'amount'        => $amount_str,
+            'period'        => $period_label,
+            'dashboard_url' => $dashboard_url,
+            'site_name'     => get_bloginfo('name'),
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+
+        // SMS twin — same gating as send_commission_notification(): only
+        // when SMS verification is on and the user has a phone on file.
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone((int) $user_id);
+            if ($phone) {
+                self::send_sms($phone, sprintf(
+                    /* translators: 1: amount, 2: billing period */
+                    __('Your account was deactivated: monthly subscription of %1$s for %2$s is unpaid. Top up your wallet and pay from your dashboard to reactivate.', 'matrix-mlm'),
+                    $amount_str,
+                    $period_label
+                ));
+            }
+        }
+    }
+
+    /**
      * Send verification email
      */
     public static function send_verification_email($user_id) {
@@ -755,6 +833,25 @@ class Matrix_MLM_Notifications {
                 if (!empty($vars['dashboard_url'])) {
                     $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('View Your Genealogy', 'matrix-mlm') . '</a></p>';
                 }
+                break;
+            case 'subscription-deactivation':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/subscription-deactivation.php
+                // on disk. Kept short and actionable — the user needs
+                // to know (a) they're locked out, (b) why, and (c)
+                // exactly what to do to fix it.
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(
+                    /* translators: 1: amount, 2: billing period */
+                    __('Your account has been deactivated because the monthly subscription of <strong>%1$s</strong> for <strong>%2$s</strong> is unpaid.', 'matrix-mlm'),
+                    esc_html($vars['amount'] ?? ''),
+                    esc_html($vars['period'] ?? '')
+                ) . '</p>';
+                $content .= '<p>' . __('To reactivate your account, top up your Matrix wallet to cover the amount above and click <strong>Pay Subscription</strong> on your dashboard. Once the payment lands, your account is restored immediately.', 'matrix-mlm') . '</p>';
+                if (!empty($vars['dashboard_url'])) {
+                    $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #dc2626; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('Go to Dashboard', 'matrix-mlm') . '</a></p>';
+                }
+                $content .= '<p style="font-size: 12px; color: #6b7280; margin-top: 20px;">' . __('If you believe this is a mistake or you have already paid, please contact support.', 'matrix-mlm') . '</p>';
                 break;
             case 'deposit':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
