@@ -67,6 +67,13 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-billing.php'
 // Always loaded — used by the self-healing seed in Matrix_MLM_Core::run().
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways.php';
 
+// Always loaded — registers admin-post handlers and the WP-Cron event
+// for the weekly automatic backup. Has to load on every request (not
+// just admin) so that wp-cron, which executes outside is_admin(),
+// still has the cron callback wired up.
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-backup.php';
+Matrix_MLM_Admin_Backup::init();
+
 // Admin
 if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin.php';

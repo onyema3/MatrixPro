@@ -34,6 +34,15 @@ class Matrix_MLM_Activator {
         // Set capabilities
         self::set_capabilities();
 
+        // Provision the backup directory now so the first manual or
+        // scheduled run doesn't have to do it lazily under load, and
+        // re-reconcile the weekly cron against the saved option in
+        // case the plugin was deactivated/reactivated between runs.
+        if (class_exists('Matrix_MLM_Admin_Backup')) {
+            Matrix_MLM_Admin_Backup::get_backup_dir();
+            Matrix_MLM_Admin_Backup::maybe_schedule_cron();
+        }
+
         // Flush rewrite rules
         flush_rewrite_rules();
 
