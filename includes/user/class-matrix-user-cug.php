@@ -531,12 +531,33 @@ class Matrix_MLM_User_CUG {
 
                     if (payload && payload.success) {
                         setFeedback('success', (payload.data && payload.data.message) || '<?php echo esc_js(__('Application submitted.', 'matrix-mlm')); ?>');
-                        // After a successful submit the form's prefill
-                        // is now the source of truth — disable inputs
-                        // briefly so the user sees the success state
-                        // and the button label reflects "update" next
-                        // time the modal opens.
+                        // Update the submit label so the next time
+                        // the modal opens it reads "Update" instead
+                        // of "Submit" — the request now exists in the
+                        // database, so any further save is an update.
                         submit.textContent = '<?php echo esc_js(__('Update Application', 'matrix-mlm')); ?>';
+                        // Disable the form briefly so the user can't
+                        // double-submit during the close animation,
+                        // and so the feedback area stays in its
+                        // success state until the modal disappears.
+                        submit.disabled = true;
+                        // Auto-close after a short delay so the user
+                        // gets visible confirmation but doesn't have
+                        // to hunt for the X. 1500ms is the sweet spot
+                        // — long enough to read the success line,
+                        // short enough that it doesn't feel sticky.
+                        // The closeModal() call already reasserts
+                        // every layer that hides the dialog, so this
+                        // works whether or not the cached CSS is
+                        // current. We re-enable the submit button
+                        // post-close so reopening the modal lands on
+                        // a working "Update Application" CTA without
+                        // needing a page refresh.
+                        setTimeout(function() {
+                            closeModal();
+                            submit.disabled = false;
+                            clearFeedback();
+                        }, 1500);
                     } else {
                         var msg = (payload && payload.data && payload.data.message) || '<?php echo esc_js(__('Submission failed. Please check the form and try again.', 'matrix-mlm')); ?>';
                         setFeedback('error', msg);
