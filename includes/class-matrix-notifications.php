@@ -184,7 +184,7 @@ class Matrix_MLM_Notifications {
      * so reviewers can distinguish a new application from an amendment.
      */
     public static function send_admin_cug_application_notification($request_row, $is_resubmission = false) {
-        $recipients = self::get_application_notification_recipients();
+        $recipients = self::get_benefit_notification_recipients('cug');
         if (empty($recipients)) return;
 
         $row = is_array($request_row) ? (object) $request_row : $request_row;
@@ -232,7 +232,7 @@ class Matrix_MLM_Notifications {
      * and gating are identical.
      */
     public static function send_admin_loan_application_notification($application_row, $is_resubmission = false) {
-        $recipients = self::get_application_notification_recipients();
+        $recipients = self::get_benefit_notification_recipients('loan');
         if (empty($recipients)) return;
 
         $row = is_array($application_row) ? (object) $application_row : $application_row;
@@ -287,7 +287,7 @@ class Matrix_MLM_Notifications {
      * because HMO premiums are tier-derived, not user-entered.
      */
     public static function send_admin_healthcare_application_notification($application_row, $is_resubmission = false) {
-        $recipients = self::get_application_notification_recipients();
+        $recipients = self::get_benefit_notification_recipients('healthcare');
         if (empty($recipients)) return;
 
         $row = is_array($application_row) ? (object) $application_row : $application_row;
@@ -329,26 +329,61 @@ class Matrix_MLM_Notifications {
     }
 
     /**
-     * Resolve the list of recipients for application-review emails.
+     * Resolve the comma-separated reviewer list for a given benefit.
+     * Each benefit has a dedicated email setting on the Settings →
+     * Notifications tab so different reviewers can triage CUG, Loan,
+     * and Healthcare applications without seeing each other's traffic.
      *
-     * Reads matrix_mlm_application_notification_email (comma-separated)
-     * and falls back to admin_email when blank. Splits, trims,
-     * sanitises, dedupes, and rejects anything that doesn't pass
-     * is_email() so a typo on the Settings page can't blow up wp_mail
-     * for the entire submission flow.
+     * Resolution chain (first non-empty wins):
+     *
+     *   1. matrix_mlm_{benefit}_notification_email
+     *      — the per-benefit override the operator configured.
+     *
+     *   2. matrix_mlm_application_notification_email
+     *      — the legacy shared field. Pre-existing installs already
+     *      have this populated; keeping it in the chain means an
+     *      upgrade does not silently stop notifications for any
+     *      benefit whose dedicated field is still blank. The
+     *      Settings tab labels it "Shared fallback" so operators
+     *      know its role.
+     *
+     *   3. admin_email
+     *      — last-resort default so a brand-new install still
+     *      delivers to *somebody* even if the operator hasn't
+     *      visited the Notifications tab yet.
+     *
+     * Per address: split on whitespace/comma/semicolon, sanitise,
+     * is_email()-validate, dedupe (case-insensitive). One typo on
+     * the Settings page can't blow up wp_mail for the entire flow
+     * — bad addresses are silently dropped and the rest are sent.
      *
      * Returns an array of valid email addresses (possibly empty if
      * even admin_email is malformed — caller should treat empty as
      * "skip notification" rather than fail loudly).
+     *
+     * $benefit_slug is one of 'cug', 'loan', 'healthcare'. An empty
+     * or unknown slug skips step 1 and goes straight to the legacy
+     * fallback, which preserves the behaviour of any caller that
+     * has not yet been wired up to pass a slug.
      */
-    private static function get_application_notification_recipients() {
-        $raw = (string) get_option('matrix_mlm_application_notification_email', '');
+    private static function get_benefit_notification_recipients($benefit_slug = '') {
+        $benefit_slug = strtolower(trim((string) $benefit_slug));
+        $valid_slugs = ['cug', 'loan', 'healthcare'];
+
+        $raw = '';
+        if (in_array($benefit_slug, $valid_slugs, true)) {
+            $raw = (string) get_option('matrix_mlm_' . $benefit_slug . '_notification_email', '');
+        }
+        if (trim($raw) === '') {
+            $raw = (string) get_option('matrix_mlm_application_notification_email', '');
+        }
         if (trim($raw) === '') {
             $raw = (string) get_option('admin_email', '');
         }
         if (trim($raw) === '') {
             return [];
         }
+
         $parts = preg_split('/[\s,;]+/', $raw);
         $out = [];
         foreach ((array) $parts as $part) {
