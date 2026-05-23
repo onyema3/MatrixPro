@@ -137,6 +137,151 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send admin-side notification when a CUG application is
+     * submitted (or resubmitted). Fired by Matrix_MLM_User_CUG's
+     * ajax_submit() right after the row is persisted, so reviewers
+     * receive a full copy of the application by email and can read
+     * it before logging in to triage. Does not block the user-facing
+     * AJAX response — wp_mail failures are swallowed so a misconfigured
+     * SMTP doesn't surface as a "submission failed" to the applicant.
+     *
+     * Recipients are taken from the matrix_mlm_application_notification_email
+     * option (comma-separated). Empty/unset falls back to admin_email,
+     * matching the placeholder shown on the Settings → Notifications tab.
+     *
+     * $request_row should be the wp_matrix_cug_requests row as a
+     * stdClass (or array). $is_resubmission flips the subject prefix
+     * so reviewers can distinguish a new application from an amendment.
+     */
+    public static function send_admin_cug_application_notification($request_row, $is_resubmission = false) {
+        $recipients = self::get_application_notification_recipients();
+        if (empty($recipients)) return;
+
+        $row = is_array($request_row) ? (object) $request_row : $request_row;
+        if (!is_object($row)) return;
+
+        $user = isset($row->user_id) ? get_userdata((int) $row->user_id) : null;
+        $applicant_label = trim((string) ($row->first_name ?? '') . ' ' . (string) ($row->last_name ?? ''));
+        if ($applicant_label === '' && $user) {
+            $applicant_label = $user->display_name ?: $user->user_login;
+        }
+        if ($applicant_label === '') {
+            $applicant_label = __('a member', 'matrix-mlm');
+        }
+
+        $tag = $is_resubmission
+            ? __('Updated CUG Application', 'matrix-mlm')
+            : __('New CUG Application', 'matrix-mlm');
+        $subject = sprintf(
+            /* translators: 1: site name, 2: tag, 3: applicant name */
+            __('[%1$s] %2$s — %3$s', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $tag,
+            $applicant_label
+        );
+
+        $admin_url = admin_url('admin.php?page=matrix-mlm-cug&action=view&id=' . intval($row->id ?? 0));
+
+        $message = self::get_email_template('cug-application-admin', [
+            'site_name'       => get_bloginfo('name'),
+            'tag'             => $tag,
+            'is_resubmission' => (bool) $is_resubmission,
+            'applicant_label' => $applicant_label,
+            'user'            => $user,
+            'row'             => $row,
+            'admin_url'       => $admin_url,
+        ]);
+
+        self::send_email($recipients, $subject, $message);
+    }
+
+    /**
+     * Send admin-side notification when a Loan application is
+     * submitted (or resubmitted). Same shape as the CUG variant
+     * above — the templates differ but the mechanics, recipients,
+     * and gating are identical.
+     */
+    public static function send_admin_loan_application_notification($application_row, $is_resubmission = false) {
+        $recipients = self::get_application_notification_recipients();
+        if (empty($recipients)) return;
+
+        $row = is_array($application_row) ? (object) $application_row : $application_row;
+        if (!is_object($row)) return;
+
+        $user = isset($row->user_id) ? get_userdata((int) $row->user_id) : null;
+        $applicant_label = trim((string) ($row->first_name ?? '') . ' ' . (string) ($row->last_name ?? ''));
+        if ($applicant_label === '' && $user) {
+            $applicant_label = $user->display_name ?: $user->user_login;
+        }
+        if ($applicant_label === '') {
+            $applicant_label = __('a member', 'matrix-mlm');
+        }
+
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount_str = $currency . number_format((float) ($row->loan_amount ?? 0), 2);
+
+        $tag = $is_resubmission
+            ? __('Updated Loan Application', 'matrix-mlm')
+            : __('New Loan Application', 'matrix-mlm');
+        $subject = sprintf(
+            /* translators: 1: site name, 2: tag, 3: applicant name, 4: loan amount */
+            __('[%1$s] %2$s — %3$s — %4$s', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $tag,
+            $applicant_label,
+            $amount_str
+        );
+
+        $admin_url = admin_url('admin.php?page=matrix-mlm-loans&action=view&id=' . intval($row->id ?? 0));
+
+        $message = self::get_email_template('loan-application-admin', [
+            'site_name'       => get_bloginfo('name'),
+            'tag'             => $tag,
+            'is_resubmission' => (bool) $is_resubmission,
+            'applicant_label' => $applicant_label,
+            'user'            => $user,
+            'row'             => $row,
+            'currency'        => $currency,
+            'amount_str'      => $amount_str,
+            'admin_url'       => $admin_url,
+        ]);
+
+        self::send_email($recipients, $subject, $message);
+    }
+
+    /**
+     * Resolve the list of recipients for application-review emails.
+     *
+     * Reads matrix_mlm_application_notification_email (comma-separated)
+     * and falls back to admin_email when blank. Splits, trims,
+     * sanitises, dedupes, and rejects anything that doesn't pass
+     * is_email() so a typo on the Settings page can't blow up wp_mail
+     * for the entire submission flow.
+     *
+     * Returns an array of valid email addresses (possibly empty if
+     * even admin_email is malformed — caller should treat empty as
+     * "skip notification" rather than fail loudly).
+     */
+    private static function get_application_notification_recipients() {
+        $raw = (string) get_option('matrix_mlm_application_notification_email', '');
+        if (trim($raw) === '') {
+            $raw = (string) get_option('admin_email', '');
+        }
+        if (trim($raw) === '') {
+            return [];
+        }
+        $parts = preg_split('/[\s,;]+/', $raw);
+        $out = [];
+        foreach ((array) $parts as $part) {
+            $email = sanitize_email(trim((string) $part));
+            if ($email !== '' && is_email($email)) {
+                $out[strtolower($email)] = $email;
+            }
+        }
+        return array_values($out);
+    }
+
+    /**
      * Send welcome email after verification
      */
     public static function send_welcome_email($user_id) {

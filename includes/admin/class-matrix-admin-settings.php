@@ -323,12 +323,24 @@ class Matrix_MLM_Admin_Settings {
         </table>
     <?php }
 
-    private function render_notifications_tab() { ?>
+    private function render_notifications_tab() {
+        $admin_fallback = (string) get_option('admin_email');
+        $app_recipients = (string) get_option('matrix_mlm_application_notification_email', '');
+        ?>
         <table class="form-table">
             <tr><th><?php _e('Email Verification', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_email_verification" value="1" <?php checked(get_option('matrix_mlm_email_verification', 1)); ?>> <?php _e('Require email verification on registration', 'matrix-mlm'); ?></label></td></tr>
             <tr><th><?php _e('SMS Verification', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_sms_verification" value="1" <?php checked(get_option('matrix_mlm_sms_verification', 0)); ?>> <?php _e('Require SMS verification', 'matrix-mlm'); ?></label></td></tr>
+            <tr><th><?php _e('Application Review Notifications', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="text" name="matrix_mlm_application_notification_email" class="regular-text"
+                           value="<?php echo esc_attr($app_recipients); ?>"
+                           placeholder="<?php echo esc_attr($admin_fallback); ?>">
+                    <p class="description">
+                        <?php _e('Email address(es) that receive a full copy of every CUG and Loan application as soon as it is submitted, so reviewers can read the application before approving it from the admin triage pages. Separate multiple addresses with commas. Leave blank to use the WordPress admin email.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
         </table>
     <?php }
 
@@ -550,7 +562,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer'];
                 break;
             case 'notifications':
-                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification'];
+                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email'];
                 break;
             case 'security':
                 $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
