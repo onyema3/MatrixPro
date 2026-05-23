@@ -65,6 +65,11 @@ class Matrix_MLM_Core {
         // loans card application form posts to.
         new Matrix_MLM_User_Loan();
 
+        // Initialize Healthcare handler — its constructor registers
+        // the wp_ajax_matrix_submit_healthcare endpoint that the
+        // Benefits-tab healthcare card application form posts to.
+        new Matrix_MLM_User_Healthcare();
+
         // Initialize monthly subscription
         new Matrix_MLM_Subscription();
 

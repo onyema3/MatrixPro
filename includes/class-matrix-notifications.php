@@ -137,6 +137,36 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send healthcare-application status notification.
+     *
+     * Fired by the admin healthcare triage UI when an operator
+     * transitions a row to a user-visible decision state (approved
+     * / rejected / cancelled). Pending and under_review do not call
+     * this method — they're internal workflow noise from the
+     * applicant's POV.
+     *
+     * The optional $policy_number is quoted in the body when a row
+     * is approved with a policy stamped — gives the user a single
+     * piece of information they need to start using the benefit
+     * without waiting for a follow-up from the HMO partner.
+     */
+    public static function send_healthcare_notification($user_id, $status, $policy_number = '') {
+        $user = get_userdata($user_id);
+        if (!$user) return;
+
+        $status_label = ucwords(str_replace('_', ' ', (string) $status));
+        $subject = sprintf(__('[%s] Healthcare Application %s', 'matrix-mlm'), get_bloginfo('name'), $status_label);
+        $message = self::get_email_template('healthcare', [
+            'username'      => $user->user_login,
+            'status'        => $status_label,
+            'policy_number' => (string) $policy_number,
+            'site_name'     => get_bloginfo('name'),
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+    }
+
+    /**
      * Send admin-side notification when a CUG application is
      * submitted (or resubmitted). Fired by Matrix_MLM_User_CUG's
      * ajax_submit() right after the row is persisted, so reviewers
@@ -243,6 +273,55 @@ class Matrix_MLM_Notifications {
             'row'             => $row,
             'currency'        => $currency,
             'amount_str'      => $amount_str,
+            'admin_url'       => $admin_url,
+        ]);
+
+        self::send_email($recipients, $subject, $message);
+    }
+
+    /**
+     * Send admin-side notification when a Healthcare application is
+     * submitted (or resubmitted). Same shape as the CUG/Loan
+     * variants — the template differs but the mechanics, recipients,
+     * and gating are identical. No amount/currency in the subject
+     * because HMO premiums are tier-derived, not user-entered.
+     */
+    public static function send_admin_healthcare_application_notification($application_row, $is_resubmission = false) {
+        $recipients = self::get_application_notification_recipients();
+        if (empty($recipients)) return;
+
+        $row = is_array($application_row) ? (object) $application_row : $application_row;
+        if (!is_object($row)) return;
+
+        $user = isset($row->user_id) ? get_userdata((int) $row->user_id) : null;
+        $applicant_label = trim((string) ($row->first_name ?? '') . ' ' . (string) ($row->last_name ?? ''));
+        if ($applicant_label === '' && $user) {
+            $applicant_label = $user->display_name ?: $user->user_login;
+        }
+        if ($applicant_label === '') {
+            $applicant_label = __('a member', 'matrix-mlm');
+        }
+
+        $tag = $is_resubmission
+            ? __('Updated Healthcare Application', 'matrix-mlm')
+            : __('New Healthcare Application', 'matrix-mlm');
+        $subject = sprintf(
+            /* translators: 1: site name, 2: tag, 3: applicant name */
+            __('[%1$s] %2$s — %3$s', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $tag,
+            $applicant_label
+        );
+
+        $admin_url = admin_url('admin.php?page=matrix-mlm-healthcare&action=view&id=' . intval($row->id ?? 0));
+
+        $message = self::get_email_template('healthcare-application-admin', [
+            'site_name'       => get_bloginfo('name'),
+            'tag'             => $tag,
+            'is_resubmission' => (bool) $is_resubmission,
+            'applicant_label' => $applicant_label,
+            'user'            => $user,
+            'row'             => $row,
             'admin_url'       => $admin_url,
         ]);
 
@@ -562,6 +641,17 @@ class Matrix_MLM_Notifications {
                 // email body when the admin triages a row.
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('Your loan application for %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
+                break;
+            case 'healthcare':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/healthcare.php on disk. No
+                // amount/currency line — HMO premiums are tier-derived
+                // and quoted by the partner HMO, not by the dashboard.
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(__('Your healthcare application has been %s.', 'matrix-mlm'), strtolower($vars['status'])) . '</p>';
+                if (!empty($vars['policy_number'])) {
+                    $content .= '<p>' . sprintf(__('Policy number: %s', 'matrix-mlm'), '<code>' . esc_html($vars['policy_number']) . '</code>') . '</p>';
+                }
                 break;
             case 'transfer':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';

@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.5');
+define('MATRIX_MLM_DB_VERSION', '1.0.6');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -82,6 +82,7 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-benefits.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-cug.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-loans.php';
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-healthcare.php';
 }
 
 // User Dashboard
@@ -102,6 +103,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-billing.ph
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-benefits.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-cug.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-loan.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-healthcare.php';
 
 // Activation/Deactivation hooks
 register_activation_hook(__FILE__, ['Matrix_MLM_Activator', 'activate']);
