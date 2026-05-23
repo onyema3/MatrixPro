@@ -62,8 +62,33 @@ class Matrix_MLM_Admin_Import {
     /** Snapshot of the most recent completed import (for the summary card). */
     const OPT_LAST_RESULT = 'matrix_mlm_import_last_result';
 
-    /** Tables PR 1 actually stages and consumes. */
-    const STAGED_TABLES = ['users', 'plans', 'levels'];
+    /**
+     * Tables we stage and consume.
+     *
+     * PR 1 added: users, plans, levels (foundation — WP users, tree, plan/level config).
+     * PR 2 added: card_holders, cards, deposits, withdrawals, commissions, pins,
+     *             support_tickets, support_messages, subscribers (financials,
+     *             Fintava wallets/cards, ticketing, mailing list).
+     *
+     * Order in this array doesn't drive processing order (that lives in
+     * next_phase()); it's just the set of table names the upload parser
+     * will recognise and stage. Anything not on this list is silently
+     * dropped from the dump.
+     */
+    const STAGED_TABLES = [
+        'users',
+        'plans',
+        'levels',
+        'card_holders',
+        'cards',
+        'deposits',
+        'withdrawals',
+        'commissions',
+        'pins',
+        'support_tickets',
+        'support_messages',
+        'subscribers',
+    ];
 
     /** Default tree shape — pulled from Laravel general_settings (3×9). */
     const DEFAULT_WIDTH = 3;
@@ -76,6 +101,17 @@ class Matrix_MLM_Admin_Import {
     const CHUNK_POSITIONS = 300;
     const CHUNK_PARENTS   = 500;
     const CHUNK_RECALC    = 500;
+    // PR 2 phase chunks. Smaller for INSERT-heavy phases; larger for
+    // pure UPDATE/lookup phases.
+    const CHUNK_FINTAVA_W = 200;
+    const CHUNK_FINTAVA_C = 200;
+    const CHUNK_DEPOSITS  = 300;
+    const CHUNK_WITHDRAW  = 300;
+    const CHUNK_COMMS     = 500;
+    const CHUNK_EPINS     = 500;
+    const CHUNK_TICKETS   = 200;
+    const CHUNK_TMSGS     = 500;
+    const CHUNK_SUBS      = 500;
 
     /**
      * Register every hook this module owns. Idempotent — safe to call
@@ -321,6 +357,245 @@ class Matrix_MLM_Admin_Import {
             `updated_at` TIMESTAMP NULL DEFAULT NULL,
             PRIMARY KEY (`id`),
             KEY `plan_id` (`plan_id`)
+        ) $charset");
+
+        // ---------- PR 2 staging tables ----------
+        //
+        // Each carries:
+        //   - The Laravel columns we actually consume (extras dropped quietly
+        //     when the dump's INSERT replays — column-count mismatches would
+        //     surface here, so we mirror the Laravel shape closely).
+        //   - `import_status` + `import_error` for per-row diagnostics.
+        //   - `wp_target_id` (or domain-specific equivalent like wp_ticket_id /
+        //     wp_wallet_id) to link a Laravel row to the new MatrixPro row it
+        //     produced. Lets dependent phases (e.g. ticket_messages →
+        //     support_tickets) join through staging instead of round-tripping
+        //     through PHP arrays.
+
+        $card_holders     = self::staging_table('card_holders');
+        $cards            = self::staging_table('cards');
+        $deposits         = self::staging_table('deposits');
+        $withdrawals      = self::staging_table('withdrawals');
+        $commissions      = self::staging_table('commissions');
+        $pins             = self::staging_table('pins');
+        $support_tickets  = self::staging_table('support_tickets');
+        $support_messages = self::staging_table('support_messages');
+        $subscribers      = self::staging_table('subscribers');
+
+        foreach ([
+            $card_holders, $cards, $deposits, $withdrawals,
+            $commissions, $pins, $support_tickets, $support_messages, $subscribers,
+        ] as $name) {
+            $wpdb->query("DROP TABLE IF EXISTS `$name`");
+        }
+
+        // card_holders → matrix_fintava_wallets (1 row per user, UNIQUE on user_id)
+        $wpdb->query("CREATE TABLE `$card_holders` (
+            `id` INT NOT NULL,
+            `user_id` BIGINT DEFAULT 0,
+            `cardholder_id` VARCHAR(255) DEFAULT NULL,
+            `wallet_id` VARCHAR(255) DEFAULT NULL,
+            `firstname` VARCHAR(255) DEFAULT NULL,
+            `lastname` VARCHAR(255) DEFAULT NULL,
+            `date_of_birth` DATE DEFAULT NULL,
+            `email` VARCHAR(255) DEFAULT NULL,
+            `mobile` VARCHAR(255) DEFAULT NULL,
+            `account_name` VARCHAR(255) DEFAULT NULL,
+            `account_number` VARCHAR(40) DEFAULT NULL,
+            `bvn` VARCHAR(40) DEFAULT NULL,
+            `nin` VARCHAR(40) DEFAULT NULL,
+            `address` VARCHAR(255) DEFAULT NULL,
+            `user_type` VARCHAR(40) DEFAULT NULL,
+            `fund_method` VARCHAR(40) DEFAULT NULL,
+            `is_frozen` TINYINT(1) NOT NULL DEFAULT 0,
+            `status` TINYINT(1) NOT NULL DEFAULT 1,
+            `provider` VARCHAR(255) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_wallet_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `user_id` (`user_id`),
+            KEY `cardholder_id` (`cardholder_id`)
+        ) $charset");
+
+        // cards → matrix_fintava_cards. Joins to card_holders via card_holder_id
+        // to resolve the destination wallet (since matrix_fintava_cards.wallet_id
+        // mirrors the card_holders.wallet_id UUID).
+        $wpdb->query("CREATE TABLE `$cards` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `user_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `card_holder_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `card_id` VARCHAR(255) DEFAULT NULL,
+            `card_holder_name` VARCHAR(255) DEFAULT NULL,
+            `card_holder_email` VARCHAR(255) DEFAULT NULL,
+            `card_holder_mobile` VARCHAR(255) DEFAULT NULL,
+            `card_brand` VARCHAR(40) DEFAULT NULL,
+            `account_number` VARCHAR(255) DEFAULT NULL,
+            `map_id` VARCHAR(255) DEFAULT NULL,
+            `card_no` VARCHAR(255) DEFAULT NULL,
+            `last4` VARCHAR(40) DEFAULT NULL,
+            `exp_month` VARCHAR(40) DEFAULT NULL,
+            `exp_year` VARCHAR(40) DEFAULT NULL,
+            `card_type` VARCHAR(40) DEFAULT NULL,
+            `card_request_status` VARCHAR(40) DEFAULT NULL,
+            `status` VARCHAR(40) DEFAULT NULL,
+            `admin_feedback` VARCHAR(255) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `is_linked` TINYINT(1) DEFAULT 0,
+            `linked_at` TIMESTAMP NULL DEFAULT NULL,
+            `activated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `card_holder_id` (`card_holder_id`),
+            KEY `user_id` (`user_id`)
+        ) $charset");
+
+        // deposits — Laravel status enum: 1=success, 2=pending, 3=cancel
+        $wpdb->query("CREATE TABLE `$deposits` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `user_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `method_code` INT UNSIGNED NOT NULL DEFAULT 0,
+            `amount` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `method_currency` VARCHAR(40) DEFAULT NULL,
+            `charge` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `rate` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `final_amo` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `detail` TEXT DEFAULT NULL,
+            `btc_amo` VARCHAR(255) DEFAULT NULL,
+            `btc_wallet` VARCHAR(255) DEFAULT NULL,
+            `trx` VARCHAR(40) DEFAULT NULL,
+            `try` INT NOT NULL DEFAULT 0,
+            `status` TINYINT(1) NOT NULL DEFAULT 0,
+            `from_api` TINYINT(1) NOT NULL DEFAULT 0,
+            `admin_feedback` VARCHAR(255) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `user_id` (`user_id`),
+            KEY `trx` (`trx`)
+        ) $charset");
+
+        // withdrawals — Laravel status enum: 1=success(approved), 2=pending, 3=cancel
+        $wpdb->query("CREATE TABLE `$withdrawals` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `method_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `user_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `amount` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `currency` VARCHAR(40) DEFAULT NULL,
+            `rate` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `charge` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `trx` VARCHAR(40) DEFAULT NULL,
+            `final_amount` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `after_charge` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `withdraw_information` TEXT DEFAULT NULL,
+            `status` TINYINT(1) NOT NULL DEFAULT 0,
+            `admin_feedback` TEXT DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `user_id` (`user_id`),
+            KEY `trx` (`trx`)
+        ) $charset");
+
+        // commissions — Laravel mark: 1=referral, 2=level (else fallback to 'level')
+        $wpdb->query("CREATE TABLE `$commissions` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `user_id` INT UNSIGNED DEFAULT 0,
+            `from_user_id` INT UNSIGNED DEFAULT 0,
+            `amount` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `charge` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `post_balance` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `trx` VARCHAR(30) DEFAULT NULL,
+            `level` INT DEFAULT 0,
+            `mark` TINYINT(1) DEFAULT 0,
+            `details` VARCHAR(255) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `user_id` (`user_id`),
+            KEY `from_user_id` (`from_user_id`)
+        ) $charset");
+
+        // pins → matrix_epins. Laravel status: 0=unused, 1=used.
+        $wpdb->query("CREATE TABLE `$pins` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `user_id` INT UNSIGNED DEFAULT NULL,
+            `generate_user_id` INT UNSIGNED DEFAULT NULL,
+            `amount` DECIMAL(28,8) NOT NULL DEFAULT 0,
+            `pin` VARCHAR(191) DEFAULT NULL,
+            `status` TINYINT(1) NOT NULL DEFAULT 0,
+            `details` VARCHAR(255) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `pin` (`pin`(64))
+        ) $charset");
+
+        // support_tickets — Laravel priority 1=low/2=med/3=high; status 0=open/1=answered/2=replied/3=closed
+        $wpdb->query("CREATE TABLE `$support_tickets` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `user_id` INT NOT NULL DEFAULT 0,
+            `name` VARCHAR(40) DEFAULT NULL,
+            `email` VARCHAR(120) DEFAULT NULL,
+            `ticket` VARCHAR(40) DEFAULT NULL,
+            `subject` VARCHAR(255) DEFAULT NULL,
+            `status` TINYINT(1) NOT NULL DEFAULT 0,
+            `priority` TINYINT(1) NOT NULL DEFAULT 0,
+            `last_reply` DATETIME DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_ticket_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `user_id` (`user_id`)
+        ) $charset");
+
+        // support_messages — admin_id>0 means a staff reply (is_admin=1).
+        $wpdb->query("CREATE TABLE `$support_messages` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `support_ticket_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `admin_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `message` LONGTEXT DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `support_ticket_id` (`support_ticket_id`)
+        ) $charset");
+
+        // subscribers — straight email list, INSERT IGNORE on the WP side
+        // because matrix_subscribers has UNIQUE on email and we want to
+        // keep whatever's already there if a duplicate appears.
+        $wpdb->query("CREATE TABLE `$subscribers` (
+            `id` BIGINT UNSIGNED NOT NULL,
+            `email` VARCHAR(120) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT NULL,
+            `wp_target_id` BIGINT UNSIGNED DEFAULT NULL,
+            `import_status` VARCHAR(20) DEFAULT NULL,
+            `import_error` VARCHAR(500) DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `email` (`email`)
         ) $charset");
     }
 
@@ -672,6 +947,44 @@ class Matrix_MLM_Admin_Import {
 
         $report['issues'] = $issues;
 
+        // PR 2 staging stats — gracefully omit when the operator
+        // uploaded a PR 1-only dump (those tables won't exist in the
+        // staging set at all).
+        $pr2_tables = [
+            'card_holders'     => 'Fintava virtual wallets',
+            'cards'            => 'Fintava cards',
+            'deposits'         => 'Deposits',
+            'withdrawals'      => 'Withdrawals',
+            'commissions'      => 'Commissions',
+            'pins'             => 'E-pins',
+            'support_tickets'  => 'Support tickets',
+            'support_messages' => 'Ticket replies',
+            'subscribers'      => 'Subscribers',
+        ];
+        $pr2_stats = [];
+        foreach ($pr2_tables as $tname => $label) {
+            $sn = self::staging_table($tname);
+            if ($wpdb->get_var("SHOW TABLES LIKE '$sn'") === $sn) {
+                $pr2_stats[$tname] = [
+                    'label' => $label,
+                    'count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sn`"),
+                ];
+            }
+        }
+        $report['pr2_stats'] = $pr2_stats;
+
+        // Sanity counts that depend on the user staging table (already
+        // checked exists above) but are PR 2 specific:
+        if (!empty($pr2_stats['card_holders'])) {
+            $sch = self::staging_table('card_holders');
+            $report['fintava_with_wallet_id'] = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM `$sch` WHERE wallet_id IS NOT NULL AND wallet_id <> ''"
+            );
+            $report['fintava_with_account']   = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM `$sch` WHERE account_number IS NOT NULL AND account_number <> ''"
+            );
+        }
+
         self::set_state([
             'status'   => 'analyzed',
             'analysis' => $report,
@@ -783,6 +1096,7 @@ class Matrix_MLM_Admin_Import {
     /** Phase order. Each phase's process_*() method handles one chunk. */
     private static function next_phase($current) {
         $order = [
+            // PR 1: foundation — users, tree, plans, level_commission JSON.
             'plans',
             'levels',
             'users',
@@ -791,6 +1105,25 @@ class Matrix_MLM_Admin_Import {
             'parents',
             'recalc_levels',
             'recalc_downline',
+            // PR 2: financials, Fintava wallets/cards, ticketing, subscribers.
+            // fintava_wallets must run before fintava_cards (cards JOIN
+            // staging card_holders to resolve the destination wallet) and
+            // before bank_code_backfill (which only touches rows we just
+            // inserted). The ticket_messages phase needs tickets done
+            // first because it joins through staging support_tickets to
+            // resolve wp_ticket_id. The remaining order is operationally
+            // independent — we just front-load Fintava since that's the
+            // pre-condition for users seeing a balance on first login.
+            'fintava_wallets',
+            'fintava_cards',
+            'deposits',
+            'withdrawals',
+            'commissions',
+            'epins',
+            'tickets',
+            'ticket_messages',
+            'subscribers',
+            'bank_code_backfill',
         ];
         $i = array_search($current, $order, true);
         return ($i !== false && $i + 1 < count($order)) ? $order[$i + 1] : null;
@@ -799,14 +1132,25 @@ class Matrix_MLM_Admin_Import {
     /** Dispatch one chunk to the right phase handler. */
     private static function process_chunk($phase, $cursor) {
         switch ($phase) {
-            case 'plans':            return self::process_plans($cursor);
-            case 'levels':           return self::process_levels($cursor);
-            case 'users':            return self::process_users($cursor);
-            case 'positions_placed': return self::process_positions_placed($cursor);
-            case 'positions_spill':  return self::process_positions_spillover($cursor);
-            case 'parents':          return self::process_parents($cursor);
-            case 'recalc_levels':    return self::process_recalc_levels($cursor);
-            case 'recalc_downline':  return self::process_recalc_downline($cursor);
+            case 'plans':              return self::process_plans($cursor);
+            case 'levels':             return self::process_levels($cursor);
+            case 'users':              return self::process_users($cursor);
+            case 'positions_placed':   return self::process_positions_placed($cursor);
+            case 'positions_spill':    return self::process_positions_spillover($cursor);
+            case 'parents':            return self::process_parents($cursor);
+            case 'recalc_levels':      return self::process_recalc_levels($cursor);
+            case 'recalc_downline':    return self::process_recalc_downline($cursor);
+            // PR 2 phases
+            case 'fintava_wallets':    return self::process_fintava_wallets($cursor);
+            case 'fintava_cards':      return self::process_fintava_cards($cursor);
+            case 'deposits':           return self::process_deposits($cursor);
+            case 'withdrawals':        return self::process_withdrawals($cursor);
+            case 'commissions':        return self::process_commissions($cursor);
+            case 'epins':              return self::process_epins($cursor);
+            case 'tickets':            return self::process_tickets($cursor);
+            case 'ticket_messages':    return self::process_ticket_messages($cursor);
+            case 'subscribers':        return self::process_subscribers($cursor);
+            case 'bank_code_backfill': return self::process_bank_code_backfill($cursor);
             default:
                 throw new RuntimeException('Unknown commit phase: ' . $phase);
         }
@@ -1174,6 +1518,23 @@ class Matrix_MLM_Admin_Import {
                 continue;
             }
 
+            // Idempotency guard: if the user already has a position in
+            // this plan (re-run after a previous successful commit, or
+            // a manual placement done before the import), reuse the
+            // existing row instead of inserting a duplicate. The
+            // staging.wp_position_id pointer is what every downstream
+            // phase joins through, so all that matters here is that it
+            // ends up pointing at *some* position row for this user.
+            $existing_pos = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$pt` WHERE user_id = %d AND plan_id = %d ORDER BY id ASC LIMIT 1",
+                (int) $row->wp_user_id, $wp_plan_id
+            ));
+            if ($existing_pos) {
+                $wpdb->update($su, ['wp_position_id' => (int) $existing_pos], ['id' => $row->id]);
+                $done++;
+                continue;
+            }
+
             // Resolve sponsor wp_user_id (NULL if ref_by is 0 or missing).
             $sponsor_wp_id = null;
             if ((int) $row->ref_by > 0) {
@@ -1300,6 +1661,20 @@ class Matrix_MLM_Admin_Import {
                 $wpdb->update($su, [
                     'import_error' => 'No active plan to spillover into',
                 ], ['id' => $row->id]);
+                continue;
+            }
+
+            // Idempotency guard: if this user already has a position in
+            // the target plan (committed in a prior run, or via the
+            // placed phase already in this run), pick that up instead
+            // of double-inserting.
+            $existing_pos = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$pt` WHERE user_id = %d AND plan_id = %d ORDER BY id ASC LIMIT 1",
+                (int) $row->wp_user_id, $wp_plan_id
+            ));
+            if ($existing_pos) {
+                $wpdb->update($su, ['wp_position_id' => (int) $existing_pos], ['id' => $row->id]);
+                $done++;
                 continue;
             }
 
@@ -1642,6 +2017,1057 @@ class Matrix_MLM_Admin_Import {
     }
 
     /* ================================================================
+     * PR 2 phases: Fintava wallets, Fintava cards, deposits,
+     * withdrawals, commissions, e-pins, tickets, ticket messages,
+     * subscribers, and the bank-code backfill auto-trigger.
+     *
+     * All phases follow the same shape as PR 1's:
+     *   - SELECT a chunk of staging rows whose import_status IS NULL
+     *   - Resolve WP-side foreign keys via the staging tables' wp_*_id
+     *     pointer columns (wp_user_id, wp_wallet_id, wp_ticket_id, etc.)
+     *   - INSERT into the matching MatrixPro table
+     *   - Mark the staging row 'imported' or 'skipped_*' for the next call
+     * Each one is idempotent within an import session because the
+     * staging.import_status check skips already-processed rows.
+     * ================================================================ */
+
+    /**
+     * Phase: fintava_wallets
+     *
+     * card_holders → matrix_fintava_wallets. One row per Laravel
+     * member with a virtual NUBAN. We deliberately do NOT migrate
+     * bank_name/bank_code from Laravel because Laravel's card_holders
+     * table doesn't carry them — the bank_code_backfill phase at the
+     * very end of the commit pipeline calls Fintava's API for every
+     * NULL bank_code we wrote here and resolves the partner-bank
+     * metadata authoritatively.
+     *
+     * matrix_fintava_wallets has UNIQUE on user_id, so we look up by
+     * wp_user_id and UPDATE if a row already exists (e.g. the operator
+     * pre-linked one manually before running the importer).
+     */
+    private static function process_fintava_wallets($cursor) {
+        global $wpdb;
+        $sch = self::staging_table('card_holders');
+        $su  = self::staging_table('users');
+        $wt  = $wpdb->prefix . 'matrix_fintava_wallets';
+
+        // Skip cleanly if the staging table doesn't exist (operator
+        // uploaded a PR 1-only dump). Same pattern for every PR 2 phase.
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sch'") !== $sch) {
+            return [
+                'done_in_chunk'   => 0,
+                'total_for_phase' => 0,
+                'cursor_after'    => 0,
+                'advance_phase'   => true,
+                'next_phase'      => self::next_phase('fintava_wallets'),
+                'message'         => 'No card_holders table staged — skipping Fintava wallets',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT ch.* FROM `$sch` ch
+             WHERE ch.id > %d
+               AND ch.import_status IS NULL
+             ORDER BY ch.id ASC
+             LIMIT " . self::CHUNK_FINTAVA_W,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sch`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk'   => 0,
+                'total_for_phase' => $total,
+                'cursor_after'    => 0,
+                'advance_phase'   => true,
+                'next_phase'      => self::next_phase('fintava_wallets'),
+                'message'         => 'Fintava wallets phase complete',
+            ];
+        }
+
+        $done    = 0;
+        $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+
+            // Resolve Laravel user_id → WP user_id via staging users table.
+            $wp_uid = $wpdb->get_var($wpdb->prepare(
+                "SELECT wp_user_id FROM `$su` WHERE id = %d",
+                (int) $row->user_id
+            ));
+            if (!$wp_uid) {
+                $wpdb->update($sch, [
+                    'import_status' => 'skipped_no_user',
+                    'import_error'  => 'Owning Laravel user did not import',
+                ], ['id' => $row->id]);
+                continue;
+            }
+            $wp_uid = (int) $wp_uid;
+
+            // Account number is the only field we treat as required —
+            // a wallet without a NUBAN is just metadata noise that
+            // would never serve a balance to its owner.
+            $account_number = trim((string) $row->account_number);
+            if ($account_number === '') {
+                $wpdb->update($sch, [
+                    'import_status' => 'skipped_no_account',
+                    'import_error'  => 'Empty account_number',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            // Status: Laravel uses tinyint (1=active, 0=inactive). is_frozen
+            // overrides if set. matrix_fintava_wallets uses a varchar.
+            $status = ((int) $row->is_frozen === 1)
+                ? 'frozen'
+                : ((int) $row->status === 1 ? 'active' : 'inactive');
+
+            // Pack KYC + provider extras into metadata so we don't lose
+            // them; future support views can decode and display.
+            $metadata = wp_json_encode([
+                'nin'         => $row->nin ?: null,
+                'address'     => $row->address ?: null,
+                'user_type'   => $row->user_type ?: null,
+                'fund_method' => $row->fund_method ?: null,
+                'provider'    => $row->provider ?: 'fintava',
+                'imported_from_laravel_id' => (int) $row->id,
+            ], JSON_UNESCAPED_UNICODE);
+
+            $account_name = trim(($row->firstname ?? '') . ' ' . ($row->lastname ?? ''));
+            if ($account_name === '') {
+                $account_name = $row->account_name ?: '';
+            }
+
+            $data = [
+                'user_id'        => $wp_uid,
+                'wallet_id'      => $row->wallet_id ?: null,
+                'customer_id'    => $row->cardholder_id ?: null,
+                'account_number' => $account_number,
+                'account_name'   => $account_name,
+                // bank_name defaults to 'Fintava' on the schema and the
+                // bank_code_backfill phase resolves the real partner bank
+                // (Globus/Wema/Providus/etc.) via the Fintava API at the
+                // end of the import.
+                'bank_name'      => 'Fintava',
+                'bank_code'      => null,
+                'currency'       => 'NGN',
+                'customer_email' => $row->email ?: null,
+                'customer_phone' => $row->mobile ?: null,
+                'bvn'            => $row->bvn ?: null,
+                'status'         => $status,
+                'metadata'       => $metadata,
+                'created_at'     => $row->created_at ?: current_time('mysql'),
+            ];
+
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$wt` WHERE user_id = %d", $wp_uid
+            ));
+            if ($existing) {
+                // Preserve manually-set bank_code/bank_name on update —
+                // we don't want a re-import to clobber an operator's
+                // hand-corrected partner-bank info.
+                unset($data['bank_name'], $data['bank_code'], $data['created_at']);
+                $wpdb->update($wt, $data, ['id' => (int) $existing]);
+                $wp_wallet_id = (int) $existing;
+            } else {
+                $wpdb->insert($wt, $data);
+                $wp_wallet_id = (int) $wpdb->insert_id;
+            }
+
+            $wpdb->update($sch, [
+                'wp_wallet_id'  => $wp_wallet_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sch` WHERE id > %d AND import_status IS NULL",
+            $last_id
+        ));
+        return [
+            'done_in_chunk'   => $done,
+            'total_for_phase' => $total,
+            'cursor_after'    => $last_id,
+            'advance_phase'   => $remaining === 0,
+            'next_phase'      => self::next_phase('fintava_wallets'),
+            'message'         => sprintf('Imported %d Fintava wallets (cursor at id %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: fintava_cards
+     *
+     * cards → matrix_fintava_cards. JOINs back through staging
+     * card_holders to resolve the destination wallet_id (Fintava's
+     * UUID, not the matrix_fintava_wallets row id). Status normalised
+     * from Laravel's UPPERCASE ('ACTIVE'/'INACTIVE') to the lowercase
+     * MatrixPro enum, with INACTIVE mapped to 'frozen' (the closest
+     * semantic match — the card exists but isn't usable).
+     */
+    private static function process_fintava_cards($cursor) {
+        global $wpdb;
+        $scd = self::staging_table('cards');
+        $sch = self::staging_table('card_holders');
+        $ct  = $wpdb->prefix . 'matrix_fintava_cards';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$scd'") !== $scd) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('fintava_cards'),
+                'message' => 'No cards table staged — skipping Fintava cards',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$scd` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_FINTAVA_C,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$scd`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('fintava_cards'),
+                'message' => 'Fintava cards phase complete',
+            ];
+        }
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+
+            // Resolve owning user (via Laravel cards.user_id → staging users).
+            $wp_uid = $wpdb->get_var($wpdb->prepare(
+                "SELECT wp_user_id FROM `" . self::staging_table('users') . "` WHERE id = %d",
+                (int) $row->user_id
+            ));
+            if (!$wp_uid) {
+                $wpdb->update($scd, [
+                    'import_status' => 'skipped_no_user',
+                    'import_error'  => 'Owning Laravel user did not import',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            // Resolve wallet UUID via card_holders join. matrix_fintava_cards
+            // stores Fintava's wallet_id (UUID), not the wp wallet row id —
+            // matches the cards-as-issued-against-a-wallet model the rest
+            // of the plugin already uses.
+            $wallet_uuid = $wpdb->get_var($wpdb->prepare(
+                "SELECT wallet_id FROM `$sch` WHERE id = %d",
+                (int) $row->card_holder_id
+            ));
+
+            // Dedupe: if a card with this Laravel card_id already exists,
+            // update rather than re-insert. card_id is Fintava-issued so
+            // it's globally unique.
+            $existing = null;
+            if (!empty($row->card_id)) {
+                $existing = $wpdb->get_var($wpdb->prepare(
+                    "SELECT id FROM `$ct` WHERE card_id = %s LIMIT 1",
+                    $row->card_id
+                ));
+            }
+
+            $status_raw = strtolower((string) $row->status);
+            $status_map = [
+                'active'    => 'active',
+                'inactive'  => 'frozen',  // best-fit semantic
+                'pending'   => 'pending',
+                'processing'=> 'processing',
+                'shipped'   => 'shipped',
+                'delivered' => 'delivered',
+                'linked'    => 'linked',
+                'frozen'    => 'frozen',
+                'blocked'   => 'blocked',
+                'expired'   => 'expired',
+            ];
+            $status = $status_map[$status_raw] ?? 'pending';
+
+            $metadata = wp_json_encode([
+                'card_holder_email'    => $row->card_holder_email ?: null,
+                'card_holder_mobile'   => $row->card_holder_mobile ?: null,
+                'account_number'       => $row->account_number ?: null,
+                'map_id'               => $row->map_id ?: null,
+                'card_no'              => $row->card_no ?: null,
+                'exp_month'            => $row->exp_month ?: null,
+                'exp_year'             => $row->exp_year ?: null,
+                'card_request_status'  => $row->card_request_status ?: null,
+                'is_linked'            => (int) $row->is_linked,
+                'linked_at'            => $row->linked_at ?: null,
+                'imported_from_laravel_id' => (int) $row->id,
+            ], JSON_UNESCAPED_UNICODE);
+
+            $data = [
+                'user_id'      => (int) $wp_uid,
+                'card_id'      => $row->card_id ?: null,
+                'wallet_id'    => $wallet_uuid ?: null,
+                'card_type'    => $row->card_type ?: 'STATIC_NO_ACCOUNT',
+                'card_brand'   => $row->card_brand ?: 'VERVE',
+                'last_four'    => $row->last4 ?: null,
+                'status'       => $status,
+                'activated_at' => $row->activated_at ?: null,
+                'metadata'     => $metadata,
+                'created_at'   => $row->created_at ?: current_time('mysql'),
+            ];
+
+            if ($existing) {
+                unset($data['created_at']);
+                $wpdb->update($ct, $data, ['id' => (int) $existing]);
+                $wp_target = (int) $existing;
+            } else {
+                $wpdb->insert($ct, $data);
+                $wp_target = (int) $wpdb->insert_id;
+            }
+
+            $wpdb->update($scd, [
+                'wp_target_id'  => $wp_target,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$scd` WHERE id > %d AND import_status IS NULL",
+            $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('fintava_cards'),
+            'message' => sprintf('Imported %d Fintava cards (cursor at id %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: deposits
+     *
+     * Laravel deposits.status: 1=success, 2=pending, 3=cancel.
+     * MatrixPro deposits.status: 'pending' | 'completed' | 'rejected' | 'cancelled'.
+     * Mapping: 1→completed, 2→pending, 3→cancelled, anything else→pending.
+     *
+     * Dedupe by transaction_id which we set to "lv-{laravel_id}" so a
+     * re-run with the same dump doesn't double-credit history.
+     */
+    private static function process_deposits($cursor) {
+        global $wpdb;
+        $sd = self::staging_table('deposits');
+        $su = self::staging_table('users');
+        $dt = $wpdb->prefix . 'matrix_deposits';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sd'") !== $sd) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('deposits'),
+                'message' => 'No deposits staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$sd` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_DEPOSITS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sd`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('deposits'),
+                'message' => 'Deposits phase complete',
+            ];
+        }
+
+        $status_map = [1 => 'completed', 2 => 'pending', 3 => 'cancelled'];
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            $wp_uid = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->user_id));
+            if (!$wp_uid) {
+                $wpdb->update($sd, ['import_status' => 'skipped_no_user'], ['id' => $row->id]);
+                continue;
+            }
+
+            // Stable Laravel-anchored transaction id so re-imports skip.
+            $marker = 'lv-deposit-' . (int) $row->id;
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$dt` WHERE transaction_id = %s LIMIT 1", $marker
+            ));
+            if ($existing) {
+                $wpdb->update($sd, [
+                    'wp_target_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            $status = $status_map[(int) $row->status] ?? 'pending';
+            $wpdb->insert($dt, [
+                'user_id'          => (int) $wp_uid,
+                // Laravel stores method_code as int → keep readable.
+                'gateway'          => 'laravel-method-' . (int) $row->method_code,
+                'amount'           => $row->amount,
+                'charge'           => $row->charge,
+                'net_amount'       => $row->final_amo,
+                'currency'         => $row->method_currency ?: 'NGN',
+                'transaction_id'   => $marker . ($row->trx ? ('-' . $row->trx) : ''),
+                'gateway_response' => $row->detail ?: null,
+                'status'           => $status,
+                'created_at'       => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($sd, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sd` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('deposits'),
+            'message' => sprintf('Imported %d deposits (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: withdrawals
+     *
+     * Laravel withdrawals.status: 1=success, 2=pending, 3=cancel.
+     * MatrixPro withdrawals.status: 'pending' | 'approved' | 'rejected' | 'cancelled'.
+     * Mapping: 1→approved, 2→pending, 3→cancelled.
+     */
+    private static function process_withdrawals($cursor) {
+        global $wpdb;
+        $sw = self::staging_table('withdrawals');
+        $su = self::staging_table('users');
+        $wt = $wpdb->prefix . 'matrix_withdrawals';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sw'") !== $sw) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('withdrawals'),
+                'message' => 'No withdrawals staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$sw` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_WITHDRAW,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sw`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('withdrawals'),
+                'message' => 'Withdrawals phase complete',
+            ];
+        }
+
+        $status_map = [1 => 'approved', 2 => 'pending', 3 => 'cancelled'];
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            $wp_uid = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->user_id));
+            if (!$wp_uid) {
+                $wpdb->update($sw, ['import_status' => 'skipped_no_user'], ['id' => $row->id]);
+                continue;
+            }
+
+            // Dedupe by Laravel id — withdrawals don't have a unique col on the WP side.
+            $marker = 'lv-withdrawal-' . (int) $row->id;
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$wt` WHERE admin_note LIKE %s LIMIT 1",
+                '%' . $wpdb->esc_like($marker) . '%'
+            ));
+            if ($existing) {
+                $wpdb->update($sw, [
+                    'wp_target_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            $status = $status_map[(int) $row->status] ?? 'pending';
+            $admin_note = $marker;
+            if (!empty($row->admin_feedback)) {
+                $admin_note .= ' | ' . $row->admin_feedback;
+            }
+
+            $wpdb->insert($wt, [
+                'user_id'         => (int) $wp_uid,
+                'method'          => 'laravel-method-' . (int) $row->method_id,
+                'amount'          => $row->amount,
+                'charge'          => $row->charge,
+                'net_amount'      => $row->after_charge ?: $row->amount,
+                'currency'        => $row->currency ?: 'NGN',
+                'account_details' => $row->withdraw_information ?: null,
+                'admin_note'      => $admin_note,
+                'status'          => $status,
+                'created_at'      => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($sw, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sw` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('withdrawals'),
+            'message' => sprintf('Imported %d withdrawals (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: commissions
+     *
+     * Laravel mark: 1=referral, 2=level. Anything else falls back to
+     * 'level' (the more inclusive bucket — a misclassified commission
+     * still renders correctly in the user dashboard's level commission
+     * tab; misclassified the other way it would never appear).
+     *
+     * Dedupe by Laravel trx (when present) or by composite
+     * (from_user, user, amount, level, created_at) which is unique
+     * enough in practice for the ViserMLM commission distribution flow.
+     */
+    private static function process_commissions($cursor) {
+        global $wpdb;
+        $sc = self::staging_table('commissions');
+        $su = self::staging_table('users');
+        $ct = $wpdb->prefix . 'matrix_commissions';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sc'") !== $sc) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('commissions'),
+                'message' => 'No commissions staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$sc` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_COMMS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sc`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('commissions'),
+                'message' => 'Commissions phase complete',
+            ];
+        }
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            // Resolve the recipient (user_id) and the source (from_user_id).
+            $wp_uid   = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->user_id));
+            $wp_from  = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->from_user_id));
+            if (!$wp_uid) {
+                $wpdb->update($sc, ['import_status' => 'skipped_no_user'], ['id' => $row->id]);
+                continue;
+            }
+
+            // Dedupe via details column — store Laravel id there so the
+            // existing details payload stays human-readable while still
+            // making the row uniquely identifiable.
+            $marker = 'lv-commission-' . (int) $row->id;
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$ct` WHERE user_id = %d AND from_user_id = %d AND amount = %s AND level = %d AND DATE(created_at) = DATE(%s) LIMIT 1",
+                (int) $wp_uid,
+                (int) ($wp_from ?: 0),
+                $row->amount,
+                (int) $row->level,
+                $row->created_at ?: current_time('mysql')
+            ));
+            if ($existing) {
+                $wpdb->update($sc, [
+                    'wp_target_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            $type = ((int) $row->mark === 1) ? 'referral' : 'level';
+            // matrix_commissions has a NOT NULL from_user_id with no
+            // sentinel; if the source user didn't import (orphan), use
+            // the recipient as a fallback to avoid breaking the FK.
+            $from_id = $wp_from ? (int) $wp_from : (int) $wp_uid;
+
+            $wpdb->insert($ct, [
+                'user_id'      => (int) $wp_uid,
+                'from_user_id' => $from_id,
+                'plan_id'      => null,
+                'type'         => $type,
+                'level'        => (int) $row->level,
+                'amount'       => $row->amount,
+                'status'       => 'paid',
+                'created_at'   => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($sc, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+                'import_error'  => $marker, // breadcrumb for support diagnostics
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sc` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('commissions'),
+            'message' => sprintf('Imported %d commissions (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: epins
+     *
+     * pins → matrix_epins. Status: 0=unused → 'unused', 1=used → 'used'.
+     * matrix_epins has UNIQUE on pin_code so a re-run with the same dump
+     * is naturally idempotent — INSERT IGNORE skips dupes.
+     */
+    private static function process_epins($cursor) {
+        global $wpdb;
+        $sp = self::staging_table('pins');
+        $su = self::staging_table('users');
+        $et = $wpdb->prefix . 'matrix_epins';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sp'") !== $sp) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('epins'),
+                'message' => 'No pins staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$sp` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_EPINS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sp`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('epins'),
+                'message' => 'E-pins phase complete',
+            ];
+        }
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            if (empty($row->pin)) {
+                $wpdb->update($sp, ['import_status' => 'skipped_empty_pin'], ['id' => $row->id]);
+                continue;
+            }
+
+            // Skip if pin_code already exists.
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM `$et` WHERE pin_code = %s LIMIT 1", $row->pin
+            ));
+            if ($existing) {
+                $wpdb->update($sp, [
+                    'wp_target_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            $created_by = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->generate_user_id));
+            $used_by    = (int) $row->user_id > 0
+                ? $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->user_id))
+                : null;
+
+            // matrix_epins.created_by is NOT NULL — fall back to user 1
+            // (typically the WP super-admin) when the Laravel generator
+            // didn't import or wasn't recorded.
+            if (!$created_by) {
+                $created_by = 1;
+            }
+
+            $status = ((int) $row->status === 1) ? 'used' : 'unused';
+            $wpdb->insert($et, [
+                'pin_code'   => $row->pin,
+                'plan_id'    => null,
+                'amount'     => $row->amount,
+                'created_by' => (int) $created_by,
+                'used_by'    => $used_by ? (int) $used_by : null,
+                'status'     => $status,
+                'created_at' => $row->created_at ?: current_time('mysql'),
+                'used_at'    => ($status === 'used' && $row->updated_at) ? $row->updated_at : null,
+                'expires_at' => null,
+            ]);
+            $wpdb->update($sp, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sp` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('epins'),
+            'message' => sprintf('Imported %d e-pins (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: tickets
+     *
+     * support_tickets → matrix_tickets. The ticket-message phase joins
+     * back through staging.wp_ticket_id to resolve which MatrixPro
+     * ticket each Laravel message belongs to.
+     */
+    private static function process_tickets($cursor) {
+        global $wpdb;
+        $st = self::staging_table('support_tickets');
+        $su = self::staging_table('users');
+        $tt = $wpdb->prefix . 'matrix_tickets';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$st'") !== $st) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('tickets'),
+                'message' => 'No tickets staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$st` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_TICKETS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$st`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('tickets'),
+                'message' => 'Tickets phase complete',
+            ];
+        }
+
+        $priority_map = [1 => 'low', 2 => 'medium', 3 => 'high'];
+        $status_map   = [0 => 'open', 1 => 'answered', 2 => 'customer_reply', 3 => 'closed'];
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            $wp_uid = $wpdb->get_var($wpdb->prepare("SELECT wp_user_id FROM `$su` WHERE id = %d", (int) $row->user_id));
+            if (!$wp_uid) {
+                $wpdb->update($st, ['import_status' => 'skipped_no_user'], ['id' => $row->id]);
+                continue;
+            }
+
+            // Dedupe via Laravel ticket number when present.
+            $existing = null;
+            if (!empty($row->ticket)) {
+                $existing = $wpdb->get_var($wpdb->prepare(
+                    "SELECT id FROM `$tt` WHERE subject LIKE %s AND user_id = %d LIMIT 1",
+                    '[' . $wpdb->esc_like($row->ticket) . ']%',
+                    (int) $wp_uid
+                ));
+            }
+            if ($existing) {
+                $wpdb->update($st, [
+                    'wp_ticket_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+
+            // Prefix subject with the Laravel ticket number so support
+            // staff can correlate back to the old system if needed.
+            $subject = ($row->ticket ? '[' . $row->ticket . '] ' : '') . ($row->subject ?: '(no subject)');
+
+            $wpdb->insert($tt, [
+                'user_id'    => (int) $wp_uid,
+                'subject'    => $subject,
+                'priority'   => $priority_map[(int) $row->priority] ?? 'medium',
+                'status'     => $status_map[(int) $row->status] ?? 'open',
+                'department' => null,
+                'created_at' => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($st, [
+                'wp_ticket_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$st` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('tickets'),
+            'message' => sprintf('Imported %d tickets (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: ticket_messages
+     *
+     * support_messages → matrix_ticket_messages. Resolves the parent
+     * ticket via staging.wp_ticket_id. is_admin = (admin_id > 0).
+     * For staff replies, user_id is set to the lowest-id WP admin
+     * (super-admin) since Laravel admins live in a separate table
+     * we don't migrate — the message text is what matters for
+     * support history; attribution to the exact original staff
+     * member would require migrating the admins table too.
+     */
+    private static function process_ticket_messages($cursor) {
+        global $wpdb;
+        $sm = self::staging_table('support_messages');
+        $st = self::staging_table('support_tickets');
+        $mt = $wpdb->prefix . 'matrix_ticket_messages';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$sm'") !== $sm) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('ticket_messages'),
+                'message' => 'No ticket messages staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT m.*, t.wp_ticket_id, t.user_id AS lv_ticket_user_id
+             FROM `$sm` m
+             LEFT JOIN `$st` t ON t.id = m.support_ticket_id
+             WHERE m.id > %d AND m.import_status IS NULL
+             ORDER BY m.id ASC
+             LIMIT " . self::CHUNK_TMSGS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sm`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('ticket_messages'),
+                'message' => 'Ticket messages phase complete',
+            ];
+        }
+
+        // Resolve the lowest-id WP admin once, used as the author for
+        // every staff reply we import.
+        $fallback_admin = (int) $wpdb->get_var(
+            "SELECT u.ID FROM {$wpdb->users} u
+             INNER JOIN {$wpdb->usermeta} m ON m.user_id = u.ID AND m.meta_key = '{$wpdb->prefix}capabilities'
+             WHERE m.meta_value LIKE '%administrator%'
+             ORDER BY u.ID ASC LIMIT 1"
+        );
+        if (!$fallback_admin) {
+            $fallback_admin = 1;
+        }
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            if (!$row->wp_ticket_id) {
+                $wpdb->update($sm, ['import_status' => 'skipped_no_ticket'], ['id' => $row->id]);
+                continue;
+            }
+
+            $is_admin = ((int) $row->admin_id > 0) ? 1 : 0;
+
+            // For member replies, use the ticket's owning WP user.
+            // We have to re-resolve from staging.support_tickets.user_id
+            // → staging.users.wp_user_id since the JOIN above only got
+            // us the Laravel user id.
+            $user_id = (int) $fallback_admin;
+            if (!$is_admin && (int) $row->lv_ticket_user_id > 0) {
+                $resolved = $wpdb->get_var($wpdb->prepare(
+                    "SELECT wp_user_id FROM `" . self::staging_table('users') . "` WHERE id = %d",
+                    (int) $row->lv_ticket_user_id
+                ));
+                $user_id = $resolved ? (int) $resolved : (int) $fallback_admin;
+            }
+
+            $wpdb->insert($mt, [
+                'ticket_id'   => (int) $row->wp_ticket_id,
+                'user_id'     => $user_id,
+                'message'     => $row->message ?: '',
+                'attachments' => null,
+                'is_admin'    => $is_admin,
+                'created_at'  => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($sm, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$sm` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('ticket_messages'),
+            'message' => sprintf('Imported %d ticket replies (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: subscribers
+     *
+     * subscribers → matrix_subscribers. matrix_subscribers has UNIQUE
+     * on email so we use a per-row existence check rather than INSERT
+     * IGNORE — that way the staging row records whether it was newly
+     * inserted vs already-on-the-list, which the import summary surfaces.
+     */
+    private static function process_subscribers($cursor) {
+        global $wpdb;
+        $ss = self::staging_table('subscribers');
+        $st = $wpdb->prefix . 'matrix_subscribers';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$ss'") !== $ss) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 0, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('subscribers'),
+                'message' => 'No subscribers staged — skipping',
+            ];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM `$ss` WHERE id > %d AND import_status IS NULL ORDER BY id ASC LIMIT " . self::CHUNK_SUBS,
+            $cursor
+        ));
+        $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$ss`");
+
+        if (empty($rows)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => $total, 'cursor_after' => 0,
+                'advance_phase' => true, 'next_phase' => self::next_phase('subscribers'),
+                'message' => 'Subscribers phase complete',
+            ];
+        }
+
+        $done = 0; $last_id = $cursor;
+        foreach ($rows as $row) {
+            $last_id = (int) $row->id;
+            $email = trim((string) $row->email);
+            if ($email === '' || !is_email($email)) {
+                $wpdb->update($ss, ['import_status' => 'skipped_invalid_email'], ['id' => $row->id]);
+                continue;
+            }
+            $existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM `$st` WHERE email = %s", $email));
+            if ($existing) {
+                $wpdb->update($ss, [
+                    'wp_target_id'  => (int) $existing,
+                    'import_status' => 'skipped_duplicate',
+                ], ['id' => $row->id]);
+                continue;
+            }
+            $wpdb->insert($st, [
+                'email'      => $email,
+                'status'     => 1,
+                'created_at' => $row->created_at ?: current_time('mysql'),
+            ]);
+            $wpdb->update($ss, [
+                'wp_target_id'  => (int) $wpdb->insert_id,
+                'import_status' => 'imported',
+            ], ['id' => $row->id]);
+            $done++;
+        }
+
+        $remaining = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM `$ss` WHERE id > %d AND import_status IS NULL", $last_id
+        ));
+        return [
+            'done_in_chunk' => $done, 'total_for_phase' => $total, 'cursor_after' => $last_id,
+            'advance_phase' => $remaining === 0, 'next_phase' => self::next_phase('subscribers'),
+            'message' => sprintf('Imported %d subscribers (cursor %d)', $done, $last_id),
+        ];
+    }
+
+    /**
+     * Phase: bank_code_backfill
+     *
+     * Auto-trigger of the existing Matrix_MLM_Fintava::backfill_missing_bank_codes()
+     * orchestrator that the migration page exposes manually as a one-
+     * click button. Runs as the final phase of an import so wallets
+     * imported in the fintava_wallets phase land with a real partner-
+     * bank sortCode (Globus, Wema, Providus, etc.) populated by the
+     * Fintava API rather than the schema-default 'Fintava' placeholder.
+     *
+     * Without this, every imported member's first matrix→virtual
+     * transfer would fail with the bank_code-missing error the
+     * existing self-heal chain documents — and the user wouldn't
+     * see their balance until an operator manually triggered the
+     * backfill from Migration → Fintava.
+     *
+     * Runs as a single chunk (the orchestrator does its own internal
+     * batching with throttled Fintava API round-trips).
+     */
+    private static function process_bank_code_backfill($cursor) {
+        if (!class_exists('Matrix_MLM_Fintava')) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 1, 'cursor_after' => 1,
+                'advance_phase' => true, 'next_phase' => self::next_phase('bank_code_backfill'),
+                'message' => 'Fintava class not loaded — skipping backfill',
+            ];
+        }
+        $fintava = new Matrix_MLM_Fintava();
+        if (!$fintava->is_active()) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 1, 'cursor_after' => 1,
+                'advance_phase' => true, 'next_phase' => self::next_phase('bank_code_backfill'),
+                'message' => 'Fintava not configured — skipping backfill (re-run from Migration → Fintava once configured)',
+            ];
+        }
+
+        // Allow the orchestrator a generous timeout — it can fire up to
+        // 5 round-trips per row in the worst case.
+        @set_time_limit(180);
+
+        $report = $fintava->backfill_missing_bank_codes();
+        if (is_wp_error($report)) {
+            return [
+                'done_in_chunk' => 0, 'total_for_phase' => 1, 'cursor_after' => 1,
+                'advance_phase' => true, 'next_phase' => self::next_phase('bank_code_backfill'),
+                'message' => 'Backfill error: ' . $report->get_error_message(),
+            ];
+        }
+
+        $resolved = (int) $report['resolved_via_wallet_details']
+                  + (int) $report['resolved_via_customer_api']
+                  + (int) $report['resolved_via_static_lookup'];
+
+        return [
+            'done_in_chunk'   => $resolved,
+            'total_for_phase' => (int) $report['total_missing_before'],
+            'cursor_after'    => 1,
+            'advance_phase'   => true,
+            'next_phase'      => self::next_phase('bank_code_backfill'),
+            'message'         => sprintf(
+                'Bank-code backfill: %d resolved out of %d (%d still missing)',
+                $resolved,
+                (int) $report['total_missing_before'],
+                (int) $report['still_missing']
+            ),
+        ];
+    }
+
+    /* ================================================================
      * handle_reset — drops staging tables and clears state
      * ================================================================ */
 
@@ -1700,9 +3126,9 @@ class Matrix_MLM_Admin_Import {
             <!-- Step 1: Upload -->
             <div class="matrix-admin-card" style="padding:16px;border:1px solid #ddd;background:#fff;margin-top:16px;<?php echo $status === 'idle' ? '' : 'opacity:0.65;'; ?>">
                 <h2><?php _e('Step 1 — Upload Laravel SQL Dump', 'matrix-mlm'); ?></h2>
-                <p><?php _e('Run on your Laravel server:', 'matrix-mlm'); ?>
+                <p><?php _e('Run on your Laravel server (or use phpMyAdmin → Export → Custom → Data only):', 'matrix-mlm'); ?>
                 <br><code>mysqldump -u USER -p --no-create-info DBNAME users plans levels card_holders cards deposits withdrawals commissions pins support_tickets support_messages subscribers > laravel-data.sql</code></p>
-                <p><?php _e('Then upload that file here:', 'matrix-mlm'); ?></p>
+                <p class="description"><?php _e('All twelve tables are required for a complete migration. Tables omitted from the dump will simply have empty data on the WordPress side — for example, dropping <code>commissions</code> means the commission ledger starts fresh on import day. The financial / Fintava / ticketing / subscriber tables are processed in the second half of the commit pipeline; uploading only <code>users plans levels</code> still works (the PR 2 phases will trivially complete with zero rows).', 'matrix-mlm'); ?></p>
                 <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
                     <?php wp_nonce_field('matrix_mlm_import_upload'); ?>
                     <input type="hidden" name="action" value="matrix_mlm_import_upload">
@@ -1774,6 +3200,41 @@ class Matrix_MLM_Admin_Import {
                                 </ul>
                             </div>
                         <?php endif; ?>
+
+                        <?php if (!empty($analysis['pr2_stats'])): ?>
+                            <h3 style="margin-top:24px;"><?php _e('Financial / Operational Tables', 'matrix-mlm'); ?></h3>
+                            <table class="widefat striped" style="max-width:900px;">
+                                <thead>
+                                    <tr>
+                                        <th><?php _e('Table', 'matrix-mlm'); ?></th>
+                                        <th style="width:140px;"><?php _e('Rows Staged', 'matrix-mlm'); ?></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($analysis['pr2_stats'] as $key => $info): ?>
+                                        <tr>
+                                            <td><?php echo esc_html($info['label']); ?> <code><?php echo esc_html($key); ?></code></td>
+                                            <td><?php echo number_format((int) $info['count']); ?></td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    <?php if (isset($analysis['fintava_with_wallet_id'])): ?>
+                                        <tr>
+                                            <td><em><?php _e('… of which Fintava wallets carry a wallet_id', 'matrix-mlm'); ?></em></td>
+                                            <td><?php echo number_format((int) $analysis['fintava_with_wallet_id']); ?></td>
+                                        </tr>
+                                    <?php endif; ?>
+                                    <?php if (isset($analysis['fintava_with_account'])): ?>
+                                        <tr>
+                                            <td><em><?php _e('… of which Fintava wallets carry an account_number', 'matrix-mlm'); ?></em></td>
+                                            <td><?php echo number_format((int) $analysis['fintava_with_account']); ?></td>
+                                        </tr>
+                                    <?php endif; ?>
+                                </tbody>
+                            </table>
+                            <p class="description" style="margin-top:8px;">
+                                <?php _e('After commit, the importer auto-runs the existing <strong>Fintava bank-code backfill</strong> as the final phase. That call resolves the partner bank (Globus / Wema / Providus / etc.) for every wallet via the Fintava API so members see live balances on first login. Wallets that remain unresolved after backfill appear in the Fintava migration page for manual review.', 'matrix-mlm'); ?>
+                            </p>
+                        <?php endif; ?>
                     <?php endif; ?>
                 </div>
             <?php endif; ?>
@@ -1838,7 +3299,12 @@ class Matrix_MLM_Admin_Import {
                         <div style="padding:12px;background:#edfaef;border-left:4px solid #2c8b3a;">
                             <strong><?php _e('Import complete!', 'matrix-mlm'); ?></strong>
                             <pre style="margin-top:8px;font-size:11px;"><?php echo esc_html(wp_json_encode($state['stats'], JSON_PRETTY_PRINT)); ?></pre>
-                            <p><?php _e('Members can now log in with their Laravel usernames/emails and existing passwords. Run PR 2 next to import deposits, withdrawals, commissions, e-pins, and Fintava wallets.', 'matrix-mlm'); ?></p>
+                            <p>
+                                <?php _e('Members can now log in with their Laravel usernames/emails and existing passwords. Their Fintava wallet balances appear live on the dashboard, deposit/withdrawal history is visible, commission earnings are restored, and any open support tickets carry over with their full reply chain.', 'matrix-mlm'); ?>
+                            </p>
+                            <p>
+                                <?php _e('Next: head to <strong>Fintava → Backfill Bank Codes</strong> on the Migration page if any wallets are still flagged as missing partner-bank info, then update the webhook URL in your Fintava merchant dashboard to point at this WordPress site so future deposits credit the right user.', 'matrix-mlm'); ?>
+                            </p>
                         </div>
                     <?php elseif ($status === 'failed'): ?>
                         <div style="padding:12px;background:#fef0f0;border-left:4px solid #b32d2e;">
