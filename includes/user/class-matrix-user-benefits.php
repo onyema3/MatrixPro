@@ -317,22 +317,36 @@ class Matrix_MLM_User_Benefits {
 
     /**
      * True if the given slug refers to the Healthcare benefit.
-     * Same matching rules as CUG/Loan: bare 'healthcare' / 'hmo' or
-     * any 'healthcare-' / 'hmo-' prefixed variant the operator might
-     * rename to (e.g. 'healthcare-family', 'hmo-premium'). Both the
-     * generic and the industry-shorthand prefix work because the
-     * Nigerian market uses them interchangeably for the same
-     * benefit, and rejecting either would silently strand operator
-     * naming choices that work fine elsewhere on the dashboard.
+     * Accepts:
+     *
+     *   - 'healthcare', 'hmo', 'health', 'health-insurance' (bare)
+     *   - any 'healthcare-' / 'hmo-' / 'health-' prefixed variant
+     *     (e.g. 'healthcare-family', 'hmo-premium', 'health-cover')
+     *
+     * The 'health-insurance' / 'health-' prefix branch matters
+     * because the activator's seed_defaults() seeds the starter
+     * Health Insurance benefit with slug='health-insurance' — without
+     * it, the seeded card on every existing install would render
+     * without the "Apply for Healthcare" CTA and the form would be
+     * unreachable from the dashboard.
+     *
+     * Both the generic and the industry-shorthand prefixes are
+     * accepted because the Nigerian market uses HMO/health insurance
+     * /healthcare interchangeably for the same benefit, and
+     * rejecting any of them would silently strand operator naming
+     * choices that work fine elsewhere on the dashboard.
      */
     public static function is_healthcare_slug($slug) {
         $slug = strtolower(trim((string) $slug));
         if ($slug === '') {
             return false;
         }
-        return $slug === 'healthcare' || $slug === 'hmo'
-            || strpos($slug, 'healthcare-') === 0
-            || strpos($slug, 'hmo-') === 0;
+        if ($slug === 'healthcare' || $slug === 'hmo' || $slug === 'health' || $slug === 'health-insurance') {
+            return true;
+        }
+        return strpos($slug, 'healthcare-') === 0
+            || strpos($slug, 'hmo-') === 0
+            || strpos($slug, 'health-') === 0;
     }
 
     /**

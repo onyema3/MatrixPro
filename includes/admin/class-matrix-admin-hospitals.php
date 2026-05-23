@@ -49,6 +49,20 @@ class Matrix_MLM_Admin_Hospitals {
             $this->save_hospital();
         }
 
+        // CSV bulk import — runs before render so the import-results
+        // notice appears at the top of the list page.
+        if (isset($_POST['import_hospitals']) && wp_verify_nonce($_POST['_wpnonce'] ?? '', 'matrix_import_hospitals')) {
+            $this->handle_import();
+        }
+
+        // CSV template download — short-circuits with a file
+        // response so operators have a starting point that already
+        // has the right column headers and a couple of example rows.
+        if (isset($_GET['download_template']) && $_GET['download_template'] === '1') {
+            $this->stream_csv_template();
+            return;
+        }
+
         // Delete — idempotent: a stale link to a row that's already
         // been removed surfaces a "not found" notice rather than a
         // 500.
@@ -136,6 +150,8 @@ class Matrix_MLM_Admin_Hospitals {
             <p class="description">
                 <?php _e('Hospitals listed here populate the "Choice of Hospital" dropdown on the member-facing Healthcare enrolment form. Only active hospitals are shown to members. Filtering on the form is by Hospital State.', 'matrix-mlm'); ?>
             </p>
+
+            <?php $this->render_import_panel(); ?>
 
             <form method="get" action="" style="margin:16px 0 0;">
                 <input type="hidden" name="page" value="matrix-mlm-hospitals">
@@ -539,6 +555,475 @@ class Matrix_MLM_Admin_Hospitals {
             DB_NAME,
             $table
         )) > 0;
+    }
+
+    /**
+     * Render the bulk-import panel — collapsed accordion with a
+     * file upload, a quick how-to, and a CSV-template download.
+     *
+     * Hidden by default to keep the list page clean; clicking the
+     * "Bulk Import" disclosure expands it. The form submits to the
+     * same admin URL and is handled by handle_import() before any
+     * output, so the result notice renders at the top of the
+     * resulting page next to any other notices.
+     */
+    private function render_import_panel() {
+        $template_url = wp_nonce_url(
+            add_query_arg('download_template', '1', admin_url('admin.php?page=matrix-mlm-hospitals')),
+            'matrix_hospital_template'
+        );
+        ?>
+        <details style="margin:16px 0 0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;">
+            <summary style="padding:12px 14px;cursor:pointer;font-weight:600;color:#1f2937;list-style:none;">
+                <span class="dashicons dashicons-upload" style="vertical-align:middle;margin-right:6px;color:#4f46e5;"></span>
+                <?php _e('Bulk Import Hospitals (CSV)', 'matrix-mlm'); ?>
+                <span style="float:right;font-weight:400;font-size:12px;color:#6b7280;">
+                    <?php _e('Click to expand', 'matrix-mlm'); ?>
+                </span>
+            </summary>
+            <div style="padding:14px 16px;border-top:1px solid #e5e7eb;background:#ffffff;border-radius:0 0 6px 6px;">
+                <p style="margin:0 0 10px;font-size:13px;color:#374151;line-height:1.5;">
+                    <?php _e('Upload a CSV file to add many hospitals at once. The first row must be a header row with column names — extra columns are ignored, missing optional columns are filled in with sensible defaults.', 'matrix-mlm'); ?>
+                </p>
+
+                <p style="margin:0 0 10px;font-size:13px;color:#374151;">
+                    <strong><?php _e('Required columns:', 'matrix-mlm'); ?></strong>
+                    <code>name</code>, <code>state</code><br>
+                    <strong><?php _e('Optional columns:', 'matrix-mlm'); ?></strong>
+                    <code>address</code>, <code>notes</code>, <code>display_order</code>, <code>status</code>
+                </p>
+
+                <p style="margin:0 0 12px;padding:8px 12px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:4px;font-size:12px;color:#78350f;line-height:1.5;">
+                    <strong><?php _e('Excel users:', 'matrix-mlm'); ?></strong>
+                    <?php _e('Save your spreadsheet as CSV UTF-8 (Comma delimited) before uploading. .xls and .xlsx files are not supported directly because parsing them reliably requires a library that is not bundled with this plugin.', 'matrix-mlm'); ?>
+                </p>
+
+                <form method="post" enctype="multipart/form-data" action="<?php echo esc_url(admin_url('admin.php?page=matrix-mlm-hospitals')); ?>"
+                      style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <?php wp_nonce_field('matrix_import_hospitals'); ?>
+                    <input type="file" name="hospitals_csv" accept=".csv,text/csv,text/plain" required>
+                    <label style="font-size:13px;display:inline-flex;align-items:center;gap:6px;">
+                        <input type="checkbox" name="update_existing" value="1">
+                        <?php _e('Update rows where (name, state) already exists', 'matrix-mlm'); ?>
+                    </label>
+                    <button type="submit" name="import_hospitals" class="button button-primary">
+                        <?php _e('Import CSV', 'matrix-mlm'); ?>
+                    </button>
+                    <a href="<?php echo esc_url($template_url); ?>" class="button">
+                        <span class="dashicons dashicons-download" style="vertical-align:text-bottom;"></span>
+                        <?php _e('Download template', 'matrix-mlm'); ?>
+                    </a>
+                </form>
+
+                <p style="margin:10px 0 0;font-size:11px;color:#6b7280;">
+                    <?php
+                    /* translators: %s: max upload size in MB, server-defined */
+                    printf(esc_html__('Max upload size: %s. Each row must include a non-empty name (2-200 chars) and a valid Nigerian state.', 'matrix-mlm'), esc_html(size_format(wp_max_upload_size())));
+                    ?>
+                </p>
+            </div>
+        </details>
+        <?php
+    }
+
+    /**
+     * Handle a CSV bulk-import POST. Reads the uploaded file,
+     * parses each row by column name (so column order doesn't
+     * matter), validates against the same rules as the Add/Edit
+     * form, then inserts (or updates, when the operator opted in)
+     * row-by-row in a single transaction-shaped loop. Renders an
+     * admin notice with per-row results.
+     *
+     * The (name, state) tuple is treated as the natural key for
+     * de-duplication. There is no DB-level UNIQUE on those columns
+     * because we want to allow legitimate duplicates (e.g., a
+     * hospital chain with separate branches sharing a name in two
+     * states is fine, two listings of the exact same branch are
+     * not). The operator-driven duplicate handling is therefore
+     * the right level of strictness here: skip-by-default,
+     * update-when-asked.
+     */
+    private function handle_import() {
+        if (empty($_FILES['hospitals_csv']) || !isset($_FILES['hospitals_csv']['tmp_name'])) {
+            self::admin_notice('error', __('No CSV file was uploaded. Pick a file and try again.', 'matrix-mlm'));
+            return;
+        }
+
+        $file = $_FILES['hospitals_csv'];
+        if ((int) ($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            self::admin_notice('error', __('Upload failed. Please try again or check your hosting upload limits.', 'matrix-mlm'));
+            return;
+        }
+
+        $update_existing = !empty($_POST['update_existing']);
+        $report = $this->import_hospitals_from_csv($file['tmp_name'], $update_existing);
+
+        $this->render_import_results($report);
+    }
+
+    /**
+     * Parse a CSV into rows keyed by header name. Returns an
+     * { rows, errors } structure rather than throwing so the caller
+     * can present a partial-success result to the operator.
+     *
+     * Handles UTF-8 BOM (Excel exports leave one) and accepts
+     * either comma or tab as a delimiter (auto-detected from the
+     * first line) so a TSV mistakenly named .csv still imports.
+     */
+    private function read_csv_file($path) {
+        $errors = [];
+        $rows   = [];
+
+        $handle = @fopen($path, 'r');
+        if (!$handle) {
+            return ['rows' => [], 'errors' => [__('Could not read the uploaded file.', 'matrix-mlm')]];
+        }
+
+        // Strip a UTF-8 BOM if Excel left one — fgetcsv would
+        // otherwise quote-include it in the first header column,
+        // turning 'name' into "\xEF\xBB\xBFname" and breaking
+        // the column-name lookup.
+        $first_bytes = fread($handle, 3);
+        if ($first_bytes !== "\xEF\xBB\xBF") {
+            rewind($handle);
+        }
+
+        // Auto-detect delimiter: peek the first line and count
+        // commas vs tabs, pick whichever is more frequent (with a
+        // tie-break in favour of comma since the form labels say
+        // "CSV" explicitly).
+        $peek_pos = ftell($handle);
+        $first_line = fgets($handle);
+        fseek($handle, $peek_pos);
+        $delim = ',';
+        if ($first_line !== false && substr_count($first_line, "\t") > substr_count($first_line, ',')) {
+            $delim = "\t";
+        }
+
+        $headers = fgetcsv($handle, 0, $delim, '"', '');
+        if (!$headers) {
+            fclose($handle);
+            return ['rows' => [], 'errors' => [__('The file is empty or unreadable.', 'matrix-mlm')]];
+        }
+        $headers = array_map(function ($h) {
+            return strtolower(trim((string) $h));
+        }, $headers);
+
+        $required = ['name', 'state'];
+        foreach ($required as $col) {
+            if (!in_array($col, $headers, true)) {
+                fclose($handle);
+                return [
+                    'rows'   => [],
+                    'errors' => [sprintf(
+                        /* translators: %s: column name */
+                        __('Missing required column: %s. The first row must contain a header with at least name and state columns.', 'matrix-mlm'),
+                        $col
+                    )],
+                ];
+            }
+        }
+
+        $line_no = 1;  // counting from the header row
+        while (($cells = fgetcsv($handle, 0, $delim, '"', '')) !== false) {
+            $line_no++;
+            // Skip completely-empty lines silently — common at the
+            // end of CSVs Excel exports.
+            $non_empty = array_filter($cells, function ($c) {
+                return trim((string) $c) !== '';
+            });
+            if (empty($non_empty)) {
+                continue;
+            }
+            $row = [];
+            foreach ($headers as $idx => $col) {
+                $row[$col] = isset($cells[$idx]) ? (string) $cells[$idx] : '';
+            }
+            $row['__line__'] = $line_no;
+            $rows[] = $row;
+        }
+        fclose($handle);
+
+        return ['rows' => $rows, 'errors' => $errors];
+    }
+
+    /**
+     * Drive the import: parse, validate row-by-row, insert or
+     * update. Returns a structured report the caller renders into
+     * an admin notice.
+     */
+    private function import_hospitals_from_csv($path, $update_existing) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_hospitals';
+
+        $report = [
+            'imported'        => 0,
+            'updated'         => 0,
+            'skipped'         => 0,  // duplicate, update_existing was off
+            'errored'         => 0,
+            'errors'          => [],  // ['line' => int, 'message' => str]
+            'parse_errors'    => [],
+        ];
+
+        $parsed = $this->read_csv_file($path);
+        if (!empty($parsed['errors'])) {
+            $report['parse_errors'] = $parsed['errors'];
+            return $report;
+        }
+        if (empty($parsed['rows'])) {
+            $report['parse_errors'][] = __('No data rows found after the header.', 'matrix-mlm');
+            return $report;
+        }
+
+        $valid_states = self::nigerian_states();
+        $now          = current_time('mysql');
+
+        foreach ($parsed['rows'] as $row) {
+            $line = (int) $row['__line__'];
+            $name = trim((string) ($row['name'] ?? ''));
+            $state = trim((string) ($row['state'] ?? ''));
+
+            if ($name === '' || mb_strlen($name) < 2 || mb_strlen($name) > 200) {
+                $report['errored']++;
+                $report['errors'][] = ['line' => $line, 'message' => sprintf(
+                    /* translators: %s: hospital name as supplied */
+                    __('Invalid name "%s" — must be 2-200 characters.', 'matrix-mlm'),
+                    $name
+                )];
+                continue;
+            }
+            $state = $this->normalise_state_name($state, $valid_states);
+            if ($state === null) {
+                $report['errored']++;
+                $report['errors'][] = ['line' => $line, 'message' => sprintf(
+                    /* translators: %s: state value as supplied */
+                    __('Unknown state "%s" — must match one of the 36 Nigerian states or "FCT - Abuja".', 'matrix-mlm'),
+                    trim((string) ($row['state'] ?? ''))
+                )];
+                continue;
+            }
+
+            $address = trim((string) ($row['address'] ?? ''));
+            if (mb_strlen($address) > 500) {
+                $report['errored']++;
+                $report['errors'][] = ['line' => $line, 'message' => __('Address is too long (max 500 characters).', 'matrix-mlm')];
+                continue;
+            }
+            $notes = trim((string) ($row['notes'] ?? ''));
+            $display_order = isset($row['display_order']) ? (int) $row['display_order'] : 0;
+            $display_order = max(0, min(9999, $display_order));
+            $status = strtolower(trim((string) ($row['status'] ?? 'active')));
+            if (!in_array($status, self::STATUSES, true)) {
+                $status = 'active';
+            }
+
+            $payload = [
+                'name'          => sanitize_text_field($name),
+                'state'         => $state,
+                'address'       => $address !== '' ? sanitize_text_field($address) : null,
+                'notes'         => $notes !== '' ? sanitize_textarea_field($notes) : null,
+                'display_order' => $display_order,
+                'status'        => $status,
+                'updated_at'    => $now,
+            ];
+
+            // Natural-key dedupe on (name, state). Case-insensitive
+            // because Excel exports are wildly inconsistent on
+            // capitalisation ("Reddington Hospital" vs "REDDINGTON
+            // HOSPITAL" vs "reddington hospital" should all be the
+            // same row).
+            $existing_id = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$table} WHERE LOWER(name) = LOWER(%s) AND state = %s LIMIT 1",
+                $payload['name'],
+                $payload['state']
+            ));
+
+            if ($existing_id > 0) {
+                if (!$update_existing) {
+                    $report['skipped']++;
+                    continue;
+                }
+                $result = $wpdb->update($table, $payload, ['id' => $existing_id]);
+                if ($result === false) {
+                    $report['errored']++;
+                    $report['errors'][] = ['line' => $line, 'message' => sprintf(
+                        /* translators: %s: hospital name */
+                        __('Database update failed for "%s".', 'matrix-mlm'),
+                        $payload['name']
+                    )];
+                    continue;
+                }
+                $report['updated']++;
+                continue;
+            }
+
+            $payload['created_at'] = $now;
+            $result = $wpdb->insert($table, $payload);
+            if ($result === false) {
+                $report['errored']++;
+                $report['errors'][] = ['line' => $line, 'message' => sprintf(
+                    /* translators: %s: hospital name */
+                    __('Database insert failed for "%s".', 'matrix-mlm'),
+                    $payload['name']
+                )];
+                continue;
+            }
+            $report['imported']++;
+        }
+
+        return $report;
+    }
+
+    /**
+     * Tolerant state-name matcher. Accepts the canonical strings
+     * from NIGERIAN_STATES exactly, and also forgives common minor
+     * variants — "FCT", "Abuja", "FCT-Abuja" all resolve to
+     * "FCT - Abuja"; case differences are ignored.
+     *
+     * Returns the canonical string or null when no match.
+     */
+    private function normalise_state_name($input, array $valid) {
+        $needle = strtolower(trim((string) $input));
+        if ($needle === '') {
+            return null;
+        }
+        foreach ($valid as $candidate) {
+            if (strtolower($candidate) === $needle) {
+                return $candidate;
+            }
+        }
+        // FCT aliases — these are the spellings Nigerian admin
+        // forms most commonly use and that operators are most
+        // likely to type.
+        $fct_aliases = ['fct', 'abuja', 'fct-abuja', 'fct abuja', 'federal capital territory'];
+        if (in_array($needle, $fct_aliases, true)) {
+            return 'FCT - Abuja';
+        }
+        // "Akwa-Ibom" vs "Akwa Ibom" and similar dash/space typos.
+        $deslashed = str_replace(['-', '_'], ' ', $needle);
+        $deslashed = preg_replace('/\s+/', ' ', $deslashed);
+        foreach ($valid as $candidate) {
+            if (strtolower(str_replace(['-', '_'], ' ', $candidate)) === $deslashed) {
+                return $candidate;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Render the import report as an admin notice. Success/error
+     * styling is decided by the per-row outcome counts: a fully
+     * clean import is success, anything with errors is warning,
+     * and a parse-time failure is a hard error with no row counts
+     * (since we never got past the header).
+     */
+    private function render_import_results(array $report) {
+        if (!empty($report['parse_errors'])) {
+            $msg = '<strong>' . esc_html__('Import failed:', 'matrix-mlm') . '</strong> '
+                 . esc_html(implode(' ', $report['parse_errors']));
+            self::admin_notice('error', $msg);
+            return;
+        }
+
+        $imported = (int) $report['imported'];
+        $updated  = (int) $report['updated'];
+        $skipped  = (int) $report['skipped'];
+        $errored  = (int) $report['errored'];
+
+        $type = $errored > 0 ? 'error' : 'success';
+        $cls  = $type === 'error' ? 'notice-warning' : 'notice-success';
+
+        $summary = sprintf(
+            /* translators: 1: imported, 2: updated, 3: skipped duplicates, 4: errored */
+            __('Import complete: <strong>%1$d</strong> added, <strong>%2$d</strong> updated, <strong>%3$d</strong> skipped (duplicates), <strong>%4$d</strong> failed.', 'matrix-mlm'),
+            $imported, $updated, $skipped, $errored
+        );
+
+        echo '<div class="notice ' . esc_attr($cls) . ' is-dismissible" style="padding:14px 16px;">';
+        echo '<p style="margin:0 0 8px;">' . wp_kses_post($summary) . '</p>';
+
+        if (!empty($report['errors'])) {
+            echo '<details style="margin-top:8px;"><summary style="cursor:pointer;font-weight:600;color:#92400e;">'
+                . sprintf(esc_html__('%d row(s) failed — click to expand', 'matrix-mlm'), count($report['errors']))
+                . '</summary>';
+            echo '<ul style="margin:8px 0 0 22px;color:#7f1d1d;font-size:13px;">';
+            // Cap the displayed list so a truly broken file doesn't
+            // explode the page; the operator can fix the first batch
+            // and re-import to surface the rest.
+            $shown = 0;
+            $cap   = 50;
+            foreach ($report['errors'] as $err) {
+                if ($shown++ >= $cap) {
+                    echo '<li><em>' . sprintf(
+                        esc_html__('… and %d more (re-run after fixing these to see the rest).', 'matrix-mlm'),
+                        count($report['errors']) - $cap
+                    ) . '</em></li>';
+                    break;
+                }
+                echo '<li>' . sprintf(
+                    /* translators: 1: line number in source CSV, 2: error message */
+                    esc_html__('Line %1$d: %2$s', 'matrix-mlm'),
+                    intval($err['line']),
+                    esc_html($err['message'])
+                ) . '</li>';
+            }
+            echo '</ul></details>';
+        }
+        echo '</div>';
+    }
+
+    /**
+     * Stream a CSV template back to the operator's browser. Three
+     * example rows so they have a working starting point that
+     * already satisfies the validator — copy the file, swap in
+     * real hospital names, re-upload.
+     *
+     * Sent with a UTF-8 BOM so Excel opens it as UTF-8 instead of
+     * mangling Naira/state-name diacritics into mojibake.
+     */
+    private function stream_csv_template() {
+        if (!current_user_can('manage_matrix_mlm')) {
+            wp_die(__('You do not have permission to download this template.', 'matrix-mlm'));
+        }
+        if (!isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], 'matrix_hospital_template')) {
+            wp_die(__('Invalid or expired link. Reload the Hospitals page and click Download template again.', 'matrix-mlm'));
+        }
+
+        nocache_headers();
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="matrix-hospitals-template.csv"');
+
+        // UTF-8 BOM for Excel compatibility.
+        echo "\xEF\xBB\xBF";
+
+        $out = fopen('php://output', 'w');
+        fputcsv($out, ['name', 'state', 'address', 'notes', 'display_order', 'status'], ',', '"', '');
+        fputcsv($out, [
+            'Reddington Hospital',
+            'Lagos',
+            '12 Idejo Street, Victoria Island, Lagos',
+            'Tier 1 partner',
+            '10',
+            'active',
+        ], ',', '"', '');
+        fputcsv($out, [
+            'Lagoon Hospitals Ikeja',
+            'Lagos',
+            '17a Bola Tinubu Way, Ikeja',
+            '',
+            '20',
+            'active',
+        ], ',', '"', '');
+        fputcsv($out, [
+            'National Hospital Abuja',
+            'FCT - Abuja',
+            'Plot 132 Central Business District, Abuja',
+            'HMO partner since 2024',
+            '10',
+            'active',
+        ], ',', '"', '');
+        fclose($out);
+        exit;
     }
 
     private static function admin_notice($type, $message) {
