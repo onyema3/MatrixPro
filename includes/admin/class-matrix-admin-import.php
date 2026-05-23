@@ -107,6 +107,139 @@ class Matrix_MLM_Admin_Import {
     const DEFAULT_WIDTH = 3;
     const DEFAULT_DEPTH = 9;
 
+    /**
+     * Canonical Laravel column ordering for each source table, exactly
+     * as `mysqldump` writes them. Used by execute_staging_insert() to
+     * inject a column list into bare-VALUES INSERTs (mysqldump's
+     * default format without --complete-insert), so that staging
+     * tables — which carry extra mapping columns (wp_user_id,
+     * wp_position_id, import_status, import_error, etc.) appended
+     * after the Laravel-source columns — accept the dump's positional
+     * VALUES tuples without raising "Column count doesn't match value
+     * count" on every row.
+     *
+     * Why this exists: a vanilla `mysqldump --no-create-info DB t1 t2 ...`
+     * — the command we tell operators to run on the Import page —
+     * produces statements like `INSERT INTO \`users\` VALUES (1,...)`
+     * with no column list. MySQL then expects a value for every
+     * column in the target table; staging carries four extra trailing
+     * mapping columns, so the insert fails and the row is silently
+     * dropped (the error gets buried in state.errors and the operator
+     * just sees "0 rows staged"). Operators previously had to know to
+     * add --complete-insert to their mysqldump command to dodge this.
+     * Detecting the bare-VALUES form here and prepending the source
+     * column list makes the importer accept the natural command.
+     *
+     * INSERTs that already carry their own column list (mysqldump
+     * with --complete-insert, phpMyAdmin Custom Export, hand-crafted
+     * dumps) skip injection and pass through with only the table-
+     * name rewrite — operators who already use the verbose form
+     * lose nothing.
+     *
+     * Schema-drift caveat: the column lists below assume the stock
+     * ViserMLM Laravel schema. A fork that adds columns to a source
+     * table will produce dumps with more values per row than this
+     * map names — those INSERTs will then fail their own column-
+     * count check at staging. The fix in that case is for the
+     * operator to use --complete-insert, which bypasses injection
+     * entirely. We keep the injection path conservative rather than
+     * trying to auto-detect the dump's row arity, because guessing
+     * wrong would silently misalign data into the wrong columns.
+     *
+     * If you change a staging table's Laravel-side columns in
+     * create_staging_tables() above, mirror the change here. The
+     * order MUST match the source CREATE TABLE column order, not
+     * the staging schema's order.
+     */
+    const LARAVEL_SOURCE_COLUMNS = [
+        'users' => [
+            'id', 'ref_by', 'position_id', 'position', 'plan_id',
+            'firstname', 'lastname', 'username', 'email', 'country_code',
+            'mobile', 'balance', 'password', 'image', 'address',
+            'status', 'kyc_data', 'kv', 'ev', 'sv',
+            'profile_complete', 'ver_code', 'ver_code_send_at', 'ts', 'tv',
+            'tsc', 'ban_reason', 'remember_token', 'next_payment_date',
+            'withdraw_status', 'completed_level', 'created_at', 'updated_at',
+        ],
+        'plans' => [
+            'id', 'name', 'price', 'referral_bonus', 'monthly_subscription',
+            'status', 'created_at', 'updated_at',
+        ],
+        'levels' => [
+            'id', 'plan_id', 'level', 'amount', 'created_at', 'updated_at',
+        ],
+        'card_holders' => [
+            'id', 'user_id', 'cardholder_id', 'wallet_id', 'firstname',
+            'lastname', 'date_of_birth', 'email', 'mobile', 'account_name',
+            'account_number', 'bvn', 'nin', 'address', 'user_type',
+            'fund_method', 'is_frozen', 'status', 'provider', 'created_at',
+            'updated_at',
+        ],
+        'cards' => [
+            'id', 'user_id', 'card_holder_id', 'card_id', 'card_holder_name',
+            'card_holder_email', 'card_holder_mobile', 'card_brand', 'account_number',
+            'map_id', 'card_no', 'last4', 'exp_month', 'exp_year',
+            'card_type', 'card_request_status', 'status', 'admin_feedback',
+            'created_at', 'updated_at', 'is_linked', 'linked_at', 'activated_at',
+        ],
+        'deposits' => [
+            'id', 'user_id', 'method_code', 'amount', 'method_currency',
+            'charge', 'rate', 'final_amo', 'detail', 'btc_amo',
+            'btc_wallet', 'trx', 'try', 'status', 'from_api',
+            'admin_feedback', 'created_at', 'updated_at',
+        ],
+        'withdrawals' => [
+            'id', 'method_id', 'user_id', 'amount', 'currency',
+            'rate', 'charge', 'trx', 'final_amount', 'after_charge',
+            'withdraw_information', 'status', 'admin_feedback', 'created_at', 'updated_at',
+        ],
+        'commissions' => [
+            'id', 'user_id', 'from_user_id', 'amount', 'charge',
+            'post_balance', 'trx', 'level', 'mark', 'details',
+            'created_at', 'updated_at',
+        ],
+        'pins' => [
+            'id', 'user_id', 'generate_user_id', 'amount', 'pin',
+            'status', 'details', 'created_at', 'updated_at',
+        ],
+        'support_tickets' => [
+            'id', 'user_id', 'name', 'email', 'ticket',
+            'subject', 'status', 'priority', 'last_reply', 'created_at',
+            'updated_at',
+        ],
+        'support_messages' => [
+            'id', 'support_ticket_id', 'admin_id', 'message', 'created_at', 'updated_at',
+        ],
+        'subscribers' => [
+            'id', 'email', 'created_at', 'updated_at',
+        ],
+    ];
+
+    /**
+     * Tables that should never be empty on a complete Laravel dump.
+     *
+     * Used by handle_upload() to flag dumps where the export step
+     * dropped tables silently. The historical failure mode this
+     * guards against is phpMyAdmin "Custom Export" — operators tick
+     * tables in a long list and miss some, the export succeeds with
+     * no warning, the resulting file is "valid SQL" but partial,
+     * and the importer used to only check the `users` table for
+     * emptiness (so a missing card_holders / cards / withdrawals /
+     * support / subscribers wouldn't trip the guard). Now we list
+     * every empty table on the error notice so operators see the
+     * full picture in one round-trip.
+     *
+     * `commissions` is intentionally absent — a Laravel install
+     * with no commission events yet has zero rows legitimately,
+     * and we don't want to false-positive on that case.
+     */
+    const EXPECTED_NON_EMPTY_TABLES = [
+        'users', 'plans', 'levels',
+        'card_holders', 'cards',
+        'deposits', 'withdrawals', 'pins',
+        'support_tickets', 'support_messages', 'subscribers',
+    ];
+
     /** Chunk sizes per phase — sized to fit comfortably under a 30s timeout. */
     const CHUNK_PLANS     = 50;
     const CHUNK_LEVELS    = 200;
@@ -720,14 +853,65 @@ class Matrix_MLM_Admin_Import {
     }
 
     /**
-     * Replay one Laravel INSERT against the matching staging table,
-     * by rewriting just the table name in the INSERT INTO clause.
-     * Everything else (column list, VALUES tuple format, escapes) is
-     * already valid MariaDB/MySQL syntax.
+     * Replay one Laravel INSERT against the matching staging table.
+     *
+     * Two transformations:
+     *   1. If the INSERT is in mysqldump's default bare-VALUES form
+     *      (no column list between the table name and the VALUES
+     *      keyword), inject the Laravel-side column list from
+     *      LARAVEL_SOURCE_COLUMNS. Required because staging tables
+     *      append mapping columns (wp_user_id, wp_position_id,
+     *      import_status, import_error, …) after the source
+     *      columns; without a column list MySQL expects a value for
+     *      every column and raises "Column count doesn't match
+     *      value count, table `<staging>`" on every row. See the
+     *      LARAVEL_SOURCE_COLUMNS doc-block for the full story.
+     *   2. Rewrite the table name from the Laravel name (e.g.
+     *      `users`) to the staging name (e.g. `wp_matrix_lv_users`).
+     *
+     * Operations always happen in that order: inject first against
+     * the source table name (so the regex anchors are correct),
+     * then rewrite the table name. Doing it the other way around
+     * would force the column-injection regex to know about the
+     * runtime-generated staging prefix.
      */
     private static function execute_staging_insert($table, $stmt) {
         global $wpdb;
         $staging = self::staging_table($table);
+
+        // Detect bare-VALUES form: "INSERT [IGNORE] INTO `table` VALUES …"
+        // with no column list "(...)" between the table name and the
+        // VALUES keyword. The whitespace allowance handles tabs,
+        // multiple spaces, and the optional IGNORE keyword.
+        $needs_column_injection = (bool) preg_match(
+            '/^INSERT\s+(?:IGNORE\s+)?INTO\s+`?' . preg_quote($table, '/') . '`?\s+VALUES\b/i',
+            $stmt
+        );
+        if ($needs_column_injection) {
+            if (!isset(self::LARAVEL_SOURCE_COLUMNS[$table])) {
+                // Should not be reachable via the streamer (it filters
+                // to STAGED_TABLES, all of which have entries in
+                // LARAVEL_SOURCE_COLUMNS), but guard anyway so a
+                // future schema change that misses one of the maps
+                // surfaces with a clear message instead of a SQL error.
+                return new WP_Error(
+                    'matrix_import_columns',
+                    sprintf(
+                        /* translators: %s: source table name */
+                        __('Bare-VALUES INSERT for `%s` cannot be repaired (no source column map registered).', 'matrix-mlm'),
+                        $table
+                    )
+                );
+            }
+            $cols = '`' . implode('`, `', self::LARAVEL_SOURCE_COLUMNS[$table]) . '`';
+            $stmt = preg_replace(
+                '/^(INSERT\s+(?:IGNORE\s+)?INTO\s+`?' . preg_quote($table, '/') . '`?\s+)(VALUES\b)/i',
+                '$1(' . $cols . ') $2',
+                $stmt,
+                1
+            );
+        }
+
         $rewritten = preg_replace(
             '/^(INSERT\s+(?:IGNORE\s+)?INTO\s+)`?' . preg_quote($table, '/') . '`?/i',
             '$1`' . $staging . '`',
@@ -824,11 +1008,60 @@ class Matrix_MLM_Admin_Import {
             'levels'            => (int) $wpdb->get_var("SELECT COUNT(*) FROM `$l`"),
             'inserts_processed' => $r,
         ];
+        // Per-table counts for the financial / Fintava / ticketing /
+        // subscriber tables too, so the EXPECTED_NON_EMPTY_TABLES
+        // guard below sees the full picture and so the Import page
+        // can render every staged count immediately after upload (not
+        // only after the dry-run runs).
+        foreach (self::STAGED_TABLES as $tname) {
+            if (isset($stats[$tname])) {
+                continue; // users / plans / levels already counted above
+            }
+            $sn = self::staging_table($tname);
+            $stats[$tname] = (int) $wpdb->get_var("SELECT COUNT(*) FROM `$sn`");
+        }
 
-        // If we got 0 users, the dump probably contained the wrong
-        // tables — don't silently advance the state machine.
-        if ($stats['users'] === 0) {
-            self::redirect_with_notice('error', __('The uploaded file did not contain any rows for the `users` table. Make sure you exported data (not just structure) for the relevant tables.', 'matrix-mlm'));
+        // Guard: any expected-non-empty table that came in at 0 rows
+        // points at one of two failure modes the operator needs to
+        // know about:
+        //   (a) a partial export — phpMyAdmin Custom Export silently
+        //       dropped checkboxes for some tables, the resulting
+        //       file is "valid SQL" but missing data;
+        //   (b) a column-count mismatch in staging — bare-VALUES
+        //       INSERTs against the staging schema (which carries
+        //       extra mapping columns) used to fail every row,
+        //       producing 0 staged rows even though the dump was
+        //       complete. With LARAVEL_SOURCE_COLUMNS injection in
+        //       execute_staging_insert() this should no longer
+        //       happen, but the guard still catches it if a future
+        //       schema change desyncs the column map.
+        // We list every empty table on the notice (not just users)
+        // and surface the first staging error if any were collected,
+        // so the operator gets the full diagnostic in one round-trip
+        // rather than fixing-and-retrying one table at a time.
+        $missing = [];
+        foreach (self::EXPECTED_NON_EMPTY_TABLES as $tname) {
+            if (($stats[$tname] ?? 0) === 0) {
+                $missing[] = $tname;
+            }
+        }
+        if (!empty($missing)) {
+            $hint = '';
+            if (!empty($errors)) {
+                // Prefix the first SQL error verbatim. For column-count
+                // mismatches MySQL says "Column count doesn't match
+                // value count" — that string makes the cause obvious.
+                $hint = ' [' . __('First staging error', 'matrix-mlm') . ': ' . current($errors) . ']';
+            }
+            self::redirect_with_notice(
+                'error',
+                sprintf(
+                    /* translators: 1: comma-separated list of empty table names, 2: optional first staging error */
+                    __('The uploaded dump came in empty for these expected-non-empty tables: %1$s. Likely causes: (a) the export missed those tables (phpMyAdmin Custom Export silently drops unchecked tables), or (b) the dump\'s INSERT statements failed against staging. Re-run mysqldump with --no-create-info covering all twelve tables and re-upload.%2$s', 'matrix-mlm'),
+                    implode(', ', $missing),
+                    $hint
+                )
+            );
         }
 
         self::set_state([
@@ -3313,7 +3546,13 @@ class Matrix_MLM_Admin_Import {
                 <h2><?php _e('Step 1 — Upload Laravel SQL Dump', 'matrix-mlm'); ?></h2>
                 <p><?php _e('Run on your Laravel server (or use phpMyAdmin → Export → Custom → Data only):', 'matrix-mlm'); ?>
                 <br><code>mysqldump -u USER -p --no-create-info DBNAME users plans levels card_holders cards deposits withdrawals commissions pins support_tickets support_messages subscribers > laravel-data.sql</code></p>
-                <p class="description"><?php _e('All twelve tables are required for a complete migration. Tables omitted from the dump will simply have empty data on the WordPress side — for example, dropping <code>commissions</code> means the commission ledger starts fresh on import day. The financial / Fintava / ticketing / subscriber tables are processed in the second half of the commit pipeline; uploading only <code>users plans levels</code> still works (the PR 2 phases will trivially complete with zero rows).', 'matrix-mlm'); ?></p>
+                <p class="description">
+                    <?php _e('All twelve tables are required for a complete migration. Tables omitted from the dump will simply have empty data on the WordPress side — for example, dropping <code>commissions</code> means the commission ledger starts fresh on import day. The financial / Fintava / ticketing / subscriber tables are processed in the second half of the commit pipeline; uploading only <code>users plans levels</code> still works (the PR 2 phases will trivially complete with zero rows).', 'matrix-mlm'); ?>
+                </p>
+                <p class="description">
+                    <strong><?php _e('Tip:', 'matrix-mlm'); ?></strong>
+                    <?php _e('Either form of <code>mysqldump</code> output is accepted — bare <code>INSERT INTO &lt;table&gt; VALUES …</code> (the default) and explicit-column <code>INSERT INTO &lt;table&gt; (col, …) VALUES …</code> (produced by <code>--complete-insert</code> or by phpMyAdmin\'s Custom Export). The importer adds the column list internally when it\'s missing, so you don\'t have to remember the flag.', 'matrix-mlm'); ?>
+                </p>
                 <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
                     <?php wp_nonce_field('matrix_mlm_import_upload'); ?>
                     <input type="hidden" name="action" value="matrix_mlm_import_upload">
@@ -3341,6 +3580,61 @@ class Matrix_MLM_Admin_Import {
                             (int) ($stats['levels'] ?? 0)
                         ); ?>
                     </p>
+                    <?php
+                    // Per-table breakdown for the financial / operational
+                    // tables. Surfaced here (not only in the dry-run
+                    // report) so a partial dump is obvious immediately
+                    // after upload — operators can spot a 0-row
+                    // card_holders or withdrawals row and re-export
+                    // without having to run the dry-run first. The
+                    // EXPECTED_NON_EMPTY_TABLES guard in handle_upload()
+                    // already blocks the upload when these come in
+                    // empty, so anything we render here is purely
+                    // informational; we still highlight zero-row rows
+                    // in red so a future change to the guard list
+                    // doesn't bury the signal.
+                    $secondary_tables = [
+                        'card_holders'     => __('Fintava virtual wallets', 'matrix-mlm'),
+                        'cards'            => __('Fintava cards', 'matrix-mlm'),
+                        'deposits'         => __('Deposits', 'matrix-mlm'),
+                        'withdrawals'      => __('Withdrawals', 'matrix-mlm'),
+                        'commissions'      => __('Commissions', 'matrix-mlm'),
+                        'pins'             => __('E-pins', 'matrix-mlm'),
+                        'support_tickets'  => __('Support tickets', 'matrix-mlm'),
+                        'support_messages' => __('Ticket replies', 'matrix-mlm'),
+                        'subscribers'      => __('Subscribers', 'matrix-mlm'),
+                    ];
+                    $any_secondary = false;
+                    foreach ($secondary_tables as $key => $label) {
+                        if (isset($stats[$key])) { $any_secondary = true; break; }
+                    }
+                    if ($any_secondary):
+                    ?>
+                        <table class="widefat striped" style="max-width:480px;margin:8px 0 16px;">
+                            <thead>
+                                <tr>
+                                    <th><?php _e('Table', 'matrix-mlm'); ?></th>
+                                    <th style="width:120px;text-align:right;"><?php _e('Rows Staged', 'matrix-mlm'); ?></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($secondary_tables as $key => $label):
+                                    if (!isset($stats[$key])) continue;
+                                    $count = (int) $stats[$key];
+                                    // commissions is allowed to be empty
+                                    // legitimately (fresh install with no
+                                    // commission events). Don't paint it
+                                    // red in that case.
+                                    $is_empty_concern = ($count === 0 && $key !== 'commissions');
+                                ?>
+                                    <tr<?php echo $is_empty_concern ? ' style="background:#fef0f0;"' : ''; ?>>
+                                        <td><?php echo esc_html($label); ?> <code><?php echo esc_html($key); ?></code></td>
+                                        <td style="text-align:right;"><?php echo number_format($count); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php endif; ?>
                     <?php if (in_array($status, ['staged'], true)): ?>
                         <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                             <?php wp_nonce_field('matrix_mlm_import_dryrun'); ?>
