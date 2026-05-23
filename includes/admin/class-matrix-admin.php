@@ -71,6 +71,15 @@ class Matrix_MLM_Admin {
         // operationally paired: one defines the choices, the other
         // triages the resulting applications.
         add_submenu_page('matrix-mlm', __('Hospitals', 'matrix-mlm'), __('Hospitals', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-hospitals', [new Matrix_MLM_Admin_Hospitals(), 'render']);
+        // Backup & Restore — gated on manage_matrix_settings (same
+        // capability as Settings) because granting access to this
+        // page is effectively granting full read/write of the
+        // plugin's data and the ability to overwrite live tables
+        // from an arbitrary uploaded SQL file. Sits next to Settings
+        // intentionally — both are infrastructure surfaces operators
+        // touch infrequently and shouldn't expose to lower-privileged
+        // staff who only manage day-to-day deposits/withdrawals.
+        add_submenu_page('matrix-mlm', __('Backup & Restore', 'matrix-mlm'), __('Backup', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-backup', ['Matrix_MLM_Admin_Backup', 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
