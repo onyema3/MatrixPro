@@ -52,7 +52,7 @@ class Matrix_MLM_User_Benefits {
             <?php if (empty($active_plans)): ?>
                 <?php $this->render_upsell(); ?>
             <?php else: ?>
-                <?php $this->render_grid(); ?>
+                <?php $this->render_grid($user_id); ?>
             <?php endif; ?>
         </div>
         <?php
@@ -85,7 +85,7 @@ class Matrix_MLM_User_Benefits {
      * any yet) we render the explanatory empty state instead of a
      * blank panel — same pattern as the other dashboard tabs.
      */
-    private function render_grid() {
+    private function render_grid($user_id) {
         global $wpdb;
         $table = $wpdb->prefix . 'matrix_benefits';
 
@@ -129,12 +129,35 @@ class Matrix_MLM_User_Benefits {
         </p>
 
         <div class="matrix-benefits-grid">
-            <?php foreach ($rows as $row): ?>
-                <?php $this->render_card($row); ?>
-            <?php endforeach; ?>
+            <?php
+            $cug_card_title = '';
+            foreach ($rows as $row) {
+                $this->render_card($row);
+                // Track whether at least one CUG card is on the page so
+                // we know to render the application-form modal scaffold
+                // exactly once below the grid. Slug is the canonical
+                // identifier (the seed inserts slug='cug'); the title
+                // fallback is purely cosmetic — passed to the modal so
+                // its heading matches whatever the operator named the
+                // card in admin.
+                if ($cug_card_title === '' && self::is_cug_slug($row->slug ?? '')) {
+                    $cug_card_title = (string) ($row->title ?? '');
+                }
+            }
+            ?>
         </div>
 
         <?php $this->render_modal_scaffold(); ?>
+
+        <?php
+        // Emit the CUG application-form modal once if the CUG card is
+        // on the page. Done outside the foreach so multiple CUG-like
+        // entries (shouldn't happen — slug is UNIQUE — but defensive)
+        // don't produce conflicting modal instances.
+        if ($cug_card_title !== '' && class_exists('Matrix_MLM_User_CUG')) {
+            Matrix_MLM_User_CUG::render_form_modal($user_id, $cug_card_title);
+        }
+        ?>
         <?php
     }
 
@@ -153,8 +176,11 @@ class Matrix_MLM_User_Benefits {
         $has_cta     = $cta_label !== '' && $cta_url !== '';
         $has_long    = trim(wp_strip_all_tags($long)) !== '';
         $card_id     = 'matrix-benefit-' . intval($row->id);
+        $is_cug      = self::is_cug_slug($row->slug ?? '');
         ?>
-        <article class="matrix-benefit-card" id="<?php echo esc_attr($card_id); ?>">
+        <article class="matrix-benefit-card<?php echo $is_cug ? ' matrix-benefit-card-cug' : ''; ?>"
+                 id="<?php echo esc_attr($card_id); ?>"
+                 <?php echo $is_cug ? 'data-benefit-slug="cug"' : ''; ?>>
             <div class="benefit-icon">
                 <?php
                 // Reuse the admin's preview helper so the user sees
@@ -171,6 +197,23 @@ class Matrix_MLM_User_Benefits {
                 <p class="benefit-short"><?php echo esc_html($short); ?></p>
             <?php endif; ?>
             <div class="benefit-actions">
+                <?php if ($is_cug): ?>
+                    <?php
+                    // The CUG card gets a primary "Apply" CTA that
+                    // opens the application-form modal rendered by
+                    // Matrix_MLM_User_CUG::render_form_modal() lower
+                    // in the page. data-cug-trigger is the contract
+                    // between the card and the modal's JS — any
+                    // future entry point (a dashboard quick action,
+                    // a footer banner) only needs to add the same
+                    // attribute to participate.
+                    ?>
+                    <button type="button"
+                            class="matrix-btn matrix-btn-sm matrix-btn-primary matrix-cug-apply"
+                            data-cug-trigger="1">
+                        <?php _e('Apply for CUG', 'matrix-mlm'); ?>
+                    </button>
+                <?php endif; ?>
                 <?php if ($has_long): ?>
                     <button type="button" class="matrix-btn matrix-btn-sm matrix-benefit-readmore"
                             data-benefit-id="<?php echo intval($row->id); ?>"
@@ -196,6 +239,20 @@ class Matrix_MLM_User_Benefits {
             </div>
         </article>
         <?php
+    }
+
+    /**
+     * True if the given slug refers to the CUG benefit. Match is
+     * case-insensitive and accepts either the exact slug or a
+     * "cug-" prefixed variant so an operator who renames the row to
+     * e.g. "cug-airtel" still gets the application form treatment.
+     */
+    public static function is_cug_slug($slug) {
+        $slug = strtolower(trim((string) $slug));
+        if ($slug === '') {
+            return false;
+        }
+        return $slug === 'cug' || strpos($slug, 'cug-') === 0;
     }
 
     /**

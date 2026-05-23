@@ -50,6 +50,7 @@ class Matrix_MLM_Database {
         'matrix_billing_transactions',
         'matrix_subscriptions',
         'matrix_benefits',
+        'matrix_cug_requests',
     ];
 
     /**
@@ -524,6 +525,36 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_benefits);
 
+        // CUG enrolment requests — submitted by users from the Benefits
+        // tab when they click "Apply" on the CUG card. Captures the
+        // four fields specified by the operator: first_name, last_name,
+        // nin, airtel_number (optional). Status defaults to 'pending'
+        // so admins can review and approve/reject from the admin
+        // (admin UI for that is intentionally out-of-scope for the
+        // initial form rollout — rows are visible via the table).
+        //
+        // user_id is unique-keyed: one open request per user. On
+        // resubmission we UPDATE the existing row instead of inserting
+        // a duplicate, which keeps the audit trail simple and prevents
+        // a user from spamming the table by clicking submit repeatedly.
+        $table_cug = $wpdb->prefix . 'matrix_cug_requests';
+        $sql_cug = "CREATE TABLE $table_cug (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            first_name varchar(60) NOT NULL,
+            last_name varchar(60) NOT NULL,
+            nin varchar(20) NOT NULL,
+            airtel_number varchar(20) DEFAULT NULL,
+            status enum('pending','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
+            admin_notes text,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY user_id (user_id),
+            KEY status (status)
+        ) $charset_collate;";
+        dbDelta($sql_cug);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -539,6 +570,7 @@ class Matrix_MLM_Database {
             'matrix_gateways', 'matrix_user_meta', 'matrix_transfers',
             'matrix_subscribers', 'matrix_pages', 'matrix_fintava_webhook_logs',
             'matrix_benefits',
+            'matrix_cug_requests',
         ];
 
         foreach ($tables as $table) {

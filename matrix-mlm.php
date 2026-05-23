@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.3');
+define('MATRIX_MLM_DB_VERSION', '1.0.4');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -98,6 +98,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-wallet.php
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-card.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-billing.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-benefits.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-cug.php';
 
 // Activation/Deactivation hooks
 register_activation_hook(__FILE__, ['Matrix_MLM_Activator', 'activate']);

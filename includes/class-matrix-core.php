@@ -55,6 +55,11 @@ class Matrix_MLM_Core {
         // Initialize Fintava Billing (registers billing AJAX hooks)
         new Matrix_MLM_Fintava_Billing();
 
+        // Initialize CUG (Closed User Group) handler — its
+        // constructor registers the wp_ajax_matrix_submit_cug
+        // endpoint that the Benefits-tab CUG card form posts to.
+        new Matrix_MLM_User_CUG();
+
         // Initialize monthly subscription
         new Matrix_MLM_Subscription();
 
