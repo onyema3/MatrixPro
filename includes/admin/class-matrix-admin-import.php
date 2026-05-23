@@ -1662,10 +1662,20 @@ class Matrix_MLM_Admin_Import {
 
             // matrix_user_meta — the plugin's per-user record. status
             // mapping: Laravel 1=active → 'active', 0=banned → 'banned'.
+            //
+            // referral_code is generated here, not lazily later. The
+            // schema enforces UNIQUE on referral_code and the public
+            // referral link / "Manage Users" admin column both read
+            // from this column directly — leaving NULL meant every
+            // imported member showed an empty Referral Code in the
+            // admin and couldn't share a referral link until they
+            // re-registered. generate_unique_referral_code() retries
+            // on collision against the UNIQUE index so this is safe
+            // to call in the import loop.
             $wpdb->insert($wpdb->prefix . 'matrix_user_meta', [
                 'user_id'            => $new_user_id,
                 'balance'            => $row->balance,
-                'referral_code'      => null, // generated lazily by plan engine
+                'referral_code'      => Matrix_MLM_User::generate_unique_referral_code($new_user_id),
                 'referred_by'        => null, // resolved in a later phase via map
                 'phone'              => trim(($row->country_code ?? '') . ($row->mobile ?? '')) ?: null,
                 'address'            => $row->address ?: null,

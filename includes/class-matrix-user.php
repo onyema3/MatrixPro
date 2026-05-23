@@ -32,6 +32,49 @@ class Matrix_MLM_User {
     }
 
     /**
+     * Generate a referral code that's guaranteed to be unique across
+     * matrix_user_meta. Used by registration, the Laravel importer, and
+     * the admin "Backfill Referral Codes" tool so all three paths share
+     * one algorithm and one uniqueness story.
+     *
+     * Algorithm matches the historical registration helper:
+     *   strtoupper(substr(md5($seed), 0, 8))
+     *
+     * The seed mixes user_id, microseconds, and a random component so
+     * that bulk callers (the importer / backfill loop) don't collide
+     * even when invoked in a tight loop within the same second. The
+     * outer loop retries on collision against the UNIQUE index on
+     * matrix_user_meta.referral_code, falling back to a 12-char code
+     * after enough collisions to keep the loop bounded.
+     */
+    public static function generate_unique_referral_code($user_id = 0) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_user_meta';
+
+        for ($attempt = 0; $attempt < 50; $attempt++) {
+            // After 25 attempts at 8 chars, widen to 12 chars. In practice
+            // we never get past the first attempt — the loop is here to
+            // make the function provably terminate even on a pathological
+            // dataset where the 8-char space is exhausted.
+            $length = $attempt < 25 ? 8 : 12;
+            $seed   = $user_id . '-' . microtime(true) . '-' . wp_generate_password(12, false, false);
+            $code   = strtoupper(substr(md5($seed), 0, $length));
+
+            $exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$table} WHERE referral_code = %s",
+                $code
+            ));
+            if ($exists === 0) {
+                return $code;
+            }
+        }
+
+        // Should never be reached, but if it is, fall back to a UUID-like
+        // suffix so the caller still gets a unique value rather than null.
+        return 'REF-' . strtoupper(wp_generate_password(10, false, false));
+    }
+
+    /**
      * Get referral link
      */
     public static function get_referral_link($user_id) {

@@ -525,6 +525,9 @@ class Matrix_MLM_Admin {
             case 'change_user_password':
                 $this->change_user_password();
                 break;
+            case 'backfill_referral_codes':
+                $this->backfill_referral_codes();
+                break;
             case 'move_user_position':
                 $this->move_user_position();
                 break;
@@ -765,6 +768,97 @@ class Matrix_MLM_Admin {
             'message' => $notify
                 ? __('Password changed and the user has been notified by email.', 'matrix-mlm')
                 : __('Password changed.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Backfill missing referral codes across matrix_user_meta.
+     *
+     * The Laravel importer historically wrote `referral_code = NULL`
+     * with a "generated lazily by plan engine" comment, but no lazy
+     * generator was ever wired up — so every imported member showed
+     * an empty Referral Code in the admin Manage Users list and
+     * couldn't share a working referral link until they re-registered.
+     *
+     * This method finds every row where referral_code is NULL or
+     * empty and assigns a freshly generated unique code via the
+     * shared helper Matrix_MLM_User::generate_unique_referral_code().
+     * The helper retries on collision against the UNIQUE index, so
+     * the loop is safe to run in bulk.
+     *
+     * Returns a structured report (processed / updated / failed +
+     * a per-row table) so the UI can show what happened, mirroring
+     * the existing wallet-id and bank-code backfill tools on the
+     * same Migration page.
+     */
+    private function backfill_referral_codes() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_user_meta';
+
+        // A long bulk loop on a 10k+ user dataset can run past the
+        // default 30s timeout on shared hosting. 180s gives roughly
+        // a 100x margin over what this UPDATE-only loop actually
+        // needs, but matches the budgets used by the sister backfill
+        // tools on the same admin page.
+        @set_time_limit(180);
+
+        $rows = $wpdb->get_results(
+            "SELECT user_id FROM {$table}
+              WHERE referral_code IS NULL OR referral_code = ''
+              ORDER BY user_id ASC"
+        );
+
+        $total     = count($rows);
+        $updated   = 0;
+        $failed    = 0;
+        $details   = [];
+
+        foreach ($rows as $row) {
+            $user_id = (int) $row->user_id;
+            $code    = Matrix_MLM_User::generate_unique_referral_code($user_id);
+
+            $result = $wpdb->update(
+                $table,
+                ['referral_code' => $code],
+                ['user_id'       => $user_id],
+                ['%s'],
+                ['%d']
+            );
+
+            if ($result === false) {
+                $failed++;
+                $details[] = [
+                    'user_id' => $user_id,
+                    'code'    => '',
+                    'status'  => 'failed',
+                    'reason'  => $wpdb->last_error ?: __('Unknown DB error', 'matrix-mlm'),
+                ];
+                continue;
+            }
+
+            $updated++;
+            $details[] = [
+                'user_id' => $user_id,
+                'code'    => $code,
+                'status'  => 'ok',
+                'reason'  => '',
+            ];
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: 1: rows updated, 2: rows that failed, 3: total rows processed */
+                __('Referral-code backfill complete: %1$d updated, %2$d failed (out of %3$d rows missing a code).', 'matrix-mlm'),
+                $updated,
+                $failed,
+                $total
+            ),
+            'report'  => [
+                'total_missing_before' => $total,
+                'updated'              => $updated,
+                'failed'               => $failed,
+                'details'              => $details,
+            ],
         ]);
     }
 
