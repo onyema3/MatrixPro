@@ -37,6 +37,81 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send a "level completed" notification to a member who just
+     * filled an entire level of their matrix. Fired idempotently from
+     * Matrix_MLM_Plan_Engine::record_level_completions() — that method
+     * INSERT IGNOREs a (user_id, plan_id, level) row first and only
+     * calls this on the first insert, so a member can't be emailed
+     * twice for the same milestone.
+     *
+     * Distinct from send_commission_notification(matrix_completion):
+     * matrix completion fires once when *every* level is filled and is
+     * paired with a wallet credit; this fires when *each* level is
+     * filled, with no wallet impact, and is purely a recognition email
+     * (with optional SMS, mirroring the commission helper). The two
+     * are intentionally non-overlapping: when the deepest reachable
+     * level happens to also complete the matrix, the user receives
+     * both messages — one per event — rather than one merged "Matrix
+     * Master" email that would conflate two distinct concerns.
+     *
+     * @param int    $user_id   Recipient (the ancestor whose level filled).
+     * @param object $plan      Row from wp_matrix_plans (uses id, name, depth).
+     * @param int    $level     Relative level under the ancestor that just filled.
+     * @param int    $width     Matrix width — surfaces "you now have W^L members" copy.
+     */
+    public static function send_level_completion_notification($user_id, $plan, $level, $width) {
+        $user = get_userdata((int) $user_id);
+        if (!$user || empty($plan)) {
+            return;
+        }
+
+        $level     = (int) $level;
+        $width     = (int) $width;
+        $positions = $level > 0 && $width > 0 ? (int) pow($width, $level) : 0;
+        $plan_name = isset($plan->name) ? (string) $plan->name : '';
+        $depth     = isset($plan->depth) ? (int) $plan->depth : 0;
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: level number, 3: plan name */
+            __('[%1$s] Level %2$d Completed in %3$s!', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $level,
+            $plan_name
+        );
+
+        $dashboard_url = home_url('/matrix-dashboard/genealogy/');
+
+        $message = self::get_email_template('level-completion', [
+            'username'      => $user->user_login,
+            'plan_name'     => $plan_name,
+            'level'         => $level,
+            'depth'         => $depth,
+            'positions'     => $positions,
+            'dashboard_url' => $dashboard_url,
+            'site_name'     => get_bloginfo('name'),
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+
+        // SMS twin — same gating as send_commission_notification(): only
+        // fires when the operator has SMS verification enabled and the
+        // user has a phone number on file. Keeps the channel mix
+        // consistent with how commissions are announced.
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone((int) $user_id);
+            if ($phone) {
+                $sms = sprintf(
+                    /* translators: 1: level number, 2: plan name */
+                    __('You completed level %1$d of your %2$s matrix! Check your dashboard for details.', 'matrix-mlm'),
+                    $level,
+                    $plan_name
+                );
+                self::send_sms($phone, $sms);
+            }
+        }
+    }
+
+    /**
      * Send commission notification
      */
     public static function send_commission_notification($user_id, $amount, $type) {
@@ -661,6 +736,25 @@ class Matrix_MLM_Notifications {
             case 'commission':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('You have received a %s commission of %s.', 'matrix-mlm'), $vars['type'], $vars['amount']) . '</p>';
+                break;
+            case 'level-completion':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/level-completion.php on disk.
+                // No "Matrix Master" branch — the engine's existing
+                // matrix_completion bonus email is the legitimate
+                // "you finished the whole matrix" message; this
+                // template stays focused on a single level.
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(
+                    /* translators: 1: level number, 2: plan name, 3: number of positions */
+                    __('You just completed <strong>Level %1$d</strong> of your <strong>%2$s</strong> matrix — every one of the %3$s positions at this depth in your downline is now filled.', 'matrix-mlm'),
+                    intval($vars['level'] ?? 0),
+                    esc_html($vars['plan_name'] ?? ''),
+                    number_format(intval($vars['positions'] ?? 0))
+                ) . '</p>';
+                if (!empty($vars['dashboard_url'])) {
+                    $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('View Your Genealogy', 'matrix-mlm') . '</a></p>';
+                }
                 break;
             case 'deposit':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';

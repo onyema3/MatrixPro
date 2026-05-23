@@ -54,6 +54,12 @@ class Matrix_MLM_Database {
         'matrix_loan_applications',
         'matrix_healthcare_applications',
         'matrix_hospitals',
+        // Level-completion ledger — one row per (user_id, plan_id, level)
+        // milestone, used both for idempotent email/toast delivery and as
+        // a future hook point for per-level bonuses. Created by
+        // self::create_tables() at the bottom of the dbDelta sequence
+        // (see the matching block there).
+        'matrix_level_completions',
     ];
 
     /**
@@ -780,6 +786,47 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_hospitals);
 
+        // Level Completions ledger — one row per (user_id, plan_id, level)
+        // milestone the user has reached, where "reached" means every one
+        // of the W^L positions at that depth in the user's downline is
+        // filled by an active member. The (user_id, plan_id, level)
+        // UNIQUE key is what makes the email + toast notification
+        // pipeline idempotent: the engine writes via INSERT IGNORE in
+        // Matrix_MLM_Plan_Engine::record_level_completions() and only
+        // sends an email when the insert actually persisted a new row,
+        // so a member who joins after the milestone is already crossed
+        // can't retrigger the notification by joining again.
+        //
+        // email_sent_at and toast_seen_at are tracked separately because
+        // they fire from different surfaces and at different moments:
+        // email_sent_at is stamped synchronously the moment the row is
+        // inserted (so that's also our "did the email go out?" audit
+        // log); toast_seen_at is stamped lazily on the user's next
+        // dashboard pageload by Matrix_MLM_User_Dashboard, so a user
+        // who never visits the dashboard between the email and reading
+        // the email still gets the toast on their next visit.
+        //
+        // Indexed on (user_id, plan_id) so the dashboard's
+        // "fetch unread for current user" query is index-only, and on
+        // position_id so admin tooling can join from a position back to
+        // its milestone history without a table scan.
+        $table_level_completions = $wpdb->prefix . 'matrix_level_completions';
+        $sql_level_completions = "CREATE TABLE $table_level_completions (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            plan_id bigint(20) UNSIGNED NOT NULL,
+            position_id bigint(20) UNSIGNED NOT NULL,
+            level int(11) NOT NULL,
+            completed_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            email_sent_at datetime DEFAULT NULL,
+            toast_seen_at datetime DEFAULT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY uniq_user_plan_level (user_id, plan_id, level),
+            KEY user_plan (user_id, plan_id),
+            KEY position_id (position_id)
+        ) $charset_collate;";
+        dbDelta($sql_level_completions);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -799,6 +846,7 @@ class Matrix_MLM_Database {
             'matrix_loan_applications',
             'matrix_healthcare_applications',
             'matrix_hospitals',
+            'matrix_level_completions',
         ];
 
         foreach ($tables as $table) {
