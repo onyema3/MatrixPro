@@ -284,7 +284,26 @@ class Matrix_MLM_User_CUG {
         // already submitted one.
         $title = $card_title !== '' ? $card_title : __('Apply for CUG', 'matrix-mlm');
         ?>
-        <div class="matrix-cug-modal" id="matrix-cug-modal" aria-hidden="true" role="dialog" aria-modal="true">
+        <?php
+        // hidden + inline style="display:none" + aria-hidden together
+        // are deliberate belt-and-braces. The CSS rule
+        // `.matrix-cug-modal { display: none; }` would normally do the
+        // job, but it failed in the wild on installs where the cached
+        // matrix-public.css predated the CUG release (the plugin
+        // version stamp wasn't bumped, so wp_enqueue_style didn't
+        // cache-bust) and the modal scaffold rendered as a giant
+        // inline form on the dashboard. The HTML `hidden` attribute
+        // is honoured by every supported browser and is the strongest
+        // guarantee that the modal is invisible until JS opens it;
+        // the inline display:none survives older browsers that ignore
+        // hidden when an !important rule is fighting it; aria-hidden
+        // keeps assistive tech in sync with the visual state. The JS
+        // open/close handlers below toggle all three.
+        ?>
+        <div class="matrix-cug-modal" id="matrix-cug-modal"
+             hidden
+             style="display:none;"
+             aria-hidden="true" role="dialog" aria-modal="true">
             <div class="matrix-cug-modal-backdrop" data-cug-modal-close></div>
             <div class="matrix-cug-modal-dialog" role="document">
                 <button type="button" class="matrix-cug-modal-close" data-cug-modal-close
@@ -382,6 +401,13 @@ class Matrix_MLM_User_CUG {
             function openModal() {
                 clearFeedback();
                 clearFieldErrors();
+                // Remove every layer that's hiding the modal: the
+                // HTML hidden attribute, the inline display:none, and
+                // the aria-hidden flag. Adding the is-open class is
+                // kept so existing CSS that hooks off it (animations,
+                // backdrop styles) keeps working.
+                modal.hidden = false;
+                modal.style.display = '';
                 modal.classList.add('is-open');
                 modal.setAttribute('aria-hidden', 'false');
                 document.body.classList.add('matrix-cug-modal-lock');
@@ -394,6 +420,11 @@ class Matrix_MLM_User_CUG {
 
             function closeModal() {
                 modal.classList.remove('is-open');
+                // Re-apply every layer of hide so the modal is gone
+                // even if the stylesheet has been swapped, removed, or
+                // is still cached without the .matrix-cug-modal rule.
+                modal.hidden = true;
+                modal.style.display = 'none';
                 modal.setAttribute('aria-hidden', 'true');
                 document.body.classList.remove('matrix-cug-modal-lock');
             }
