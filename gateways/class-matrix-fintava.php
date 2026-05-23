@@ -3530,6 +3530,42 @@ class Matrix_MLM_Fintava {
 
     /**
      * POST /virtual-wallet/generate
+     *
+     * Payload shape is locked to exactly what Fintava's DTO whitelists.
+     * The endpoint runs through a NestJS ValidationPipe with
+     * `forbidNonWhitelisted: true`, so any field outside the DTO causes
+     * a 400 with messages like "property X should not exist" — and the
+     * whole request is rejected, not just the offending field.
+     *
+     * Whitelisted fields (camelCase, per the DTO):
+     *   - firstName        (string, required)
+     *   - lastName         (string, required)
+     *   - email            (string, required)
+     *   - phone            (string, required)
+     *   - amount           (number, required by the DTO; we send a tiny
+     *                       default so the wallet is provisioned with a
+     *                       zero-funded balance — the API treats this as
+     *                       the minimum credit/expiry threshold, not a
+     *                       charge against the merchant wallet)
+     *   - expireTimeInMin  (number, required; 525600 = 1 year)
+     *   - merchantReference(string, idempotency key)
+     *
+     * Fields that historically lived on this payload but were rejected
+     * by the live API and have therefore been removed from the request:
+     *   - first_name / last_name (snake_case spellings of the above —
+     *     the DTO is camelCase only)
+     *   - currency       (Fintava virtual wallets are NGN-only, no
+     *                     currency selector exposed on this endpoint)
+     *   - bvn, nin       (KYC data was forwarded here for /virtual-
+     *                     wallet/generate but the DTO never accepted
+     *                     it; KYC happens out-of-band on the merchant
+     *                     dashboard)
+     *   - date_of_birth, gender, address (same — not on the DTO)
+     *
+     * The legacy form (render_create_form) used to collect BVN/DOB/
+     * gender; those inputs were removed at the same time as this
+     * payload cleanup so the UI doesn't ask users for PII that the
+     * gateway has no path for.
      */
     public function generate_virtual_wallet($customer_data) {
         $required_fields = ['first_name', 'last_name', 'email', 'phone'];
@@ -3540,21 +3576,14 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'first_name'      => sanitize_text_field($customer_data['first_name']),
-            'last_name'       => sanitize_text_field($customer_data['last_name']),
-            'email'           => sanitize_email($customer_data['email']),
-            'phone'           => sanitize_text_field($customer_data['phone']),
-            'currency'        => $customer_data['currency'] ?? 'NGN',
-            'amount'          => intval($customer_data['amount'] ?? 100),
-            'expireTimeInMin' => intval($customer_data['expireTimeInMin'] ?? 525600),
+            'firstName'         => sanitize_text_field($customer_data['first_name']),
+            'lastName'          => sanitize_text_field($customer_data['last_name']),
+            'email'             => sanitize_email($customer_data['email']),
+            'phone'             => sanitize_text_field($customer_data['phone']),
+            'amount'            => intval($customer_data['amount'] ?? 100),
+            'expireTimeInMin'   => intval($customer_data['expireTimeInMin'] ?? 525600),
             'merchantReference' => $customer_data['reference'] ?? ('MTX-VW-' . uniqid()),
         ];
-
-        foreach (['bvn', 'nin', 'date_of_birth', 'gender', 'address'] as $optional) {
-            if (!empty($customer_data[$optional])) {
-                $payload[$optional] = sanitize_text_field($customer_data[$optional]);
-            }
-        }
 
         $response = $this->make_request('POST', '/virtual-wallet/generate', $payload);
         if (is_wp_error($response)) {
@@ -4782,9 +4811,6 @@ class Matrix_MLM_Fintava {
         $last_name = sanitize_text_field($_POST['last_name'] ?? '');
         $email = sanitize_email($_POST['email'] ?? '');
         $phone = sanitize_text_field($_POST['phone'] ?? '');
-        $bvn = sanitize_text_field($_POST['bvn'] ?? '');
-        $date_of_birth = sanitize_text_field($_POST['date_of_birth'] ?? '');
-        $gender = sanitize_text_field($_POST['gender'] ?? '');
 
         if (empty($first_name) || empty($last_name)) {
             wp_send_json_error(['message' => __('First name and last name are required', 'matrix-mlm')]);
@@ -4798,22 +4824,21 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Phone number is required', 'matrix-mlm')]);
         }
 
-        if (!empty($bvn) && !preg_match('/^\d{11}$/', $bvn)) {
-            wp_send_json_error(['message' => __('BVN must be 11 digits', 'matrix-mlm')]);
-        }
-
         $reference = 'MTX-VW-' . $user_id . '-' . time();
 
+        // BVN, date of birth, and gender used to be forwarded here as
+        // optional KYC enrichment, but Fintava's /virtual-wallet/generate
+        // DTO does not accept any of those fields (the live API rejects
+        // the request outright with "property X should not exist"). The
+        // form inputs were removed at the same time; the AJAX handler
+        // therefore no longer reads or stores them. KYC, if needed, is
+        // collected out-of-band on the merchant dashboard.
         $result = $this->generate_virtual_wallet([
             'first_name' => $first_name,
             'last_name' => $last_name,
             'email' => $email,
             'phone' => $phone,
-            'bvn' => $bvn,
-            'date_of_birth' => $date_of_birth,
-            'gender' => $gender,
             'reference' => $reference,
-            'currency' => 'NGN',
         ]);
 
         if (is_wp_error($result)) {
@@ -4835,13 +4860,11 @@ class Matrix_MLM_Fintava {
                 'currency' => $result['currency'],
                 'customer_email' => $email,
                 'customer_phone' => $phone,
-                'bvn' => $bvn ?: null,
+                'bvn' => null,
                 'status' => 'active',
                 'metadata' => json_encode([
                     'first_name' => $first_name,
                     'last_name' => $last_name,
-                    'date_of_birth' => $date_of_birth,
-                    'gender' => $gender,
                     'reference' => $reference,
                 ]),
             ],
