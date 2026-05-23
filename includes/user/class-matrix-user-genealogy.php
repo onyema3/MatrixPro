@@ -114,7 +114,7 @@ class Matrix_MLM_User_Genealogy {
         <div class="matrix-genealogy-wrapper">
             <div class="matrix-genealogy-tree" id="genealogy-tree">
                 <?php if ($tree): ?>
-                    <?php $this->render_tree_node($tree, $current_position->width); ?>
+                    <?php $this->render_tree_node($tree, $current_position->width, true, $user_id); ?>
                 <?php else: ?>
                     <div class="matrix-alert matrix-alert-info"><?php _e('No tree data available yet.', 'matrix-mlm'); ?></div>
                 <?php endif; ?>
@@ -123,7 +123,8 @@ class Matrix_MLM_User_Genealogy {
 
         <div class="matrix-genealogy-legend">
             <span class="legend-item"><span class="legend-dot legend-you"></span> <?php _e('You', 'matrix-mlm'); ?></span>
-            <span class="legend-item"><span class="legend-dot legend-active"></span> <?php _e('Active Member', 'matrix-mlm'); ?></span>
+            <span class="legend-item"><span class="legend-dot legend-direct"></span> <?php _e('Direct Referral', 'matrix-mlm'); ?></span>
+            <span class="legend-item"><span class="legend-dot legend-spillover"></span> <?php _e('Spillover', 'matrix-mlm'); ?></span>
             <span class="legend-item"><span class="legend-dot legend-empty"></span> <?php _e('Empty Slot', 'matrix-mlm'); ?></span>
         </div>
 
@@ -309,21 +310,85 @@ class Matrix_MLM_User_Genealogy {
     }
 
     /**
-     * Render a tree node recursively as HTML
+     * Render a tree node recursively as HTML.
+     *
+     * Differentiates three node states by border colour and a small
+     * badge: "You" (the tree root, the user viewing their own tree),
+     * "Direct" (a member the root personally sponsored, regardless of
+     * where they sit in the tree), and "Spillover" (a member sitting in
+     * the root's downline because they were placed there structurally,
+     * but whose sponsor is someone else — typically a downstream member
+     * whose own slot was full when the new sign-up came in).
+     *
+     * The distinction matters because compensation rules in MLM
+     * commonly differ between direct and spillover referrals (referral
+     * bonus vs level commission), and members care a lot about which
+     * sign-ups they personally drove. Before this change every
+     * non-root node looked identical, hiding what is arguably the most
+     * important piece of information in the view.
+     *
+     * Classification rule: a node is "direct" if its sponsor_id equals
+     * the tree-root user_id, and "spillover" otherwise. Imported legacy
+     * rows where the referrals-backfill phase couldn't resolve a
+     * sponsor (sponsor_id IS NULL) fall through to "spillover" — the
+     * conservative default, since labelling them "direct" without
+     * evidence would let an admin or member double-count direct
+     * referrals.
+     *
+     * @param array $node          Tree node from
+     *                             Matrix_MLM_Plan_Engine::build_tree_recursive().
+     * @param int   $width         Plan width (used to render empty slots).
+     * @param bool  $is_root       True only for the outermost call.
+     * @param int   $root_user_id  WP user id of the tree-root user (the
+     *                             member whose tree we are rendering).
+     *                             Required to classify each descendant
+     *                             as direct vs spillover.
      */
-    private function render_tree_node($node, $width, $is_root = true) {
+    private function render_tree_node($node, $width, $is_root = true, $root_user_id = 0) {
         if (!$node) return;
 
-        $is_current_user = ($node['user_id'] == get_current_user_id());
-        $node_class = $is_current_user ? 'matrix-tree-node-you' : 'matrix-tree-node-active';
+        $is_current_user = ($node['user_id'] == $root_user_id);
+
+        // Classify the node so the right badge + style can apply.
+        // Tree root is always "you" — we never label the root as
+        // direct/spillover even though formally the root has no sponsor
+        // in this tree.
+        if ($is_current_user) {
+            $node_class    = 'matrix-tree-node-you';
+            $relationship  = 'you';
+            $relationship_label = __('You', 'matrix-mlm');
+        } else {
+            // sponsor_id can be NULL on rows where the importer couldn't
+            // resolve a sponsor (orphan ref_by) — treat those as
+            // spillover for safety. See class docblock for rationale.
+            $sponsor_id = isset($node['sponsor_id']) ? (int) $node['sponsor_id'] : 0;
+            if ($sponsor_id > 0 && $sponsor_id === (int) $root_user_id) {
+                $node_class         = 'matrix-tree-node-direct';
+                $relationship       = 'direct';
+                $relationship_label = __('Direct', 'matrix-mlm');
+            } else {
+                $node_class         = 'matrix-tree-node-spillover';
+                $relationship       = 'spillover';
+                $relationship_label = __('Spillover', 'matrix-mlm');
+            }
+        }
         ?>
         <div class="matrix-tree-item">
-            <div class="matrix-tree-node <?php echo $node_class; ?>">
+            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>">
                 <div class="tree-node-avatar">
                     <?php echo get_avatar($node['user_id'], 36); ?>
                 </div>
                 <div class="tree-node-info">
-                    <strong><?php echo esc_html($node['username'] ?? 'User #' . $node['user_id']); ?></strong>
+                    <div class="tree-node-name-row">
+                        <strong><?php echo esc_html($node['username'] ?? 'User #' . $node['user_id']); ?></strong>
+                        <?php if (!$is_current_user): ?>
+                        <span class="tree-node-badge tree-node-badge-<?php echo esc_attr($relationship); ?>" title="<?php echo $relationship === 'direct'
+                            ? esc_attr__('You personally sponsored this member.', 'matrix-mlm')
+                            : esc_attr__('Placed under you via spillover — someone else sponsored them.', 'matrix-mlm'); ?>">
+                            <?php echo esc_html($relationship_label); ?>
+                        </span>
+                        <?php endif; ?>
+                    </div>
                     <small><?php printf(__('Level %d', 'matrix-mlm'), $node['level']); ?> &bull; <?php printf(__('%d downline', 'matrix-mlm'), $node['total_downline']); ?></small>
                 </div>
             </div>
@@ -331,10 +396,14 @@ class Matrix_MLM_User_Genealogy {
             <div class="matrix-tree-children">
                 <?php
                 $child_count = count($node['children'] ?? []);
-                // Render existing children
+                // Render existing children. Pass the same $root_user_id
+                // down so descendants are classified relative to the
+                // tree owner, not the immediate parent — a member 3
+                // levels deep is still "direct" from the root's
+                // perspective if the root sponsored them.
                 if (!empty($node['children'])) {
                     foreach ($node['children'] as $child) {
-                        $this->render_tree_node($child, $width, false);
+                        $this->render_tree_node($child, $width, false, $root_user_id);
                     }
                 }
                 // Render empty slots
