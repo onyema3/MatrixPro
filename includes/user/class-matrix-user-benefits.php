@@ -130,18 +130,21 @@ class Matrix_MLM_User_Benefits {
 
         <div class="matrix-benefits-grid">
             <?php
-            $cug_card_title = '';
+            $cug_card_title  = '';
+            $loan_card_title = '';
             foreach ($rows as $row) {
                 $this->render_card($row);
-                // Track whether at least one CUG card is on the page so
-                // we know to render the application-form modal scaffold
+                // Track which special-case cards are on the page so
+                // we know to render their respective modal scaffolds
                 // exactly once below the grid. Slug is the canonical
-                // identifier (the seed inserts slug='cug'); the title
-                // fallback is purely cosmetic — passed to the modal so
-                // its heading matches whatever the operator named the
-                // card in admin.
+                // identifier; the title fallback is purely cosmetic
+                // — passed to each modal so its heading matches
+                // whatever the operator named the card in admin.
                 if ($cug_card_title === '' && self::is_cug_slug($row->slug ?? '')) {
                     $cug_card_title = (string) ($row->title ?? '');
+                }
+                if ($loan_card_title === '' && self::is_loan_slug($row->slug ?? '')) {
+                    $loan_card_title = (string) ($row->title ?? '');
                 }
             }
             ?>
@@ -156,6 +159,10 @@ class Matrix_MLM_User_Benefits {
         // don't produce conflicting modal instances.
         if ($cug_card_title !== '' && class_exists('Matrix_MLM_User_CUG')) {
             Matrix_MLM_User_CUG::render_form_modal($user_id, $cug_card_title);
+        }
+        // Same one-shot pattern for the loan application form.
+        if ($loan_card_title !== '' && class_exists('Matrix_MLM_User_Loan')) {
+            Matrix_MLM_User_Loan::render_form_modal($user_id, $loan_card_title);
         }
         ?>
         <?php
@@ -177,10 +184,14 @@ class Matrix_MLM_User_Benefits {
         $has_long    = trim(wp_strip_all_tags($long)) !== '';
         $card_id     = 'matrix-benefit-' . intval($row->id);
         $is_cug      = self::is_cug_slug($row->slug ?? '');
+        $is_loan     = self::is_loan_slug($row->slug ?? '');
         ?>
-        <article class="matrix-benefit-card<?php echo $is_cug ? ' matrix-benefit-card-cug' : ''; ?>"
+        <article class="matrix-benefit-card<?php echo $is_cug ? ' matrix-benefit-card-cug' : ''; echo $is_loan ? ' matrix-benefit-card-loan' : ''; ?>"
                  id="<?php echo esc_attr($card_id); ?>"
-                 <?php echo $is_cug ? 'data-benefit-slug="cug"' : ''; ?>>
+                 <?php
+                 if ($is_cug) echo 'data-benefit-slug="cug"';
+                 elseif ($is_loan) echo 'data-benefit-slug="loan"';
+                 ?>>
             <div class="benefit-icon">
                 <?php
                 // Reuse the admin's preview helper so the user sees
@@ -212,6 +223,13 @@ class Matrix_MLM_User_Benefits {
                             class="matrix-btn matrix-btn-sm matrix-btn-primary matrix-cug-apply"
                             data-cug-trigger="1">
                         <?php _e('Apply for CUG', 'matrix-mlm'); ?>
+                    </button>
+                <?php endif; ?>
+                <?php if ($is_loan): ?>
+                    <button type="button"
+                            class="matrix-btn matrix-btn-sm matrix-btn-primary matrix-loan-apply"
+                            data-loan-trigger="1">
+                        <?php _e('Apply for Loan', 'matrix-mlm'); ?>
                     </button>
                 <?php endif; ?>
                 <?php if ($has_long): ?>
@@ -253,6 +271,23 @@ class Matrix_MLM_User_Benefits {
             return false;
         }
         return $slug === 'cug' || strpos($slug, 'cug-') === 0;
+    }
+
+    /**
+     * True if the given slug refers to the Loans benefit. Same
+     * matching rules as CUG: bare 'loan'/'loans' or any 'loan-' /
+     * 'loans-' prefixed variant the operator might rename to (e.g.
+     * 'loan-sme', 'loans-corporate'). Lets the operator rename the
+     * card title freely without breaking the form association.
+     */
+    public static function is_loan_slug($slug) {
+        $slug = strtolower(trim((string) $slug));
+        if ($slug === '') {
+            return false;
+        }
+        return $slug === 'loan' || $slug === 'loans'
+            || strpos($slug, 'loan-') === 0
+            || strpos($slug, 'loans-') === 0;
     }
 
     /**

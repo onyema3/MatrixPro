@@ -60,6 +60,11 @@ class Matrix_MLM_Core {
         // endpoint that the Benefits-tab CUG card form posts to.
         new Matrix_MLM_User_CUG();
 
+        // Initialize Loan handler — its constructor registers the
+        // wp_ajax_matrix_submit_loan endpoint that the Benefits-tab
+        // loans card application form posts to.
+        new Matrix_MLM_User_Loan();
+
         // Initialize monthly subscription
         new Matrix_MLM_Subscription();
 

@@ -51,6 +51,7 @@ class Matrix_MLM_Database {
         'matrix_subscriptions',
         'matrix_benefits',
         'matrix_cug_requests',
+        'matrix_loan_applications',
     ];
 
     /**
@@ -555,6 +556,85 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_cug);
 
+        // Business loan applications — submitted by members from the
+        // Benefits tab when they click "Apply for Loan" on the loans
+        // card. The schema is wide because the form has four sections
+        // (personal / account / project / guarantor) plus six file
+        // upload URLs, but it's flat by design: keeping all of it in
+        // one row makes admin triage straightforward and avoids the
+        // join overhead that a normalised parent/children layout
+        // would introduce. Loan amounts and project gross value use
+        // DECIMAL(15,2) so they comfortably hold up to ₦9.9 trillion
+        // — well above the ₦5,000,000 cap in the operator's T&Cs but
+        // future-proof against a corporate loan tier.
+        //
+        // user_id is unique-keyed for the same reason as the CUG
+        // table: one open application per user. Resubmission UPDATEs
+        // the existing row, so a member who needs to fix a typo or
+        // re-upload a rejected document doesn't end up with a forest
+        // of half-completed applications. When admins approve or
+        // reject an application, the operator workflow can clear the
+        // row (or transition it to 'cancelled') so the user can
+        // submit a new one — this is a deliberate trade-off in the
+        // initial rollout. If we later want a full loan history per
+        // user, we'll relax the UNIQUE constraint and add a
+        // status-scoped index instead.
+        $table_loans = $wpdb->prefix . 'matrix_loan_applications';
+        $sql_loans = "CREATE TABLE $table_loans (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            first_name varchar(60) NOT NULL,
+            last_name varchar(60) NOT NULL,
+            email varchar(120) NOT NULL,
+            phone varchar(20) NOT NULL,
+            address_line1 varchar(200) NOT NULL,
+            address_line2 varchar(200) DEFAULT NULL,
+            city varchar(100) NOT NULL,
+            state varchar(100) NOT NULL,
+            zip_code varchar(20) DEFAULT NULL,
+            country varchar(100) NOT NULL,
+            date_of_birth date NOT NULL,
+            trade_name varchar(120) DEFAULT NULL,
+            bank_name varchar(200) NOT NULL,
+            account_number varchar(20) NOT NULL,
+            account_name varchar(200) NOT NULL,
+            applying_as enum('sole_proprietor','partnership','corporation') NOT NULL,
+            business_address_line1 varchar(200) NOT NULL,
+            business_address_line2 varchar(200) DEFAULT NULL,
+            business_city varchar(100) NOT NULL,
+            business_state varchar(100) NOT NULL,
+            business_zip varchar(20) DEFAULT NULL,
+            business_country varchar(100) NOT NULL,
+            bvn varchar(20) NOT NULL,
+            nin_file_url varchar(500) DEFAULT NULL,
+            utility_bill_url varchar(500) DEFAULT NULL,
+            valid_id_url varchar(500) DEFAULT NULL,
+            passport_photo_url varchar(500) DEFAULT NULL,
+            marketing_material_url varchar(500) DEFAULT NULL,
+            project_info_url varchar(500) DEFAULT NULL,
+            has_assets_statement tinyint(1) NOT NULL DEFAULT 0,
+            previously_financed tinyint(1) NOT NULL DEFAULT 0,
+            loan_reason enum('sme','farming','refinancing','other') NOT NULL,
+            project_gross_value decimal(15,2) NOT NULL,
+            loan_amount decimal(15,2) NOT NULL,
+            repayment_plan enum('daily','weekly','monthly') NOT NULL,
+            guarantor_first_name varchar(60) NOT NULL,
+            guarantor_last_name varchar(60) NOT NULL,
+            guarantor_phone varchar(20) NOT NULL,
+            guarantor_valid_id_url varchar(500) DEFAULT NULL,
+            guarantor_passport_url varchar(500) DEFAULT NULL,
+            agreed_terms tinyint(1) NOT NULL DEFAULT 0,
+            status enum('pending','under_review','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
+            admin_notes text,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY user_id (user_id),
+            KEY status (status),
+            KEY created_at (created_at)
+        ) $charset_collate;";
+        dbDelta($sql_loans);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -571,6 +651,7 @@ class Matrix_MLM_Database {
             'matrix_subscribers', 'matrix_pages', 'matrix_fintava_webhook_logs',
             'matrix_benefits',
             'matrix_cug_requests',
+            'matrix_loan_applications',
         ];
 
         foreach ($tables as $table) {
@@ -703,6 +784,26 @@ class Matrix_MLM_Database {
                 'cta_label'         => '',
                 'cta_url'           => '',
                 'display_order'     => 20,
+                'status'            => 'active',
+                'created_at'        => $now,
+                'updated_at'        => $now,
+            ]);
+            // Loans card. Slug 'loans' is what
+            // Matrix_MLM_User_Benefits::is_loan_slug() matches against
+            // to swap the generic Read more CTA for the Apply for
+            // Loan modal. Operators can rename the title freely; they
+            // can also rename the slug as long as it stays prefixed
+            // 'loan-' (e.g. 'loan-sme', 'loan-farming') and the
+            // detection still fires.
+            $wpdb->insert($benefits_table, [
+                'title'             => 'Loans',
+                'slug'              => 'loans',
+                'icon'              => 'dashicons-money-alt',
+                'short_description' => __('Apply for a business loan with flexible repayment plans tailored to your matrix level.', 'matrix-mlm'),
+                'long_description'  => __('Active members in good standing are eligible to apply for a Liberty Hub business loan. Loans range from ₦50,000 to ₦5,000,000 with a 1-12 month tenor and flat interest of 5-6.5% per month. The application captures personal, account, project, and guarantor details — your administrator reviews each submission before disbursement.', 'matrix-mlm'),
+                'cta_label'         => '',
+                'cta_url'           => '',
+                'display_order'     => 30,
                 'status'            => 'active',
                 'created_at'        => $now,
                 'updated_at'        => $now,

@@ -823,3 +823,185 @@ body.matrix-cug-modal-lock {
         width: 100%;
     }
 }
+
+
+
+/* ============================================================
+ * Loan application modal — wider and taller than the CUG modal
+ * because the form has 30+ fields across four sections plus a
+ * scrolling T&Cs block. Same belt-and-braces hide pattern (HTML
+ * hidden + inline display:none + .is-open class) so the modal
+ * stays invisible until JS opens it, even if the cached CSS is
+ * stale.
+ * ============================================================ */
+
+.matrix-loan-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: none;
+}
+.matrix-loan-modal.is-open {
+    display: block;
+}
+.matrix-loan-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.55);
+    cursor: pointer;
+}
+.matrix-loan-modal-dialog {
+    position: relative;
+    max-width: 760px;
+    margin: 3vh auto;
+    background: #fff;
+    border-radius: 12px;
+    padding: 32px 32px 24px;
+    box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
+    max-height: 94vh;
+    overflow-y: auto;
+}
+.matrix-loan-modal-close {
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    background: transparent;
+    border: none;
+    font-size: 28px;
+    line-height: 1;
+    color: #6b7280;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+.matrix-loan-modal-close:hover { color: #111827; }
+.matrix-loan-modal-title {
+    margin: 0 0 6px;
+    color: var(--matrix-dark);
+    font-size: 22px;
+}
+.matrix-loan-modal-intro {
+    margin: 0 0 18px;
+    color: #4b5563;
+    font-size: 14px;
+    line-height: 1.5;
+}
+body.matrix-loan-modal-lock { overflow: hidden; }
+
+
+.matrix-loan-status {
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    line-height: 1.45;
+}
+.matrix-loan-status-pending,
+.matrix-loan-status-under_review { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+.matrix-loan-status-approved     { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+.matrix-loan-status-rejected     { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+.matrix-loan-status-cancelled    { background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; }
+
+.matrix-loan-section {
+    border: 1px solid var(--matrix-border);
+    border-radius: 8px;
+    padding: 18px 18px 8px;
+    margin-bottom: 18px;
+}
+.matrix-loan-section legend {
+    font-weight: 600;
+    color: var(--matrix-dark);
+    padding: 0 8px;
+    font-size: 15px;
+}
+.matrix-loan-subhead {
+    font-size: 13px;
+    color: #4b5563;
+    margin: 14px 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+.matrix-loan-hint {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: #6b7280;
+}
+.matrix-loan-radios {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.matrix-loan-radio {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #374151;
+    cursor: pointer;
+}
+.matrix-loan-radio input[type="radio"] { width: auto; margin: 0; }
+.matrix-loan-file input[type="file"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px dashed var(--matrix-border);
+    border-radius: 6px;
+    background: #f9fafb;
+    font-size: 13px;
+}
+
+
+.matrix-loan-file-current { font-size: 12px; font-weight: 400; color: #6b7280; }
+.matrix-loan-file-current a { color: var(--matrix-primary); }
+
+.matrix-loan-terms {
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid var(--matrix-border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    background: #f9fafb;
+    font-size: 12px;
+    line-height: 1.55;
+    color: #374151;
+    margin-bottom: 14px;
+}
+.matrix-loan-terms p { margin: 0 0 8px; }
+.matrix-loan-terms p:last-child { margin-bottom: 0; }
+.matrix-loan-agree {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    font-size: 13px;
+    color: #374151;
+    cursor: pointer;
+}
+.matrix-loan-agree input[type="checkbox"] {
+    margin-top: 3px;
+    width: auto;
+}
+.matrix-loan-feedback { min-height: 0; margin: 4px 0 12px; font-size: 13px; line-height: 1.45; }
+.matrix-loan-feedback:empty { display: none; }
+.matrix-loan-feedback-success {
+    background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0;
+    padding: 10px 12px; border-radius: 6px;
+}
+.matrix-loan-feedback-error {
+    background: #fef2f2; color: #991b1b; border: 1px solid #fecaca;
+    padding: 10px 12px; border-radius: 6px;
+}
+.matrix-loan-actions {
+    display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px;
+}
+.matrix-loan-form .has-error input,
+.matrix-loan-form .has-error select,
+.matrix-loan-form .has-error textarea {
+    border-color: var(--matrix-danger);
+    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+@media (max-width: 600px) {
+    .matrix-loan-modal-dialog {
+        margin: 0; border-radius: 0; max-height: 100vh; height: 100vh;
+        max-width: 100%; padding: 24px 18px;
+    }
+    .matrix-loan-actions { flex-direction: column-reverse; }
+    .matrix-loan-actions .matrix-btn { width: 100%; }
+}
