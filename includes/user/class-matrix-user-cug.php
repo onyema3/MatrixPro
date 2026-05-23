@@ -182,6 +182,8 @@ class Matrix_MLM_User_CUG {
                 ]);
             }
             $message = __('Your CUG application has been updated and is pending review.', 'matrix-mlm');
+            $row_id  = (int) $existing->id;
+            $is_resubmission = true;
         } else {
             $data['created_at'] = current_time('mysql');
             $formats[] = '%s';
@@ -193,6 +195,27 @@ class Matrix_MLM_User_CUG {
                 ]);
             }
             $message = __('Your CUG application has been submitted and is pending review.', 'matrix-mlm');
+            $row_id  = (int) $wpdb->insert_id;
+            $is_resubmission = false;
+        }
+
+        // Notify the configured review team. Fetched fresh from the
+        // table (rather than reusing $data) so the email reflects
+        // exactly what was persisted, including any DB-default
+        // columns and the canonical timestamps. Failures are
+        // swallowed inside the notifier — a misconfigured SMTP
+        // shouldn't break the user-facing submission flow.
+        if ($row_id > 0 && class_exists('Matrix_MLM_Notifications')) {
+            $persisted = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table} WHERE id = %d",
+                $row_id
+            ));
+            if ($persisted) {
+                Matrix_MLM_Notifications::send_admin_cug_application_notification(
+                    $persisted,
+                    $is_resubmission
+                );
+            }
         }
 
         wp_send_json_success([

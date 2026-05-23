@@ -124,6 +124,25 @@ class Matrix_MLM_User_Loan {
         $data['updated_at'] = current_time('mysql');
         $message = self::save($user_id, $existing, $data);
 
+        // Notify the configured review team. Fetched fresh via
+        // get_user_request() (UNIQUE on user_id) rather than reusing
+        // $data, so the email reflects exactly what was persisted
+        // — including DB-default columns, the canonical timestamps,
+        // and the resolved upload URLs from wp_handle_upload.
+        // $existing is the row state BEFORE this save, so its
+        // truthiness is the correct signal for the resubmission flag.
+        // Failures inside the notifier are swallowed so a
+        // misconfigured SMTP can't break the submission flow.
+        if (class_exists('Matrix_MLM_Notifications')) {
+            $persisted = self::get_user_request($user_id);
+            if ($persisted) {
+                Matrix_MLM_Notifications::send_admin_loan_application_notification(
+                    $persisted,
+                    $existing !== null
+                );
+            }
+        }
+
         wp_send_json_success([
             'message' => $message,
             'status'  => 'pending',
