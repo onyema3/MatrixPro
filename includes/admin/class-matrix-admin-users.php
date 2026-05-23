@@ -350,6 +350,105 @@ class Matrix_MLM_Admin_Users {
             }
             </script>
 
+            <!-- Admin Change User Password -->
+            <div class="matrix-admin-card">
+                <h2><?php _e('Change Password', 'matrix-mlm'); ?></h2>
+                <p class="description"><?php _e('Set a new password for this user. The user will be notified by email and any active login sessions will be ended.', 'matrix-mlm'); ?></p>
+                <table class="form-table">
+                    <tr>
+                        <th><label for="admin_edit_new_password"><?php _e('New Password', 'matrix-mlm'); ?></label></th>
+                        <td>
+                            <input type="password" id="admin_edit_new_password" class="regular-text" autocomplete="new-password" minlength="8">
+                            <button type="button" class="button" onclick="matrixAdminToggleNewPassword()" style="margin-left:6px;"><?php _e('Show', 'matrix-mlm'); ?></button>
+                            <button type="button" class="button" onclick="matrixAdminGeneratePassword()" style="margin-left:6px;"><?php _e('Generate', 'matrix-mlm'); ?></button>
+                            <p class="description"><?php _e('Minimum 8 characters. Use a mix of letters, numbers and symbols.', 'matrix-mlm'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><label for="admin_edit_confirm_password"><?php _e('Confirm Password', 'matrix-mlm'); ?></label></th>
+                        <td>
+                            <input type="password" id="admin_edit_confirm_password" class="regular-text" autocomplete="new-password" minlength="8">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><?php _e('Notify User', 'matrix-mlm'); ?></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" id="admin_edit_notify_user" checked>
+                                <?php _e('Send the user an email letting them know their password was changed.', 'matrix-mlm'); ?>
+                            </label>
+                        </td>
+                    </tr>
+                </table>
+                <p>
+                    <button class="button button-primary" onclick="matrixAdminChangePassword(<?php echo $user_id; ?>)"><?php _e('Change Password', 'matrix-mlm'); ?></button>
+                </p>
+            </div>
+            <script>
+            function matrixAdminToggleNewPassword() {
+                var f = document.getElementById('admin_edit_new_password');
+                var c = document.getElementById('admin_edit_confirm_password');
+                var newType = f.type === 'password' ? 'text' : 'password';
+                f.type = newType;
+                c.type = newType;
+            }
+            function matrixAdminGeneratePassword() {
+                var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&*';
+                var pwd = '';
+                var crypto = window.crypto || window.msCrypto;
+                if (crypto && crypto.getRandomValues) {
+                    var arr = new Uint32Array(14);
+                    crypto.getRandomValues(arr);
+                    for (var i = 0; i < arr.length; i++) {
+                        pwd += chars.charAt(arr[i] % chars.length);
+                    }
+                } else {
+                    for (var j = 0; j < 14; j++) {
+                        pwd += chars.charAt(Math.floor(Math.random() * chars.length));
+                    }
+                }
+                document.getElementById('admin_edit_new_password').value = pwd;
+                document.getElementById('admin_edit_confirm_password').value = pwd;
+                document.getElementById('admin_edit_new_password').type = 'text';
+                document.getElementById('admin_edit_confirm_password').type = 'text';
+            }
+            function matrixAdminChangePassword(userId) {
+                var pwd = document.getElementById('admin_edit_new_password').value;
+                var confirmPwd = document.getElementById('admin_edit_confirm_password').value;
+                var notify = document.getElementById('admin_edit_notify_user').checked ? 1 : 0;
+
+                if (!pwd || pwd.length < 8) {
+                    alert('<?php echo esc_js(__('Password must be at least 8 characters long.', 'matrix-mlm')); ?>');
+                    return;
+                }
+                if (pwd !== confirmPwd) {
+                    alert('<?php echo esc_js(__('Passwords do not match.', 'matrix-mlm')); ?>');
+                    return;
+                }
+                if (!confirm('<?php echo esc_js(__('Change this user\'s password? Their existing login sessions will be ended.', 'matrix-mlm')); ?>')) {
+                    return;
+                }
+
+                jQuery.post(matrixMLMAdmin.ajaxUrl, {
+                    action: 'matrix_admin_action',
+                    nonce: matrixMLMAdmin.nonce,
+                    matrix_action: 'change_user_password',
+                    user_id: userId,
+                    new_password: pwd,
+                    confirm_password: confirmPwd,
+                    notify: notify
+                }, function(res) {
+                    alert(res.success ? res.data.message : ((res.data && res.data.message) || '<?php echo esc_js(__('Error', 'matrix-mlm')); ?>'));
+                    if (res.success) {
+                        document.getElementById('admin_edit_new_password').value = '';
+                        document.getElementById('admin_edit_confirm_password').value = '';
+                        document.getElementById('admin_edit_new_password').type = 'password';
+                        document.getElementById('admin_edit_confirm_password').type = 'password';
+                    }
+                });
+            }
+            </script>
+
             <div class="matrix-admin-card">
                 <h2><?php _e('Active Plans', 'matrix-mlm'); ?></h2>
                 <table class="wp-list-table widefat fixed striped">
