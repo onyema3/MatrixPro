@@ -81,6 +81,7 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-migration.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-benefits.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-cug.php';
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-loans.php';
 }
 
 // User Dashboard
