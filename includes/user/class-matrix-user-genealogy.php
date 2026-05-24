@@ -63,9 +63,21 @@ class Matrix_MLM_User_Genealogy {
             return;
         }
 
-        // Get tree data (limit to 4 levels for performance)
+        // Get tree data — initial render is capped at 4 levels to keep
+        // the page payload bounded. Levels deeper than this are
+        // surfaced via the on-demand "Show more" button on each leaf,
+        // which fires the matrix_action=fetch_subtree AJAX endpoint
+        // and injects the next 3 levels in place. The constant lives
+        // here (rather than as a class-level constant) because it's
+        // also the value we pass to render_tree_node so the renderer
+        // knows where to draw the expand button — keeping both reads
+        // off the same local variable means a future tuning change
+        // (e.g. "render 5 levels for first-time users") only needs to
+        // touch one line.
+        $initial_render_depth = min(4, (int) $current_position->depth);
+
         $plan_engine = new Matrix_MLM_Plan_Engine();
-        $tree = $plan_engine->get_matrix_tree($user_id, $selected_plan_id, min(4, $current_position->depth));
+        $tree = $plan_engine->get_matrix_tree($user_id, $selected_plan_id, $initial_render_depth);
         $max_members = Matrix_MLM_Plan_Engine::calculate_max_members($current_position->width, $current_position->depth);
 
         // Per-level fill status for the badge panel below the stats row.
@@ -112,9 +124,9 @@ class Matrix_MLM_User_Genealogy {
         <?php $this->render_level_badges($level_status, $levels_completed, $all_levels_complete, $current_position); ?>
 
         <div class="matrix-genealogy-wrapper">
-            <div class="matrix-genealogy-tree" id="genealogy-tree">
+            <div class="matrix-genealogy-tree" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $current_position->depth; ?>" data-plan-width="<?php echo (int) $current_position->width; ?>">
                 <?php if ($tree): ?>
-                    <?php $this->render_tree_node($tree, $current_position->width, true, $user_id); ?>
+                    <?php $this->render_tree_node($tree, $current_position->width, true, $user_id, $initial_render_depth); ?>
                 <?php else: ?>
                     <div class="matrix-alert matrix-alert-info"><?php _e('No tree data available yet.', 'matrix-mlm'); ?></div>
                 <?php endif; ?>
@@ -128,7 +140,113 @@ class Matrix_MLM_User_Genealogy {
             <span class="legend-item"><span class="legend-dot legend-empty"></span> <?php _e('Empty Slot', 'matrix-mlm'); ?></span>
         </div>
 
+        <?php $this->render_lazy_load_script(); ?>
+
         <?php endif; ?>
+        <?php
+    }
+
+    /**
+     * Emit the inline JS that powers the "Show more" expand buttons.
+     *
+     * Runs once per genealogy view render, attached as a delegated
+     * click listener on the body so it picks up buttons that come in
+     * via AJAX-injected subtrees too — not just the ones present on
+     * first page load. That matters because every level we expand
+     * itself contains more "Show more" buttons at its new bottom
+     * edge, and binding listeners directly to each button at render
+     * time would miss the ones that arrive later.
+     *
+     * Why inline rather than enqueued: the rest of the genealogy view
+     * already collocates its inline CSS and inline scripts with the
+     * markup that needs them (see render_level_badges() above and the
+     * plan-selector inline onchange handler). A standalone .js file
+     * for ~40 lines of behaviour would be more friction than payoff
+     * — the dashboard is already authenticated and uncached, so
+     * payload weight is not the issue an external file would solve.
+     *
+     * Spinner uses the existing dashicons-update glyph plus the
+     * matching CSS keyframe defined in matrix-dashboard.css. We
+     * intentionally don't add error toast UI here: a failed expansion
+     * just restores the original button so the user can retry, and
+     * surfaces the server's error message via the standard window.alert.
+     * That matches how the existing wallet/balance flows handle their
+     * AJAX errors elsewhere on the dashboard.
+     */
+    private function render_lazy_load_script() {
+        ?>
+        <script>
+        (function() {
+            var tree = document.getElementById('genealogy-tree');
+            if (!tree) return;
+
+            // Delegated listener: catches clicks on buttons that arrive
+            // later via AJAX-injected subtrees, not just the ones
+            // present at initial render.
+            tree.addEventListener('click', function(e) {
+                var btn = e.target.closest('.matrix-tree-expand-btn');
+                if (!btn) return;
+                e.preventDefault();
+
+                var positionId = btn.getAttribute('data-position-id');
+                var fromLevel  = btn.getAttribute('data-from-level');
+                var wrapper    = btn.closest('.matrix-tree-expand');
+                if (!positionId || !fromLevel || !wrapper) return;
+
+                var originalHtml = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '<span class="dashicons dashicons-update matrix-tree-spin"></span> '
+                              + '<?php echo esc_js(__('Loading…', 'matrix-mlm')); ?>';
+
+                var data = new FormData();
+                data.append('action',        'matrix_mlm_action');
+                data.append('matrix_action', 'fetch_subtree');
+                data.append('nonce',         matrixMLM.nonce);
+                data.append('position_id',   positionId);
+                data.append('from_level',    fromLevel);
+
+                fetch(matrixMLM.ajaxUrl, {
+                    method:      'POST',
+                    body:        data,
+                    credentials: 'same-origin'
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(j) {
+                    if (!j || !j.success) {
+                        btn.disabled  = false;
+                        btn.innerHTML = originalHtml;
+                        var msg = (j && j.data && j.data.message)
+                            ? j.data.message
+                            : '<?php echo esc_js(__('Could not load deeper levels. Please try again.', 'matrix-mlm')); ?>';
+                        alert(msg);
+                        return;
+                    }
+                    // Replace the expand wrapper with the freshly
+                    // rendered .matrix-tree-children block. The server
+                    // already wraps the response in the right markup
+                    // so we don't need to add anything around it.
+                    var holder = document.createElement('div');
+                    holder.innerHTML = j.data.html.trim();
+                    var newChildren = holder.firstElementChild;
+                    if (newChildren) {
+                        wrapper.replaceWith(newChildren);
+                    } else {
+                        // Defensive: server returned empty markup.
+                        // Don't leave the user staring at a stuck
+                        // spinner — restore the button and let them
+                        // try again.
+                        btn.disabled  = false;
+                        btn.innerHTML = originalHtml;
+                    }
+                })
+                .catch(function() {
+                    btn.disabled  = false;
+                    btn.innerHTML = originalHtml;
+                    alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                });
+            });
+        })();
+        </script>
         <?php
     }
 
@@ -335,16 +453,24 @@ class Matrix_MLM_User_Genealogy {
      * evidence would let an admin or member double-count direct
      * referrals.
      *
-     * @param array $node          Tree node from
-     *                             Matrix_MLM_Plan_Engine::build_tree_recursive().
-     * @param int   $width         Plan width (used to render empty slots).
-     * @param bool  $is_root       True only for the outermost call.
-     * @param int   $root_user_id  WP user id of the tree-root user (the
-     *                             member whose tree we are rendering).
-     *                             Required to classify each descendant
-     *                             as direct vs spillover.
+     * @param array $node              Tree node from
+     *                                 Matrix_MLM_Plan_Engine::build_tree_recursive().
+     * @param int   $width             Plan width (used to render empty slots).
+     * @param bool  $is_root           True only for the outermost call.
+     * @param int   $root_user_id      WP user id of the tree-root user (the
+     *                                 member whose tree we are rendering).
+     *                                 Required to classify each descendant
+     *                                 as direct vs spillover.
+     * @param int   $max_render_depth  Deepest absolute level to render
+     *                                 children for. At any node whose
+     *                                 level == $max_render_depth and
+     *                                 whose total_downline > 0, render a
+     *                                 "Show more" expand button instead
+     *                                 of children. Click triggers the
+     *                                 fetch_subtree AJAX endpoint to
+     *                                 lazy-load the next chunk.
      */
-    private function render_tree_node($node, $width, $is_root = true, $root_user_id = 0) {
+    private function render_tree_node($node, $width, $is_root = true, $root_user_id = 0, $max_render_depth = 4) {
         if (!$node) return;
 
         $is_current_user = ($node['user_id'] == $root_user_id);
@@ -372,9 +498,21 @@ class Matrix_MLM_User_Genealogy {
                 $relationship_label = __('Spillover', 'matrix-mlm');
             }
         }
+
+        $node_level    = (int) $node['level'];
+        $downline      = (int) $node['total_downline'];
+        $has_children  = !empty($node['children']);
+        // We render the children block (with its existing children +
+        // empty slots) whenever the node is shallower than the render
+        // cap OR already has children we received from the server.
+        // Once we hit the cap with no children rendered, the node
+        // gets an "expand" button instead — provided it has any
+        // downline at all to reveal.
+        $render_children_block = ($node_level < $max_render_depth) || $has_children;
+        $render_expand_button  = !$render_children_block && $downline > 0;
         ?>
         <div class="matrix-tree-item">
-            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>">
+            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>" data-position-id="<?php echo (int) $node['id']; ?>">
                 <div class="tree-node-avatar">
                     <?php echo get_avatar($node['user_id'], 36); ?>
                 </div>
@@ -389,44 +527,92 @@ class Matrix_MLM_User_Genealogy {
                         </span>
                         <?php endif; ?>
                     </div>
-                    <small><?php printf(__('Level %d', 'matrix-mlm'), $node['level']); ?> &bull; <?php printf(__('%d downline', 'matrix-mlm'), $node['total_downline']); ?></small>
+                    <small><?php printf(__('Level %d', 'matrix-mlm'), $node_level); ?> &bull; <?php printf(__('%d downline', 'matrix-mlm'), $downline); ?></small>
                 </div>
             </div>
-            <?php if (!empty($node['children']) || $node['level'] < 4): ?>
+            <?php if ($render_children_block): ?>
             <div class="matrix-tree-children">
-                <?php
-                $child_count = count($node['children'] ?? []);
-                // Render existing children. Pass the same $root_user_id
-                // down so descendants are classified relative to the
-                // tree owner, not the immediate parent — a member 3
-                // levels deep is still "direct" from the root's
-                // perspective if the root sponsored them.
-                if (!empty($node['children'])) {
-                    foreach ($node['children'] as $child) {
-                        $this->render_tree_node($child, $width, false, $root_user_id);
-                    }
-                }
-                // Render empty slots
-                $empty_slots = $width - $child_count;
-                for ($i = 0; $i < $empty_slots; $i++) {
-                    ?>
-                    <div class="matrix-tree-item">
-                        <div class="matrix-tree-node matrix-tree-node-empty">
-                            <div class="tree-node-avatar tree-node-empty-avatar">
-                                <span class="dashicons dashicons-plus-alt2"></span>
-                            </div>
-                            <div class="tree-node-info">
-                                <strong><?php _e('Empty Slot', 'matrix-mlm'); ?></strong>
-                                <small><?php _e('Available', 'matrix-mlm'); ?></small>
-                            </div>
-                        </div>
-                    </div>
+                <?php $this->render_children_inner($node, $width, $root_user_id, $max_render_depth); ?>
+            </div>
+            <?php elseif ($render_expand_button): ?>
+            <div class="matrix-tree-expand">
+                <button type="button" class="matrix-tree-expand-btn"
+                        data-position-id="<?php echo (int) $node['id']; ?>"
+                        data-from-level="<?php echo $node_level; ?>"
+                        aria-label="<?php echo esc_attr(sprintf(
+                            /* translators: %s: username of the node being expanded */
+                            __('Show downline below %s', 'matrix-mlm'),
+                            $node['username'] ?? ('User #' . $node['user_id'])
+                        )); ?>">
+                    <span class="dashicons dashicons-arrow-down-alt2" aria-hidden="true"></span>
                     <?php
-                }
-                ?>
+                    printf(
+                        esc_html(_n(
+                            'Show %s more member',
+                            'Show %s more members',
+                            $downline,
+                            'matrix-mlm'
+                        )),
+                        number_format_i18n($downline)
+                    );
+                    ?>
+                </button>
             </div>
             <?php endif; ?>
         </div>
         <?php
+    }
+
+    /**
+     * Render the contents of one .matrix-tree-children block — the
+     * children + empty-slot placeholders for a single parent node.
+     *
+     * Pulled out of render_tree_node() so the AJAX expansion handler
+     * can reuse the same code path. When a member clicks "Show more"
+     * the server-side fetch_subtree handler builds a full subtree (via
+     * Matrix_MLM_Plan_Engine::build_subtree) rooted at the position
+     * being expanded, then calls this helper to produce the exact same
+     * markup the initial render would have produced if the original
+     * page load had asked for those deeper levels. The AJAX response
+     * is then injected directly under the expand button as a
+     * .matrix-tree-children block, so the resulting DOM is
+     * indistinguishable from a deeper initial render.
+     *
+     * Visibility: public so the AJAX endpoint in Matrix_MLM_Core can
+     * call it; intentionally NOT static so it remains the single
+     * recursion partner of render_tree_node() (also a method on this
+     * class). The two functions call each other and share the same
+     * $max_render_depth contract — keeping them as siblings on the
+     * same instance makes that relationship the easiest to follow.
+     *
+     * @see Matrix_MLM_Core::process_fetch_subtree()  AJAX entry point.
+     * @see Matrix_MLM_Plan_Engine::build_subtree()    Data fetcher.
+     */
+    public function render_children_inner($node, $width, $root_user_id, $max_render_depth) {
+        $children    = !empty($node['children']) ? $node['children'] : [];
+        $child_count = count($children);
+
+        foreach ($children as $child) {
+            $this->render_tree_node($child, $width, false, $root_user_id, $max_render_depth);
+        }
+
+        // Empty placeholder slots so an underbuilt level reads as a
+        // matrix instead of a sparse list. Width minus existing
+        // children = how many filler cards to draw.
+        for ($i = 0; $i < $width - $child_count; $i++) {
+            ?>
+            <div class="matrix-tree-item">
+                <div class="matrix-tree-node matrix-tree-node-empty">
+                    <div class="tree-node-avatar tree-node-empty-avatar">
+                        <span class="dashicons dashicons-plus-alt2"></span>
+                    </div>
+                    <div class="tree-node-info">
+                        <strong><?php _e('Empty Slot', 'matrix-mlm'); ?></strong>
+                        <small><?php _e('Available', 'matrix-mlm'); ?></small>
+                    </div>
+                </div>
+            </div>
+            <?php
+        }
     }
 }

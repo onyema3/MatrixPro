@@ -487,6 +487,87 @@
     border: 1px dashed #9ca3af;
 }
 
+/*
+ * "Show more" expand affordance.
+ *
+ * Rendered in place of a .matrix-tree-children block at the bottom
+ * edge of the server-rendered tree (initially level 4, but gets
+ * pushed deeper as members click to expand). Visually consistent
+ * with the empty-slot placeholders — dashed border, muted palette —
+ * so it reads as "there is structure below this, you can pull it
+ * in" rather than as a primary action button.
+ *
+ * Sits on its own row under the parent node via the desktop tree's
+ * existing flex column layout. The connector line continues from
+ * the parent down into the button's box because we leave the
+ * preceding ::before pseudo on .matrix-tree-children intact when
+ * the button is in its place — small visual lie that keeps the
+ * tree's spine continuous even though the children haven't loaded
+ * yet.
+ */
+.matrix-tree-expand {
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+}
+
+.matrix-tree-expand-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #fff;
+    color: var(--matrix-primary);
+    border: 1px dashed #c7d2fe;
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+
+.matrix-tree-expand-btn:hover:not(:disabled) {
+    background: var(--matrix-primary);
+    color: #fff;
+    border-color: var(--matrix-primary);
+    border-style: solid;
+}
+
+.matrix-tree-expand-btn:disabled {
+    opacity: 0.7;
+    cursor: wait;
+}
+
+.matrix-tree-expand-btn .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+}
+
+/*
+ * Spinner used during the lazy-load fetch. Reuses the existing
+ * dashicons-update glyph (curved arrow). The infinite rotate
+ * keyframe is plain CSS so it works without bringing in an animation
+ * library — every browser the rest of the dashboard targets supports
+ * @keyframes natively. Animation is paused for users who've opted
+ * out of motion at the OS level.
+ */
+.matrix-tree-spin {
+    animation: matrix-tree-spin 1s linear infinite;
+}
+
+@keyframes matrix-tree-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .matrix-tree-spin {
+        animation: none;
+    }
+}
+
 /* Responsive tree */
 @media (max-width: 768px) {
     .matrix-tree-node {

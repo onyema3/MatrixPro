@@ -860,6 +860,134 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Build a partial subtree starting from an arbitrary position id.
+     *
+     * Public wrapper around the recursive builder that the genealogy
+     * "lazy-load deeper levels" flow uses on its expand-button AJAX
+     * round-trip. Matches build_tree_recursive's return shape exactly so
+     * the rendering layer can reuse the same code path for both the
+     * initial server-rendered tree and the on-demand expansions.
+     *
+     * The two parameters that differ from get_matrix_tree() are:
+     *
+     *   - $start_depth: the absolute level number the requested position
+     *     sits at in the user's tree. Threaded through so each node in
+     *     the returned subtree carries the correct 'level' value
+     *     (members three levels below the tree root see "Level 5", not
+     *     "Level 1"). The renderer relies on this to decide where the
+     *     next "Show more" button should appear.
+     *
+     *   - $max_depth: the deepest absolute level to fetch. The chunked
+     *     expansion typically asks for $start_depth + 3, capped at the
+     *     plan's depth — three more levels per click keeps each network
+     *     round trip under the soft "small payload" budget the rest of
+     *     the dashboard targets.
+     *
+     * Returns null when the requested position doesn't exist or
+     * $start_depth > $max_depth (degenerate request from a stale UI).
+     *
+     * @param int $position_id  matrix_positions.id of the subtree root.
+     * @param int $plan_id      Plan id (matches the position's plan_id).
+     * @param int $start_depth  Absolute level number for the subtree root.
+     * @param int $max_depth    Absolute deepest level to recurse to.
+     * @return array|null
+     */
+    public function build_subtree($position_id, $plan_id, $start_depth, $max_depth) {
+        $position_id = (int) $position_id;
+        $plan_id     = (int) $plan_id;
+        $start_depth = max(1, (int) $start_depth);
+        $max_depth   = (int) $max_depth;
+
+        if ($position_id <= 0 || $plan_id <= 0 || $max_depth < $start_depth) {
+            return null;
+        }
+
+        return $this->build_tree_recursive($position_id, $plan_id, $start_depth, $max_depth);
+    }
+
+    /**
+     * Authorize a viewer to see a particular position's subtree.
+     *
+     * Returns true when $viewer_user_id either OWNS $position_id directly
+     * or sits anywhere on its ancestor chain in the same plan. Used by
+     * AJAX endpoints that fetch portions of the genealogy tree to make
+     * sure a member can't poke around someone else's downline by
+     * guessing a position id.
+     *
+     * Implementation walks parent_id up from the requested position; at
+     * each step it asks "is this position owned by the viewer?" and
+     * returns true on the first match. The walk is bounded by a
+     * defensive depth ceiling — matrix_positions.parent_id is meant to
+     * form a strict tree but a corrupted dataset could in theory loop,
+     * and we don't want this helper to spin forever for the sake of
+     * one auth check.
+     *
+     * Why the parent-chain walk is the right contract:
+     *   - Matches the natural "is this in my downline?" question.
+     *   - Reads only the indexed parent_id column, so it costs O(depth)
+     *     queries in the worst case (typically <= 9 for a 3x9 plan).
+     *   - Doesn't over-trust matrix_positions.total_downline, which is
+     *     a denormalised count that any of the tree-recompute paths
+     *     could leave temporarily stale. The walk re-derives ancestry
+     *     from the structural truth (parent_id), so an out-of-date
+     *     total_downline can't grant or deny access incorrectly.
+     *
+     * @param int $viewer_user_id  WP user id requesting the view.
+     * @param int $position_id     matrix_positions.id whose subtree they want.
+     * @return bool
+     */
+    public function user_can_view_position($viewer_user_id, $position_id) {
+        global $wpdb;
+
+        $viewer_user_id = (int) $viewer_user_id;
+        $position_id    = (int) $position_id;
+        if ($viewer_user_id <= 0 || $position_id <= 0) {
+            return false;
+        }
+
+        // First touch: does the viewer own the requested position
+        // outright? Cheaper than walking up so test it first.
+        $self = $wpdb->get_var($wpdb->prepare(
+            "SELECT user_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+            $position_id
+        ));
+        if ((int) $self === $viewer_user_id) {
+            return true;
+        }
+
+        // Climb. Cap the iteration count at the largest plausible
+        // matrix depth (any wp_matrix_plans.depth value is validated to
+        // <= 20 in self::validate_matrix(), and bumping the ceiling a
+        // little gives the cap room to absorb a future schema change
+        // without re-tuning).
+        $current_id = $position_id;
+        for ($hops = 0; $hops < 30; $hops++) {
+            $parent_id = $wpdb->get_var($wpdb->prepare(
+                "SELECT parent_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+                $current_id
+            ));
+            if (!$parent_id) {
+                return false;
+            }
+
+            $parent_user_id = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT user_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+                (int) $parent_id
+            ));
+            if ($parent_user_id === $viewer_user_id) {
+                return true;
+            }
+
+            $current_id = (int) $parent_id;
+        }
+
+        // Safety net: a corrupted parent chain that didn't terminate
+        // by our hop ceiling. Refuse the lookup rather than risk
+        // leaking visibility.
+        return false;
+    }
+
+    /**
      * Build tree recursively
      */
     private function build_tree_recursive($position_id, $plan_id, $current_depth, $max_depth) {
