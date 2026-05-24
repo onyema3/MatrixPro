@@ -171,7 +171,7 @@ class Matrix_MLM_User_Dashboard {
                     <a href="<?php echo self::tab_url('tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('profile'); ?>" class="<?php echo $tab === 'profile' ? 'active' : ''; ?>"><span class="dashicons dashicons-admin-users"></span> <?php _e('Profile', 'matrix-mlm'); ?></a>
                     <a href="<?php echo self::tab_url('security'); ?>" class="<?php echo $tab === 'security' ? 'active' : ''; ?>"><span class="dashicons dashicons-shield"></span> <?php _e('2FA Security', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo wp_logout_url(home_url()); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>
             <div class="matrix-dashboard-content">
