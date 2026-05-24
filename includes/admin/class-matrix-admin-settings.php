@@ -26,6 +26,7 @@ class Matrix_MLM_Admin_Settings {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=notifications'); ?>" class="nav-tab <?php echo $tab === 'notifications' ? 'nav-tab-active' : ''; ?>"><?php _e('Notifications', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=security'); ?>" class="nav-tab <?php echo $tab === 'security' ? 'nav-tab-active' : ''; ?>"><?php _e('Security', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=appearance'); ?>" class="nav-tab <?php echo $tab === 'appearance' ? 'nav-tab-active' : ''; ?>"><?php _e('Appearance', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=dashboard_menus'); ?>" class="nav-tab <?php echo $tab === 'dashboard_menus' ? 'nav-tab-active' : ''; ?>"><?php _e('Dashboard Menus', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=sms'); ?>" class="nav-tab <?php echo $tab === 'sms' ? 'nav-tab-active' : ''; ?>"><?php _e('SMS', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=language'); ?>" class="nav-tab <?php echo $tab === 'language' ? 'nav-tab-active' : ''; ?>"><?php _e('Language', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=livechat'); ?>" class="nav-tab <?php echo $tab === 'livechat' ? 'nav-tab-active' : ''; ?>"><?php _e('Livechat', 'matrix-mlm'); ?></a>
@@ -45,6 +46,7 @@ class Matrix_MLM_Admin_Settings {
                     case 'notifications': $this->render_notifications_tab(); break;
                     case 'security': $this->render_security_tab(); break;
                     case 'appearance': $this->render_appearance_tab(); break;
+                    case 'dashboard_menus': $this->render_dashboard_menus_tab(); break;
                     case 'sms': $this->render_sms_tab(); break;
                     case 'language': $this->render_language_tab(); break;
                     case 'livechat': $this->render_livechat_tab(); break;
@@ -527,6 +529,79 @@ class Matrix_MLM_Admin_Settings {
         </table>
     <?php }
 
+    /**
+     * Dashboard Menus tab — per-item visibility toggles for the user
+     * dashboard sidebar. Storage: matrix_mlm_dashboard_menu_visibility
+     * (JSON-encoded slug => 0|1 map). Read at render time by
+     * Matrix_MLM_User_Dashboard::is_menu_visible(); see that helper for
+     * the resolution semantics.
+     *
+     * Three slugs (overview, profile, security) are LOCKED on the user
+     * side via Matrix_MLM_User_Dashboard::LOCKED_MENU_SLUGS — hiding
+     * them would either strand users on a dashboard with no landing
+     * tab or remove the only place a user can edit KYC / manage 2FA.
+     * They render here as disabled-and-checked checkboxes with a "Locked"
+     * pill so the admin can see the full menu and understand why those
+     * three can't be turned off.
+     */
+    private function render_dashboard_menus_tab() {
+        $items     = Matrix_MLM_User_Dashboard::dashboard_menu_definition();
+        $locked    = Matrix_MLM_User_Dashboard::LOCKED_MENU_SLUGS;
+        $stored    = get_option('matrix_mlm_dashboard_menu_visibility', '');
+        $stored    = is_string($stored) && $stored !== '' ? json_decode($stored, true) : [];
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+        ?>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('Toggle individual menu items in the user dashboard sidebar. Disabled items are hidden from the navigation and direct URLs to those tabs fall through to the Dashboard overview. Three core items (Dashboard, Profile, 2FA Security) are locked and cannot be hidden because users would otherwise have no landing screen, no way to update their profile, or no way to manage their 2FA.', 'matrix-mlm'); ?>
+        </p>
+        <table class="form-table">
+            <?php foreach ($items as $item):
+                $slug      = $item['slug'];
+                $is_locked = in_array($slug, $locked, true);
+                // Default to ON when no per-slug preference has been
+                // saved yet — matches is_menu_visible()'s missing-key
+                // default and gives fresh installs an opt-OUT model.
+                $checked   = $is_locked
+                    ? true
+                    : (array_key_exists($slug, $stored) ? (bool) $stored[$slug] : true);
+                ?>
+                <tr>
+                    <th scope="row">
+                        <span class="dashicons <?php echo esc_attr($item['icon']); ?>" style="vertical-align:middle;color:#6b7280;"></span>
+                        <?php echo esc_html($item['label']); ?>
+                        <?php if ($is_locked): ?>
+                            <span style="display:inline-block;margin-left:6px;padding:1px 8px;font-size:11px;font-weight:600;background:#fef3c7;color:#92400e;border-radius:9999px;vertical-align:middle;"><?php _e('Locked', 'matrix-mlm'); ?></span>
+                        <?php endif; ?>
+                    </th>
+                    <td>
+                        <label>
+                            <?php if ($is_locked): ?>
+                                <input type="checkbox" checked disabled>
+                                <?php
+                                /* translators: tooltip explaining why a core menu item can't be hidden */
+                                _e('Always visible (required by the dashboard).', 'matrix-mlm'); ?>
+                            <?php else: ?>
+                                <input type="checkbox"
+                                       name="matrix_mlm_dashboard_menu_visibility[<?php echo esc_attr($slug); ?>]"
+                                       value="1"
+                                       <?php checked($checked); ?>>
+                                <?php _e('Show this menu item in the user dashboard sidebar.', 'matrix-mlm'); ?>
+                            <?php endif; ?>
+                        </label>
+                        <p class="description" style="margin-top:4px;">
+                            <?php
+                            /* translators: %s is a URL slug for one of the user-dashboard tabs */
+                            printf(esc_html__('Slug: %s', 'matrix-mlm'), '<code>' . esc_html($slug) . '</code>');
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+        </table>
+    <?php }
+
     private function render_sms_tab() { ?>
         <table class="form-table">
             <tr><th><?php _e('SMS Provider', 'matrix-mlm'); ?></th>
@@ -739,6 +814,35 @@ class Matrix_MLM_Admin_Settings {
                 break;
             case 'appearance':
                 $settings = ['matrix_mlm_primary_color', 'matrix_mlm_secondary_color', 'matrix_mlm_custom_css', 'matrix_mlm_login_logo_url', 'matrix_mlm_login_logo_id'];
+                break;
+            case 'dashboard_menus':
+                // Per-item visibility for the user-dashboard sidebar.
+                // POST shape is matrix_mlm_dashboard_menu_visibility[<slug>] = "1"
+                // for ticked boxes; unchecked boxes are absent from POST,
+                // which is how we know to record them as 0. Locked slugs
+                // (overview/profile/security) never render an input on
+                // this tab, so they never appear in either branch — and
+                // is_menu_visible() short-circuits them anyway, so the
+                // stored value for those keys is moot.
+                $posted_raw = isset($_POST['matrix_mlm_dashboard_menu_visibility']) && is_array($_POST['matrix_mlm_dashboard_menu_visibility'])
+                    ? $_POST['matrix_mlm_dashboard_menu_visibility']
+                    : [];
+                $locked = Matrix_MLM_User_Dashboard::LOCKED_MENU_SLUGS;
+                $map = [];
+                foreach (Matrix_MLM_User_Dashboard::dashboard_menu_definition() as $item) {
+                    $slug = $item['slug'];
+                    if (in_array($slug, $locked, true)) {
+                        // Skip — never store a preference for a locked
+                        // slug; is_menu_visible() forces them to true.
+                        continue;
+                    }
+                    $map[$slug] = !empty($posted_raw[$slug]) ? 1 : 0;
+                }
+                update_option('matrix_mlm_dashboard_menu_visibility', wp_json_encode($map));
+                // Settings array stays empty so the generic save loop
+                // below has nothing to do for this tab — the JSON blob
+                // above is the only persisted change.
+                $settings = [];
                 break;
             case 'sms':
                 $settings = ['matrix_mlm_sms_provider', 'matrix_mlm_sms_api_key', 'matrix_mlm_sms_api_secret', 'matrix_mlm_sms_sender_id'];
