@@ -380,7 +380,7 @@ class Matrix_MLM_Admin_Gateways {
                                      * disable just the external cash-out without freezing
                                      * the rest of the platform.
                                      */
-                                    _e('Toggle this off to keep the Fintava integration available (virtual wallet, Matrix → Virtual transfer) while blocking only the external bank-transfer pane. The Matrix Transfers manual flow (admin-approved) stays available either way, so users who need to cash out can still submit a request.', 'matrix-mlm');
+                                    _e('Toggle this off to keep the Fintava integration available (virtual wallet, Matrix → Virtual transfer) while blocking only the external bank-transfer pane. The Matrix Transfers flow stays available either way, so users who need to cash out can still send funds straight from their Matrix wallet to a bank account.', 'matrix-mlm');
                                     ?>
                                 </p>
                             </td>

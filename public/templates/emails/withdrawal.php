@@ -36,7 +36,7 @@ ob_start();
 </table>
 <?php if (strtolower($status) === 'approved'): ?>
 <p style="color:#4b5563;font-size:14px;line-height:1.5;margin:0;">
-    <?php _e('Your withdrawal has been approved and credited to your Fintava wallet. You can initiate a bank payout from there.', 'matrix-mlm'); ?>
+    <?php _e('Your Matrix transfer has been processed instantly. Funds are on the way to the bank account you specified.', 'matrix-mlm'); ?>
 </p>
 <?php elseif (strtolower($status) === 'rejected'): ?>
 <p style="color:#4b5563;font-size:14px;line-height:1.5;margin:0;">

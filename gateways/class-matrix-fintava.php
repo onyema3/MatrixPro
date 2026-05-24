@@ -1724,7 +1724,7 @@ class Matrix_MLM_Fintava {
         // server-side check and gets a clean rejection.
         if (!(int) get_option('matrix_mlm_fintava_payouts_enabled', 1)) {
             wp_send_json_error([
-                'message' => __('Bank transfers via Fintava are currently disabled by the administrator. Please use the Matrix Transfers (manual) request form instead, or try again later.', 'matrix-mlm'),
+                'message' => __('Bank transfers via Fintava are currently disabled by the administrator. Please use the Matrix Transfers form instead, or try again later.', 'matrix-mlm'),
             ]);
         }
 
