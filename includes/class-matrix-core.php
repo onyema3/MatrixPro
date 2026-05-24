@@ -634,6 +634,27 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => sprintf(__('Minimum transfer amount is %s', 'matrix-mlm'), $min)]);
         }
 
+        // Optional per-request maximum. Stored as 0 by default
+        // (unbounded), so the historic behaviour is preserved unless
+        // the admin explicitly sets a cap on Settings → Financial →
+        // Wallet to Wallet. Useful as a fraud-style constraint to
+        // suppress drain-and-cash-out chains where a compromised
+        // account funnels its entire balance to an accomplice in
+        // one shot. Defended client-side too (form max attribute +
+        // submit-time check in the wallet page's JS), but the real
+        // gate is here — a tampered POST that bypasses the field's
+        // max= attribute still hits this check and gets a clean
+        // rejection.
+        $max = floatval(get_option('matrix_mlm_max_transfer', 0));
+        if ($max > 0 && $amount > $max) {
+            $cur_sym = get_option('matrix_mlm_currency_symbol', '₦');
+            wp_send_json_error(['message' => sprintf(
+                /* translators: %1$s: currency symbol, %2$s: maximum amount */
+                __('Maximum transfer amount is %1$s%2$s per request.', 'matrix-mlm'),
+                $cur_sym, number_format($max, 2)
+            )]);
+        }
+
         $recipient = get_user_by('login', $recipient_username);
         if (!$recipient || $recipient->ID === $user_id) {
             wp_send_json_error(['message' => __('Invalid recipient', 'matrix-mlm')]);
@@ -821,6 +842,27 @@ class Matrix_MLM_Core {
         $eligibility = Matrix_MLM_User::can_withdraw($user_id);
         if (!$eligibility['allowed']) {
             wp_send_json_error(['message' => $eligibility['reason']]);
+        }
+
+        // Dedicated kill switch for the manual Matrix Transfers queue.
+        // Independent from the master matrix_mlm_withdrawals_enabled
+        // (which kills all three external paths at once) and from the
+        // matrix_mlm_fintava_payouts_enabled toggle (which gates only
+        // the instant Fintava bank-payout pane). Lets an operator
+        // pause just this queue — e.g. while clearing a backlog,
+        // swapping the company bank account, or rotating reviewers —
+        // without simultaneously freezing instant Fintava payouts or
+        // the Matrix → Virtual top-up flow.
+        //
+        // Defence-in-depth pair with the UI-level hide in
+        // Matrix_MLM_User_Wallet::render_action_buttons(): a tampered
+        // POST that bypasses the hidden button still hits this
+        // server-side check and gets a clean rejection that points
+        // the user at the still-available instant path when applicable.
+        if (!(int) get_option('matrix_mlm_matrix_transfers_enabled', 1)) {
+            wp_send_json_error([
+                'message' => __('Manual bank-payout requests (Matrix Transfers) are temporarily disabled by the administrator. Please use the instant "Transfer to Bank" option, or try again later.', 'matrix-mlm'),
+            ]);
         }
 
         $amount         = floatval($_POST['amount'] ?? 0);

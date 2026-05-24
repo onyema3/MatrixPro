@@ -80,11 +80,20 @@ class Matrix_MLM_User_Wallet {
         // only the Fintava-driven external bank transfer pane without
         // tearing down the rest of the Fintava integration. See the
         // toggle's description on Gateways → Fintava for the operator
-        // semantics. The 4th button (Matrix Transfers, manual admin-approved
-        // withdrawal) ignores this toggle on purpose — it's the operational
-        // fallback that's supposed to remain available when instant
-        // payouts are disabled.
+        // semantics.
         $payouts_enabled = $is_active && (int) get_option('matrix_mlm_fintava_payouts_enabled', 1) === 1;
+
+        // Dedicated Matrix Transfers (manual) toggle
+        // (matrix_mlm_matrix_transfers_enabled, default ON). Independent
+        // from $is_active and from $payouts_enabled so admins can pause
+        // just the manual admin-approved queue — e.g. while clearing a
+        // backlog or swapping reviewers — without simultaneously taking
+        // down the instant Fintava bank-payout pane or the rest of the
+        // Fintava integration. The server-side check lives in
+        // Matrix_MLM_Core::process_withdraw(); this flag is the
+        // matching UI hide so users don't see a button that the server
+        // would reject anyway.
+        $matrix_transfers_enabled = (int) get_option('matrix_mlm_matrix_transfers_enabled', 1) === 1;
 
         echo '<h2>' . esc_html__('Wallet', 'matrix-mlm') . '</h2>';
         echo '<p class="matrix-subtitle">' . esc_html__('Your virtual bank account and Matrix wallet, all in one place.', 'matrix-mlm') . '</p>';
@@ -150,8 +159,8 @@ class Matrix_MLM_User_Wallet {
         }
 
         $this->render_header($wallet, $user_id, $matrix_balance, $currency, $fintava);
-        $this->render_action_buttons($payouts_enabled);
-        $this->render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled);
+        $this->render_action_buttons($payouts_enabled, $matrix_transfers_enabled);
+        $this->render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled, $matrix_transfers_enabled);
         // Transaction History is rendered as an always-visible table at
         // the bottom of the page rather than as a fourth toggleable
         // action pane: it's a read-only ledger, not an action, so
@@ -349,23 +358,36 @@ class Matrix_MLM_User_Wallet {
      *     Both states are folded into the $payouts_enabled flag the
      *     caller passes in.
      *
-     *   - "Matrix Transfers" (manual admin-approved) is ALWAYS visible
-     *     in the wallet-exists state. That's the entire point of
-     *     having a second cash-out path: when the Fintava-instant
-     *     flow is disabled (either by the dedicated toggle or by
-     *     Fintava being down), users can still submit a manual
-     *     withdrawal request that the admin processes out-of-band.
+     *   - "Matrix Transfers" (manual admin-approved) is hidden when
+     *     the dedicated `matrix_mlm_matrix_transfers_enabled` toggle
+     *     on Settings → Financial → External Transfer Controls is
+     *     OFF. Defaults ON, so the historic "always visible" behaviour
+     *     is preserved out of the box. This toggle exists so an
+     *     operator can pause just this queue (clear a backlog, rotate
+     *     reviewers, swap the company bank account) without
+     *     simultaneously freezing instant Fintava payouts.
+     *
+     *   - When BOTH external paths are disabled, the entire "External
+     *     Transfers" group is suppressed so the user doesn't see an
+     *     empty section header. Hidden by the
+     *     ($payouts_enabled || $matrix_transfers_enabled) guard
+     *     wrapping the group below.
      *
      * No button starts in the .is-active state and all panes (see
      * render_panes()) are rendered with the [hidden] attribute, so
      * the wallet page lands in a clean overview state on page load.
      *
-     * @param bool $payouts_enabled Whether the dedicated Fintava bank-
-     *                              payout toggle is on (and Fintava is
-     *                              active). When false, the Transfer
-     *                              to Bank button is suppressed.
+     * @param bool $payouts_enabled         Whether the dedicated Fintava
+     *                                      bank-payout toggle is on (and
+     *                                      Fintava is active). When false,
+     *                                      the Transfer to Bank button is
+     *                                      suppressed.
+     * @param bool $matrix_transfers_enabled Whether the dedicated Matrix
+     *                                      Transfers (manual) toggle is
+     *                                      on. When false, the Matrix
+     *                                      Transfers button is suppressed.
      */
-    private function render_action_buttons($payouts_enabled = true) {
+    private function render_action_buttons($payouts_enabled = true, $matrix_transfers_enabled = true) {
         ?>
         <div class="matrix-wallet-action-group">
             <div class="matrix-wallet-action-group-header">
@@ -390,6 +412,7 @@ class Matrix_MLM_User_Wallet {
             </div>
         </div>
 
+        <?php if ($payouts_enabled || $matrix_transfers_enabled): ?>
         <div class="matrix-wallet-action-group matrix-wallet-action-group-external">
             <div class="matrix-wallet-action-group-header">
                 <h3><?php esc_html_e('External Transfers', 'matrix-mlm'); ?></h3>
@@ -405,6 +428,7 @@ class Matrix_MLM_User_Wallet {
                     </span>
                 </button>
                 <?php endif; ?>
+                <?php if ($matrix_transfers_enabled): ?>
                 <button type="button" class="matrix-wallet-action-btn" data-target="matrix-transfers">
                     <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
                     <span class="matrix-wallet-action-text">
@@ -412,8 +436,10 @@ class Matrix_MLM_User_Wallet {
                         <small><?php esc_html_e('Manual — admin-approved request, debited from your Matrix wallet', 'matrix-mlm'); ?></small>
                     </span>
                 </button>
+                <?php endif; ?>
             </div>
         </div>
+        <?php endif; ?>
         <?php
     }
 
@@ -432,11 +458,16 @@ class Matrix_MLM_User_Wallet {
      * The bank pane is only rendered when $payouts_enabled is true;
      * otherwise the Transfer to Bank action button is also hidden in
      * render_action_buttons() so the [data-pane="bank"] target never
-     * gets clicked. The matrix-transfers pane is always rendered — it's
-     * the operational fallback that has to stay available regardless
-     * of Fintava state.
+     * gets clicked. Symmetrically, the matrix-transfers pane is only
+     * rendered when $matrix_transfers_enabled is true; that toggle
+     * is on by default, so the historic "always rendered" behaviour
+     * is preserved out of the box. When admins flip it off (e.g. to
+     * pause the manual queue while clearing a backlog), both the
+     * button AND the pane go away — server-side rejection in
+     * Core::process_withdraw is the third line of defence for any
+     * tampered POST that bypasses both UI gates.
      */
-    private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true) {
+    private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true, $matrix_transfers_enabled = true) {
         ?>
         <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
             <?php $this->render_transfer_to_own_wallet_form($wallet, $user_id, $matrix_balance, $currency); ?>
@@ -472,9 +503,11 @@ class Matrix_MLM_User_Wallet {
         </section>
         <?php endif; ?>
 
+        <?php if ($matrix_transfers_enabled): ?>
         <section class="matrix-wallet-pane" data-pane="matrix-transfers" hidden>
             <?php $this->render_matrix_transfers_form($user_id, $matrix_balance, $currency); ?>
         </section>
+        <?php endif; ?>
         <?php
     }
 
@@ -801,6 +834,11 @@ class Matrix_MLM_User_Wallet {
                 // -----------------------------------------------------------
                 var ownCurrency    = '<?php echo esc_js($currency); ?>';
                 var w2wMin         = <?php echo floatval(get_option('matrix_mlm_min_transfer', 500)); ?>;
+                // Optional admin-set per-request cap; 0 = unbounded.
+                // Mirrors the server-side check in
+                // Core::process_transfer so users get an immediate
+                // alert instead of a round-trip rejection.
+                var w2wMax         = <?php echo floatval(get_option('matrix_mlm_max_transfer', 0)); ?>;
                 var w2wChargeType  = '<?php echo esc_js(get_option('matrix_mlm_transfer_charge_type', 'fixed')); ?>';
                 var w2wChargeValue = <?php echo floatval(get_option('matrix_mlm_transfer_charge', 100)); ?>;
                 var w2wBalance     = <?php echo floatval($matrix_balance); ?>;
@@ -834,6 +872,10 @@ class Matrix_MLM_User_Wallet {
                     }
                     if (!amount || amount < w2wMin) {
                         alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                        return;
+                    }
+                    if (w2wMax > 0 && amount > w2wMax) {
+                        alert('<?php echo esc_js(__('Amount exceeds the maximum transfer per request.', 'matrix-mlm')); ?>');
                         return;
                     }
 
@@ -1093,6 +1135,11 @@ class Matrix_MLM_User_Wallet {
         global $wpdb;
 
         $min_transfer = floatval(get_option('matrix_mlm_min_transfer', 500));
+        // Optional admin-set cap; 0 = unbounded (default). When > 0,
+        // it clamps the form's max attribute and the JS submit gate
+        // below, in addition to the server-side enforcement in
+        // Core::process_transfer.
+        $max_transfer = floatval(get_option('matrix_mlm_max_transfer', 0));
         $charge_type  = get_option('matrix_mlm_transfer_charge_type', 'fixed');
         $charge_value = floatval(get_option('matrix_mlm_transfer_charge', 100));
 
@@ -1107,6 +1154,13 @@ class Matrix_MLM_User_Wallet {
             $balance_ceiling = max(0, $matrix_balance - $charge_value);
         }
         $effective_max = floor($balance_ceiling * 100) / 100;
+        // Apply the admin-set per-request cap on top. We take the
+        // smaller of the balance ceiling and the admin cap so the
+        // user can never type a value that would either fail the
+        // balance check or fail the per-request cap.
+        if ($max_transfer > 0) {
+            $effective_max = min($effective_max, $max_transfer);
+        }
 
         // History (incoming + outgoing). Same query the legacy
         // Balance Transfer page used; just trimmed to 10 rows so the
@@ -1132,6 +1186,9 @@ class Matrix_MLM_User_Wallet {
         <div class="matrix-info-box">
             <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
             <p><strong><?php esc_html_e('Minimum Transfer:', 'matrix-mlm'); ?></strong> <?php echo esc_html($currency . number_format($min_transfer, 2)); ?></p>
+            <?php if ($max_transfer > 0): ?>
+            <p><strong><?php esc_html_e('Maximum Transfer (per request):', 'matrix-mlm'); ?></strong> <?php echo esc_html($currency . number_format($max_transfer, 2)); ?></p>
+            <?php endif; ?>
             <p><strong><?php esc_html_e('Service Charge:', 'matrix-mlm'); ?></strong> <?php echo esc_html($charge_type === 'percent' ? $charge_value . '%' : $currency . number_format($charge_value, 2)); ?></p>
         </div>
 
@@ -2017,6 +2074,11 @@ class Matrix_MLM_User_Wallet {
             // transfer.
             // -----------------------------------------------------------
             var w2wMin         = <?php echo floatval(get_option('matrix_mlm_min_transfer', 500)); ?>;
+            // Optional admin-set per-request cap; 0 = unbounded.
+            // Mirrors the server-side check in Core::process_transfer
+            // so users get an immediate alert instead of a round-trip
+            // rejection.
+            var w2wMax         = <?php echo floatval(get_option('matrix_mlm_max_transfer', 0)); ?>;
             var w2wChargeType  = '<?php echo esc_js(get_option('matrix_mlm_transfer_charge_type', 'fixed')); ?>';
             var w2wChargeValue = <?php echo floatval(get_option('matrix_mlm_transfer_charge', 100)); ?>;
             var w2wBalance     = <?php echo floatval($matrix_balance); ?>;
@@ -2053,6 +2115,10 @@ class Matrix_MLM_User_Wallet {
                 }
                 if (!amount || amount < w2wMin) {
                     alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                    return;
+                }
+                if (w2wMax > 0 && amount > w2wMax) {
+                    alert('<?php echo esc_js(__('Amount exceeds the maximum transfer per request.', 'matrix-mlm')); ?>');
                     return;
                 }
 
