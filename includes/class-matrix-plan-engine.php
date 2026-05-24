@@ -1114,6 +1114,192 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Search the viewer's downline for members whose username, email
+     * or display name matches a free-text query.
+     *
+     * Drives the genealogy "search & jump-to-user" affordance: a
+     * member types a few characters into the search box above the
+     * tree, this method returns up to $limit downline matches, and
+     * the JS hands the user a pivot URL for whichever result they
+     * pick. The search is intentionally scoped to the viewer's
+     * downline within a single plan — searching the whole
+     * matrix_positions table would either leak visibility ("oh,
+     * @bob exists somewhere on the platform") or require a much
+     * bigger auth surface than we want to maintain. Same plan, same
+     * downline, same auth gate as ?pivot_user_id=X.
+     *
+     * Algorithm:
+     *   1. Resolve the viewer's own position id in the plan. No
+     *      position → empty result (you can't have a downline you
+     *      aren't part of).
+     *   2. SQL LIKE-search wp_matrix_positions JOIN wp_users for
+     *      candidates whose user_login, user_email or display_name
+     *      contains the query. Restrict to the same plan and
+     *      status='active', and exclude the viewer themselves
+     *      (you can't pivot to yourself; the breadcrumb's "Back
+     *      to my tree" already covers that). Cap candidates at
+     *      $candidate_pool to keep worst-case auth-walk cost
+     *      bounded — see step 3.
+     *   3. For each candidate, run user_can_view_position() to
+     *      confirm the candidate is strictly below the viewer in
+     *      the parent_id chain. This is the same authoriser
+     *      ?pivot_user_id=X uses on the page render and the
+     *      lazy-load AJAX endpoint uses on subtree fetches, so
+     *      visibility rules can never diverge across the three
+     *      surfaces. Each call is O(depth) and depth is capped at
+     *      ~20 by validate_matrix(), so the worst-case work here
+     *      is candidate_pool * 30 == 1500 trivial PK lookups —
+     *      acceptable for a typeahead because the candidate pool
+     *      almost always contains <10 rows in practice (free-text
+     *      search across active positions for a 3-char query
+     *      typically returns a handful).
+     *   4. Stop as soon as we have $limit confirmed matches.
+     *
+     * Why we don't precompute and cache a "viewer's downline ids"
+     * set: the matrix is mutable (admins move members, new sign-ups
+     * arrive) and we don't have an invalidation hook for it; doing
+     * the auth walk per-candidate keeps correctness obvious without
+     * a cache layer to reason about. If search latency ever shows
+     * up in monitoring we can revisit with a per-request memo.
+     *
+     * Returns rows in the order the SQL produced them (best-match
+     * first when MySQL's collation honours that, otherwise
+     * insertion order). Each row carries enough fields for the JS
+     * dropdown to render a useful label (username + display name +
+     * level) and for the click handler to navigate without a
+     * second roundtrip.
+     *
+     * @param int    $viewer_user_id  WP user id of the searcher.
+     * @param int    $plan_id         Plan whose tree we're searching.
+     * @param string $query           Raw free-text query (will be
+     *                                 normalised here).
+     * @param int    $limit           Max confirmed matches to return.
+     *                                 Defaults to 10 — the dropdown
+     *                                 above the tree won't usefully
+     *                                 show more than that without
+     *                                 turning into a scroll.
+     * @return array<int, array{
+     *     position_id:int,
+     *     user_id:int,
+     *     username:string,
+     *     email:string,
+     *     display_name:string,
+     *     level:int
+     * }>
+     */
+    public function search_downline_users($viewer_user_id, $plan_id, $query, $limit = 10) {
+        global $wpdb;
+
+        $viewer_user_id = (int) $viewer_user_id;
+        $plan_id        = (int) $plan_id;
+        $limit          = max(1, min(20, (int) $limit));
+        $query          = is_string($query) ? trim($query) : '';
+
+        // Single-character searches are too noisy to be useful and
+        // would force the auth walk to run against effectively the
+        // whole position table for each common-letter request.
+        // Two characters is the same minimum the plan's WP user
+        // search uses elsewhere.
+        if ($viewer_user_id <= 0 || $plan_id <= 0 || mb_strlen($query) < 2) {
+            return [];
+        }
+
+        // Confirm the viewer actually has a position in this plan
+        // before we go any further. If they don't, they have no
+        // downline to search and any results would be either zero
+        // (waste of a query) or — worse — accidentally accept a
+        // candidate the auth walk failed to reject, e.g. via a
+        // future bug in user_can_view_position. Belt-and-braces.
+        $viewer_position_id = $this->get_position_id_for_user_in_plan($viewer_user_id, $plan_id);
+        if ($viewer_position_id <= 0) {
+            return [];
+        }
+
+        // Pull a bounded candidate pool. We over-fetch (5x the
+        // requested limit, capped at 50) so that when the auth walk
+        // rejects some candidates we still have headroom to fill
+        // $limit slots. 50 is the ceiling because each rejected
+        // candidate still costs an auth walk, and the search must
+        // feel like a typeahead (sub-300ms typical).
+        $candidate_pool = min(50, $limit * 5);
+
+        $like = '%' . $wpdb->esc_like($query) . '%';
+        $candidates = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.id           AS position_id,
+                    p.user_id      AS user_id,
+                    p.level        AS level,
+                    u.user_login   AS user_login,
+                    u.user_email   AS user_email,
+                    u.display_name AS display_name
+               FROM {$wpdb->prefix}matrix_positions p
+               JOIN {$wpdb->users} u ON u.ID = p.user_id
+              WHERE p.plan_id = %d
+                AND p.status  = 'active'
+                AND p.user_id <> %d
+                AND (
+                        u.user_login   LIKE %s
+                     OR u.user_email   LIKE %s
+                     OR u.display_name LIKE %s
+                )
+              ORDER BY
+                    CASE WHEN u.user_login   = %s THEN 0
+                         WHEN u.user_email   = %s THEN 0
+                         WHEN u.display_name = %s THEN 0
+                         WHEN u.user_login   LIKE %s THEN 1
+                         ELSE 2
+                    END,
+                    p.level ASC,
+                    u.user_login ASC
+              LIMIT %d",
+            $plan_id,
+            $viewer_user_id,
+            $like, $like, $like,
+            // Exact-match boosters: a search for "alice" should rank
+            // user_login='alice' above one whose email merely
+            // contains 'alice'.
+            $query, $query, $query,
+            // Prefix-match (starts-with) gets second priority — a
+            // search for "ali" should still surface 'alice' before
+            // a 'goalie' whose login happens to contain the
+            // substring.
+            $wpdb->esc_like($query) . '%',
+            $candidate_pool
+        ));
+
+        if (empty($candidates)) {
+            return [];
+        }
+
+        $matches = [];
+        foreach ($candidates as $row) {
+            // Auth gate: same walk-up check the page render and
+            // lazy-load endpoints use. Anything not strictly below
+            // the viewer in the parent_id chain is silently dropped
+            // — the searcher must not learn that another member
+            // exists on the platform unless they're already
+            // entitled to see them via the matrix.
+            if (!$this->user_can_view_position($viewer_user_id, (int) $row->position_id)) {
+                continue;
+            }
+
+            $matches[] = [
+                'position_id'  => (int) $row->position_id,
+                'user_id'      => (int) $row->user_id,
+                'username'     => (string) $row->user_login,
+                'email'        => (string) $row->user_email,
+                'display_name' => (string) $row->display_name,
+                'level'        => (int) $row->level,
+            ];
+
+            if (count($matches) >= $limit) {
+                break;
+            }
+        }
+
+        return $matches;
+    }
+
+    /**
      * Build tree recursively
      */
     private function build_tree_recursive($position_id, $plan_id, $current_depth, $max_depth) {
