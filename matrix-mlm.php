@@ -111,6 +111,11 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-healthcare.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-hospitals.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-genealogy.php';
+    // Aggregate, company-wide views over the matrix tree —
+    // orphan branches, stuck levels, top sponsors, dormant
+    // subtrees. Read-only, no schema changes; sits next to the
+    // per-user Genealogy editor on the admin menu.
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-genealogy-analytics.php';
 }
 
 // User Dashboard

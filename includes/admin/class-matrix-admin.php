@@ -46,6 +46,17 @@ class Matrix_MLM_Admin {
         // and the typed-username "Move in Genealogy" form on each
         // user's edit page now links here as the recommended path.
         add_submenu_page('matrix-mlm', __('Genealogy', 'matrix-mlm'), __('Genealogy', 'matrix-mlm'), 'manage_matrix_users', 'matrix-mlm-genealogy', [new Matrix_MLM_Admin_Genealogy(), 'render']);
+        // Genealogy Analytics — company-wide aggregate views
+        // (orphan branches, stuck levels, top sponsors, dormant
+        // subtrees) that the per-user Genealogy editor does not
+        // surface. Sits directly next to its sibling so an
+        // operator pivoting between "fix one user" and "scan the
+        // whole tree" doesn't have to hunt for the other tab.
+        // Capability is manage_matrix_mlm (the Dashboard cap)
+        // because the page is read-only — operators who can
+        // already see the dashboard stat tiles can see these
+        // slices of the same data.
+        add_submenu_page('matrix-mlm', __('Genealogy Analytics', 'matrix-mlm'), __('Tree Analytics', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-genealogy-analytics', [new Matrix_MLM_Admin_Genealogy_Analytics(), 'render']);
         add_submenu_page('matrix-mlm', __('Manage Plans', 'matrix-mlm'), __('Plans', 'matrix-mlm'), 'manage_matrix_plans', 'matrix-mlm-plans', [new Matrix_MLM_Admin_Plans(), 'render']);
         add_submenu_page('matrix-mlm', __('E-Pins', 'matrix-mlm'), __('E-Pins', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-epins', [$this, 'render_epins']);
         add_submenu_page('matrix-mlm', __('Payment Gateways', 'matrix-mlm'), __('Gateways', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-gateways', [new Matrix_MLM_Admin_Gateways(), 'render']);
