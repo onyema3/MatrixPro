@@ -3946,16 +3946,26 @@ class Matrix_MLM_Fintava {
     /**
      * POST /virtual-wallet/generate
      *
-     * NOTE: This is now the FALLBACK path. The primary wallet-creation
-     * flow goes through create_customer() above, which provisions a
-     * customer-attached static wallet whose bank-side account name
-     * matches the user. /virtual-wallet/generate produces a wallet
-     * under the merchant master account — the partner-bank name
-     * resolution then shows the merchant's registered company name
-     * to anyone trying to send funds in. We keep this path as a
-     * graceful-degradation fallback for when create_customer fails
-     * (network blip, validation rejection on a tier we haven't seen,
-     * etc.) so wallet creation never hard-fails.
+     * @deprecated Not called by ajax_create_virtual_wallet anymore.
+     *             Kept for backward-compatibility with external callers
+     *             that may still depend on it. Do NOT add new call sites.
+     *
+     * Why this is deprecated: this endpoint provisions wallets under the
+     * merchant master account. Other Nigerian banks resolve the virtual
+     * NUBAN against that master, so anyone trying to fund the account
+     * sees the merchant's registered company name (e.g. "LIBERTY HUB
+     * INTERNATIONAL LIMITED") instead of the user's. That is the exact
+     * failure mode #197 (collect KYC fields) and #198 (recover existing
+     * customer on duplicate) were meant to prevent, and silently falling
+     * back here on a transient /create/customer failure was the third
+     * way to land on a merchant-named wallet — so the AJAX handler now
+     * surfaces a clear "please retry / contact admin" error instead of
+     * calling this method.
+     *
+     * The customer-attached path (create_customer + STATIC_FUND) is the
+     * only supported way to provision a user wallet. If you find yourself
+     * needing this method as a fallback, fix the upstream issue (KYC
+     * validation, duplicate recovery, async-binding retry) instead.
      *
      * Payload shape is locked to exactly what Fintava's DTO whitelists.
      * The endpoint runs through a NestJS ValidationPipe with
@@ -3996,13 +4006,6 @@ class Matrix_MLM_Fintava {
      *                     it; KYC happens out-of-band on the merchant
      *                     dashboard)
      *   - date_of_birth, gender, address (same — not on the DTO)
-     *
-     * The legacy form (render_create_form) used to collect BVN/DOB/
-     * gender; those inputs were removed at the same time as that
-     * payload cleanup so the UI doesn't ask users for PII that the
-     * gateway has no path for. We keep first_name/last_name in the
-     * form because they're still useful for the local account_name
-     * fallback even though the gateway doesn't accept them.
      */
     public function generate_virtual_wallet($customer_data) {
         // first_name / last_name are no longer required by the API
@@ -5315,24 +5318,27 @@ class Matrix_MLM_Fintava {
 
         $reference = 'MTX-VW-' . $user_id . '-' . time();
 
-        // Primary path: POST /create/customer with fundingMethod=STATIC_FUND.
+        // Sole wallet-provisioning path: POST /create/customer with
+        // fundingMethod=STATIC_FUND.
         //
         // This is the only flow that produces a wallet whose bank-side
-        // account name resolves to the user's name. Calling
-        // /virtual-wallet/generate directly (the legacy fallback below)
-        // provisions the wallet under the merchant master account, so
-        // the partner bank's name-enquiry returns the merchant's
-        // registered company name (e.g. "LIBERTY HUB INTERNATIONAL
-        // LIMITED") to any sender who tries to fund the account —
-        // confusing for senders and wrong on the user's own dashboard.
+        // account name resolves to the user's name. The legacy
+        // /virtual-wallet/generate endpoint provisions the wallet under
+        // the merchant master account, so partner-bank name resolution
+        // returns the merchant's registered company name (e.g. "LIBERTY
+        // HUB INTERNATIONAL LIMITED") to any sender who tries to fund
+        // the account — wrong on the user's own dashboard, and a
+        // customer-support nightmare to unwind once it lands. The
+        // refusal-to-fall-back guard further down enforces this
+        // invariant: if /create/customer fails or returns no embedded
+        // wallet, we surface a clear "please retry" error rather than
+        // silently provisioning a merchant-named wallet.
         //
         // create_customer returns the customer record with an embedded
         // wallet object on success: { userInfo: {...}, wallet: {...} }.
         // We pull wallet_id / account_number / account_name / bank
-        // straight off that wallet object using the same extractors
-        // /virtual-wallet/generate's response goes through, so the rest
-        // of the row-build logic is identical regardless of which path
-        // produced the data.
+        // straight off that wallet object using the gateway's existing
+        // extractors.
         $result = null;
         $customer = $this->create_customer([
             'first_name'     => $first_name,
@@ -5488,44 +5494,80 @@ class Matrix_MLM_Fintava {
                 ];
             }
         } else {
-            // Surface the create_customer failure in the PHP error log so
-            // an operator watching the log can see why we fell through.
-            // We don't fail the AJAX call yet — the legacy path below
-            // still produces a working (if merchant-named) wallet.
+            // Surface the create_customer failure in the PHP error log
+            // so an operator watching the log can see what Fintava
+            // rejected. We do NOT fall through to /virtual-wallet/generate
+            // anymore — see the no-fallback block below for the rationale.
             error_log(
                 '[Matrix Fintava] create_customer failed for user_id=' . $user_id
-                . ', falling back to /virtual-wallet/generate. Error: '
-                . $customer->get_error_message()
+                . '. Error: ' . $customer->get_error_message()
             );
         }
 
-        // Fallback path: legacy /virtual-wallet/generate. Reached when
-        // create_customer either errored OR returned no embedded wallet
-        // object. Produces a working wallet but the bank-side account
-        // name will be the merchant's company name — so log a warning
-        // when we land here so operators can investigate why the
-        // primary path didn't succeed.
+        // Refusal-to-fall-back guard.
+        //
+        // Earlier revisions of this handler called /virtual-wallet/generate
+        // here whenever the primary /create/customer path didn't yield a
+        // wallet — either because Fintava returned a WP_Error, or because
+        // create_customer succeeded but the response carried no embedded
+        // wallet object. That fallback produces a working wallet, but it
+        // provisions it under the merchant master account rather than the
+        // user's customer record, so partner-bank name resolution returns
+        // the merchant's registered company name (e.g. "LIBERTY HUB
+        // INTERNATIONAL LIMITED") to anyone who tries to fund the account.
+        // That is the exact failure mode #197 (the KYC fields PR) and the
+        // duplicate-customer recovery in #198 are meant to prevent. Once
+        // a merchant-named wallet lands in matrix_fintava_wallets, fixing
+        // it requires manual cleanup at both Fintava and in the local DB —
+        // permanently asking a confused user to send funds to "LIBERTY HUB
+        // INTERNATIONAL LIMITED" is much worse than asking them to retry.
+        //
+        // Two paths into this guard:
+        //
+        //   1. create_customer returned a WP_Error AND any duplicate-
+        //      customer recovery (when deployed) didn't yield a usable
+        //      wallet. Surface Fintava's error verbatim so the user can
+        //      act on it: retry on transient 5xx, fix BVN/DOB/address on
+        //      a 4xx validator rejection, or contact support on a hard
+        //      block. The diagnostic log block above already captured the
+        //      raw upstream response.
+        //
+        //   2. create_customer returned 200 but no embedded wallet object.
+        //      This is the async-binding case — Fintava's bank-side
+        //      partner enrolment hasn't finished by the time the response
+        //      is sent. The wallet usually appears on retry within a
+        //      minute. Tell the user to wait and try again, and capture
+        //      the response shape in the error log so support can confirm
+        //      whether the issue is async-binding or a tier that simply
+        //      doesn't return wallets on this endpoint.
         if ($result === null) {
-            $result = $this->generate_virtual_wallet([
-                'first_name' => $first_name,
-                'last_name'  => $last_name,
-                'email'      => $email,
-                'phone'      => $phone,
-                'reference'  => $reference,
-            ]);
-
-            if (is_wp_error($result)) {
-                wp_send_json_error(['message' => $result->get_error_message()]);
+            if (is_wp_error($customer)) {
+                error_log(
+                    '[Matrix Fintava] Refusing to provision a merchant-named wallet for user_id=' . $user_id
+                    . ' after create_customer failure (no recovery). Surfacing upstream error to user.'
+                );
+                wp_send_json_error([
+                    'message' => sprintf(
+                        /* translators: %s: upstream Fintava error message */
+                        __('Could not create your Fintava virtual wallet: %s. Please try again. If the problem persists, contact an administrator.', 'matrix-mlm'),
+                        $customer->get_error_message()
+                    ),
+                ]);
                 return;
             }
 
+            // create_customer returned 200 but the response had no wallet
+            // object on it. The diagnostic log block above already dumped
+            // the raw response; ask the user to retry while we wait for
+            // Fintava's async wallet binding to land.
             error_log(
-                '[Matrix Fintava] Wallet for user_id=' . $user_id
-                . ' created via /virtual-wallet/generate fallback.'
-                . ' Bank-side account name will reflect the merchant'
-                . ' (not the user). Investigate why /create/customer'
-                . ' did not return an embedded wallet on this tier.'
+                '[Matrix Fintava] create_customer returned no embedded wallet object for user_id=' . $user_id
+                . '. Asking the user to retry; refusing to fall through to merchant-named /virtual-wallet/generate.'
             );
+            wp_send_json_error([
+                'message' => __('Your Fintava customer record was created but the wallet has not been attached yet. Please wait a minute and try again. If the issue persists, contact an administrator.', 'matrix-mlm'),
+            ]);
+            return;
         }
 
         global $wpdb;
