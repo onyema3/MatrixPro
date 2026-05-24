@@ -1840,6 +1840,21 @@ class Matrix_MLM_User_Genealogy {
      *                                      already sanitised.
      */
     private function render_d3_view($tree, $display_position, $plan_id, $root_user_id, $initial_depth, $active_view) {
+        // Late-enqueue the D3 vendor + genealogy module by handle.
+        // Both are pre-registered in Matrix_MLM_Core::enqueue_public_assets()
+        // but deliberately not enqueued there — we bind the actual
+        // load to the genealogy render so the 273 KB D3 payload only
+        // ships on pages that actually instantiate this view, not on
+        // every front-end page of the site, AND so the enqueue can't
+        // be silently dropped by a brittle has_shortcode() check
+        // against $post->post_content. Calling wp_enqueue_script
+        // from inside a shortcode is safe because both handles are
+        // footer-loaded — wp_print_footer_scripts fires after
+        // the_content, so anything enqueued during render still
+        // makes it into the output.
+        wp_enqueue_script('matrix-mlm-d3-vendor');
+        wp_enqueue_script('matrix-mlm-genealogy-d3');
+
         // Build the URL the toggle button will navigate to. Keep all
         // existing query params (plan_id, pivot_user_id, mode,
         // heat_metric, …) so toggling views never loses the member's
