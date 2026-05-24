@@ -88,6 +88,16 @@ Matrix_MLM_Share::init();
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-backup.php';
 Matrix_MLM_Admin_Backup::init();
 
+// Always loaded — registers the /wp-json/matrix-mlm/v1/attachment
+// REST route used by the admin Loans/Healthcare review pages to
+// stream KYC documents through a short-lived signed URL instead of
+// linking the raw /uploads/ public path. Front-end requests never
+// touch this route, but rest_api_init has to be hooked on every
+// request because that's when WP decides whether the current
+// request IS a REST request. (audit M3)
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-attachment-signer.php';
+Matrix_MLM_Attachment_Signer::init();
+
 // Always loaded — the Laravel importer registers the bcrypt-compatible
 // check_password filter, which must run on every front-end login (not
 // just admin requests). The same class also registers the chunked

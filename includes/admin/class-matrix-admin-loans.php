@@ -506,9 +506,13 @@ class Matrix_MLM_Admin_Loans {
     /**
      * Documents card — eight uploads (six required + two optional).
      * Renders inline thumbnails for image MIMEs and "View" links for
-     * PDFs. The schema stores absolute URLs from wp_handle_upload, so
-     * the URL is also the visible target — no signing or token logic
-     * is required here.
+     * PDFs. The schema stores absolute URLs from wp_handle_upload,
+     * but the admin page no longer links them directly: every URL
+     * is rewritten to a short-lived signed REST URL via
+     * Matrix_MLM_Attachment_Signer so a forwarded link is bounded
+     * to ~10 minutes, capability-checked on retrieval, and free of
+     * the path-guessing surface that the raw /uploads/ URLs
+     * exposed (audit M3).
      */
     private static function render_documents_card($row) {
         $docs = [
@@ -526,15 +530,24 @@ class Matrix_MLM_Admin_Loans {
             <h2 style="margin-top:0;"><?php _e('Documents', 'matrix-mlm'); ?></h2>
             <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;">
                 <?php foreach ($docs as $col => $label):
-                    $url = isset($row->{$col}) ? (string) $row->{$col} : '';
+                    $raw_url    = isset($row->{$col}) ? (string) $row->{$col} : '';
+                    // sign_url_from_public returns the original URL
+                    // unchanged for paths outside the loan/healthcare
+                    // subtrees (defensive — shouldn't happen in
+                    // normal data, but lets the admin page still
+                    // render something rather than a dead link if a
+                    // legacy row holds an off-tree URL). Production
+                    // rows resolve to a fresh REST URL with HMAC +
+                    // 10-minute expiry.
+                    $signed_url = $raw_url !== '' ? Matrix_MLM_Attachment_Signer::sign_url_from_public($raw_url) : '';
+                    $url        = $signed_url !== '' ? $signed_url : $raw_url;
+                    $is_image   = $raw_url !== '' && self::is_image_url($raw_url);
                 ?>
                     <div style="border:1px solid #e5e7eb;border-radius:6px;padding:10px;background:#fafafa;">
                         <div style="font-weight:600;font-size:12px;color:#374151;margin-bottom:6px;">
                             <?php echo esc_html($label); ?>
                         </div>
-                        <?php if ($url !== ''):
-                            $is_image = self::is_image_url($url);
-                        ?>
+                        <?php if ($url !== ''): ?>
                             <?php if ($is_image): ?>
                                 <a href="<?php echo esc_url($url); ?>" target="_blank" rel="noopener noreferrer">
                                     <img src="<?php echo esc_url($url); ?>" alt="<?php echo esc_attr($label); ?>"
