@@ -3529,7 +3529,112 @@ class Matrix_MLM_Fintava {
     // =========================================================================
 
     /**
+     * POST /create/customer
+     *
+     * Registers a Fintava customer record for the user and (with
+     * fundingMethod=static_fund) provisions a permanent virtual account
+     * tied to that customer's identity in the same round-trip.
+     *
+     * This is the path that causes the bank-side account name to echo
+     * back the user's name (firstName + lastName) when other Nigerian
+     * banks resolve the virtual account number — instead of echoing
+     * back the merchant's company name, which is what calling
+     * /virtual-wallet/generate alone produces (that endpoint provisions
+     * the wallet under the merchant master account, so every wallet
+     * shows up at the partner bank as the merchant's registered name,
+     * e.g. "LIBERTY HUB INTERNATIONAL LIMITED" — confusing for senders
+     * and not what users expect on their own dashboard).
+     *
+     * Whitelisted payload fields:
+     *   - firstName     (string, required)
+     *   - lastName      (string, required)
+     *   - email         (string, required)
+     *   - phone         (string, required)
+     *   - fundingMethod (string, required; we pass 'static_fund' so the
+     *                    customer gets a permanent virtual NUBAN that
+     *                    can receive funds at any time — the alternative
+     *                    is 'dynamic_fund' which mints one-time-use
+     *                    account numbers per transaction, not what we
+     *                    want for a member-facing wallet)
+     *   - merchantReference (string, optional idempotency key)
+     *
+     * Standard Fintava envelope on success:
+     *   { status: 200|201,
+     *     message: 'successful',
+     *     data: {
+     *       userInfo: { id, firstName, lastName, email, phone, ... },
+     *       wallet:   { id, virtualAcctNo, virtualAcctName, bank, ... }
+     *     } }
+     *
+     * On failure (e.g. duplicate email/phone, validation error) returns
+     * a WP_Error with the upstream status + message decorated by
+     * make_request().
+     *
+     * @param array $customer_data Required: first_name, last_name, email,
+     *                             phone. Optional: funding_method
+     *                             (default 'static_fund'), reference.
+     * @return array|WP_Error      The unwrapped `data` object on success
+     *                             (i.e. `{ userInfo, wallet, ... }`).
+     */
+    public function create_customer($customer_data) {
+        $required = ['first_name', 'last_name', 'email', 'phone'];
+        foreach ($required as $field) {
+            if (empty($customer_data[$field])) {
+                return new WP_Error(
+                    'missing_field',
+                    sprintf(__('Missing required field: %s', 'matrix-mlm'), $field)
+                );
+            }
+        }
+
+        $payload = [
+            'firstName'     => sanitize_text_field($customer_data['first_name']),
+            'lastName'      => sanitize_text_field($customer_data['last_name']),
+            'email'         => sanitize_email($customer_data['email']),
+            'phone'         => sanitize_text_field($customer_data['phone']),
+            'fundingMethod' => sanitize_text_field($customer_data['funding_method'] ?? 'static_fund'),
+        ];
+
+        if (!empty($customer_data['reference'])) {
+            $payload['merchantReference'] = sanitize_text_field($customer_data['reference']);
+        }
+
+        $response = $this->make_request('POST', '/create/customer', $payload);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        // Standard envelope: { data: { userInfo, wallet, ... } }
+        if (isset($response['data']) && is_array($response['data'])) {
+            return $response['data'];
+        }
+
+        // Bare-object fallback: some tiers return the payload directly
+        // without the envelope. Accept it if we can see the shape we
+        // expect (a userInfo OR wallet OR id field).
+        if (is_array($response) && (isset($response['userInfo']) || isset($response['wallet']) || isset($response['id']))) {
+            return $response;
+        }
+
+        return new WP_Error(
+            'fintava_create_customer_error',
+            $response['message'] ?? __('Failed to create Fintava customer', 'matrix-mlm')
+        );
+    }
+
+    /**
      * POST /virtual-wallet/generate
+     *
+     * NOTE: This is now the FALLBACK path. The primary wallet-creation
+     * flow goes through create_customer() above, which provisions a
+     * customer-attached static wallet whose bank-side account name
+     * matches the user. /virtual-wallet/generate produces a wallet
+     * under the merchant master account — the partner-bank name
+     * resolution then shows the merchant's registered company name
+     * to anyone trying to send funds in. We keep this path as a
+     * graceful-degradation fallback for when create_customer fails
+     * (network blip, validation rejection on a tier we haven't seen,
+     * etc.) so wallet creation never hard-fails.
      *
      * Payload shape is locked to exactly what Fintava's DTO whitelists.
      * The endpoint runs through a NestJS ValidationPipe with
@@ -4839,31 +4944,117 @@ class Matrix_MLM_Fintava {
 
         $reference = 'MTX-VW-' . $user_id . '-' . time();
 
-        // BVN, date of birth, and gender used to be forwarded here as
-        // optional KYC enrichment, but Fintava's /virtual-wallet/generate
-        // DTO does not accept any of those fields (the live API rejects
-        // the request outright with "property X should not exist"). The
-        // form inputs were removed at the same time; the AJAX handler
-        // therefore no longer reads or stores them. KYC, if needed, is
-        // collected out-of-band on the merchant dashboard.
+        // Primary path: POST /create/customer with fundingMethod=static_fund.
         //
-        // firstName/lastName were also removed from the DTO in a later
-        // Fintava change, so generate_virtual_wallet() no longer puts
-        // them on the request payload either. We still collect first_name
-        // and last_name here because they're useful for the locally
-        // cached account_name fallback when Fintava's response doesn't
-        // include a server-resolved name (BVN/NIN-derived).
-        $result = $this->generate_virtual_wallet([
-            'first_name' => $first_name,
-            'last_name' => $last_name,
-            'email' => $email,
-            'phone' => $phone,
-            'reference' => $reference,
+        // This is the only flow that produces a wallet whose bank-side
+        // account name resolves to the user's name. Calling
+        // /virtual-wallet/generate directly (the legacy fallback below)
+        // provisions the wallet under the merchant master account, so
+        // the partner bank's name-enquiry returns the merchant's
+        // registered company name (e.g. "LIBERTY HUB INTERNATIONAL
+        // LIMITED") to any sender who tries to fund the account —
+        // confusing for senders and wrong on the user's own dashboard.
+        //
+        // create_customer returns the customer record with an embedded
+        // wallet object on success: { userInfo: {...}, wallet: {...} }.
+        // We pull wallet_id / account_number / account_name / bank
+        // straight off that wallet object using the same extractors
+        // /virtual-wallet/generate's response goes through, so the rest
+        // of the row-build logic is identical regardless of which path
+        // produced the data.
+        $result = null;
+        $customer = $this->create_customer([
+            'first_name'     => $first_name,
+            'last_name'      => $last_name,
+            'email'          => $email,
+            'phone'          => $phone,
+            'reference'      => $reference,
+            'funding_method' => 'static_fund',
         ]);
 
-        if (is_wp_error($result)) {
-            wp_send_json_error(['message' => $result->get_error_message()]);
-            return;
+        if (!is_wp_error($customer)) {
+            $wallet_data = (isset($customer['wallet']) && is_array($customer['wallet']))
+                ? $customer['wallet']
+                : null;
+
+            $resolved_customer_id = '';
+            if (isset($customer['userInfo']['id'])) {
+                $resolved_customer_id = (string) $customer['userInfo']['id'];
+            } elseif (isset($customer['id'])) {
+                $resolved_customer_id = (string) $customer['id'];
+            } elseif (isset($customer['customerId'])) {
+                $resolved_customer_id = (string) $customer['customerId'];
+            } elseif (isset($customer['customer_id'])) {
+                $resolved_customer_id = (string) $customer['customer_id'];
+            }
+
+            if ($wallet_data) {
+                $resolved_name = self::extract_account_name($wallet_data);
+                if ($resolved_name === '') {
+                    // Some tiers return the wallet object without the
+                    // virtualAcctName field populated yet (the bank-side
+                    // name binding is asynchronous). The customer record
+                    // we just registered carries the canonical name, so
+                    // fall through to firstName/lastName from there or
+                    // from the form input.
+                    $resolved_name = trim(
+                        (string) ($customer['userInfo']['firstName'] ?? $first_name)
+                        . ' '
+                        . (string) ($customer['userInfo']['lastName'] ?? $last_name)
+                    );
+                }
+
+                $result = [
+                    'success'        => true,
+                    'wallet_id'      => self::extract_wallet_id($wallet_data) ?: ($wallet_data['id'] ?? null),
+                    'customer_id'    => $resolved_customer_id,
+                    'account_number' => self::extract_account_number($wallet_data),
+                    'account_name'   => $resolved_name,
+                    'bank_name'      => self::extract_bank_name($wallet_data) ?: 'Fintava',
+                    'bank_code'      => $wallet_data['bank_code'] ?? $wallet_data['bankCode'] ?? null,
+                    'currency'       => $wallet_data['currency'] ?? 'NGN',
+                    'status'         => $wallet_data['status'] ?? 'active',
+                ];
+            }
+        } else {
+            // Surface the create_customer failure in the PHP error log so
+            // an operator watching the log can see why we fell through.
+            // We don't fail the AJAX call yet — the legacy path below
+            // still produces a working (if merchant-named) wallet.
+            error_log(
+                '[Matrix Fintava] create_customer failed for user_id=' . $user_id
+                . ', falling back to /virtual-wallet/generate. Error: '
+                . $customer->get_error_message()
+            );
+        }
+
+        // Fallback path: legacy /virtual-wallet/generate. Reached when
+        // create_customer either errored OR returned no embedded wallet
+        // object. Produces a working wallet but the bank-side account
+        // name will be the merchant's company name — so log a warning
+        // when we land here so operators can investigate why the
+        // primary path didn't succeed.
+        if ($result === null) {
+            $result = $this->generate_virtual_wallet([
+                'first_name' => $first_name,
+                'last_name'  => $last_name,
+                'email'      => $email,
+                'phone'      => $phone,
+                'reference'  => $reference,
+            ]);
+
+            if (is_wp_error($result)) {
+                wp_send_json_error(['message' => $result->get_error_message()]);
+                return;
+            }
+
+            error_log(
+                '[Matrix Fintava] Wallet for user_id=' . $user_id
+                . ' created via /virtual-wallet/generate fallback.'
+                . ' Bank-side account name will reflect the merchant'
+                . ' (not the user). Investigate why /create/customer'
+                . ' did not return an embedded wallet on this tier.'
+            );
         }
 
         global $wpdb;
