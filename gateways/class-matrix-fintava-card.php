@@ -12,7 +12,7 @@
  * activate it for use at ATM/POS/online.
  *
  * Endpoints:
- * - POST /cards/physical/   - Create a new card record (STATIC_NO_ACCOUNT)
+ * - POST /cards/physical    - Create a new card record (STATIC_NO_ACCOUNT)
  * - POST /cards/link        - Link card to user's wallet
  * - GET  /cards/fetch/{id}  - View card details
  * - POST /cards/activate    - Activate the card
@@ -53,7 +53,12 @@ class Matrix_MLM_Fintava_Card {
     /**
      * Create a physical card record (Verve, pre-produced).
      *
-     * POST /cards/physical/
+     * POST /cards/physical
+     *
+     * Note: NO trailing slash. Fintava's router treats `/cards/physical/`
+     * (trailing slash) as a different — non-existent — route and returns
+     * "Cannot POST /api/dev/cards/physical/" (Express's default 404).
+     * The endpoint is `/cards/physical` exactly.
      *
      * Card type is fixed to STATIC_NO_ACCOUNT — these are the pre-produced
      * physical Verve cards Fintava has already issued for the merchant.
@@ -99,7 +104,7 @@ class Matrix_MLM_Fintava_Card {
         // a separate step via POST /cards/link, performed after the card
         // record exists.
 
-        $response = $this->make_request('POST', '/cards/physical/', $payload);
+        $response = $this->make_request('POST', '/cards/physical', $payload);
 
         if (is_wp_error($response)) {
             return $response;
