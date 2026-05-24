@@ -288,7 +288,7 @@ class Matrix_MLM_User_Card {
             $('#matrix-request-card-form').on('submit', function(e) {
                 e.preventDefault();
                 var form = $(this), btn = $('#request-card-btn');
-                if (!confirm('<?php _e("Create your Verve card record now? You'll link it to your wallet in the next step.", "matrix-mlm"); ?>')) return;
+                if (!confirm('<?php _e("Create your Verve card record now? You will link it to your wallet in the next step.", "matrix-mlm"); ?>')) return;
                 btn.prop('disabled', true).text('<?php _e("Creating...", "matrix-mlm"); ?>');
                 $.ajax({
                     url: matrixMLM.ajaxUrl, type: 'POST',
