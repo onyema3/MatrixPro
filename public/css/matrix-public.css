@@ -37,17 +37,45 @@
     margin-bottom: 30px;
 }
 
+/* Login-page logo. Sized to coexist with the auth-card padding
+ * on phones as small as 320px wide:
+ *   - The img is display:block + auto-margin instead of inline-block
+ *     so centering doesn't depend on the parent's text-align cascade
+ *     (some themes reset text-align inside form blocks).
+ *   - max-width uses min(240px, 100%) so the image is bounded by
+ *     EITHER the 240px desktop cap OR the available content width,
+ *     whichever is smaller — prevents overflow when a theme leaks
+ *     `width: auto` => natural-pixel rendering on a logo whose
+ *     intrinsic resolution is huge (e.g. a 1500px-wide PNG uploaded
+ *     for retina displays).
+ *   - object-fit: contain pins aspect ratio even if a downstream
+ *     rule sets explicit width/height on IMG, which WordPress's
+ *     auto-attribute injection can do depending on theme/version.
+ *   - Mobile breakpoint tightens both axes so a tall/square logo
+ *     can't dominate the auth card on phones — 60px tall keeps
+ *     vertical proportion under the heading.
+ */
 .matrix-auth-logo {
-    margin-bottom: 20px;
+    margin: 0 auto 20px;
     line-height: 0;
+    text-align: center;
 }
 
 .matrix-auth-logo img {
+    display: block;
+    margin: 0 auto;
+    max-width: min(240px, 100%);
     max-height: 80px;
-    max-width: 240px;
     width: auto;
     height: auto;
-    display: inline-block;
+    object-fit: contain;
+}
+
+@media (max-width: 480px) {
+    .matrix-auth-logo img {
+        max-width: 180px;
+        max-height: 60px;
+    }
 }
 
 .matrix-auth-header h2 {
