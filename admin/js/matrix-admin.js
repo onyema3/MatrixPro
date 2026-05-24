@@ -11,6 +11,48 @@
         }
     });
 
+    // Media uploader for settings (e.g. login page logo).
+    // Looks for any .matrix-media-uploader container with sibling
+    // .matrix-media-url, .matrix-media-id, .matrix-media-preview,
+    // .matrix-media-upload, .matrix-media-remove elements.
+    $(document).on('click', '.matrix-media-upload', function(e) {
+        e.preventDefault();
+        if (typeof wp === 'undefined' || !wp.media) {
+            alert('WordPress media library is not available.');
+            return;
+        }
+        var $btn = $(this);
+        var $wrap = $btn.closest('.matrix-media-uploader');
+
+        var frame = wp.media({
+            title: $btn.data('title') || 'Select or Upload Image',
+            button: { text: $btn.data('button') || 'Use this image' },
+            library: { type: 'image' },
+            multiple: false
+        });
+
+        frame.on('select', function() {
+            var attachment = frame.state().get('selection').first().toJSON();
+            $wrap.find('.matrix-media-url').val(attachment.url);
+            $wrap.find('.matrix-media-id').val(attachment.id);
+            var $preview = $wrap.find('.matrix-media-preview');
+            $preview.find('img').attr('src', attachment.url);
+            $preview.show();
+            $wrap.find('.matrix-media-remove').show();
+        });
+
+        frame.open();
+    });
+
+    $(document).on('click', '.matrix-media-remove', function(e) {
+        e.preventDefault();
+        var $wrap = $(this).closest('.matrix-media-uploader');
+        $wrap.find('.matrix-media-url').val('');
+        $wrap.find('.matrix-media-id').val('');
+        $wrap.find('.matrix-media-preview').hide().find('img').attr('src', '');
+        $(this).hide();
+    });
+
     // Admin AJAX action helper
     window.matrixAdminAction = function(action, extraData) {
         const data = $.extend({

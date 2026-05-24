@@ -252,6 +252,11 @@ class Matrix_MLM_Core {
             return;
         }
 
+        // Media library is required for the settings page logo uploader
+        if (function_exists('wp_enqueue_media')) {
+            wp_enqueue_media();
+        }
+
         wp_enqueue_style(
             'matrix-mlm-admin',
             MATRIX_MLM_PLUGIN_URL . 'admin/css/matrix-admin.css',

@@ -37,6 +37,19 @@
     margin-bottom: 30px;
 }
 
+.matrix-auth-logo {
+    margin-bottom: 20px;
+    line-height: 0;
+}
+
+.matrix-auth-logo img {
+    max-height: 80px;
+    max-width: 240px;
+    width: auto;
+    height: auto;
+    display: inline-block;
+}
+
 .matrix-auth-header h2 {
     font-size: 24px;
     color: var(--matrix-dark);

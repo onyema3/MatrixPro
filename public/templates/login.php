@@ -2,6 +2,12 @@
 <div class="matrix-auth-wrapper">
     <div class="matrix-auth-card">
         <div class="matrix-auth-header">
+            <?php $matrix_login_logo = get_option('matrix_mlm_login_logo_url', ''); ?>
+            <?php if (!empty($matrix_login_logo)): ?>
+                <div class="matrix-auth-logo">
+                    <img src="<?php echo esc_url($matrix_login_logo); ?>" alt="<?php echo esc_attr(get_bloginfo('name')); ?>">
+                </div>
+            <?php endif; ?>
             <h2><?php _e('Login to Your Account', 'matrix-mlm'); ?></h2>
             <p><?php _e('Enter your credentials to access your dashboard', 'matrix-mlm'); ?></p>
         </div>
