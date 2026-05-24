@@ -112,32 +112,55 @@ class Matrix_MLM_Paystack {
 
     /**
      * Handle Paystack webhook
+     *
+     * Security:
+     * - Signature verification is MANDATORY. If no webhook_secret is
+     *   configured, all webhook calls are rejected with 401. This prevents
+     *   forged deposit-completion events from anyone on the internet.
+     * - Uses hash_equals() to avoid timing-attack leaks.
+     * - complete_deposit() validates that the verified gateway amount and
+     *   currency match the server-stored deposit row before crediting.
      */
     public function handle_webhook($request) {
         $payload = $request->get_body();
         $signature = $request->get_header('x-paystack-signature');
 
-        // Verify webhook signature
         $gateway_params = $this->get_gateway_params();
-        $webhook_secret = $gateway_params['webhook_secret'] ?? $this->secret_key;
+        $webhook_secret = $gateway_params['webhook_secret'] ?? '';
 
-        if ($signature !== hash_hmac('sha512', $payload, $webhook_secret)) {
-            return new WP_REST_Response(['status' => 'error'], 401);
+        // Mandatory signature: refuse to process unsigned/unconfigured webhooks.
+        if (empty($webhook_secret) || !is_string($signature) || $signature === '') {
+            error_log('[Matrix Paystack Webhook] Rejected: missing webhook_secret or signature header');
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Webhook signature required'], 401);
+        }
+
+        $computed = hash_hmac('sha512', $payload, $webhook_secret);
+        if (!hash_equals($computed, $signature)) {
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid signature'], 401);
         }
 
         $event = json_decode($payload, true);
+        if (!is_array($event) || empty($event['event'])) {
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid payload'], 400);
+        }
 
         if ($event['event'] === 'charge.success') {
-            $data = $event['data'];
-            $reference = $data['reference'];
-            $this->complete_deposit($reference, $data);
+            $data = $event['data'] ?? [];
+            $reference = $data['reference'] ?? '';
+            if ($reference !== '') {
+                $this->complete_deposit($reference, $data);
+            }
         }
 
         return new WP_REST_Response(['status' => 'success'], 200);
     }
 
     /**
-     * Complete deposit after successful payment
+     * Complete deposit after successful payment.
+     *
+     * Server-side amount and currency validation: the gateway-verified
+     * payment is compared against the deposit row stored at initialization
+     * time. Mismatches are recorded (status='disputed') and never credited.
      */
     private function complete_deposit($reference, $payment_data) {
         global $wpdb;
@@ -151,17 +174,56 @@ class Matrix_MLM_Paystack {
             return;
         }
 
-        // Update deposit status
-        $wpdb->update(
+        // Paystack reports amounts in the smallest currency unit (kobo for NGN).
+        // The deposit was initialized with $amount * 100, so divide back to compare.
+        $paid_minor = isset($payment_data['amount']) ? intval($payment_data['amount']) : 0;
+        $expected_minor = intval(round(floatval($deposit->amount) * 100));
+        $paid_currency = isset($payment_data['currency']) ? strtoupper((string) $payment_data['currency']) : '';
+        $expected_currency = strtoupper((string) ($deposit->currency ?? get_option('matrix_mlm_currency', 'NGN')));
+
+        if ($paid_minor < $expected_minor || ($paid_currency !== '' && $paid_currency !== $expected_currency)) {
+            // Underpayment or currency mismatch: do NOT credit. Mark as disputed.
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_deposits',
+                [
+                    'status' => 'disputed',
+                    'gateway_response' => json_encode([
+                        'reason' => 'amount_or_currency_mismatch',
+                        'expected_amount_minor' => $expected_minor,
+                        'paid_amount_minor' => $paid_minor,
+                        'expected_currency' => $expected_currency,
+                        'paid_currency' => $paid_currency,
+                        'payment_data' => $payment_data,
+                    ]),
+                ],
+                ['id' => $deposit->id]
+            );
+            error_log(sprintf(
+                '[Matrix Paystack Webhook] Disputed deposit #%d ref=%s: expected %d %s got %d %s',
+                $deposit->id, $reference, $expected_minor, $expected_currency, $paid_minor, $paid_currency
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'paystack_deposit_disputed',
+                sprintf(__('Paystack deposit disputed (Ref: %s) - amount/currency mismatch', 'matrix-mlm'), $reference)
+            );
+            return;
+        }
+
+        // Conditional update: only the first webhook delivery wins.
+        $updated = $wpdb->update(
             $wpdb->prefix . 'matrix_deposits',
             [
                 'status' => 'completed',
-                'gateway_response' => json_encode($payment_data)
+                'gateway_response' => json_encode($payment_data),
             ],
-            ['id' => $deposit->id]
+            ['id' => $deposit->id, 'status' => 'pending']
         );
 
-        // Credit user wallet
+        if ($updated !== 1) {
+            // A concurrent delivery already completed this deposit.
+            return;
+        }
+
         $wallet = new Matrix_MLM_Wallet();
         $wallet->credit(
             $deposit->user_id,
@@ -171,7 +233,6 @@ class Matrix_MLM_Paystack {
             $reference
         );
 
-        // Send notification
         Matrix_MLM_Notifications::send_deposit_notification($deposit->user_id, $deposit->amount, 'completed');
     }
 
