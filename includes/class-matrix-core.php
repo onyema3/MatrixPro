@@ -280,6 +280,9 @@ class Matrix_MLM_Core {
             case 'redeem_epin':
                 $this->process_epin_redeem();
                 break;
+            case 'fetch_subtree':
+                $this->process_fetch_subtree();
+                break;
             case 'submit_ticket':
                 $this->process_ticket();
                 break;
@@ -725,6 +728,122 @@ class Matrix_MLM_Core {
         } else {
             wp_send_json_error($result);
         }
+    }
+
+    /**
+     * AJAX endpoint for the genealogy "Show more" button.
+     *
+     * The genealogy view server-renders only the first 4 levels of a
+     * member's matrix on initial pageload — below that, leaf nodes
+     * with downline get a "Show more" expand button. Click fires this
+     * endpoint with the position id being expanded plus its current
+     * absolute level; the server fetches the next 3 levels of subtree
+     * rooted there and returns it as ready-to-inject HTML matching the
+     * rest of the tree's markup.
+     *
+     * Why a chunked / on-demand model rather than a single deep
+     * initial render:
+     *
+     *   - A 3x9 plan has up to 29,524 positions; rendering all of them
+     *     server-side on every dashboard pageload would balloon both
+     *     query time and HTML payload.
+     *   - Most members never need to navigate past their direct
+     *     downline. Lazy-loading deeper levels only when a member
+     *     actually clicks to see them keeps the typical pageload
+     *     small while still letting curious members drill all the
+     *     way down.
+     *   - Each click adds 3 levels (so 4 → 7 → 10 → …, capped at the
+     *     plan's depth). The renderer places another expand button at
+     *     the new bottom edge if more remains, so deep dives compose
+     *     naturally without any client-side state.
+     *
+     * Authorization: a member can only fetch a subtree they're already
+     * entitled to see — namely, anything that descends from their own
+     * position in the same plan. Matrix_MLM_Plan_Engine::user_can_view_position()
+     * walks parent_id up from the requested position and confirms the
+     * caller's user id appears on the chain. That auth check costs
+     * O(depth) queries (typically <= 9), well below the budget for
+     * the rest of this call.
+     *
+     * Returns an HTML payload (server-rendered) rather than JSON
+     * structured data because the rendering layer is PHP-only — the
+     * genealogy view server-renders every other piece of tree markup,
+     * and duplicating the render logic in JS just so this one
+     * endpoint can return JSON would double the maintenance surface.
+     * The response HTML is wrapped in a single <div class="matrix-tree-children">
+     * so the client side just replaces the expand button with it
+     * verbatim.
+     */
+    private function process_fetch_subtree() {
+        $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        $from_level  = isset($_POST['from_level'])  ? (int) $_POST['from_level']  : 0;
+
+        if ($position_id <= 0 || $from_level <= 0) {
+            wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+
+        // Look up the position to authorize the read AND get its plan
+        // dimensions in one trip. We need plan width to render the
+        // empty-slot placeholders consistently with the initial render,
+        // and plan depth as the absolute ceiling for the expansion
+        // chunk so we don't query past where the matrix can possibly
+        // hold members.
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT p.id AS position_id, p.user_id AS owner_user_id, p.plan_id,
+                    pl.width AS plan_width, pl.depth AS plan_depth
+               FROM {$wpdb->prefix}matrix_positions p
+               LEFT JOIN {$wpdb->prefix}matrix_plans pl ON pl.id = p.plan_id
+              WHERE p.id = %d",
+            $position_id
+        ));
+
+        if (!$row || !$row->plan_id) {
+            wp_send_json_error(['message' => __('Position not found.', 'matrix-mlm')]);
+        }
+
+        $current_user_id = get_current_user_id();
+        $plan_engine     = new Matrix_MLM_Plan_Engine();
+
+        // Refuse the lookup if the caller can't see this branch of the
+        // tree. See user_can_view_position()'s docblock for the
+        // walk-up algorithm and why parent_id is the right structural
+        // truth to query against.
+        if (!$plan_engine->user_can_view_position($current_user_id, $position_id)) {
+            wp_send_json_error(['message' => __('You do not have access to this part of the genealogy.', 'matrix-mlm')]);
+        }
+
+        // Each click reveals 3 more absolute levels, capped by the
+        // plan's depth. Three is small enough to keep the round-trip
+        // payload bounded yet large enough to feel like meaningful
+        // progress on each click — picking 1 would leave members
+        // clicking endlessly down a 9-level plan.
+        $expand_levels = 3;
+        $max_depth     = min((int) $row->plan_depth, $from_level + $expand_levels);
+
+        $tree = $plan_engine->build_subtree($position_id, (int) $row->plan_id, $from_level, $max_depth);
+        if (!$tree) {
+            wp_send_json_error(['message' => __('Could not build subtree.', 'matrix-mlm')]);
+        }
+
+        // Render only the children block (the parent node itself is
+        // already on the page — this AJAX call replaces the expand
+        // button under it with a freshly-rendered .matrix-tree-children
+        // sibling).
+        ob_start();
+        echo '<div class="matrix-tree-children">';
+        $renderer = new Matrix_MLM_User_Genealogy();
+        $renderer->render_children_inner(
+            $tree,
+            (int) $row->plan_width,
+            $current_user_id,
+            $max_depth
+        );
+        echo '</div>';
+        $html = ob_get_clean();
+
+        wp_send_json_success(['html' => $html]);
     }
 
     private function process_ticket() {
