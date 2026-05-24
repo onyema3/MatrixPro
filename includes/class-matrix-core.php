@@ -777,7 +777,7 @@ class Matrix_MLM_Core {
     }
 
     /**
-     * Process a "Bank Transfers" (manual admin-approved withdrawal)
+     * Process a "Matrix Transfers" (manual admin-approved withdrawal)
      * request from the consolidated Wallet page.
      *
      * Distinct from process_transfer (user-to-user, internal) and
