@@ -11,9 +11,25 @@ class Matrix_MLM_Support {
 
     /**
      * Create a ticket
+     *
+     * Priority is coerced to the allow-list {low, medium, high, urgent} as
+     * a defense-in-depth chokepoint (H15). The HTTP entry point in
+     * Matrix_MLM_Core::process_ticket already coerces, but every future
+     * caller (REST, programmatic, importer reuse) hits this method, so
+     * the allow-list belongs here too. sanitize_text_field upstream does
+     * not escape quotes, so without coercion a value like
+     * 'medium" onclick="alert(1)' could land in the DB and fire on every
+     * admin ticket-list page load. Render-side esc_attr / esc_html is
+     * the universal fix; this is the upstream guard so payloads never
+     * reach storage in the first place.
      */
     public function create_ticket($user_id, $subject, $message, $priority = 'medium', $department = null) {
         global $wpdb;
+
+        $allowed_priorities = ['low', 'medium', 'high', 'urgent'];
+        if (!in_array($priority, $allowed_priorities, true)) {
+            $priority = 'medium';
+        }
 
         $wpdb->insert($wpdb->prefix . 'matrix_tickets', [
             'user_id' => $user_id,

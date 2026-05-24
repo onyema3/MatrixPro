@@ -1736,6 +1736,21 @@ class Matrix_MLM_Core {
         $message = sanitize_textarea_field($_POST['message'] ?? '');
         $priority = sanitize_text_field($_POST['priority'] ?? 'medium');
 
+        // Defense-in-depth: priority must be one of the four UI options.
+        // sanitize_text_field strips HTML tags but does NOT escape quotes,
+        // so a value like 'medium" onclick="alert(1)' would survive and
+        // land verbatim in the DB. The render layer escapes via
+        // esc_attr / esc_html (H15), but coercing here keeps anything
+        // outside the allow-list from ever reaching storage in the
+        // first place. Unknown values fall back to 'medium' rather
+        // than rejecting the submission, so a copy-paste of an old
+        // form payload that no longer matches the current options
+        // doesn't surface as a user-facing error.
+        $allowed_priorities = ['low', 'medium', 'high', 'urgent'];
+        if (!in_array($priority, $allowed_priorities, true)) {
+            $priority = 'medium';
+        }
+
         if (empty($subject) || empty($message)) {
             wp_send_json_error(['message' => __('Subject and message are required', 'matrix-mlm')]);
         }
