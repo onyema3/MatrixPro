@@ -248,8 +248,69 @@ class Matrix_MLM_Fintava_Billing {
         $flat    = max(0.0, floatval($cfg[$type]['flat']    ?? 0));
         $percent = max(0.0, floatval($cfg[$type]['percent'] ?? 0));
         $percent = min(100.0, $percent);
+        // Self-heal cap on flat. See resolve_max_flat_fee() for the
+        // default and the filter override. Cheap to evaluate every
+        // call; matches the percent cap above so neither field can
+        // be exploited by an option-value typo to produce an absurd
+        // total.
+        $flat    = min($flat, self::resolve_max_flat_fee($type));
 
         return round($flat + ($nominal * $percent / 100.0), 2);
+    }
+
+    /**
+     * The default upper bound (in major currency units) on the flat
+     * component of the per-category service fee. The percent
+     * component is capped at 100% in code; the flat component used
+     * to be uncapped, which let an admin who typed 14000 in airtime's
+     * flat field block every member whose wallet balance was below
+     * ~14k from buying any airtime at all (compute total = 100 + 14000
+     * = 14100 > balance -> "Insufficient wallet balance").
+     *
+     * 1000 (~₦1,000 in NGN, ~$1 in USD-equivalent) is comfortably
+     * above the realistic flat-fee range for telco-style services
+     * (typically 20–200) and well below the smallest plausible bill
+     * cap, so it catches obvious typos without surprising operators
+     * who have a legitimately-elevated flat fee. Operators who
+     * genuinely need more can:
+     *
+     *   - Set a higher per-category cap via the
+     *     matrix_mlm_fintava_billing_max_flat_fee filter
+     *     (return scalar -> applies to all categories;
+     *      return array  -> {category: cap}).
+     *   - OR shift the burden onto the percent component, which
+     *     scales with nominal and can't accidentally exceed it.
+     */
+    const DEFAULT_MAX_FLAT_FEE = 1000;
+
+    /**
+     * Resolve the effective max-flat cap for a given bill category.
+     * Filterable so an operator with a genuine high-flat use case
+     * can override without forking the plugin. Used by
+     * compute_service_fee() (compute-time self-heal) AND by the
+     * admin Settings save handler (save-time clamp + admin notice).
+     *
+     * Filter contract:
+     *   - Scalar return    -> applies to every category.
+     *   - Array return     -> per-category override; missing keys
+     *                         fall back to DEFAULT_MAX_FLAT_FEE.
+     *   - Anything else    -> ignored, default applies.
+     *   - Non-numeric / negative values -> coerced to 0 (effectively
+     *                         forbids flat fees on that category).
+     *
+     * @param string $type  One of self::BILL_CATEGORIES.
+     * @return float        Max flat fee in major units, >= 0.
+     */
+    public static function resolve_max_flat_fee($type) {
+        $default  = (float) self::DEFAULT_MAX_FLAT_FEE;
+        $filtered = apply_filters('matrix_mlm_fintava_billing_max_flat_fee', $default, $type);
+        if (is_array($filtered)) {
+            $filtered = $filtered[$type] ?? $default;
+        }
+        if (!is_numeric($filtered)) {
+            return $default;
+        }
+        return max(0.0, (float) $filtered);
     }
 
     /**
@@ -275,6 +336,12 @@ class Matrix_MLM_Fintava_Billing {
             $flat    = max(0.0, floatval($entry['flat']    ?? 0));
             $percent = max(0.0, floatval($entry['percent'] ?? 0));
             $percent = min(100.0, $percent);
+            // Mirror the compute_service_fee() flat clamp so the
+            // client-side preview shows the SAME total the server
+            // will charge — a stored option whose flat is above the
+            // resolved max would otherwise display a higher
+            // "Total to debit" than the user actually pays.
+            $flat    = min($flat, self::resolve_max_flat_fee($slug));
             $out[$slug] = [
                 'flat'    => round($flat, 2),
                 'percent' => round($percent, 2),
@@ -930,6 +997,29 @@ class Matrix_MLM_Fintava_Billing {
         // 1. Debit the user's wallet for the full total.
         $debit = self::debit_for_purchase($user_id, $total, $type, $debit_description);
         if (is_wp_error($debit)) {
+            // Special-case the insufficient-balance error: rebuild
+            // it with a fee-aware message that surfaces the
+            // breakdown (nominal / fee / total / balance / shortfall).
+            // The default "Insufficient wallet balance. Please fund
+            // your wallet first." is correct but misleading when the
+            // user can plainly see their wallet has more than the
+            // bill amount but is being told it's not enough — that's
+            // the symptom of a too-large flat-fee config, and a
+            // breakdown lets the user (and ops) diagnose it
+            // immediately rather than guess.
+            if ($debit->get_error_code() === 'insufficient_balance') {
+                $err_data = $debit->get_error_data();
+                $balance  = is_array($err_data) && isset($err_data['balance'])
+                    ? (float) $err_data['balance']
+                    : 0.0;
+                $debit = new WP_Error(
+                    'insufficient_balance',
+                    self::format_insufficient_balance_message(
+                        $balance, $nominal, $fee, $total
+                    ),
+                    $err_data
+                );
+            }
             return [
                 'kind'     => 'wallet_error',
                 'wp_error' => $debit,
@@ -1328,6 +1418,68 @@ class Matrix_MLM_Fintava_Billing {
     }
 
     /**
+     * Build a fee-aware "insufficient balance" message that surfaces
+     * the full breakdown (balance / nominal / fee / total / shortfall)
+     * so the user — and ops, if the user copies it into a support
+     * ticket — can see at a glance whether the gap is genuine
+     * (small shortfall) or symptomatic of a misconfigured fee
+     * (huge fee, e.g. flat=14000 typo on airtime).
+     *
+     * Branches on the relationship between fee, nominal, and balance:
+     *
+     *   - fee == 0      : pre-C single-amount message — same shape
+     *                     as the legacy error, just enriched with
+     *                     the actual balance and shortfall.
+     *
+     *   - fee > nominal : the fee is larger than the bill itself,
+     *                     which is a strong signal that the markup
+     *                     option is misconfigured. The message
+     *                     explicitly flags it as "unusually high"
+     *                     and asks the user to contact support
+     *                     before adding funds — protects the user
+     *                     from depositing more money to satisfy a
+     *                     fee that shouldn't have been charged.
+     *
+     *   - otherwise     : standard "you're a bit short" message
+     *                     with the breakdown.
+     *
+     * The "fee > nominal" heuristic catches the user-reported
+     * report verbatim (₦100 airtime + ₦14,000 fee) without flagging
+     * legitimate small-bill flat fees (₦100 + ₦20 fee = false; ₦50
+     * + ₦150 fee = TRUE, which is correct because that's also
+     * unusual and worth flagging).
+     */
+    private static function format_insufficient_balance_message($balance, $nominal, $fee, $total) {
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $shortfall = max(0.0, round((float) $total - (float) $balance, 2));
+        $fmt = function ($v) use ($currency) {
+            return $currency . number_format((float) $v, 2);
+        };
+
+        if ($fee <= 0) {
+            return sprintf(
+                /* translators: 1: balance, 2: bill amount, 3: shortfall */
+                __('Your wallet has %1$s but this purchase requires %2$s. Add %3$s to continue.', 'matrix-mlm'),
+                $fmt($balance), $fmt($nominal), $fmt($shortfall)
+            );
+        }
+
+        if ($fee > $nominal) {
+            return sprintf(
+                /* translators: 1: balance, 2: total to debit, 3: bill amount, 4: service fee, 5: shortfall */
+                __('Your wallet has %1$s but this purchase costs %2$s — that\'s %3$s for the bill plus a %4$s service fee. The service fee looks unusually high; please contact support if this is unexpected. Otherwise, add %5$s to continue.', 'matrix-mlm'),
+                $fmt($balance), $fmt($total), $fmt($nominal), $fmt($fee), $fmt($shortfall)
+            );
+        }
+
+        return sprintf(
+            /* translators: 1: balance, 2: total to debit, 3: bill amount, 4: service fee, 5: shortfall */
+            __('Your wallet has %1$s but this purchase costs %2$s (%3$s bill + %4$s service fee). Add %5$s to continue.', 'matrix-mlm'),
+            $fmt($balance), $fmt($total), $fmt($nominal), $fmt($fee), $fmt($shortfall)
+        );
+    }
+
+    /**
      * Debit the user's MatrixPro wallet for a bill purchase.
      *
      * Returns a unique reference string on success, or WP_Error on
@@ -1338,8 +1490,19 @@ class Matrix_MLM_Fintava_Billing {
      */
     private static function debit_for_purchase($user_id, $amount, $type, $description) {
         $wallet = new Matrix_MLM_Wallet();
-        if ($wallet->get_balance($user_id) < $amount) {
-            return new WP_Error('insufficient_balance', __('Insufficient wallet balance. Please fund your wallet first.', 'matrix-mlm'));
+        $balance = $wallet->get_balance($user_id);
+        if ($balance < $amount) {
+            // Carry the balance + requested-amount through the
+            // WP_Error data slot so process_purchase() can rebuild
+            // a fee-aware message ("you have ₦X but this costs ₦Y
+            // including a ₦Z service fee, add ₦W"). The default
+            // message is kept generic so legacy callers that don't
+            // re-examine error_data still surface something sensible.
+            return new WP_Error(
+                'insufficient_balance',
+                __('Insufficient wallet balance. Please fund your wallet first.', 'matrix-mlm'),
+                ['balance' => $balance, 'requested' => (float) $amount]
+            );
         }
 
         $reference = 'BILL-' . $type . '-' . $user_id . '-' . wp_generate_uuid4();
