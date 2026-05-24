@@ -433,6 +433,33 @@ class Matrix_MLM_Core {
     }
 
     private function process_login() {
+        // 2FA-aware login. The flow is:
+        //
+        //   Step 1: client posts {username, password}. We authenticate
+        //           the password. If the user has 2FA enabled we DO NOT
+        //           issue an auth cookie yet — instead we mint a short-
+        //           lived single-use challenge token, return it to the
+        //           client, and respond with requires_2fa=true so the
+        //           frontend can prompt for the OTP.
+        //
+        //   Step 2: client posts {challenge_token, code}. We look the
+        //           token up, verify the OTP via Matrix_MLM_Two_Factor,
+        //           delete the token (single-use), and only then issue
+        //           wp_set_auth_cookie().
+        //
+        // If a user does not have 2FA enabled, the flow degrades to the
+        // original one-shot login path. This way enrolment is voluntary
+        // but actually enforced for those who turn it on — the previous
+        // implementation displayed a "2FA active" badge but never called
+        // verify(), so the second factor was purely cosmetic (audit C5).
+
+        $challenge_token = isset($_POST['challenge_token']) ? sanitize_text_field($_POST['challenge_token']) : '';
+
+        if ($challenge_token !== '') {
+            $this->process_login_2fa_step($challenge_token);
+            return;
+        }
+
         $username = sanitize_text_field($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
 
@@ -441,7 +468,71 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => $user->get_error_message()]);
         }
 
+        $two_factor = new Matrix_MLM_Two_Factor();
+        if ($two_factor->is_enabled($user->ID)) {
+            $token = bin2hex(random_bytes(32));
+            // 5-minute TTL is long enough for users to fetch a code from
+            // their authenticator app but short enough that a leaked
+            // token isn't useful for long.
+            set_transient('matrix_2fa_login_' . $token, [
+                'user_id' => $user->ID,
+                'created_at' => time(),
+            ], 5 * MINUTE_IN_SECONDS);
+
+            wp_send_json_success([
+                'requires_2fa' => true,
+                'challenge_token' => $token,
+                'message' => __('Enter the 6-digit code from your authenticator app.', 'matrix-mlm'),
+            ]);
+            return;
+        }
+
         wp_set_auth_cookie($user->ID);
+        wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
+    }
+
+    /**
+     * Second step of 2FA-aware login.
+     *
+     * Looks up the challenge token, verifies the OTP, and only then
+     * issues the auth cookie. The token is consumed even on a wrong
+     * code (single-use) — clients must restart from step 1. This
+     * prevents a stolen token from being brute-forced against the
+     * 6-digit OTP space.
+     */
+    private function process_login_2fa_step($challenge_token) {
+        $key = 'matrix_2fa_login_' . $challenge_token;
+        $payload = get_transient($key);
+
+        if (!is_array($payload) || empty($payload['user_id'])) {
+            wp_send_json_error([
+                'message' => __('Login session expired. Please sign in again.', 'matrix-mlm'),
+                'restart' => true,
+            ]);
+        }
+
+        // Single-use: consume the token before validating the code so a
+        // wrong OTP cannot be retried with the same token.
+        delete_transient($key);
+
+        $user_id = intval($payload['user_id']);
+        $code = preg_replace('/\D/', '', (string) ($_POST['code'] ?? ''));
+        if (strlen($code) < 6) {
+            wp_send_json_error([
+                'message' => __('Please enter a 6-digit code.', 'matrix-mlm'),
+                'restart' => true,
+            ]);
+        }
+
+        $two_factor = new Matrix_MLM_Two_Factor();
+        if (!$two_factor->verify($user_id, $code)) {
+            wp_send_json_error([
+                'message' => __('Invalid authentication code. Please sign in again.', 'matrix-mlm'),
+                'restart' => true,
+            ]);
+        }
+
+        wp_set_auth_cookie($user_id);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
     }
 
