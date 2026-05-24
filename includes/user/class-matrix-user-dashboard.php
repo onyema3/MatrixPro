@@ -17,6 +17,25 @@ class Matrix_MLM_User_Dashboard {
      *
      * @var string[]
      */
+    /**
+     * Sidebar menu items the admin is NOT allowed to disable. Hiding any
+     * of these would either strand the user (no landing tab) or remove
+     * the only place a user can perform a critical self-service action,
+     * so the visibility toggle is forced to "on" for these slugs.
+     *
+     *   - overview is the default landing tab AND the default: branch in
+     *     render_tab(); a hidden landing tab leaves the dashboard with
+     *     no fallback view.
+     *   - profile is the only place a user can edit KYC / contact info.
+     *   - security is the only surface for managing 2FA + recovery codes.
+     *
+     * The Logout link in the sidebar is built off wp_logout_url() and is
+     * not slug-keyed, so it's naturally exempt without being listed here.
+     *
+     * @var string[]
+     */
+    const LOCKED_MENU_SLUGS = ['overview', 'profile', 'security'];
+
     private static $valid_tabs = [
         'overview',
         'deposits',
@@ -91,6 +110,91 @@ class Matrix_MLM_User_Dashboard {
     }
 
     /**
+     * Canonical sidebar menu definition. The single source of truth for
+     * what the user sees in /matrix-dashboard's left rail and what the
+     * admin sees as a list of toggleable items on the Dashboard Menus
+     * settings tab.
+     *
+     * Returned as an ordered array so the sidebar render and the admin
+     * checkbox list both surface items in the same order users see them.
+     * Each entry must have:
+     *
+     *   - slug:   matches a case in render_tab() and an entry in
+     *             self::$valid_tabs (otherwise the link 404-styles back
+     *             to overview as crafted-input).
+     *   - label:  i18n string already passed through __().
+     *   - icon:   dashicon class without the leading 'dashicons '.
+     *
+     * The 'overview', 'profile', and 'security' slugs are LOCKED via
+     * self::LOCKED_MENU_SLUGS — see is_menu_visible() for the gate
+     * semantics. Anything else can be hidden by an admin via the
+     * matrix_mlm_dashboard_menu_visibility option.
+     *
+     * @return array<int, array{slug:string,label:string,icon:string}>
+     */
+    public static function dashboard_menu_definition() {
+        return [
+            ['slug' => 'overview',        'label' => __('Dashboard',        'matrix-mlm'), 'icon' => 'dashicons-dashboard'],
+            ['slug' => 'deposits',        'label' => __('Deposit',          'matrix-mlm'), 'icon' => 'dashicons-download'],
+            ['slug' => 'deposit-history', 'label' => __('Deposit History',  'matrix-mlm'), 'icon' => 'dashicons-list-view'],
+            ['slug' => 'genealogy',       'label' => __('Genealogy Tree',   'matrix-mlm'), 'icon' => 'dashicons-networking'],
+            ['slug' => 'referrals',       'label' => __('Referrals',        'matrix-mlm'), 'icon' => 'dashicons-groups'],
+            ['slug' => 'commissions',     'label' => __('Commissions',      'matrix-mlm'), 'icon' => 'dashicons-chart-area'],
+            ['slug' => 'plans',           'label' => __('My Plans',         'matrix-mlm'), 'icon' => 'dashicons-networking'],
+            ['slug' => 'epin',            'label' => __('E-Pin Recharge',   'matrix-mlm'), 'icon' => 'dashicons-tickets-alt'],
+            ['slug' => 'wallet',          'label' => __('Wallet',           'matrix-mlm'), 'icon' => 'dashicons-bank'],
+            ['slug' => 'card',            'label' => __('Verve Card',       'matrix-mlm'), 'icon' => 'dashicons-id-alt'],
+            ['slug' => 'billing',         'label' => __('Bill Payments',    'matrix-mlm'), 'icon' => 'dashicons-smartphone'],
+            ['slug' => 'benefits',        'label' => __('Benefits',         'matrix-mlm'), 'icon' => 'dashicons-awards'],
+            ['slug' => 'tickets',         'label' => __('Support',          'matrix-mlm'), 'icon' => 'dashicons-sos'],
+            ['slug' => 'profile',         'label' => __('Profile',          'matrix-mlm'), 'icon' => 'dashicons-admin-users'],
+            ['slug' => 'security',        'label' => __('2FA Security',     'matrix-mlm'), 'icon' => 'dashicons-shield'],
+        ];
+    }
+
+    /**
+     * Whether a sidebar menu item is currently visible to dashboard users.
+     *
+     * Resolution order:
+     *
+     *   1. Locked slugs (LOCKED_MENU_SLUGS) ALWAYS return true regardless
+     *      of stored preference. This is the kill-switch protection that
+     *      keeps the admin UI from rendering a dashboard with no landing
+     *      tab / no profile editor / no 2FA management surface.
+     *   2. The matrix_mlm_dashboard_menu_visibility option is read as a
+     *      JSON-encoded slug=>0|1 map. Missing slugs and an unparseable
+     *      blob both default to TRUE so:
+     *        a. Fresh installs with no option saved show every menu.
+     *        b. New menu items added in a future plugin version are
+     *           visible by default until an admin chooses to hide them.
+     *
+     * Both the sidebar render (cosmetic, in render_dashboard()) and the
+     * server-side dispatch (defensive, at the top of render_tab()) call
+     * this — so a hidden tab is unreachable both via the rendered link
+     * and via direct-URL navigation through cached pages.
+     *
+     * @param string $slug A sidebar slug from dashboard_menu_definition().
+     * @return bool TRUE if the menu item should be shown / dispatched.
+     */
+    public static function is_menu_visible($slug) {
+        if (in_array($slug, self::LOCKED_MENU_SLUGS, true)) {
+            return true;
+        }
+
+        $raw = get_option('matrix_mlm_dashboard_menu_visibility', '');
+        if (!is_string($raw) || $raw === '') {
+            return true;
+        }
+
+        $map = json_decode($raw, true);
+        if (!is_array($map) || !array_key_exists($slug, $map)) {
+            return true;
+        }
+
+        return (bool) $map[$slug];
+    }
+
+    /**
      * Build a sidebar nav URL for the given tab.
      *
      * Uses the pretty form /matrix-dashboard/{tab}/ which the rewrite rule
@@ -161,21 +265,21 @@ class Matrix_MLM_User_Dashboard {
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
                 </div>
                 <nav class="matrix-dashboard-nav">
-                    <a href="<?php echo self::tab_url('overview'); ?>" class="<?php echo $tab === 'overview' ? 'active' : ''; ?>"><span class="dashicons dashicons-dashboard"></span> <?php _e('Dashboard', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('deposits'); ?>" class="<?php echo $tab === 'deposits' ? 'active' : ''; ?>"><span class="dashicons dashicons-download"></span> <?php _e('Deposit', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('deposit-history'); ?>" class="<?php echo $tab === 'deposit-history' ? 'active' : ''; ?>"><span class="dashicons dashicons-list-view"></span> <?php _e('Deposit History', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('genealogy'); ?>" class="<?php echo $tab === 'genealogy' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('Genealogy Tree', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('referrals'); ?>" class="<?php echo $tab === 'referrals' ? 'active' : ''; ?>"><span class="dashicons dashicons-groups"></span> <?php _e('Referrals', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('commissions'); ?>" class="<?php echo $tab === 'commissions' ? 'active' : ''; ?>"><span class="dashicons dashicons-chart-area"></span> <?php _e('Commissions', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('plans'); ?>" class="<?php echo $tab === 'plans' ? 'active' : ''; ?>"><span class="dashicons dashicons-networking"></span> <?php _e('My Plans', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('epin'); ?>" class="<?php echo $tab === 'epin' ? 'active' : ''; ?>"><span class="dashicons dashicons-tickets-alt"></span> <?php _e('E-Pin Recharge', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('wallet'); ?>" class="<?php echo $tab === 'wallet' ? 'active' : ''; ?>"><span class="dashicons dashicons-bank"></span> <?php _e('Wallet', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('card'); ?>" class="<?php echo $tab === 'card' ? 'active' : ''; ?>"><span class="dashicons dashicons-id-alt"></span> <?php _e('Verve Card', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('billing'); ?>" class="<?php echo $tab === 'billing' ? 'active' : ''; ?>"><span class="dashicons dashicons-smartphone"></span> <?php _e('Bill Payments', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('benefits'); ?>" class="<?php echo $tab === 'benefits' ? 'active' : ''; ?>"><span class="dashicons dashicons-awards"></span> <?php _e('Benefits', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('tickets'); ?>" class="<?php echo $tab === 'tickets' ? 'active' : ''; ?>"><span class="dashicons dashicons-sos"></span> <?php _e('Support', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('profile'); ?>" class="<?php echo $tab === 'profile' ? 'active' : ''; ?>"><span class="dashicons dashicons-admin-users"></span> <?php _e('Profile', 'matrix-mlm'); ?></a>
-                    <a href="<?php echo self::tab_url('security'); ?>" class="<?php echo $tab === 'security' ? 'active' : ''; ?>"><span class="dashicons dashicons-shield"></span> <?php _e('2FA Security', 'matrix-mlm'); ?></a>
+                    <?php
+                    // Render only menu items the admin hasn't explicitly
+                    // hidden via the Dashboard Menus settings tab. Locked
+                    // slugs (overview / profile / security) always pass
+                    // is_menu_visible() — see LOCKED_MENU_SLUGS.
+                    foreach (self::dashboard_menu_definition() as $item) {
+                        if (!self::is_menu_visible($item['slug'])) {
+                            continue;
+                        }
+                        $is_active = ($tab === $item['slug']) ? 'active' : '';
+                        ?>
+                        <a href="<?php echo esc_url(self::tab_url($item['slug'])); ?>" class="<?php echo esc_attr($is_active); ?>"><span class="dashicons <?php echo esc_attr($item['icon']); ?>"></span> <?php echo esc_html($item['label']); ?></a>
+                        <?php
+                    }
+                    ?>
                     <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>
@@ -348,6 +452,16 @@ class Matrix_MLM_User_Dashboard {
     }
 
     private function render_tab($tab, $user_id) {
+        // Defense-in-depth for the admin's per-menu visibility toggle:
+        // a user typing /matrix-dashboard/deposits/ directly (or hitting
+        // a stale bookmark, or a page-cached link from before the menu
+        // was hidden) bypasses the sidebar render-time filter. Re-check
+        // visibility here and fall through to overview for hidden slugs.
+        // Locked slugs (overview / profile / security) always pass.
+        if (!self::is_menu_visible($tab)) {
+            $tab = 'overview';
+        }
+
         switch ($tab) {
             case 'overview':
                 $this->render_overview($user_id);
