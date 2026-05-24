@@ -452,6 +452,17 @@ class Matrix_MLM_Core {
         // but actually enforced for those who turn it on — the previous
         // implementation displayed a "2FA active" badge but never called
         // verify(), so the second factor was purely cosmetic (audit C5).
+        //
+        // Audit H12 also called for two protections layered on top of
+        // the C5 fix:
+        //   - Rate limit (per-username + per-IP transient counters) so a
+        //     brute-force loop is bounded by network-side latency * cap.
+        //   - Uniform error messages so the response cannot be used as
+        //     a username-enumeration oracle. wp_authenticate emits
+        //     'invalid_username' vs 'incorrect_password' on its own —
+        //     we collapse both into "Invalid username or password" on
+        //     the wire and keep the distinction only in error_log for
+        //     operator-visible diagnostics.
 
         $challenge_token = isset($_POST['challenge_token']) ? sanitize_text_field($_POST['challenge_token']) : '';
 
@@ -462,10 +473,25 @@ class Matrix_MLM_Core {
 
         $username = sanitize_text_field($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
+        $ip = $this->get_client_ip();
+
+        // Rate-limit gate. Sits in front of wp_authenticate so the
+        // password-check codepath is unreachable from the brute-force
+        // loop once the threshold is crossed.
+        if ($this->is_login_rate_limited($username, $ip)) {
+            wp_send_json_error([
+                'message' => __('Too many login attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
 
         $user = wp_authenticate($username, $password);
         if (is_wp_error($user)) {
-            wp_send_json_error(['message' => $user->get_error_message()]);
+            $this->record_failed_login_attempt($username, $ip, 'wp_auth:' . $user->get_error_code());
+            wp_send_json_error([
+                // Uniform message: does not distinguish 'invalid_username'
+                // from 'incorrect_password'. (audit H12)
+                'message' => __('Invalid username or password.', 'matrix-mlm'),
+            ]);
         }
 
         $two_factor = new Matrix_MLM_Two_Factor();
@@ -474,9 +500,17 @@ class Matrix_MLM_Core {
             // 5-minute TTL is long enough for users to fetch a code from
             // their authenticator app but short enough that a leaked
             // token isn't useful for long.
+            //
+            // Also persist the username + ip into the challenge payload
+            // so process_login_2fa_step can score wrong-OTP failures
+            // against the same rate-limit counters as step 1, instead
+            // of letting an attacker who knows a valid password but no
+            // OTP cycle through fresh tokens for free.
             set_transient('matrix_2fa_login_' . $token, [
                 'user_id' => $user->ID,
                 'created_at' => time(),
+                'username' => $username,
+                'ip' => $ip,
             ], 5 * MINUTE_IN_SECONDS);
 
             wp_send_json_success([
@@ -487,6 +521,10 @@ class Matrix_MLM_Core {
             return;
         }
 
+        // No 2FA — full success. Clear counters so the user isn't
+        // penalised on subsequent legitimate logins after a couple of
+        // typos earlier in the session.
+        $this->clear_login_attempts($username, $ip);
         wp_set_auth_cookie($user->ID);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
     }
@@ -516,8 +554,11 @@ class Matrix_MLM_Core {
         delete_transient($key);
 
         $user_id = intval($payload['user_id']);
+        $username = isset($payload['username']) ? (string) $payload['username'] : '';
+        $ip = isset($payload['ip']) ? (string) $payload['ip'] : $this->get_client_ip();
         $code = preg_replace('/\D/', '', (string) ($_POST['code'] ?? ''));
         if (strlen($code) < 6) {
+            $this->record_failed_login_attempt($username, $ip, '2fa_short_code');
             wp_send_json_error([
                 'message' => __('Please enter a 6-digit code.', 'matrix-mlm'),
                 'restart' => true,
@@ -526,14 +567,138 @@ class Matrix_MLM_Core {
 
         $two_factor = new Matrix_MLM_Two_Factor();
         if (!$two_factor->verify($user_id, $code)) {
+            // Score wrong OTP into the same per-username + per-IP
+            // counters as step 1. Without this, an attacker who knows a
+            // valid password but no OTP could cycle fresh challenge
+            // tokens through step 1 indefinitely; here every failed
+            // OTP costs them a slot. (audit H12)
+            $this->record_failed_login_attempt($username, $ip, '2fa_wrong_code');
             wp_send_json_error([
                 'message' => __('Invalid authentication code. Please sign in again.', 'matrix-mlm'),
                 'restart' => true,
             ]);
         }
 
+        // Full success — clear counters.
+        $this->clear_login_attempts($username, $ip);
         wp_set_auth_cookie($user_id);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
+    }
+
+    /* ------------------------------------------------------------------
+     * Login rate-limit helpers (audit H12)
+     *
+     * Two parallel transient counters: per-username (caps brute force
+     * against a single account) and per-IP (caps credential stuffing
+     * across many accounts from one source). Both gate ahead of
+     * wp_authenticate so the password-check codepath is unreachable
+     * once the threshold is crossed. Window and caps are filterable so
+     * operators on shared NATs (university, mobile carrier) can raise
+     * the per-IP cap without touching the per-username one.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Resolve the client IP. REMOTE_ADDR is the only header we trust by
+     * default — X-Forwarded-For etc. can be set by anyone making the
+     * request unless the WP install is explicitly behind a known
+     * reverse proxy that strips/sets it. Operators on cloud platforms
+     * with verified-RP configs can hook 'matrix_mlm_client_ip' to
+     * return the real client IP from the trusted forwarded header.
+     */
+    private function get_client_ip() {
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+        return apply_filters('matrix_mlm_client_ip', $ip);
+    }
+
+    /**
+     * Build the per-username transient key. sha1 normalises the byte
+     * shape so usernames with characters outside the option_name
+     * charset (rare, but possible on some installs) don't break the
+     * key. Lowercased so 'Alice' and 'alice' share the counter — WP
+     * usernames are case-insensitive on lookup.
+     */
+    private function login_rate_limit_user_key($username) {
+        return 'matrix_login_user_' . sha1(strtolower((string) $username));
+    }
+
+    /**
+     * Build the per-IP transient key. sha1 likewise normalises and
+     * also avoids storing raw IPs in option_name (tiny privacy nudge).
+     */
+    private function login_rate_limit_ip_key($ip) {
+        return 'matrix_login_ip_' . sha1((string) $ip);
+    }
+
+    /**
+     * @return bool true if either the per-username or per-IP counter
+     *              is already at or above its cap.
+     */
+    private function is_login_rate_limited($username, $ip) {
+        $max_user = (int) apply_filters('matrix_mlm_login_max_attempts_per_user', 10);
+        $max_ip   = (int) apply_filters('matrix_mlm_login_max_attempts_per_ip',   50);
+
+        if ($username !== '') {
+            $user_count = (int) get_transient($this->login_rate_limit_user_key($username));
+            if ($user_count >= $max_user) {
+                return true;
+            }
+        }
+
+        if ($ip !== '') {
+            $ip_count = (int) get_transient($this->login_rate_limit_ip_key($ip));
+            if ($ip_count >= $max_ip) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Increment both counters. Each counter has its own (rolling) TTL —
+     * legitimate users with a slow reset window aren't punished
+     * indefinitely. The window is filterable for the same reason caps
+     * are. Operator-visible diagnostic is logged so legitimate support
+     * cases can still be reasoned about; user-facing response stays
+     * uniform per audit H12.
+     */
+    private function record_failed_login_attempt($username, $ip, $reason = '') {
+        $window = (int) apply_filters('matrix_mlm_login_window_seconds', 15 * MINUTE_IN_SECONDS);
+        if ($window < MINUTE_IN_SECONDS) {
+            $window = MINUTE_IN_SECONDS; // floor — never auto-reset every second
+        }
+
+        if ($username !== '') {
+            $user_key = $this->login_rate_limit_user_key($username);
+            $user_count = (int) get_transient($user_key);
+            set_transient($user_key, $user_count + 1, $window);
+        }
+
+        if ($ip !== '') {
+            $ip_key = $this->login_rate_limit_ip_key($ip);
+            $ip_count = (int) get_transient($ip_key);
+            set_transient($ip_key, $ip_count + 1, $window);
+        }
+
+        error_log(sprintf(
+            '[Matrix Login] failed_attempt user=%s ip=%s reason=%s',
+            $username !== '' ? $username : '(empty)',
+            $ip !== '' ? $ip : '(empty)',
+            $reason !== '' ? $reason : '(unspecified)'
+        ));
+    }
+
+    /**
+     * Clear both counters on successful login so a legitimate user who
+     * mistyped a couple of times isn't penalised on the next attempt.
+     */
+    private function clear_login_attempts($username, $ip) {
+        if ($username !== '') {
+            delete_transient($this->login_rate_limit_user_key($username));
+        }
+        if ($ip !== '') {
+            delete_transient($this->login_rate_limit_ip_key($ip));
+        }
     }
 
     private function process_registration() {
