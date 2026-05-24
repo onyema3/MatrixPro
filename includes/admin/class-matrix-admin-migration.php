@@ -1223,7 +1223,12 @@ class Matrix_MLM_Admin_Migration {
                         'currency' => 'NGN',
                         'customer_email' => sanitize_email($data['customer_email'] ?? $user->user_email),
                         'customer_phone' => sanitize_text_field($data['customer_phone'] ?? ''),
-                        'bvn' => sanitize_text_field($data['bvn'] ?? ''),
+                        // Encrypt BVN at rest via the same envelope used by
+                        // ajax_create_virtual_wallet (audit H5). Empty
+                        // input passes through as null/empty so existing
+                        // import workflows that don't carry BVN still
+                        // work.
+                        'bvn' => Matrix_MLM_Fintava::encrypt_bvn(sanitize_text_field($data['bvn'] ?? '')),
                         'status' => $default_status,
                     ];
 
@@ -1308,6 +1313,19 @@ class Matrix_MLM_Admin_Migration {
                  LEFT JOIN {$wpdb->users} u ON w.user_id = u.ID
                  ORDER BY w.created_at DESC", ARRAY_A
             );
+            // Decrypt BVN for the export — column is at-rest encrypted
+            // (audit H5), but the admin-gated CSV/JSON export is the
+            // documented re-export path and operators expect the plain
+            // 11-digit value here for cross-system migration. Legacy
+            // plaintext rows pass through unchanged.
+            if (class_exists('Matrix_MLM_Fintava')) {
+                foreach ($wallets as &$row_ref) {
+                    if (!empty($row_ref['bvn'])) {
+                        $row_ref['bvn'] = Matrix_MLM_Fintava::decrypt_bvn($row_ref['bvn']);
+                    }
+                }
+                unset($row_ref);
+            }
             if ($type === 'wallets') $data = $wallets;
         }
 
