@@ -2554,14 +2554,47 @@ class Matrix_MLM_Fintava {
             if (!is_wp_error($status)) {
                 $new_status = $status['status'] ?? $payout->status;
                 if ($new_status !== $payout->status) {
-                    $wpdb->update(
+                    // Compare-and-swap on the status we read at SELECT.
+                    //
+                    // M3: a delayed `transfer.success` (or stale Fintava
+                    // poll response) MUST NOT be allowed to overwrite a
+                    // row that has already moved to `failed` or
+                    // `refunded` via the webhook path. Without this
+                    // guard the sequence
+                    //   T0 SELECT (status=processing)
+                    //   T1 GET /transfer/{id} -> "completed"
+                    //   T2 webhook transfer.failed lands -> row flips
+                    //      to failed then refunded; user wallet credited
+                    //   T3 our unconditional UPDATE writes "completed"
+                    // leaves the user with both the refund AND the
+                    // bank settlement.
+                    //
+                    // The WHERE clause requires the row to still be in
+                    // the non-terminal state we observed; if anything
+                    // (webhook, parallel poll, admin action) has moved
+                    // it, the UPDATE matches 0 rows and we re-read.
+                    $rows = $wpdb->update(
                         $wpdb->prefix . 'matrix_fintava_payouts',
                         ['status' => $new_status, 'updated_at' => current_time('mysql')],
-                        ['id' => $payout->id],
+                        ['id' => $payout->id, 'status' => $payout->status],
                         ['%s', '%s'],
-                        ['%d']
+                        ['%d', '%s']
                     );
-                    $payout->status = $new_status;
+                    if ($rows === 1) {
+                        $payout->status = $new_status;
+                    } else {
+                        // Row moved underneath us — re-read so the
+                        // response reflects the authoritative state
+                        // (typically `failed` or `refunded` after a
+                        // webhook).
+                        $fresh = $wpdb->get_row($wpdb->prepare(
+                            "SELECT * FROM {$wpdb->prefix}matrix_fintava_payouts WHERE id = %d",
+                            $payout->id
+                        ));
+                        if ($fresh) {
+                            $payout = $fresh;
+                        }
+                    }
                 }
             }
         }
@@ -2829,9 +2862,17 @@ class Matrix_MLM_Fintava {
         $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_payouts',
             ['status' => 'refunded', 'updated_at' => current_time('mysql')],
-            ['id' => $payout->id],
+            // CAS guard: only the `failed` row we just wrote earlier in
+            // this handler is eligible to be promoted to `refunded`. If
+            // some other code path raced us and the row is no longer
+            // `failed` (e.g. a stale poll wrote `completed`), do NOT
+            // overwrite — that would mask the inconsistency. Refund
+            // credit has already been issued; an operator-visible
+            // mismatch is the right outcome and is alarmed below via
+            // the admin notification.
+            ['id' => $payout->id, 'status' => 'failed'],
             ['%s', '%s'],
-            ['%d']
+            ['%d', '%s']
         );
 
         Matrix_MLM_Notifications::send_admin_notification(
