@@ -41,6 +41,11 @@ class Matrix_MLM_Admin {
         // Submenus
         add_submenu_page('matrix-mlm', __('Dashboard', 'matrix-mlm'), __('Dashboard', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm', [$this, 'render_dashboard']);
         add_submenu_page('matrix-mlm', __('Manage Users', 'matrix-mlm'), __('Users', 'matrix-mlm'), 'manage_matrix_users', 'matrix-mlm-users', [new Matrix_MLM_Admin_Users(), 'render']);
+        // Visual genealogy editor — sits right next to "Users"
+        // because tree surgery is a per-user concern operationally,
+        // and the typed-username "Move in Genealogy" form on each
+        // user's edit page now links here as the recommended path.
+        add_submenu_page('matrix-mlm', __('Genealogy', 'matrix-mlm'), __('Genealogy', 'matrix-mlm'), 'manage_matrix_users', 'matrix-mlm-genealogy', [new Matrix_MLM_Admin_Genealogy(), 'render']);
         add_submenu_page('matrix-mlm', __('Manage Plans', 'matrix-mlm'), __('Plans', 'matrix-mlm'), 'manage_matrix_plans', 'matrix-mlm-plans', [new Matrix_MLM_Admin_Plans(), 'render']);
         add_submenu_page('matrix-mlm', __('E-Pins', 'matrix-mlm'), __('E-Pins', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-epins', [$this, 'render_epins']);
         add_submenu_page('matrix-mlm', __('Payment Gateways', 'matrix-mlm'), __('Gateways', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-gateways', [new Matrix_MLM_Admin_Gateways(), 'render']);
@@ -531,6 +536,9 @@ class Matrix_MLM_Admin {
             case 'move_user_position':
                 $this->move_user_position();
                 break;
+            case 'preview_move_position':
+                $this->preview_move_position();
+                break;
             case 'link_fintava_account':
                 $this->link_fintava_account();
                 break;
@@ -860,6 +868,41 @@ class Matrix_MLM_Admin {
                 'details'              => $details,
             ],
         ]);
+    }
+
+    /**
+     * Drag-and-drop preview endpoint for the visual genealogy
+     * editor.
+     *
+     * Used by the admin Genealogy page (see
+     * Matrix_MLM_Admin_Genealogy::render_inline_script): when the
+     * operator drops a node onto another node, the page calls this
+     * action to compute the impact summary the confirmation modal
+     * displays before they commit. Validation here mirrors
+     * move_user_position() exactly so the modal can never
+     * green-light a move that the commit would then reject.
+     *
+     * Read-only — does not mutate any matrix_* tables. The actual
+     * commit still flows through move_user_position() once the
+     * operator confirms.
+     */
+    private function preview_move_position() {
+        // Class file is only required inside is_admin(); we're in
+        // an AJAX request here so it's loaded. Guard defensively
+        // anyway — cheaper than debugging a fatal six months from
+        // now if someone reorganises the loader.
+        if (!class_exists('Matrix_MLM_Admin_Genealogy')) {
+            require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-genealogy.php';
+        }
+
+        $position_id            = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        $new_parent_position_id = isset($_POST['new_parent_position_id']) ? (int) $_POST['new_parent_position_id'] : 0;
+
+        $payload = Matrix_MLM_Admin_Genealogy::build_move_preview(
+            $position_id,
+            $new_parent_position_id
+        );
+        wp_send_json_success($payload);
     }
 
     /**
