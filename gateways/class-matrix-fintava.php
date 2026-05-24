@@ -3545,11 +3545,28 @@ class Matrix_MLM_Fintava {
      * e.g. "LIBERTY HUB INTERNATIONAL LIMITED" — confusing for senders
      * and not what users expect on their own dashboard).
      *
-     * Whitelisted payload fields:
+     * Whitelisted payload fields (KYC-aware DTO, observed live May 2026):
      *   - firstName     (string, required)
      *   - lastName      (string, required)
      *   - email         (string, required)
-     *   - phone         (string, required)
+     *   - phoneNumber   (string, required; Fintava's class-validator
+     *                    rejects anything that doesn't pass libphonenumber's
+     *                    isValidPhoneNumber. We normalize to E.164
+     *                    upstream so a Nigerian local "08012345678"
+     *                    becomes "+2348012345678" before this method
+     *                    sees it — the local form input lets the user
+     *                    type either form.)
+     *   - bvn           (string, required; 11-digit Nigerian Bank
+     *                    Verification Number. Fintava's KYC step
+     *                    binds the partner-bank account name on this
+     *                    field, so without a real BVN the bank-side
+     *                    name resolution falls back to the merchant
+     *                    master account — exactly the failure mode
+     *                    that surfaces wallets named "LIBERTY HUB
+     *                    INTERNATIONAL LIMITED" instead of the user.)
+     *   - dateOfBirth   (string, required; ISO 8601 date YYYY-MM-DD.)
+     *   - address       (string, required; non-empty residential or
+     *                    business address used for KYC.)
      *   - fundingMethod (string, required; we pass 'STATIC_FUND' so the
      *                    customer gets a permanent virtual NUBAN that
      *                    can receive funds at any time — the alternative
@@ -3558,26 +3575,39 @@ class Matrix_MLM_Fintava {
      *                    want for a member-facing wallet)
      *   - merchantReference (string, optional idempotency key)
      *
+     * Field-name history: this endpoint used to accept `phone` (not
+     * `phoneNumber`) and didn't require BVN/DOB/address at all. The
+     * legacy form (render_create_form) was simplified at that time
+     * to drop those PII inputs. Fintava re-tightened the DTO in
+     * early 2026 to require all four fields above; sending the old
+     * `phone`-only payload now produces an HTTP 400 with messages
+     * like "phoneNumber must be a valid phone number" + "bvn should
+     * not be empty" + "dateOfBirth must be a valid ISO 8601 date
+     * string" + "address should not be empty", which silently
+     * cascades into the /virtual-wallet/generate fallback below and
+     * causes every wallet to come back named after the merchant.
+     *
      * Standard Fintava envelope on success:
      *   { status: 200|201,
      *     message: 'successful',
      *     data: {
-     *       userInfo: { id, firstName, lastName, email, phone, ... },
+     *       userInfo: { id, firstName, lastName, email, phoneNumber, ... },
      *       wallet:   { id, virtualAcctNo, virtualAcctName, bank, ... }
      *     } }
      *
-     * On failure (e.g. duplicate email/phone, validation error) returns
-     * a WP_Error with the upstream status + message decorated by
-     * make_request().
+     * On failure (e.g. duplicate email/phone, KYC validation, BVN
+     * mismatch) returns a WP_Error with the upstream status + message
+     * decorated by make_request().
      *
      * @param array $customer_data Required: first_name, last_name, email,
-     *                             phone. Optional: funding_method
-     *                             (default 'STATIC_FUND'), reference.
+     *                             phone, bvn, date_of_birth, address.
+     *                             Optional: funding_method (default
+     *                             'STATIC_FUND'), reference.
      * @return array|WP_Error      The unwrapped `data` object on success
      *                             (i.e. `{ userInfo, wallet, ... }`).
      */
     public function create_customer($customer_data) {
-        $required = ['first_name', 'last_name', 'email', 'phone'];
+        $required = ['first_name', 'last_name', 'email', 'phone', 'bvn', 'date_of_birth', 'address'];
         foreach ($required as $field) {
             if (empty($customer_data[$field])) {
                 return new WP_Error(
@@ -3587,11 +3617,29 @@ class Matrix_MLM_Fintava {
             }
         }
 
+        // Normalize phone to E.164 (+234...). Fintava's class-validator
+        // runs the field through libphonenumber's isValidPhoneNumber and
+        // rejects anything that isn't an internationally-formatted
+        // number. Nigerian local entries like "08012345678" pass our
+        // form but fail Fintava's check, so we coerce here so the
+        // gateway accepts whatever shape the user typed without
+        // pushing the formatting rules into the form layer.
+        $normalized_phone = self::normalize_ng_phone((string) $customer_data['phone']);
+        if ($normalized_phone === '') {
+            return new WP_Error(
+                'invalid_phone',
+                __('Phone number is not a valid Nigerian mobile number.', 'matrix-mlm')
+            );
+        }
+
         $payload = [
             'firstName'     => sanitize_text_field($customer_data['first_name']),
             'lastName'      => sanitize_text_field($customer_data['last_name']),
             'email'         => sanitize_email($customer_data['email']),
-            'phone'         => sanitize_text_field($customer_data['phone']),
+            'phoneNumber'   => $normalized_phone,
+            'bvn'           => preg_replace('/\D/', '', (string) $customer_data['bvn']),
+            'dateOfBirth'   => sanitize_text_field($customer_data['date_of_birth']),
+            'address'       => sanitize_text_field($customer_data['address']),
             'fundingMethod' => sanitize_text_field($customer_data['funding_method'] ?? 'STATIC_FUND'),
         ];
 
@@ -4929,6 +4977,19 @@ class Matrix_MLM_Fintava {
         $last_name = sanitize_text_field($_POST['last_name'] ?? '');
         $email = sanitize_email($_POST['email'] ?? '');
         $phone = sanitize_text_field($_POST['phone'] ?? '');
+        // KYC fields — required by Fintava's /create/customer DTO since
+        // early 2026. Without all three, the call 400s and the gateway
+        // silently falls through to /virtual-wallet/generate, which
+        // produces a working wallet but bound to the merchant master
+        // account (so the bank-side account name resolves to "LIBERTY
+        // HUB INTERNATIONAL LIMITED" instead of the user's name).
+        // Collected from the form on every wallet-creation request
+        // rather than pulled from existing user_meta — KYC information
+        // is sensitive and the form prompt makes the user explicit
+        // consent visible per request.
+        $bvn           = preg_replace('/\D/', '', (string) ($_POST['bvn'] ?? ''));
+        $date_of_birth = sanitize_text_field($_POST['date_of_birth'] ?? '');
+        $address       = sanitize_text_field($_POST['address'] ?? '');
 
         if (empty($first_name) || empty($last_name)) {
             wp_send_json_error(['message' => __('First name and last name are required', 'matrix-mlm')]);
@@ -4940,6 +5001,43 @@ class Matrix_MLM_Fintava {
 
         if (empty($phone)) {
             wp_send_json_error(['message' => __('Phone number is required', 'matrix-mlm')]);
+        }
+
+        // BVN: Fintava's class-validator rejects anything that isn't an
+        // 11-character numeric string. We strip non-digits client-side
+        // already so the only failure shape that hits here is a wrong
+        // length — bail with a specific message so the user can fix
+        // the input rather than getting a generic upstream 400.
+        if (strlen($bvn) !== 11) {
+            wp_send_json_error([
+                'message' => __('BVN must be exactly 11 digits. Your BVN is the number you receive when you dial *565*0# on the phone tied to your bank account.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Date of Birth: Fintava expects ISO 8601 (YYYY-MM-DD). The
+        // form uses <input type="date"> which already serializes to
+        // that format, but be defensive against direct/programmatic
+        // POSTs that submit a different shape (e.g. "12/31/1990").
+        // We also enforce a sane range — Fintava's KYC will reject
+        // future dates and ages that look obviously bogus, but
+        // catching them locally gives a clearer error.
+        $dob_ts = strtotime($date_of_birth);
+        if (empty($date_of_birth) || $dob_ts === false || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_of_birth)) {
+            wp_send_json_error(['message' => __('Please enter a valid date of birth (YYYY-MM-DD).', 'matrix-mlm')]);
+        }
+        $today_ts  = strtotime(date('Y-m-d'));
+        $oldest_ts = strtotime('1900-01-01');
+        if ($dob_ts > $today_ts || $dob_ts < $oldest_ts) {
+            wp_send_json_error(['message' => __('Date of birth is outside the accepted range.', 'matrix-mlm')]);
+        }
+
+        // Address: Fintava's "should not be empty" check is the only
+        // server-side rule we know about, but a 5-character minimum
+        // catches accidental whitespace-only or single-letter inputs
+        // that would pass the empty check but obviously can't be a
+        // real address.
+        if (strlen(trim($address)) < 5) {
+            wp_send_json_error(['message' => __('Please enter your full residential or business address (at least 5 characters).', 'matrix-mlm')]);
         }
 
         $reference = 'MTX-VW-' . $user_id . '-' . time();
@@ -4968,6 +5066,9 @@ class Matrix_MLM_Fintava {
             'last_name'      => $last_name,
             'email'          => $email,
             'phone'          => $phone,
+            'bvn'            => $bvn,
+            'date_of_birth'  => $date_of_birth,
+            'address'        => $address,
             'reference'      => $reference,
             'funding_method' => 'STATIC_FUND',
         ]);
@@ -5102,12 +5203,20 @@ class Matrix_MLM_Fintava {
                 'currency' => $result['currency'],
                 'customer_email' => $email,
                 'customer_phone' => $phone,
-                'bvn' => null,
+                // Persist BVN to the dedicated column. KYC fields that
+                // don't have their own column (date_of_birth, address)
+                // go into the metadata JSON below — they're part of
+                // the audit trail for what we sent to Fintava on this
+                // wallet's creation, so support can reconcile if a
+                // KYC challenge ever comes up.
+                'bvn' => $bvn ?: null,
                 'status' => 'active',
                 'metadata' => json_encode([
-                    'first_name' => $first_name,
-                    'last_name' => $last_name,
-                    'reference' => $reference,
+                    'first_name'    => $first_name,
+                    'last_name'     => $last_name,
+                    'reference'     => $reference,
+                    'date_of_birth' => $date_of_birth,
+                    'address'       => $address,
                 ]),
             ],
             ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s']
@@ -5792,6 +5901,55 @@ class Matrix_MLM_Fintava {
 
     private function generate_reference() {
         return 'MTX-FTV-' . strtoupper(substr(md5(uniqid(mt_rand(), true)), 0, 12)) . '-' . time();
+    }
+
+    /**
+     * Normalize a Nigerian phone number to E.164 (+234...).
+     *
+     * Fintava's /create/customer DTO runs the `phoneNumber` field
+     * through libphonenumber's isValidPhoneNumber check. Nigerian
+     * local entries like "08012345678" or "8012345678" fail that
+     * check even though they're what users actually type into the
+     * form. Coercing here keeps the form input forgiving while
+     * sending exactly what Fintava expects on the wire.
+     *
+     * Accepted inputs (whitespace, dashes, parens stripped first):
+     *   - "08012345678"      (11-digit local with leading 0)
+     *   - "8012345678"       (10-digit local, no leading 0)
+     *   - "2348012345678"    (E.164 without the plus)
+     *   - "+2348012345678"   (E.164, the canonical form)
+     *
+     * Returns the canonical E.164 form, or '' if the input doesn't
+     * resolve to a Nigerian mobile prefix (7, 8, or 9 — landlines
+     * are out of scope; Fintava virtual wallets only support
+     * mobile-line KYC).
+     *
+     * @param string $raw User-supplied phone string.
+     * @return string Canonical "+234..." form or ''.
+     */
+    public static function normalize_ng_phone($raw) {
+        $digits = preg_replace('/\D/', '', (string) $raw);
+        if ($digits === '') {
+            return '';
+        }
+        // Strip the international prefix variants down to the 10-digit
+        // subscriber number (without the leading 0 / 234).
+        if (substr($digits, 0, 3) === '234' && strlen($digits) === 13) {
+            $subscriber = substr($digits, 3);
+        } elseif (substr($digits, 0, 1) === '0' && strlen($digits) === 11) {
+            $subscriber = substr($digits, 1);
+        } elseif (strlen($digits) === 10) {
+            $subscriber = $digits;
+        } else {
+            return '';
+        }
+        // Nigerian mobile prefixes start with 7, 8, or 9. Anything else
+        // (1, 2, 3, etc.) is a landline / non-mobile / malformed entry
+        // and Fintava's KYC will reject it anyway.
+        if (!preg_match('/^[789]\d{9}$/', $subscriber)) {
+            return '';
+        }
+        return '+234' . $subscriber;
     }
 
     /**

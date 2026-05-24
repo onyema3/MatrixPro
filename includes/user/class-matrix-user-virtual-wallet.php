@@ -512,6 +512,10 @@ class Matrix_MLM_User_Virtual_Wallet {
 
         <div class="matrix-form-card">
             <h3><?php _e('Create Fintava Wallet', 'matrix-mlm'); ?></h3>
+            <p style="margin: 0 0 16px; padding: 12px 14px; background: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #f59e0b; border-radius: 6px; font-size: 13px; line-height: 1.5; color: #78350f;">
+                <strong><?php _e('KYC required.', 'matrix-mlm'); ?></strong>
+                <?php _e('Fintava (the bank partner) needs your BVN, date of birth, and home address before they can open a virtual account in your own name. Without these details the account can only be opened under the merchant\'s company name, which is confusing for senders. Your BVN is never used for transactions — only to verify your identity with the bank.', 'matrix-mlm'); ?>
+            </p>
             <form id="matrix-create-virtual-wallet-form" class="matrix-form">
                 <div class="matrix-form-row">
                     <div class="matrix-form-group">
@@ -531,6 +535,23 @@ class Matrix_MLM_User_Virtual_Wallet {
                     <div class="matrix-form-group">
                         <label><?php _e('Phone Number', 'matrix-mlm'); ?> <span style="color:red;">*</span></label>
                         <input type="tel" name="phone" required value="<?php echo esc_attr($meta->phone ?? ''); ?>" placeholder="08012345678">
+                    </div>
+                </div>
+                <div class="matrix-form-row">
+                    <div class="matrix-form-group">
+                        <label><?php _e('Bank Verification Number (BVN)', 'matrix-mlm'); ?> <span style="color:red;">*</span></label>
+                        <input type="text" name="bvn" required pattern="\d{11}" maxlength="11" inputmode="numeric" autocomplete="off" placeholder="11-digit BVN">
+                        <small style="display:block;margin-top:4px;color:#6b7280;font-size:12px;"><?php _e('Dial *565*0# on the phone tied to your bank account to retrieve your BVN.', 'matrix-mlm'); ?></small>
+                    </div>
+                    <div class="matrix-form-group">
+                        <label><?php _e('Date of Birth', 'matrix-mlm'); ?> <span style="color:red;">*</span></label>
+                        <input type="date" name="date_of_birth" required max="<?php echo esc_attr(date('Y-m-d')); ?>">
+                    </div>
+                </div>
+                <div class="matrix-form-row">
+                    <div class="matrix-form-group" style="flex: 1 1 100%;">
+                        <label><?php _e('Residential or Business Address', 'matrix-mlm'); ?> <span style="color:red;">*</span></label>
+                        <input type="text" name="address" required maxlength="255" placeholder="<?php esc_attr_e('e.g. 12 Awolowo Road, Ikoyi, Lagos', 'matrix-mlm'); ?>">
                     </div>
                 </div>
 
@@ -598,7 +619,15 @@ class Matrix_MLM_User_Virtual_Wallet {
                         first_name: form.find('[name="first_name"]').val(),
                         last_name: form.find('[name="last_name"]').val(),
                         email: form.find('[name="email"]').val(),
-                        phone: form.find('[name="phone"]').val()
+                        phone: form.find('[name="phone"]').val(),
+                        // KYC fields — Fintava's /create/customer DTO
+                        // requires all three. The PHP handler validates
+                        // server-side; sending them here is the only
+                        // way the primary path produces a wallet bound
+                        // to the user's name (vs. the merchant master).
+                        bvn: form.find('[name="bvn"]').val(),
+                        date_of_birth: form.find('[name="date_of_birth"]').val(),
+                        address: form.find('[name="address"]').val()
                     },
                     success: function(response) {
                         if (response.success) {
