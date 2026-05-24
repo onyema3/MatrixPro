@@ -73,7 +73,7 @@ class Matrix_MLM_User_Deposits {
             }
         }
 
-        return ['status' => 'pending', 'message' => __('Payment is being processed. Your wallet will be credited once confirmed.', 'matrix-mlm')];
+        return ['status' => 'pending', 'message' => __('Payment confirmation is finalising. Your wallet will be credited in a few seconds — refresh this page to see the update.', 'matrix-mlm')];
     }
 
     /**
@@ -107,7 +107,7 @@ class Matrix_MLM_User_Deposits {
             }
         }
 
-        return ['status' => 'pending', 'message' => __('Payment is being processed. Your wallet will be credited once confirmed.', 'matrix-mlm')];
+        return ['status' => 'pending', 'message' => __('Payment confirmation is finalising. Your wallet will be credited in a few seconds — refresh this page to see the update.', 'matrix-mlm')];
     }
 
     public function render_deposit_form($user_id) {
