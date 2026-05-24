@@ -283,6 +283,9 @@ class Matrix_MLM_Core {
             case 'fetch_subtree':
                 $this->process_fetch_subtree();
                 break;
+            case 'search_genealogy':
+                $this->process_genealogy_search();
+                break;
             case 'submit_ticket':
                 $this->process_ticket();
                 break;
@@ -875,6 +878,157 @@ class Matrix_MLM_Core {
         $html = ob_get_clean();
 
         wp_send_json_success(['html' => $html]);
+    }
+
+    /**
+     * AJAX: search the current viewer's downline for members whose
+     * username, email or display name matches a free-text query.
+     *
+     * Powers the typeahead in the genealogy view's search box. The
+     * request shape is intentionally minimal — `q` and `plan_id` —
+     * because the box only ever runs against the currently-viewed
+     * plan and the only thing the viewer is allowed to do with a
+     * result is jump to it (so we precompute the pivot URL on the
+     * server and ship it down with the row).
+     *
+     * Authorization model:
+     *   - Standard nonce check (already done in the dispatcher).
+     *   - Must be logged in (get_current_user_id > 0). Anonymous
+     *     callers can't have a downline so their search is never
+     *     meaningful.
+     *   - The downline scope itself is enforced inside
+     *     Matrix_MLM_Plan_Engine::search_downline_users(), which
+     *     runs each candidate position through user_can_view_position()
+     *     before letting the row out. That's the same gate the
+     *     ?pivot_user_id=X page render and the fetch_subtree AJAX
+     *     endpoint use, so what comes back from the search will
+     *     always be a valid pivot target — the JS can navigate
+     *     straight to result.pivot_url without re-validating.
+     *
+     * Response shape on success:
+     *     {
+     *       success: true,
+     *       data: {
+     *         query:   "ali",
+     *         results: [
+     *           {
+     *             user_id:      42,
+     *             username:     "alice",
+     *             display_name: "Alice Wonderland",
+     *             email_masked: "a***@example.com",
+     *             level:        3,
+     *             pivot_url:    "https://…/matrix-dashboard/?tab=genealogy&plan_id=…&pivot_user_id=42"
+     *           },
+     *           …
+     *         ]
+     *       }
+     *     }
+     *
+     * The email is *masked* before being returned because the
+     * downline list above contains members the viewer hasn't
+     * necessarily transacted with — they're often just structural
+     * placements via spillover. Showing full email addresses to
+     * upline members would be a privacy regression compared to
+     * the rest of the genealogy view, which only shows usernames.
+     * The masked form is a disambiguator (so two members named
+     * "Alice" can be told apart), not a contact channel.
+     */
+    private function process_genealogy_search() {
+        $current_user_id = get_current_user_id();
+        if ($current_user_id <= 0) {
+            wp_send_json_error(['message' => __('You must be logged in to search.', 'matrix-mlm')]);
+        }
+
+        $query   = isset($_POST['q'])       ? sanitize_text_field(wp_unslash($_POST['q'])) : '';
+        $plan_id = isset($_POST['plan_id']) ? (int) $_POST['plan_id']                       : 0;
+
+        if ($plan_id <= 0) {
+            wp_send_json_error(['message' => __('Plan is required.', 'matrix-mlm')]);
+        }
+
+        // Mirror the engine's own minimum-length contract here so
+        // we return a clean empty payload (rather than an error)
+        // when the user has only typed one character — that lets
+        // the JS render the empty-state hint instead of an error
+        // toast every keystroke.
+        if (mb_strlen($query) < 2) {
+            wp_send_json_success([
+                'query'   => $query,
+                'results' => [],
+            ]);
+        }
+
+        $plan_engine = new Matrix_MLM_Plan_Engine();
+        $matches     = $plan_engine->search_downline_users(
+            $current_user_id,
+            $plan_id,
+            $query,
+            10
+        );
+
+        // Build the pivot URL on the server so the JS doesn't have
+        // to know about pretty-permalink vs query-string
+        // dashboards. Matrix_MLM_User_Dashboard::tab_url() already
+        // makes that decision for the rest of the dashboard, and
+        // routing every pivot URL through it keeps the search
+        // results consistent with the breadcrumb crumb hrefs.
+        $base_url = class_exists('Matrix_MLM_User_Dashboard')
+            ? Matrix_MLM_User_Dashboard::tab_url('genealogy')
+            : home_url('/matrix-dashboard/?tab=genealogy');
+
+        $rows = [];
+        foreach ($matches as $m) {
+            $rows[] = [
+                'user_id'      => (int) $m['user_id'],
+                'username'     => (string) $m['username'],
+                'display_name' => (string) $m['display_name'],
+                'email_masked' => $this->mask_email_for_search((string) $m['email']),
+                'level'        => (int) $m['level'],
+                'pivot_url'    => add_query_arg(
+                    [
+                        'plan_id'       => $plan_id,
+                        'pivot_user_id' => (int) $m['user_id'],
+                    ],
+                    $base_url
+                ),
+            ];
+        }
+
+        wp_send_json_success([
+            'query'   => $query,
+            'results' => $rows,
+        ]);
+    }
+
+    /**
+     * Mask an email address for display in the genealogy search
+     * dropdown.
+     *
+     * Renders alice@example.com as a***@example.com — enough for
+     * the searcher to disambiguate two members with the same
+     * display name but not enough to harvest contact details from
+     * the downline tree. Used only by the search response; full
+     * email addresses are never returned to upline members through
+     * any genealogy-view surface.
+     *
+     * Edge cases that fall through to a generic placeholder:
+     *   - Missing or malformed addresses (no '@'): returns ''.
+     *   - Single-character local part: keeps the visible char and
+     *     replaces the rest of the local with three asterisks
+     *     (e.g. 'a@x.com' -> 'a***@x.com') so the format reads
+     *     consistently in the dropdown.
+     */
+    private function mask_email_for_search($email) {
+        $email = trim((string) $email);
+        if ($email === '' || strpos($email, '@') === false) {
+            return '';
+        }
+        list($local, $domain) = explode('@', $email, 2);
+        if ($local === '') {
+            return '';
+        }
+        $first = mb_substr($local, 0, 1);
+        return $first . '***@' . $domain;
     }
 
     private function process_ticket() {

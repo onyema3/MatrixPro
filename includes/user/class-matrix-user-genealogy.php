@@ -205,6 +205,8 @@ class Matrix_MLM_User_Genealogy {
         <?php $this->render_pivot_breadcrumbs($pivot_breadcrumbs); ?>
         <?php endif; ?>
 
+        <?php $this->render_search_box($selected_plan_id); ?>
+
         <div class="matrix-stats-grid" style="margin-bottom: 20px;">
             <div class="matrix-stat-card primary">
                 <div class="stat-value"><?php echo $display_position->width . 'x' . $display_position->depth; ?></div>
@@ -252,6 +254,7 @@ class Matrix_MLM_User_Genealogy {
         </div>
 
         <?php $this->render_lazy_load_script(); ?>
+        <?php $this->render_search_script($selected_plan_id); ?>
 
         <?php endif; ?>
         <?php
@@ -878,5 +881,546 @@ class Matrix_MLM_User_Genealogy {
             </div>
             <?php
         }
+    }
+
+    /**
+     * Render the search box that sits above the genealogy tree.
+     *
+     * Lets a viewer find a specific downline member by typing their
+     * username, email or display name and either pressing Enter or
+     * clicking a result, which navigates straight to that member's
+     * pivoted view (?pivot_user_id=X). Solves the "I have hundreds
+     * of downline members and need to scroll to find Bob" problem
+     * without bolting on a separate directory page.
+     *
+     * Markup contract (the JS in render_search_script() depends on
+     * these hooks staying stable):
+     *   .matrix-genealogy-search           outer wrapper
+     *     input.matrix-genealogy-search-input          the text field
+     *     button.matrix-genealogy-search-clear         clear-X (hidden when empty)
+     *     ul.matrix-genealogy-search-results           dropdown (hidden by default)
+     *
+     * Plan id is rendered as a data-* attribute on the wrapper
+     * rather than passed via a hidden form field — the value is
+     * already in the URL (?plan_id=…) and the JS just needs a way
+     * to read it without re-parsing window.location every keystroke.
+     *
+     * Renders nothing pivoted-specific: the search is intentionally
+     * always against the *viewer's* downline, not the pivoted root's
+     * downline. That matches what the URL already shows when a
+     * member jumps to a result (?pivot_user_id=X is always set
+     * relative to the viewer's tree), and avoids a confusing edge
+     * case where searching from inside a pivoted view could
+     * surface members the viewer can't authorise without first
+     * un-pivoting.
+     *
+     * Inline CSS lives in the same render method so the markup and
+     * its style are co-located — the existing render_level_badges()
+     * helper above this class uses exactly that pattern. If shared
+     * dashboard styling later absorbs these rules they should move
+     * into matrix-dashboard.css alongside the existing
+     * .matrix-genealogy-* declarations.
+     *
+     * @param int $plan_id Plan whose downline we're scoping the search to.
+     */
+    private function render_search_box($plan_id) {
+        $plan_id = (int) $plan_id;
+        $input_id = 'matrix-genealogy-search-input';
+        ?>
+        <div class="matrix-genealogy-search" data-plan-id="<?php echo esc_attr($plan_id); ?>">
+            <label for="<?php echo esc_attr($input_id); ?>" class="screen-reader-text"><?php
+                esc_html_e('Search your downline', 'matrix-mlm');
+            ?></label>
+            <div class="matrix-genealogy-search-field">
+                <span class="dashicons dashicons-search matrix-genealogy-search-icon" aria-hidden="true"></span>
+                <input
+                    type="search"
+                    id="<?php echo esc_attr($input_id); ?>"
+                    class="matrix-genealogy-search-input"
+                    placeholder="<?php esc_attr_e('Search downline by username or email…', 'matrix-mlm'); ?>"
+                    autocomplete="off"
+                    spellcheck="false"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded="false"
+                    aria-controls="matrix-genealogy-search-results"
+                />
+                <button
+                    type="button"
+                    class="matrix-genealogy-search-clear"
+                    aria-label="<?php esc_attr_e('Clear search', 'matrix-mlm'); ?>"
+                    hidden
+                >
+                    <span class="dashicons dashicons-no-alt" aria-hidden="true"></span>
+                </button>
+            </div>
+            <div class="matrix-genealogy-search-status" role="status" aria-live="polite"></div>
+            <ul
+                id="matrix-genealogy-search-results"
+                class="matrix-genealogy-search-results"
+                role="listbox"
+                hidden
+            ></ul>
+        </div>
+
+        <style>
+        .matrix-genealogy-search {
+            position: relative;
+            margin-bottom: 18px;
+        }
+        .matrix-genealogy-search-field {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        .matrix-genealogy-search-icon {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #9ca3af;
+            font-size: 18px;
+            width: 18px;
+            height: 18px;
+            pointer-events: none;
+        }
+        .matrix-genealogy-search-input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px 38px 10px 38px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            background: #fff;
+            transition: border-color .15s ease, box-shadow .15s ease;
+        }
+        .matrix-genealogy-search-input:focus {
+            outline: none;
+            border-color: #8b5cf6;
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+        }
+        .matrix-genealogy-search-clear {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: 0;
+            padding: 4px;
+            cursor: pointer;
+            color: #6b7280;
+            border-radius: 4px;
+        }
+        .matrix-genealogy-search-clear:hover { color: #111827; background: #f3f4f6; }
+        .matrix-genealogy-search-clear .dashicons { font-size: 18px; width: 18px; height: 18px; }
+
+        .matrix-genealogy-search-status {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 6px;
+            min-height: 16px;
+        }
+        .matrix-genealogy-search-status.is-error { color: #b91c1c; }
+
+        .matrix-genealogy-search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            margin: 4px 0 0;
+            padding: 4px;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            box-shadow: 0 12px 28px -8px rgba(0,0,0,0.14);
+            list-style: none;
+            max-height: 320px;
+            overflow-y: auto;
+            z-index: 20;
+        }
+        .matrix-genealogy-search-result {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            color: inherit;
+            text-decoration: none;
+        }
+        .matrix-genealogy-search-result:hover,
+        .matrix-genealogy-search-result.is-active {
+            background: #f5f3ff;
+            color: #111827;
+        }
+        .matrix-genealogy-search-result-name {
+            font-weight: 600;
+            font-size: 14px;
+            line-height: 1.2;
+        }
+        .matrix-genealogy-search-result-meta {
+            font-size: 12px;
+            color: #6b7280;
+            line-height: 1.2;
+            margin-top: 2px;
+        }
+        .matrix-genealogy-search-result-level {
+            margin-left: auto;
+            flex-shrink: 0;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            color: #6d28d9;
+            background: #ede9fe;
+            padding: 3px 8px;
+            border-radius: 999px;
+        }
+        .matrix-genealogy-search-empty {
+            padding: 10px;
+            font-size: 13px;
+            color: #6b7280;
+            text-align: center;
+        }
+        </style>
+        <?php
+    }
+
+    /**
+     * Inline JS that powers the genealogy search box's typeahead.
+     *
+     * Behaviour:
+     *   - Debounces the input by 250ms so a typing burst maps to a
+     *     single AJAX request, not one per keystroke.
+     *   - Sequences requests with a monotonically increasing token
+     *     so an out-of-order response from a slow earlier query
+     *     can never overwrite a fresher result list. Without this
+     *     guard a user typing "a" -> "al" -> "ali" with variable
+     *     network latency could end up looking at "a"'s results
+     *     under "ali"'s query.
+     *   - Caches the last query's results in memory so backspacing
+     *     and re-typing the same prefix doesn't re-hit the server.
+     *     Cache is cleared on Escape or on Clear so the user can
+     *     force a refresh if the downline changed mid-session.
+     *   - Keyboard nav: ArrowDown/Up move highlight, Enter
+     *     navigates to the highlighted result (or the first if
+     *     none is highlighted), Escape closes the dropdown and
+     *     restores focus to the input.
+     *   - Click outside closes the dropdown but leaves the query
+     *     in the box, so the user can re-open it without retyping.
+     *
+     * Why inline rather than enqueued: identical reasoning to
+     * render_lazy_load_script() above — the dashboard view is
+     * authenticated and uncached, the script is short and
+     * single-purpose, and co-locating it with the markup it
+     * decorates is the existing convention in this class. Moving
+     * it to matrix-public.js would scatter responsibility for
+     * features that only ever run on this one tab.
+     *
+     * @param int $plan_id Plan id baked into the AJAX payload.
+     */
+    private function render_search_script($plan_id) {
+        $plan_id = (int) $plan_id;
+        ?>
+        <script>
+        (function() {
+            var wrapper = document.querySelector('.matrix-genealogy-search');
+            if (!wrapper) return;
+
+            var input    = wrapper.querySelector('.matrix-genealogy-search-input');
+            var clearBtn = wrapper.querySelector('.matrix-genealogy-search-clear');
+            var listEl   = wrapper.querySelector('.matrix-genealogy-search-results');
+            var statusEl = wrapper.querySelector('.matrix-genealogy-search-status');
+            if (!input || !listEl || !statusEl) return;
+
+            var planId    = parseInt(wrapper.getAttribute('data-plan-id'), 10) || 0;
+            var DEBOUNCE  = 250;
+            var MIN_CHARS = 2;
+            // Monotonically increasing request token — see comment
+            // on race-condition handling in the docblock above.
+            var requestSeq      = 0;
+            var lastRenderedSeq = 0;
+            var debounceTimer   = null;
+            // Tiny in-memory cache so re-typing the same prefix
+            // (which is what users actually do — type, see,
+            // backspace, re-type) doesn't hit the server every time.
+            var cache = Object.create(null);
+            var activeIndex = -1;
+            var currentResults = [];
+
+            var STR_NO_RESULTS = '<?php echo esc_js(__('No matches in your downline.', 'matrix-mlm')); ?>';
+            var STR_TYPE_MORE  = '<?php echo esc_js(__('Type at least 2 characters to search.', 'matrix-mlm')); ?>';
+            var STR_SEARCHING  = '<?php echo esc_js(__('Searching…', 'matrix-mlm')); ?>';
+            var STR_ERROR      = '<?php echo esc_js(__('Search failed. Please try again.', 'matrix-mlm')); ?>';
+            var STR_LEVEL      = '<?php echo esc_js(__('L%d', 'matrix-mlm')); ?>';
+
+            function setStatus(msg, isError) {
+                statusEl.textContent = msg || '';
+                if (isError) {
+                    statusEl.classList.add('is-error');
+                } else {
+                    statusEl.classList.remove('is-error');
+                }
+            }
+
+            function setListOpen(open) {
+                if (open) {
+                    listEl.hidden = false;
+                    input.setAttribute('aria-expanded', 'true');
+                } else {
+                    listEl.hidden = true;
+                    input.setAttribute('aria-expanded', 'false');
+                    activeIndex = -1;
+                }
+            }
+
+            function renderResults(results, query) {
+                currentResults = results || [];
+                listEl.innerHTML = '';
+                activeIndex = -1;
+
+                if (!currentResults.length) {
+                    var empty = document.createElement('li');
+                    empty.className = 'matrix-genealogy-search-empty';
+                    empty.textContent = STR_NO_RESULTS;
+                    listEl.appendChild(empty);
+                    setListOpen(true);
+                    return;
+                }
+
+                currentResults.forEach(function(r, i) {
+                    var li = document.createElement('li');
+                    li.setAttribute('role', 'option');
+                    li.setAttribute('id', 'matrix-genealogy-search-result-' + i);
+
+                    var a = document.createElement('a');
+                    a.className = 'matrix-genealogy-search-result';
+                    a.href = r.pivot_url;
+                    a.setAttribute('data-index', String(i));
+
+                    var info = document.createElement('div');
+                    info.style.minWidth = '0';
+                    info.style.flex = '1 1 auto';
+
+                    var nameEl = document.createElement('div');
+                    nameEl.className = 'matrix-genealogy-search-result-name';
+                    // Use the username as the primary label since
+                    // it's the unique identifier members recognise;
+                    // display_name (when distinct) goes in the
+                    // sub-line for disambiguation.
+                    nameEl.textContent = r.username || ('User #' + r.user_id);
+
+                    var metaEl = document.createElement('div');
+                    metaEl.className = 'matrix-genealogy-search-result-meta';
+                    var metaBits = [];
+                    if (r.display_name && r.display_name !== r.username) {
+                        metaBits.push(r.display_name);
+                    }
+                    if (r.email_masked) {
+                        metaBits.push(r.email_masked);
+                    }
+                    metaEl.textContent = metaBits.join(' · ');
+
+                    info.appendChild(nameEl);
+                    if (metaBits.length) info.appendChild(metaEl);
+
+                    var levelEl = document.createElement('span');
+                    levelEl.className = 'matrix-genealogy-search-result-level';
+                    levelEl.textContent = STR_LEVEL.replace('%d', String(r.level));
+
+                    a.appendChild(info);
+                    a.appendChild(levelEl);
+                    li.appendChild(a);
+                    listEl.appendChild(li);
+                });
+
+                setListOpen(true);
+            }
+
+            function highlight(index) {
+                var items = listEl.querySelectorAll('.matrix-genealogy-search-result');
+                if (!items.length) return;
+                if (index < 0) index = items.length - 1;
+                if (index >= items.length) index = 0;
+                items.forEach(function(el, i) {
+                    if (i === index) {
+                        el.classList.add('is-active');
+                        el.scrollIntoView({ block: 'nearest' });
+                    } else {
+                        el.classList.remove('is-active');
+                    }
+                });
+                activeIndex = index;
+                input.setAttribute('aria-activedescendant', 'matrix-genealogy-search-result-' + index);
+            }
+
+            function navigateTo(index) {
+                if (!currentResults.length) return;
+                var target = currentResults[index >= 0 ? index : 0];
+                if (target && target.pivot_url) {
+                    window.location.href = target.pivot_url;
+                }
+            }
+
+            function runSearch(query) {
+                // Cache-hit fast path: skip both the debounce roundtrip
+                // *and* the server hit if we already have results for
+                // this exact query. Cache is keyed by the trimmed
+                // lowercased query so case-only differences share a
+                // slot.
+                var key = query.trim().toLowerCase();
+                if (cache[key]) {
+                    setStatus('');
+                    renderResults(cache[key], query);
+                    return;
+                }
+
+                setStatus(STR_SEARCHING);
+                var seq = ++requestSeq;
+
+                var data = new FormData();
+                data.append('action',        'matrix_mlm_action');
+                data.append('matrix_action', 'search_genealogy');
+                data.append('nonce',         matrixMLM.nonce);
+                data.append('plan_id',       String(planId));
+                data.append('q',             query);
+
+                fetch(matrixMLM.ajaxUrl, {
+                    method:      'POST',
+                    body:        data,
+                    credentials: 'same-origin'
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(j) {
+                    // Drop stale responses — only the latest fired
+                    // request is allowed to update the dropdown.
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
+
+                    if (!j || !j.success) {
+                        setStatus(STR_ERROR, true);
+                        setListOpen(false);
+                        return;
+                    }
+                    var rows = (j.data && j.data.results) || [];
+                    cache[key] = rows;
+                    setStatus('');
+                    renderResults(rows, query);
+                })
+                .catch(function() {
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
+                    setStatus(STR_ERROR, true);
+                    setListOpen(false);
+                });
+            }
+
+            function onInput() {
+                var q = input.value || '';
+                clearBtn.hidden = q.length === 0;
+
+                if (debounceTimer) {
+                    clearTimeout(debounceTimer);
+                    debounceTimer = null;
+                }
+
+                if (q.trim().length === 0) {
+                    setStatus('');
+                    setListOpen(false);
+                    currentResults = [];
+                    return;
+                }
+                if (q.trim().length < MIN_CHARS) {
+                    setStatus(STR_TYPE_MORE);
+                    setListOpen(false);
+                    currentResults = [];
+                    return;
+                }
+
+                debounceTimer = setTimeout(function() {
+                    runSearch(q);
+                }, DEBOUNCE);
+            }
+
+            function clearAll() {
+                input.value = '';
+                clearBtn.hidden = true;
+                setStatus('');
+                setListOpen(false);
+                currentResults = [];
+                // Also nuke the cache so re-typing the same prefix
+                // forces a fresh server query — matches user
+                // intent when they explicitly hit Clear.
+                cache = Object.create(null);
+                input.focus();
+            }
+
+            input.addEventListener('input', onInput);
+            input.addEventListener('focus', function() {
+                if (currentResults.length || (input.value.trim().length >= MIN_CHARS && statusEl.textContent)) {
+                    setListOpen(true);
+                }
+            });
+
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (listEl.hidden) {
+                        // No results to scroll through yet — re-run
+                        // the current query so a focused user
+                        // pressing ArrowDown doesn't get stuck on
+                        // an empty dropdown.
+                        if (input.value.trim().length >= MIN_CHARS) onInput();
+                        return;
+                    }
+                    highlight(activeIndex + 1);
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    if (listEl.hidden) return;
+                    highlight(activeIndex - 1);
+                } else if (e.key === 'Enter') {
+                    if (!listEl.hidden && currentResults.length) {
+                        e.preventDefault();
+                        navigateTo(activeIndex);
+                    }
+                } else if (e.key === 'Escape') {
+                    if (!listEl.hidden) {
+                        e.preventDefault();
+                        setListOpen(false);
+                    } else if (input.value) {
+                        clearAll();
+                    }
+                }
+            });
+
+            clearBtn.addEventListener('click', clearAll);
+
+            // Delegated click handler so we don't have to attach a
+            // listener to every result row at render time.
+            listEl.addEventListener('click', function(e) {
+                var a = e.target.closest('.matrix-genealogy-search-result');
+                if (!a) return;
+                // Let the browser handle modified-click (Ctrl+click,
+                // middle-click) so power users can open a result
+                // in a new tab. Only intercept the plain click to
+                // route through navigateTo() and pick up the
+                // highlighted-row semantics.
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1) return;
+                e.preventDefault();
+                var idx = parseInt(a.getAttribute('data-index'), 10) || 0;
+                navigateTo(idx);
+            });
+
+            // Click-away to close the dropdown but keep the query
+            // text — same affordance the WP admin search dropdown
+            // uses.
+            document.addEventListener('click', function(e) {
+                if (!wrapper.contains(e.target)) {
+                    setListOpen(false);
+                }
+            });
+        })();
+        </script>
+        <?php
     }
 }
