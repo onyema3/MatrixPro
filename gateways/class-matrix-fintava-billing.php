@@ -220,6 +220,18 @@ class Matrix_MLM_Fintava_Billing {
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
 
+        // M4: bound airtime-purchase volume per user. The user's
+        // wallet is debited up-front so spam costs the attacker
+        // money, but a compromised account would otherwise drain at
+        // line speed.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_buy_airtime',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many airtime purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);
         $network = sanitize_text_field($_POST['network'] ?? '');
@@ -266,6 +278,16 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
+
+        // M4: bound bill-purchase volume per user. Same threat model
+        // as ajax_buy_airtime.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_buy_data',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many data purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
 
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
@@ -324,6 +346,15 @@ class Matrix_MLM_Fintava_Billing {
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
 
+        // M4: bound bill-purchase volume per user.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_buy_cable',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many cable purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $smartcard = sanitize_text_field($_POST['smartcard_number'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
         $provider = sanitize_text_field($_POST['provider'] ?? '');
@@ -368,6 +399,18 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         if (!is_user_logged_in()) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
 
+        // M4: meter-number enumeration oracle. /billing/meter/verify
+        // returns customer name + tariff data for a valid meter, so
+        // unbounded calls let an attacker enumerate meter numbers
+        // against a disco. Tighter cap than purchase endpoints.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_verify_meter',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 20, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many meter lookups. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $disco = sanitize_text_field($_POST['disco'] ?? '');
         $meter_type = sanitize_text_field($_POST['meter_type'] ?? 'prepaid');
@@ -386,6 +429,15 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
+
+        // M4: bound bill-purchase volume per user.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_buy_electricity',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many electricity purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
 
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);

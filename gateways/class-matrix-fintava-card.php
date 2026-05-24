@@ -430,6 +430,18 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // M4: bound spam against the upstream /cards/request endpoint.
+        // Generous cap because legitimate retry on a transient failure
+        // is a normal flow, but tight enough to make scripted abuse
+        // pointless.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_request_card',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 10, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many card requests. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         if (!Matrix_MLM_User::is_active($user_id)) {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
         }
@@ -487,6 +499,20 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // M4: PAN brute-force gate. Tight cap (5 / 15m) because the
+        // PAN field is a 16-digit secret an attacker would otherwise
+        // be able to guess against the backend with no friction. A
+        // legitimate user setting up their card needs the cap to be
+        // > 1 (PAN typo + retry is realistic), but should never need
+        // more than a handful of attempts.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_setup_card',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many card setup attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $pan = wp_unslash($_POST['pan'] ?? '');
         $result = $this->setup_card($user_id, $pan);
 
@@ -508,6 +534,17 @@ class Matrix_MLM_Fintava_Card {
         $user_id = get_current_user_id();
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // M4: same PAN brute-force gate as ajax_setup_card. Both
+        // accept a 16-digit PAN and reach the same upstream
+        // /cards/link endpoint, so the threat model is identical.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_link_card',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many card link attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
         $pan = wp_unslash($_POST['pan'] ?? '');
@@ -541,6 +578,15 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // M4: PAN-bearing endpoint. Same cap as setup/link.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_activate_card',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many card activation attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $pan = wp_unslash($_POST['pan'] ?? '');
         $result = $this->activate_card($user_id, $pan);
 
@@ -569,6 +615,15 @@ class Matrix_MLM_Fintava_Card {
         $user_id = get_current_user_id();
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // M4: PAN-bearing endpoint. Same cap as setup/link.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_deactivate_card',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many card deactivation attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
         $pan = wp_unslash($_POST['pan'] ?? '');
