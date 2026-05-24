@@ -472,6 +472,33 @@ class Matrix_MLM_Admin_Users {
                 <p class="description"><?php _e('Reassign this user\'s position in the matrix tree. You can change their tree parent (who they sit under) and/or their sponsor (who referred them).', 'matrix-mlm'); ?></p>
 
                 <?php
+                // Pre-fill the visual editor's "View from user"
+                // field with this user, so the operator lands
+                // straight on this user's branch rather than the
+                // plan root and has to re-find them.
+                $visual_genealogy_url = add_query_arg(
+                    [
+                        'page'         => 'matrix-mlm-genealogy',
+                        'root_user_id' => (int) $user_id,
+                    ],
+                    admin_url('admin.php')
+                );
+                ?>
+                <div class="notice notice-info inline" style="margin:0 0 14px;padding:10px 14px;">
+                    <strong><?php _e('Tip:', 'matrix-mlm'); ?></strong>
+                    <?php
+                    printf(
+                        /* translators: %s: link to the visual genealogy editor */
+                        wp_kses(
+                            __('Prefer dragging? Open the %s to drag this user onto a new parent and see a live preview before committing — no usernames to type.', 'matrix-mlm'),
+                            ['a' => ['href' => [], 'class' => []]]
+                        ),
+                        '<a href="' . esc_url($visual_genealogy_url) . '">' . esc_html__('visual Genealogy editor', 'matrix-mlm') . '</a>'
+                    );
+                    ?>
+                </div>
+
+                <?php
                 // Get positions with parent info
                 $user_positions = $wpdb->get_results($wpdb->prepare(
                     "SELECT p.*, pl.name as plan_name, pl.width, pl.depth,
