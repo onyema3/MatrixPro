@@ -361,6 +361,9 @@ class Matrix_MLM_Core {
             case 'transfer':
                 $this->process_transfer();
                 break;
+            case 'withdraw':
+                $this->process_withdraw();
+                break;
             case 'join_plan':
                 $this->process_join_plan();
                 break;
@@ -771,6 +774,199 @@ class Matrix_MLM_Core {
         Matrix_MLM_Notifications::send_transfer_notification($recipient->ID, $user_id, $amount);
 
         wp_send_json_success(['message' => __('Transfer completed successfully', 'matrix-mlm')]);
+    }
+
+    /**
+     * Process a "Bank Transfers" (manual admin-approved withdrawal)
+     * request from the consolidated Wallet page.
+     *
+     * Distinct from process_transfer (user-to-user, internal) and
+     * Matrix_MLM_Fintava::ajax_initiate_transfer (Fintava virtual
+     * wallet → external bank, instant via /bank/credit). This path
+     * is the operational fallback users take when:
+     *
+     *   - They don't have a Fintava virtual wallet at all.
+     *   - The dedicated Fintava bank-payouts toggle on
+     *     Gateways → Fintava is OFF.
+     *   - The Fintava integration is otherwise unavailable (key
+     *     rotation, gateway outage, environment switch, etc.).
+     *
+     * Mechanics: this handler debits the user's *Matrix* wallet by
+     * (amount + charge), inserts a `pending` row into the existing
+     * wp_matrix_withdrawals table (the same table the admin Manage
+     * Withdrawals page already reads/approves/rejects), and emails
+     * the user a "request submitted" notification. The actual bank
+     * payout is performed out-of-band by the operator who reviews
+     * the row in admin and approves it; an admin Reject re-credits
+     * the wallet via the existing approval workflow.
+     *
+     * Atomicity: same START TRANSACTION / COMMIT / ROLLBACK envelope
+     * as process_transfer above. Either the debit AND the row
+     * insert both succeed and we emit a JSON success; or the whole
+     * thing rolls back and we surface a real error to the user.
+     * Pretending success when nothing actually moved is the bug
+     * class we explicitly defend against — same lesson learned in
+     * process_transfer for user-to-user transfers.
+     */
+    private function process_withdraw() {
+        $user_id = get_current_user_id();
+
+        // Eligibility chain. can_withdraw() bundles every admin
+        // toggle (master kill switch, active-user requirement,
+        // restricted-plan tier) into one place — the bank-payout
+        // and matrix-to-virtual flows use the same helper, so the
+        // three paths stay aligned. The returned reason string is
+        // already localised, round-trip it straight to the JSON
+        // error response.
+        $eligibility = Matrix_MLM_User::can_withdraw($user_id);
+        if (!$eligibility['allowed']) {
+            wp_send_json_error(['message' => $eligibility['reason']]);
+        }
+
+        $amount         = floatval($_POST['amount'] ?? 0);
+        $bank_name      = sanitize_text_field($_POST['bank_name'] ?? '');
+        $account_number = sanitize_text_field($_POST['account_number'] ?? '');
+        $account_name   = sanitize_text_field($_POST['account_name'] ?? '');
+        $narration      = sanitize_text_field($_POST['narration'] ?? '');
+
+        $min     = floatval(get_option('matrix_mlm_min_withdraw', 1000));
+        $max     = floatval(get_option('matrix_mlm_max_withdraw', 1000000));
+        $cur_sym = get_option('matrix_mlm_currency_symbol', '₦');
+
+        if ($amount < $min) {
+            wp_send_json_error(['message' => sprintf(
+                /* translators: %1$s: currency symbol, %2$s: minimum amount */
+                __('Minimum withdrawal amount is %1$s%2$s.', 'matrix-mlm'),
+                $cur_sym, number_format($min, 2)
+            )]);
+        }
+        if ($amount > $max) {
+            wp_send_json_error(['message' => sprintf(
+                /* translators: %1$s: currency symbol, %2$s: maximum amount */
+                __('Maximum withdrawal amount is %1$s%2$s.', 'matrix-mlm'),
+                $cur_sym, number_format($max, 2)
+            )]);
+        }
+        if ($bank_name === '' || $account_name === '') {
+            wp_send_json_error(['message' => __('Bank name and account name are required.', 'matrix-mlm')]);
+        }
+        if (!preg_match('/^\d{10}$/', $account_number)) {
+            wp_send_json_error(['message' => __('Please provide a valid 10-digit account number.', 'matrix-mlm')]);
+        }
+
+        // Charge calculation. Same setting keys the Settings → Financial
+        // tab exposes, so admins manage both this manual flow and any
+        // future automated withdrawal flow from one place. Defaults
+        // (5%, percent) match the activator seed.
+        $charge_type  = get_option('matrix_mlm_withdraw_charge_type', 'percent');
+        $charge_value = floatval(get_option('matrix_mlm_withdraw_charge', 5));
+        $charge       = $charge_type === 'percent' ? ($amount * $charge_value / 100) : $charge_value;
+        $charge       = round($charge, 2);
+        $total        = round($amount + $charge, 2);
+        $net          = $amount; // user receives the requested amount; charge is on top.
+
+        $wallet  = new Matrix_MLM_Wallet();
+        $balance = $wallet->get_balance($user_id);
+        if ($balance < $total) {
+            wp_send_json_error(['message' => sprintf(
+                /* translators: %1$s: total to debit, %2$s: current balance */
+                __('Insufficient Matrix wallet balance. This request would debit %1$s but your balance is %2$s.', 'matrix-mlm'),
+                $cur_sym . number_format($total, 2),
+                $cur_sym . number_format($balance, 2)
+            )]);
+        }
+
+        // Pack the destination details into a single column. The
+        // wp_matrix_withdrawals.account_details column is TEXT and
+        // shared with any other future withdrawal method, so we use a
+        // small structured JSON blob that the admin Manage Withdrawals
+        // page can render verbatim (it currently does esc_html on the
+        // value) and that any later view can decode for richer
+        // formatting without a schema migration.
+        //
+        // The legacy admin page renders this string raw in the
+        // "Account Details" column, so the human-readable form below
+        // doubles as the operator-facing label. We keep the JSON
+        // alongside in a parenthetical so a future structured render
+        // can switch to it without losing the legacy text.
+        $account_label = sprintf(
+            /* translators: 1: bank name, 2: account number, 3: account name */
+            __('%1$s — %2$s (%3$s)', 'matrix-mlm'),
+            $bank_name, $account_number, $account_name
+        );
+        if ($narration !== '') {
+            $account_label .= ' | ' . $narration;
+        }
+
+        $currency_code = get_option('matrix_mlm_currency_code', 'NGN');
+
+        global $wpdb;
+
+        // Same transactional envelope as process_transfer — the debit
+        // and the row insert have to either both succeed or both roll
+        // back, otherwise we'd land in the silent-money-vanish state
+        // (Matrix wallet debited, no withdrawal row, no admin queue
+        // entry, no recoverable audit trail).
+        $wpdb->query('START TRANSACTION');
+
+        $debit_result = $wallet->debit(
+            $user_id,
+            $total,
+            'withdrawal_request',
+            sprintf(
+                /* translators: 1: amount, 2: bank name */
+                __('Bank Transfer request to %2$s for %1$s', 'matrix-mlm'),
+                $cur_sym . number_format($amount, 2),
+                $bank_name
+            )
+        );
+        if ($debit_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] process_withdraw: debit() returned false for user_id=%d total=%s last_error=%s',
+                $user_id, $total, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Could not debit your Matrix wallet. Please refresh and try again, or contact support if the problem persists.', 'matrix-mlm'),
+            ]);
+        }
+
+        $insert_result = $wpdb->insert($wpdb->prefix . 'matrix_withdrawals', [
+            'user_id'         => $user_id,
+            'method'          => 'bank_transfer_manual',
+            'amount'          => $amount,
+            'charge'          => $charge,
+            'net_amount'      => $net,
+            'currency'        => $currency_code,
+            'account_details' => $account_label,
+            'admin_note'      => '',
+            'status'          => 'pending',
+        ]);
+        if ($insert_result === false) {
+            $wpdb->query('ROLLBACK');
+            error_log(sprintf(
+                '[Matrix MLM] process_withdraw: matrix_withdrawals insert failed; user_id=%d amount=%s last_error=%s',
+                $user_id, $amount, $wpdb->last_error
+            ));
+            wp_send_json_error([
+                'message' => __('Could not record the bank transfer request. Your wallet was not debited. Please try again or contact support.', 'matrix-mlm'),
+            ]);
+        }
+
+        $wpdb->query('COMMIT');
+
+        // Email the user a "request received" confirmation. The
+        // 'pending' status is what the existing
+        // send_withdrawal_notification helper expects (it's also
+        // called on approve/reject from the admin side with the
+        // matching status). Send AFTER COMMIT so a transient SMTP
+        // failure can't roll back the money movement; the request
+        // is already real and queued.
+        Matrix_MLM_Notifications::send_withdrawal_notification($user_id, $amount, 'pending');
+
+        wp_send_json_success([
+            'message' => __('Bank transfer request submitted. Your Matrix wallet has been debited; the bank account will be paid out after admin approval.', 'matrix-mlm'),
+        ]);
     }
 
     private function process_join_plan() {

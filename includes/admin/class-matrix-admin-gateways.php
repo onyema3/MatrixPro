@@ -342,6 +342,47 @@ class Matrix_MLM_Admin_Gateways {
                                     <option value="1" <?php selected(get_option('matrix_mlm_fintava_status', 0), 1); ?>><?php _e('Active', 'matrix-mlm'); ?></option>
                                     <option value="0" <?php selected(get_option('matrix_mlm_fintava_status', 0), 0); ?>><?php _e('Inactive', 'matrix-mlm'); ?></option>
                                 </select>
+                                <p class="description"><?php _e('Master switch for the Fintava integration. When inactive, the entire Fintava feature set is disabled — virtual wallet display, Matrix → Virtual transfer, Transfer to Bank, and bills.', 'matrix-mlm'); ?></p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><?php _e('Bank Payouts (Transfer to Bank)', 'matrix-mlm'); ?></th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="fintava_payouts_enabled" value="1" <?php checked((int) get_option('matrix_mlm_fintava_payouts_enabled', 1), 1); ?>>
+                                    <?php _e('Allow users to transfer from their Fintava virtual wallet to external Nigerian bank accounts.', 'matrix-mlm'); ?>
+                                </label>
+                                <p class="description">
+                                    <?php
+                                    /*
+                                     * Dedicated toggle for the "Transfer to Bank" pane on
+                                     * the Wallet page (Fintava virtual wallet → external bank
+                                     * via /bank/credit). Independent from the master Status
+                                     * select above and from the global "Allow users to
+                                     * withdraw funds" toggle on Settings → Financial.
+                                     *
+                                     * When OFF: the Transfer to Bank button + pane disappear
+                                     * from the Wallet page, and Matrix_MLM_Fintava::ajax_initiate_transfer
+                                     * short-circuits with "Bank transfers via Fintava are
+                                     * currently disabled" as a defence-in-depth gate.
+                                     * Other Fintava features (virtual wallet display, Matrix →
+                                     * Virtual transfer, bills, balance refresh) continue to
+                                     * work normally — that's the whole point of having a
+                                     * dedicated toggle instead of using the master Status
+                                     * select for this.
+                                     *
+                                     * When the global Withdrawal Controls master kill switch
+                                     * (matrix_mlm_withdrawals_enabled) is OFF, this gate is
+                                     * effectively redundant — can_withdraw() blocks every
+                                     * money-out path including bank payouts. The reverse is
+                                     * not true: turning Bank Payouts off here leaves the
+                                     * matrix-to-virtual transfer pane usable, so admins can
+                                     * disable just the external cash-out without freezing
+                                     * the rest of the platform.
+                                     */
+                                    _e('Toggle this off to keep the Fintava integration available (virtual wallet, Matrix → Virtual transfer) while blocking only the external bank-transfer pane. The Bank Transfers manual flow (admin-approved) stays available either way, so users who need to cash out can still submit a request.', 'matrix-mlm');
+                                    ?>
+                                </p>
                             </td>
                         </tr>
                     </table>
@@ -829,6 +870,16 @@ class Matrix_MLM_Admin_Gateways {
         // Keep the legacy "_enabled" option in sync so any older code paths
         // that still read it stay aligned with the toggle on this page.
         update_option('matrix_mlm_fintava_enabled', intval($_POST['fintava_status'] ?? 0));
+
+        // Dedicated Bank Payouts (Transfer to Bank) toggle. Stored as 0/1
+        // so checked()/get_option lookups stay aligned with the rest of
+        // the gateway settings. Read the checkbox via isset() — unchecked
+        // checkboxes are NOT submitted by browsers, so $_POST['fintava_payouts_enabled']
+        // is absent (not '0') when the admin clears the box.
+        update_option(
+            'matrix_mlm_fintava_payouts_enabled',
+            isset($_POST['fintava_payouts_enabled']) ? 1 : 0
+        );
 
         // Bust the cached Fintava /banks list so a key/env change takes
         // effect on the very next page load instead of being shadowed by a
