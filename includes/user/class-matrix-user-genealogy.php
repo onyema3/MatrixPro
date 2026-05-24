@@ -3501,7 +3501,16 @@ class Matrix_MLM_User_Genealogy {
             z-index: 9999;
             width: 320px;
             max-width: calc(100vw - 24px);
-            background: #fff;
+            /* Subtle gradient wash on the card body itself —
+               keeps the readable white card surface but tints
+               the bottom edge with the same purple/pink we use
+               on the stripe and field accents. Visible even if
+               every other colour rule is somehow overridden by
+               the host theme, so members can confirm at a
+               glance that the styled card is loading.
+               !important defends against themes that aggressively
+               reset background on dialog / popup containers. */
+            background: linear-gradient(180deg, #ffffff 0%, #ffffff 70%, #faf5ff 100%) !important;
             border: 1px solid #e5e7eb;
             border-radius: 10px;
             box-shadow: 0 18px 36px -10px rgba(99, 102, 241, 0.28),
@@ -3510,24 +3519,30 @@ class Matrix_MLM_User_Genealogy {
             font-size: 13px;
             color: #111827;
             line-height: 1.4;
+            overflow: hidden;
         }
         /* Decorative gradient stripe across the top of the card. Pure
            CSS via ::before so the JS-managed markup contract stays
            untouched. Stripe colours echo the per-field accents below
            (indigo → violet → pink → amber) so the card reads as one
-           coordinated palette rather than four random colours. */
+           coordinated palette rather than four random colours.
+           !important on background defends against themes that
+           force a flat colour onto pseudo-elements via aggressive
+           resets (e.g. Astra, GeneratePress when their "popup
+           hardening" CSS module is on). */
         .matrix-tree-hovercard::before {
-            content: "";
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 4px;
+            content: "" !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            height: 5px !important;
             background: linear-gradient(90deg,
-                #6366f1 0%, #8b5cf6 35%, #ec4899 70%, #f59e0b 100%);
+                #6366f1 0%, #8b5cf6 35%, #ec4899 70%, #f59e0b 100%) !important;
             border-top-left-radius: 10px;
             border-top-right-radius: 10px;
             pointer-events: none;
+            z-index: 1;
         }
         .matrix-tree-hovercard[hidden] { display: none; }
 
@@ -3603,39 +3618,59 @@ class Matrix_MLM_User_Genealogy {
             margin-bottom: 10px;
             padding-right: 22px; /* leave space for the close X */
         }
-        .matrix-tree-hovercard-name {
-            font-size: 15px;
-            font-weight: 700;
-            background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 60%, #db2777 100%);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-            color: #4f46e5; /* fallback for browsers that ignore background-clip:text */
+        /* Member name. Solid bold indigo + !important so a host
+           theme can't reset <strong> back to its body-text colour.
+           We dropped the background-clip:text gradient text trick:
+           too many themes neutralise it (either by overriding
+           color, by setting -webkit-text-fill-color, or by adding
+           a text-shadow that paints over the transparent fill),
+           which on those sites left the name looking unstyled.
+           A solid bold indigo reliably reads as "primary brand
+           colour" everywhere instead. */
+        .matrix-tree-hovercard .matrix-tree-hovercard-name {
+            font-size: 15px !important;
+            font-weight: 700 !important;
+            color: #4f46e5 !important;
+            background: transparent !important;
+            -webkit-text-fill-color: #4f46e5 !important;
         }
-        .matrix-tree-hovercard-username {
-            font-size: 12px;
-            color: #6d28d9;
-            background: #ede9fe;
+        /* Username pill. !important on color/background so themes
+           that style <span> with a global colour reset (common in
+           "minimal" themes) don't strip the purple. */
+        .matrix-tree-hovercard .matrix-tree-hovercard-username {
+            font-size: 12px !important;
+            color: #6d28d9 !important;
+            background: #ede9fe !important;
             border-radius: 999px;
             padding: 2px 8px;
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            align-self: flex-start;
         }
 
-        .matrix-tree-hovercard-fields {
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields {
             display: grid;
             grid-template-columns: 110px 1fr;
             gap: 6px 10px;
             margin: 0 0 10px;
         }
-        .matrix-tree-hovercard-fields dt {
-            font-size: 11px;
-            text-transform: uppercase;
+        /* Per-field label colours + dot. !important on the
+           color and the dot's background because themes that
+           style <dt> globally (most do — `dl dt` reset rules
+           are extremely common) win over our plain selectors
+           on equal specificity due to source order on certain
+           themes that load CSS into the body via late-loading
+           customizer overrides. The parent-prefixed selector
+           already raises specificity above a bare `dt` rule;
+           the !important is the second line of defence. */
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt {
+            font-size: 11px !important;
+            text-transform: uppercase !important;
             letter-spacing: 0.5px;
-            font-weight: 600;
-            color: #6b7280;
-            margin: 0;
+            font-weight: 600 !important;
+            color: #6b7280 !important;
+            margin: 0 !important;
             padding-top: 1px;
-            display: flex;
+            display: flex !important;
             align-items: center;
             gap: 6px;
         }
@@ -3644,25 +3679,25 @@ class Matrix_MLM_User_Genealogy {
            Branch commission) so :nth-of-type is safe — the markup is
            rendered server-side in render_hovercard() in the same
            order on every load. */
-        .matrix-tree-hovercard-fields dt::before {
-            content: "";
-            display: inline-block;
-            width: 6px;
-            height: 6px;
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt::before {
+            content: "" !important;
+            display: inline-block !important;
+            width: 8px !important;
+            height: 8px !important;
             border-radius: 50%;
-            background: #9ca3af;
+            background: #9ca3af !important;
             flex: 0 0 auto;
         }
-        .matrix-tree-hovercard-fields dt:nth-of-type(1) { color: #2563eb; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(1)::before { background: #2563eb; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(2) { color: #db2777; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(2)::before { background: #db2777; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(3) { color: #7c3aed; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(3)::before { background: #7c3aed; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(4) { color: #047857; }
-        .matrix-tree-hovercard-fields dt:nth-of-type(4)::before { background: #047857; }
-        .matrix-tree-hovercard-fields dd {
-            margin: 0;
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(1) { color: #2563eb !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(1)::before { background: #2563eb !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(2) { color: #db2777 !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(2)::before { background: #db2777 !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(3) { color: #7c3aed !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(3)::before { background: #7c3aed !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(4) { color: #047857 !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dt:nth-of-type(4)::before { background: #047857 !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-fields dd {
+            margin: 0 !important;
             font-size: 13px;
             color: #111827;
             word-break: break-word;
@@ -3672,31 +3707,37 @@ class Matrix_MLM_User_Genealogy {
             font-style: normal;
             font-size: 12px;
         }
-        .matrix-tree-hovercard-commission {
-            font-weight: 600;
-            color: #047857; /* same emerald the level-badge "complete" pill uses */
+        .matrix-tree-hovercard .matrix-tree-hovercard-commission {
+            font-weight: 600 !important;
+            color: #047857 !important; /* same emerald the level-badge "complete" pill uses */
         }
-        .matrix-tree-hovercard-commission.is-zero { color: #6b7280; font-weight: 500; }
-        .matrix-tree-hovercard-commission.is-capped { color: #b45309; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-commission.is-zero { color: #6b7280 !important; font-weight: 500 !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-commission.is-capped { color: #b45309 !important; }
 
-        .matrix-tree-hovercard-profile {
-            display: inline-block;
+        /* Profile pill button. Theme override-resistant: every
+           visual property carries !important, including
+           text-decoration (most themes underline links by default
+           and a transparent gradient pill with an underline reads
+           visually broken). */
+        .matrix-tree-hovercard .matrix-tree-hovercard-profile {
+            display: inline-block !important;
             margin-top: 4px;
-            padding: 6px 12px;
-            font-size: 12px;
-            font-weight: 600;
-            color: #fff;
-            text-decoration: none;
-            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%);
-            border-radius: 999px;
+            padding: 6px 12px !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            color: #fff !important;
+            text-decoration: none !important;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%) !important;
+            border: 0 !important;
+            border-radius: 999px !important;
             box-shadow: 0 2px 8px -2px rgba(139, 92, 246, 0.5);
             transition: transform .15s ease, box-shadow .15s ease;
         }
-        .matrix-tree-hovercard-profile[hidden] { display: none; }
-        .matrix-tree-hovercard-profile:hover,
-        .matrix-tree-hovercard-profile:focus-visible {
-            text-decoration: none;
-            color: #fff;
+        .matrix-tree-hovercard .matrix-tree-hovercard-profile[hidden] { display: none !important; }
+        .matrix-tree-hovercard .matrix-tree-hovercard-profile:hover,
+        .matrix-tree-hovercard .matrix-tree-hovercard-profile:focus-visible {
+            text-decoration: none !important;
+            color: #fff !important;
             transform: translateY(-1px);
             box-shadow: 0 4px 14px -2px rgba(139, 92, 246, 0.6);
         }
