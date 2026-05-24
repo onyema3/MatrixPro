@@ -1840,20 +1840,55 @@ class Matrix_MLM_User_Genealogy {
      *                                      already sanitised.
      */
     private function render_d3_view($tree, $display_position, $plan_id, $root_user_id, $initial_depth, $active_view) {
-        // Late-enqueue the D3 vendor + genealogy module by handle.
-        // Both are pre-registered in Matrix_MLM_Core::enqueue_public_assets()
-        // but deliberately not enqueued there — we bind the actual
-        // load to the genealogy render so the 273 KB D3 payload only
-        // ships on pages that actually instantiate this view, not on
-        // every front-end page of the site, AND so the enqueue can't
-        // be silently dropped by a brittle has_shortcode() check
-        // against $post->post_content. Calling wp_enqueue_script
-        // from inside a shortcode is safe because both handles are
-        // footer-loaded — wp_print_footer_scripts fires after
-        // the_content, so anything enqueued during render still
-        // makes it into the output.
-        wp_enqueue_script('matrix-mlm-d3-vendor');
-        wp_enqueue_script('matrix-mlm-genealogy-d3');
+        // Load the D3 vendor + genealogy module. Both are
+        // pre-registered (but not enqueued) in
+        // Matrix_MLM_Core::enqueue_public_assets() so the registry
+        // knows about them; we bind the actual load to this render
+        // so the 273 KB D3 payload only ships on pages that
+        // actually instantiate the view, not on every front-end
+        // page of the site.
+        //
+        // Two paths because the genealogy view can be hosted in
+        // request-lifecycle positions where the obvious
+        // wp_enqueue_script() approach silently fails:
+        //
+        //   1. Stock published Page rendering [matrix_dashboard]:
+        //      shortcode runs during the_content (early), wp_footer
+        //      fires later, footer scripts get printed correctly.
+        //      wp_enqueue_script() is the right call here.
+        //
+        //   2. FSE templates / page-builder blocks / certain caching
+        //      plugins / themes that buffer-and-render shortcodes
+        //      after wp_footer has already fired: by the time we
+        //      get here, wp_print_footer_scripts has already run
+        //      and emptied its queue. Anything we enqueue at that
+        //      point is silently dropped — the user-visible
+        //      symptom is "Interactive view stuck on Loading…"
+        //      because the JS module never loads to either mount
+        //      D3 or fail-over to classic. PR #182 fixed the
+        //      gating issue but didn't fix THIS variant.
+        //
+        // did_action('wp_footer') returns the count of times the
+        // hook has fired — non-zero means we missed the bus and
+        // need to print the script tags inline at this exact
+        // point in the output buffer instead.
+        //
+        // wp_print_scripts(handles) emits the <script> tags
+        // immediately and marks the handles as "done" in the
+        // global $wp_scripts registry, so they won't be
+        // double-printed if a future hook somehow fires
+        // wp_print_footer_scripts again. Both handles are
+        // already registered (with the matrix-mlm-public
+        // dependency baked in), so calling wp_print_scripts
+        // resolves dependencies correctly — jquery + matrix-mlm-public
+        // get pulled in ahead of d3-vendor + genealogy-d3 if they
+        // weren't already on the page.
+        if (did_action('wp_footer')) {
+            wp_print_scripts(['matrix-mlm-d3-vendor', 'matrix-mlm-genealogy-d3']);
+        } else {
+            wp_enqueue_script('matrix-mlm-d3-vendor');
+            wp_enqueue_script('matrix-mlm-genealogy-d3');
+        }
 
         // Build the URL the toggle button will navigate to. Keep all
         // existing query params (plan_id, pivot_user_id, mode,
