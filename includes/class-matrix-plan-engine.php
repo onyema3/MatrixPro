@@ -1488,6 +1488,198 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Per-position commission attribution for the genealogy "income
+     * map" overlay. Same recipient/trigger semantics as
+     * sum_branch_commissions_for_viewer() but instead of collapsing
+     * the branch into a single number, this returns a map keyed by
+     * from_user_id so the D3 view can paint a per-node badge showing
+     * exactly how much money each downline member triggered for the
+     * viewer.
+     *
+     * Strategy mirrors sum_branch_commissions_for_viewer() so the two
+     * helpers stay in lockstep on edge cases (capping, root inclusion,
+     * status filter):
+     *
+     *   1. BFS from $branch_root_position_id within $plan_id to
+     *      collect every descendant's user_id. Root included — if
+     *      the branch head themself triggered a referral bonus to
+     *      the viewer, it belongs on their card too.
+     *   2. ONE GROUP BY query against matrix_commissions filtered by
+     *      user_id = $viewer AND status = 'paid' AND from_user_id IN
+     *      (...). One round-trip regardless of branch size, which is
+     *      the whole point of doing this server-side rather than
+     *      asking the client to fan out one query per node.
+     *
+     * Authorization is the caller's job (see the parallel docblock
+     * on sum_branch_commissions_for_viewer for why). The AJAX
+     * endpoint that exposes this gates with user_can_view_position
+     * before calling in.
+     *
+     * Empty-amount entries are intentionally NOT included in the
+     * returned map — a downline member with zero attributed
+     * commission is the absence of a key, not a key with a zero
+     * value. Saves bytes on the wire (most members in any sizeable
+     * downline contribute zero, so a sparse map is meaningfully
+     * smaller) and lets the client decide rendering policy
+     * (currently: no badge for non-contributors, which makes the
+     * income map "read" — your eye finds the green pills naturally).
+     *
+     * @param int $viewer_user_id           WP user id of the recipient.
+     * @param int $branch_root_position_id  matrix_positions.id at top of branch.
+     * @param int $plan_id                  Plan id (sanity filter).
+     * @param int $hard_cap                 Max descendants to walk (incl. root).
+     * @return array{
+     *     attribution: array<int, array{amount:float, count:int}>,
+     *     total: array{amount:float, count:int, members:int},
+     *     capped: bool,
+     *     descendants: int
+     * }
+     */
+    public function get_per_user_commission_attribution($viewer_user_id, $branch_root_position_id, $plan_id, $hard_cap = 5000) {
+        global $wpdb;
+
+        $viewer_user_id          = (int) $viewer_user_id;
+        $branch_root_position_id = (int) $branch_root_position_id;
+        $plan_id                 = (int) $plan_id;
+        $hard_cap                = max(1, (int) $hard_cap);
+
+        $empty_result = [
+            'attribution' => [],
+            'total'       => ['amount' => 0.0, 'count' => 0, 'members' => 0],
+            'capped'      => false,
+            'descendants' => 0,
+        ];
+        if ($viewer_user_id <= 0 || $branch_root_position_id <= 0 || $plan_id <= 0) {
+            return $empty_result;
+        }
+
+        // Seed BFS with the branch root's user (see
+        // sum_branch_commissions_for_viewer for why the root is
+        // included rather than skipped).
+        $root_user_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT user_id FROM {$wpdb->prefix}matrix_positions
+              WHERE id = %d AND plan_id = %d",
+            $branch_root_position_id, $plan_id
+        ));
+        if ($root_user_id <= 0) {
+            return $empty_result;
+        }
+
+        $user_ids = [$root_user_id];
+        $frontier = [$branch_root_position_id];
+        $capped   = false;
+
+        while (!empty($frontier)) {
+            if (count($user_ids) >= $hard_cap) {
+                $capped = true;
+                break;
+            }
+
+            // %d-only IN clause: every value in $frontier comes from
+            // matrix_positions.id which we cast to int below — safe
+            // to interpolate after intval-ing each element. Same
+            // pattern sum_branch_commissions_for_viewer uses.
+            $placeholders = implode(',', array_fill(0, count($frontier), '%d'));
+            $params       = array_map('intval', $frontier);
+            $params[]     = $plan_id;
+
+            $children = $wpdb->get_results($wpdb->prepare(
+                "SELECT id, user_id
+                   FROM {$wpdb->prefix}matrix_positions
+                  WHERE parent_id IN ($placeholders)
+                    AND plan_id = %d
+                    AND status = 'active'",
+                $params
+            ));
+
+            if (empty($children)) {
+                break;
+            }
+
+            $next_frontier = [];
+            foreach ($children as $child) {
+                $user_ids[]      = (int) $child->user_id;
+                $next_frontier[] = (int) $child->id;
+                if (count($user_ids) >= $hard_cap) {
+                    $capped = true;
+                    break 2;
+                }
+            }
+            $frontier = $next_frontier;
+        }
+
+        // De-dupe and bound the IN list (see parent helper for the
+        // multi-position-same-member edge case this handles).
+        $user_ids = array_values(array_unique($user_ids));
+        if ($capped) {
+            $user_ids = array_slice($user_ids, 0, $hard_cap);
+        }
+        if (empty($user_ids)) {
+            return $empty_result;
+        }
+
+        // Single GROUP BY round-trip. matrix_commissions has KEY
+        // user_id and KEY from_user_id, so the planner can satisfy
+        // (user_id = X AND from_user_id IN (...)) using either index
+        // depending on selectivity — both are cheap. Sum_branch uses
+        // a flat SUM here; we group instead so the per-node payload
+        // is one row per contributor.
+        $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+        $params       = array_map('intval', $user_ids);
+        array_unshift($params, $viewer_user_id);
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT from_user_id, COUNT(*) AS cnt, SUM(amount) AS total
+               FROM {$wpdb->prefix}matrix_commissions
+              WHERE user_id = %d
+                AND status = 'paid'
+                AND from_user_id IN ($placeholders)
+              GROUP BY from_user_id",
+            $params
+        ));
+
+        $attribution   = [];
+        $total_amount  = 0.0;
+        $total_count   = 0;
+        if (!empty($rows)) {
+            foreach ($rows as $row) {
+                $uid = (int) $row->from_user_id;
+                if ($uid <= 0) {
+                    continue;
+                }
+                $amount = (float) $row->total;
+                $count  = (int) $row->cnt;
+                // GROUP BY shouldn't yield a zero-sum row in
+                // practice (all amounts in matrix_commissions are
+                // positive by schema), but guard anyway — a future
+                // adjustment row with a negative amount could net
+                // to zero and we'd want to drop it from the
+                // sparse map.
+                if ($amount <= 0) {
+                    continue;
+                }
+                $attribution[$uid] = [
+                    'amount' => $amount,
+                    'count'  => $count,
+                ];
+                $total_amount += $amount;
+                $total_count  += $count;
+            }
+        }
+
+        return [
+            'attribution' => $attribution,
+            'total'       => [
+                'amount'  => $total_amount,
+                'count'   => $total_count,
+                'members' => count($attribution),
+            ],
+            'capped'      => $capped,
+            'descendants' => count($user_ids),
+        ];
+    }
+
+    /**
      * Pick the most-actionable incomplete level for a member's matrix
      * and pair it with the per-slot commission so the genealogy
      * "next goal" banner can quote a concrete earnings number.
