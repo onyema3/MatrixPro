@@ -130,6 +130,15 @@ if (is_admin()) {
     // subtrees. Read-only, no schema changes; sits next to the
     // per-user Genealogy editor on the admin menu.
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-genealogy-analytics.php';
+    // Admin Bill Payments History (Item D). Surfaces the
+    // matrix_billing_transactions table with filters + per-row
+    // manual refund. Loaded inside is_admin() because the page
+    // and the wp_ajax_matrix_admin_billing_refund handler are
+    // both admin-context only — admin-ajax.php has is_admin()
+    // === true, so the init() call below registers the AJAX
+    // hook before WordPress dispatches the request.
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-billing-history.php';
+    Matrix_MLM_Admin_Billing_History::init();
 }
 
 // User Dashboard
