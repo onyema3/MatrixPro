@@ -152,6 +152,85 @@
     align-items: center;
     gap: 12px;
     margin: 16px 0;
+    flex-wrap: wrap;
+}
+
+/* M2: inline reauth form for 2FA enable/disable/regen. */
+.matrix-2fa-form {
+    margin-top: 16px;
+    padding: 20px;
+    border: 1px solid var(--matrix-border, #e5e7eb);
+    border-radius: 8px;
+    background: var(--matrix-bg-soft, #f9fafb);
+    max-width: 480px;
+}
+
+.matrix-2fa-form .matrix-form-row {
+    margin-bottom: 14px;
+}
+
+.matrix-2fa-form .matrix-form-row label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 6px;
+    font-size: 14px;
+}
+
+.matrix-2fa-form .matrix-form-row input[type="password"],
+.matrix-2fa-form .matrix-form-row input[type="text"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--matrix-border, #d1d5db);
+    border-radius: 6px;
+    font-size: 14px;
+}
+
+.matrix-2fa-form .matrix-form-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.matrix-2fa-help {
+    color: var(--matrix-text-soft, #6b7280);
+    font-size: 13px;
+    margin: 0 0 12px;
+}
+
+.matrix-2fa-recovery-status {
+    margin: 12px 0;
+    padding: 10px 14px;
+    border-left: 3px solid var(--matrix-warning, #f59e0b);
+    background: rgba(245, 158, 11, 0.08);
+    font-size: 14px;
+}
+
+.matrix-2fa-recovery-block {
+    margin-top: 24px;
+    padding: 16px 20px;
+    border: 1px dashed var(--matrix-border, #d1d5db);
+    border-radius: 8px;
+    background: #fff;
+}
+
+.matrix-2fa-codes {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 16px;
+}
+
+.matrix-2fa-codes li code {
+    display: inline-block;
+    padding: 6px 10px;
+    background: #f3f4f6;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    user-select: all;
 }
 
 /* Plans in dashboard */

@@ -401,6 +401,12 @@ class Matrix_MLM_Core {
             case 'enable_2fa':
                 $this->process_enable_2fa();
                 break;
+            case 'disable_2fa':
+                $this->process_disable_2fa();
+                break;
+            case 'regenerate_recovery_codes':
+                $this->process_regenerate_recovery_codes();
+                break;
             case 'pay_subscription':
                 $this->process_pay_subscription();
                 break;
@@ -582,11 +588,31 @@ class Matrix_MLM_Core {
         $user_id = intval($payload['user_id']);
         $username = isset($payload['username']) ? (string) $payload['username'] : '';
         $ip = isset($payload['ip']) ? (string) $payload['ip'] : $this->get_client_ip();
-        $code = preg_replace('/\D/', '', (string) ($_POST['code'] ?? ''));
-        if (strlen($code) < 6) {
+
+        // Two acceptable input shapes:
+        //   - A 6-digit numeric TOTP code from the authenticator app.
+        //   - A recovery code (alphanumeric, dash optional, ~10 chars
+        //     after normalisation). Audit M2 shipped recovery codes
+        //     into Matrix_MLM_Two_Factor::verify, but the original
+        //     digits-only filter here would have stripped a recovery
+        //     code to either an empty string (mostly-letters) or a
+        //     truncated digit substring (mixed) before verify() ever
+        //     saw it — making the recovery path unreachable at the
+        //     login step it was designed for.
+        //
+        // Normalise to uppercase A–Z + 0–9, accept lengths from 6
+        // (TOTP) up to 20 (defence-in-depth headroom over the 10-char
+        // recovery format). verify() does its own format-aware match,
+        // so the only job here is to refuse trivially-short or
+        // empty input and to score wrong codes into the brute-force
+        // counters.
+        $raw_code = isset($_POST['code']) ? (string) $_POST['code'] : '';
+        $code = strtoupper($raw_code);
+        $code = preg_replace('/[^A-Z0-9]/', '', $code);
+        if (strlen($code) < 6 || strlen($code) > 20) {
             $this->record_failed_login_attempt($username, $ip, '2fa_short_code');
             wp_send_json_error([
-                'message' => __('Please enter a 6-digit code.', 'matrix-mlm'),
+                'message' => __('Enter the 6-digit code from your authenticator app, or one of your recovery codes.', 'matrix-mlm'),
                 'restart' => true,
             ]);
         }
@@ -2466,11 +2492,256 @@ class Matrix_MLM_Core {
         ]);
     }
 
+    /**
+     * Enable 2FA for the current user.
+     *
+     * Hardened per audit M2:
+     *
+     *   1. Require a fresh password reauth. A logged-in session alone
+     *      is not enough — without this, an attacker who hijacked a
+     *      session (XSS on a non-MatrixPro plugin, stolen auth cookie
+     *      on a shared device, browser-extension token theft) could
+     *      silently rotate the user's authenticator to a device they
+     *      control, locking the legitimate user out of their own
+     *      second factor.
+     *
+     *   2. Reject re-enrolment when 2FA is already enabled. The
+     *      caller must disable first (which itself requires a
+     *      current OTP or recovery code), so a hijacked session can
+     *      never overwrite an existing authenticator without also
+     *      possessing the second factor.
+     *
+     *   3. Return one-time recovery codes alongside the QR/secret so
+     *      a user who later loses their device has a self-service
+     *      recovery path, instead of depending on admin
+     *      intervention. The codes are displayed exactly once; the
+     *      DB stores only password_hash() digests.
+     */
     private function process_enable_2fa() {
         $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        // Rate-limit before any bcrypt work. Without this, a stolen
+        // session can spam the endpoint to drain wp_check_password
+        // cycles. 5 attempts per 15-min is plenty for a real user
+        // typo'ing their password a few times; brute-force loops are
+        // bounded the same way the login surface is.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            '2fa_enable',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
         $two_factor = new Matrix_MLM_Two_Factor();
+
+        // Block silent rotation. The disable path is the only way to
+        // reach a state where this branch falls through, and that path
+        // already requires a current OTP / recovery code.
+        if ($two_factor->is_enabled($user_id)) {
+            wp_send_json_error([
+                'message' => __('Two-factor authentication is already enabled. Disable it first if you want to re-enrol.', 'matrix-mlm'),
+                'already_enabled' => true,
+            ]);
+        }
+
+        $this->require_password_reauth($user_id);
+
+        // Successful reauth — clear the throttle so a real user who
+        // typo'd their password a few times isn't penalised on the
+        // good attempt that followed.
+        Matrix_MLM_Rate_Limiter::reset(
+            '2fa_enable',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
         $result = $two_factor->enable($user_id);
         wp_send_json_success($result);
+    }
+
+    /**
+     * Disable 2FA for the current user.
+     *
+     * Two gates: a fresh password reauth, and proof the caller still
+     * controls the second factor (a current TOTP code OR an unused
+     * recovery code). The second gate is what makes the disable path
+     * safe to publish — without it, a hijacked session could disable
+     * 2FA in one click and re-enable it pointed at the attacker's
+     * device.
+     *
+     * Wires up the front-end button that has been calling
+     * 'matrix_action: disable_2fa' since at least the public.js
+     * baseline; before this PR the dispatcher had no case for it and
+     * every disable click silently failed with 'Invalid action'.
+     */
+    private function process_disable_2fa() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        // Rate-limit BEFORE any state probe or bcrypt work. This is
+        // the most sensitive of the three new endpoints because it
+        // accepts a 6-digit OTP from an attacker who already has the
+        // password — exactly the threat model 2FA exists for. Login
+        // is bounded at 10/user/15-min, so an unbounded disable
+        // endpoint would be the asymmetric way around that gate.
+        // Five attempts per 15-min is the same shape used by the
+        // bank/PAN handlers and gives the OTP space ~3 days to
+        // brute-force at the cap, which is well below the practical
+        // detection window on any operator with any monitoring.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            '2fa_disable',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Password reauth comes BEFORE the is_enabled() probe so a
+        // session-only attacker cannot use this endpoint to learn
+        // whether 2FA is currently on for the account they hijacked.
+        // Without this ordering, the early-return on the
+        // already-disabled branch would answer that question without
+        // requiring a password.
+        $this->require_password_reauth($user_id);
+
+        $two_factor = new Matrix_MLM_Two_Factor();
+        if (!$two_factor->is_enabled($user_id)) {
+            // Idempotent — disable on an already-disabled account is
+            // a no-op success rather than an error so the UI doesn't
+            // surface a confusing message after a quick double-click.
+            // Reset the throttle on this path too: a successful
+            // password reauth has happened.
+            Matrix_MLM_Rate_Limiter::reset(
+                '2fa_disable',
+                Matrix_MLM_Rate_Limiter::key_for_request()
+            );
+            wp_send_json_success([
+                'message' => __('Two-factor authentication is already disabled.', 'matrix-mlm'),
+            ]);
+        }
+
+        // The caller submits whichever they have available — a
+        // current 6-digit OTP from their authenticator, or an unused
+        // recovery code. verify() accepts both and consumes the
+        // recovery code if that's what matched.
+        $code = isset($_POST['code']) ? (string) $_POST['code'] : '';
+        if ($code === '') {
+            wp_send_json_error([
+                'message' => __('Enter your current 2FA code or a recovery code to confirm.', 'matrix-mlm'),
+            ]);
+        }
+        if (!$two_factor->verify($user_id, $code)) {
+            wp_send_json_error([
+                'message' => __('Invalid 2FA code.', 'matrix-mlm'),
+            ]);
+        }
+
+        $two_factor->disable($user_id);
+        Matrix_MLM_Rate_Limiter::reset(
+            '2fa_disable',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+        wp_send_json_success([
+            'message' => __('Two-factor authentication has been disabled.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Regenerate the user's recovery codes.
+     *
+     * Used when the user has burned through (or lost) their original
+     * codes and wants a fresh batch. Replaces the entire previous
+     * batch — partial-list regeneration is not a pattern any
+     * reference implementation supports and would be confusing.
+     *
+     * Gated on password reauth + 2FA being currently enabled. The
+     * user is not asked for a current OTP because they may already
+     * be in the "lost device" path that prompted the regeneration in
+     * the first place; the password reauth is the integrity gate.
+     */
+    private function process_regenerate_recovery_codes() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            '2fa_regen_recovery',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Reauth before probing 2FA state, same reasoning as
+        // process_disable_2fa — don't make this endpoint a 2FA-state
+        // oracle for an attacker who only has the session.
+        $this->require_password_reauth($user_id);
+
+        $two_factor = new Matrix_MLM_Two_Factor();
+        if (!$two_factor->is_enabled($user_id)) {
+            wp_send_json_error([
+                'message' => __('Two-factor authentication is not enabled on this account.', 'matrix-mlm'),
+            ]);
+        }
+
+        Matrix_MLM_Rate_Limiter::reset(
+            '2fa_regen_recovery',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
+        $codes = $two_factor->regenerate_recovery_codes($user_id);
+        wp_send_json_success([
+            'recovery_codes' => $codes,
+            'message' => __('New recovery codes generated. Save them now — they are shown only once.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Verify the current user's password against a `current_password`
+     * POST field, or terminate the AJAX response with an error.
+     *
+     * Shared gate for sensitive self-service flows (2FA enrol /
+     * disable / recovery-code regeneration). Deliberately a hard
+     * wp_send_json_error so callers can rely on it as a guard
+     * statement, the same way require_admin() works in the import
+     * module.
+     *
+     * Uses wp_check_password rather than wp_authenticate so we don't
+     * accidentally trigger any of the wp_authenticate filters that
+     * could log a "failed login" (these flows aren't logins; the
+     * user is already authenticated and we're just reverifying
+     * their possession of the password).
+     */
+    private function require_password_reauth($user_id) {
+        $current_password = isset($_POST['current_password']) ? (string) $_POST['current_password'] : '';
+        if ($current_password === '') {
+            wp_send_json_error([
+                'message' => __('Enter your current password to continue.', 'matrix-mlm'),
+                'reauth_required' => true,
+            ]);
+        }
+        $user = get_userdata($user_id);
+        if (!$user) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+        if (!wp_check_password($current_password, $user->user_pass, $user_id)) {
+            wp_send_json_error([
+                'message' => __('Password is incorrect.', 'matrix-mlm'),
+                'reauth_required' => true,
+            ]);
+        }
     }
 
     private function process_pay_subscription() {

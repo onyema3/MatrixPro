@@ -335,29 +335,160 @@
         });
     };
 
-    // 2FA functions
-    window.matrixEnable2FA = function() {
-        matrixAjax({
-            action: 'matrix_mlm_action',
-            matrix_action: 'enable_2fa'
-        }, function(data) {
-            $('#matrix-2fa-setup').show();
-            $('#matrix-2fa-qr').attr('src', data.qr_url);
-            $('#matrix-2fa-secret').text(data.secret);
-            showNotification(data.message, 'success');
-        });
+    // 2FA functions.
+    //
+    // Audit M2: enable / disable / regenerate-recovery-codes all go
+    // through the same inline reauth form, which captures a
+    // current-password (and an OTP or recovery code on the disable
+    // path) before submitting. The dashboard template renders the
+    // form hidden — these helpers swap the visible inputs and wire
+    // the submit button to the right action.
+    //
+    // matrixToggle2FAForm(mode) where mode is 'enable' | 'disable' | 'regen'.
+    var matrix2FAState = { mode: null };
+
+    window.matrixToggle2FAForm = function(mode) {
+        matrix2FAState.mode = mode;
+        var $form    = $('#matrix-2fa-form');
+        var $title   = $('#matrix-2fa-form-title');
+        var $help    = $('#matrix-2fa-form-help');
+        var $codeRow = $('#matrix-2fa-code-row');
+        var $submit  = $('#matrix-2fa-submit');
+
+        // Reset inputs every time so a previous half-finished attempt
+        // doesn't leak into the next one.
+        $('#matrix-2fa-password').val('');
+        $('#matrix-2fa-code').val('');
+
+        if (mode === 'enable') {
+            $title.text('Enable two-factor authentication');
+            $help.text('Confirm your password to start enrolment.');
+            $codeRow.hide();
+            $submit.text('Continue');
+        } else if (mode === 'disable') {
+            $title.text('Disable two-factor authentication');
+            $help.text('Confirm your password and a current authenticator code (or one of your recovery codes).');
+            $codeRow.show();
+            $submit.text('Disable 2FA');
+        } else if (mode === 'regen') {
+            $title.text('Regenerate recovery codes');
+            $help.text('Confirm your password. Your previous recovery codes will stop working immediately.');
+            $codeRow.hide();
+            $submit.text('Generate new codes');
+        }
+
+        // Hide any previously-rendered post-enrolment block — the user
+        // should never see old codes when starting a new flow.
+        $('#matrix-2fa-setup').hide();
+
+        $form.show();
+        $('#matrix-2fa-password').trigger('focus');
     };
 
-    window.matrixDisable2FA = function() {
-        if (!confirm('Are you sure you want to disable 2FA?')) return;
-        matrixAjax({
-            action: 'matrix_mlm_action',
-            matrix_action: 'disable_2fa'
-        }, function() {
-            showNotification('2FA disabled successfully', 'success');
-            setTimeout(function() { matrixMLMReload(); }, 1500);
-        });
+    window.matrixCancel2FAForm = function() {
+        matrix2FAState.mode = null;
+        $('#matrix-2fa-form').hide();
+        $('#matrix-2fa-password').val('');
+        $('#matrix-2fa-code').val('');
     };
+
+    // Wire the single submit button — it dispatches based on state.
+    $(document).on('click', '#matrix-2fa-submit', function(e) {
+        e.preventDefault();
+        var password = $('#matrix-2fa-password').val();
+        var code     = $('#matrix-2fa-code').val();
+
+        if (!password) {
+            showNotification('Enter your current password.', 'error');
+            return;
+        }
+
+        var mode = matrix2FAState.mode;
+        if (mode === 'enable') {
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'enable_2fa',
+                current_password: password
+            }, function(data) {
+                $('#matrix-2fa-form').hide();
+                $('#matrix-2fa-setup').show();
+                $('#matrix-2fa-setup-qr-block').show();
+                $('#matrix-2fa-qr').attr('src', data.qr_url);
+                $('#matrix-2fa-secret').text(data.secret);
+                renderRecoveryCodes(data.recovery_codes);
+                showNotification(data.message, 'success');
+            });
+        } else if (mode === 'disable') {
+            if (!code) {
+                showNotification('Enter a current authenticator code or a recovery code.', 'error');
+                return;
+            }
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'disable_2fa',
+                current_password: password,
+                code: code
+            }, function(data) {
+                showNotification(data.message || '2FA disabled.', 'success');
+                setTimeout(function() { matrixMLMReload(); }, 1200);
+            });
+        } else if (mode === 'regen') {
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'regenerate_recovery_codes',
+                current_password: password
+            }, function(data) {
+                $('#matrix-2fa-form').hide();
+                // Same display surface as enrol but without the QR
+                // block — only the codes are new.
+                $('#matrix-2fa-setup').show();
+                $('#matrix-2fa-setup-qr-block').hide();
+                renderRecoveryCodes(data.recovery_codes);
+                showNotification(data.message, 'success');
+            });
+        }
+    });
+
+    function renderRecoveryCodes(codes) {
+        var $list = $('#matrix-2fa-recovery-codes');
+        $list.empty();
+        if (!Array.isArray(codes)) return;
+        codes.forEach(function(code) {
+            $list.append($('<li>').append($('<code>').text(code)));
+        });
+    }
+
+    window.matrixCopyRecoveryCodes = function() {
+        var codes = $('#matrix-2fa-recovery-codes code').map(function() {
+            return $(this).text();
+        }).get().join('\n');
+        if (!codes) return;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(codes).then(function() {
+                showNotification('Recovery codes copied to clipboard.', 'success');
+            }, function() {
+                showNotification('Could not copy automatically — please select and copy manually.', 'error');
+            });
+        } else {
+            showNotification('Clipboard not available — please select and copy manually.', 'info');
+        }
+    };
+
+    window.matrixDismissRecoveryCodes = function() {
+        if (!confirm('Have you stored your recovery codes somewhere safe? They will not be shown again.')) {
+            return;
+        }
+        // Reload so the dashboard reflects the new "remaining: N"
+        // counter and the re-enrolment buttons.
+        matrixMLMReload();
+    };
+
+    // Legacy aliases — older inline onclick handlers from cached
+    // dashboard pages may still call these names; route them through
+    // the new flow instead of letting them post empty (and now-rejected)
+    // requests against the hardened endpoints.
+    window.matrixEnable2FA  = function() { matrixToggle2FAForm('enable'); };
+    window.matrixDisable2FA = function() { matrixToggle2FAForm('disable'); };
 
     // Notification styles
     $('<style>')
