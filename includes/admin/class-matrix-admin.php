@@ -1500,8 +1500,15 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('User ID required', 'matrix-mlm')]);
         }
 
+        // Pull card_id (= Fintava cardMapId) alongside id/status so we can
+        // run a best-effort Fintava-side preflight before mutating the
+        // local row. The reset is purely local — the cardMapId on
+        // Fintava is preserved — so this snapshot is diagnostic only:
+        // it confirms (or disputes) the desync hypothesis the admin is
+        // acting on, and gives support a postmortem record of what the
+        // card actually looked like on Fintava when the reset ran.
         $card = $wpdb->get_row($wpdb->prepare(
-            "SELECT id, status FROM {$wpdb->prefix}matrix_fintava_cards WHERE user_id = %d ORDER BY id DESC LIMIT 1",
+            "SELECT id, status, card_id FROM {$wpdb->prefix}matrix_fintava_cards WHERE user_id = %d ORDER BY id DESC LIMIT 1",
             $user_id
         ));
         if (!$card) {
@@ -1509,6 +1516,46 @@ class Matrix_MLM_Admin {
         }
 
         $previous_status = $card->status;
+
+        // Best-effort Fintava-side snapshot. We do NOT block the reset on
+        // this call — the reset is the recovery tool for cases where
+        // Fintava is unreachable or returning conflicting data, and
+        // forcing this round-trip to succeed would defeat that. We just
+        // record what we saw so the admin and support can correlate the
+        // local view (about to be mutated) against what Fintava thinks
+        // the card looks like at the same moment.
+        $fintava_status = null;
+        $fintava_note   = null;
+        if (!empty($card->card_id)
+            && class_exists('Matrix_MLM_Fintava')
+            && class_exists('Matrix_MLM_Fintava_Card')) {
+            $fintava_main = new Matrix_MLM_Fintava();
+            if ($fintava_main->is_active()) {
+                $fintava_card = new Matrix_MLM_Fintava_Card();
+                $details = $fintava_card->fetch_card($card->card_id);
+                if (is_wp_error($details)) {
+                    $fintava_note = $details->get_error_message();
+                    error_log(sprintf(
+                        '[Matrix MLM] reset_card preflight: user_id=%d cardMapId=%s local_status=%s fintava_lookup_failed=%s',
+                        $user_id,
+                        $card->card_id,
+                        $previous_status,
+                        $fintava_note
+                    ));
+                } else {
+                    $fintava_status = isset($details['status'])
+                        ? Matrix_MLM_Fintava_Card::normalize_status((string) $details['status'])
+                        : null;
+                    error_log(sprintf(
+                        '[Matrix MLM] reset_card preflight: user_id=%d cardMapId=%s local_status=%s fintava_status=%s',
+                        $user_id,
+                        $card->card_id,
+                        $previous_status,
+                        $fintava_status ?? '(unknown)'
+                    ));
+                }
+            }
+        }
 
         $updated = $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_cards',
@@ -1525,12 +1572,36 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('Failed to reset card', 'matrix-mlm')]);
         }
 
+        // Build the admin-visible summary. Surface the Fintava-side
+        // snapshot when we managed to get one so the admin can confirm
+        // whether the reset actually correlated with a desync. When the
+        // preflight failed we still complete the reset, but include the
+        // upstream error so support sees that Fintava is the unreachable
+        // side rather than (silently) treating the reset as a clean
+        // refresh.
+        $base_message = sprintf(
+            /* translators: 1: previous card status the row was in before reset */
+            __('Card reset to pending (was %s). The user can now reload their card page and re-enter their PAN to link and activate it. The cardMapId on Fintava is preserved.', 'matrix-mlm'),
+            $previous_status
+        );
+        if ($fintava_status !== null) {
+            $base_message .= ' ' . sprintf(
+                /* translators: 1: Fintava-side status at reset time */
+                __('Fintava-side status at reset time: %s.', 'matrix-mlm'),
+                $fintava_status
+            );
+        } elseif ($fintava_note !== null) {
+            $base_message .= ' ' . sprintf(
+                /* translators: 1: error message returned by Fintava during the preflight check */
+                __('Fintava preflight check could not be completed (%s); proceeded with reset anyway.', 'matrix-mlm'),
+                $fintava_note
+            );
+        }
+
         wp_send_json_success([
-            'message' => sprintf(
-                /* translators: 1: previous card status the row was in before reset */
-                __('Card reset to pending (was %s). The user can now reload their card page and re-enter their PAN to link and activate it. The cardMapId on Fintava is preserved.', 'matrix-mlm'),
-                $previous_status
-            ),
+            'message'         => $base_message,
+            'previous_status' => $previous_status,
+            'fintava_status'  => $fintava_status,
         ]);
     }
 }
