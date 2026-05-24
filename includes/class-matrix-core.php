@@ -918,6 +918,59 @@ class Matrix_MLM_Core {
             'level_commissions' => $level_commissions,
             'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
         ]);
+        // Compute heat data for the lazy-loaded subtree so the
+        // newly-injected nodes carry the same data-heat-* and
+        // data-pill-* attributes as the initial render. Without
+        // this, expanding a branch in Activity mode would drop
+        // back to neutral cards under the expansion point — the
+        // CSS heat selectors would have nothing to match against.
+        //
+        // The bucketing is necessarily local to this subtree
+        // (relative to the descendants we just loaded, not the
+        // whole on-screen tree). That's an intentional trade
+        // documented in compute_heat_data()'s "boundary caveat":
+        // expanding a branch is a focused inspection action, and
+        // re-bucketing against just-loaded peers is what members
+        // care about at that moment of inspection.
+        //
+        // The mode + heat_metric URL params from the page render
+        // are NOT plumbed through the AJAX call — instead the JS
+        // mode-toggle script's matrix:subtree-loaded handler
+        // refreshes the visible pill text against whatever metric
+        // is currently active on the page. That keeps the
+        // AJAX contract narrow (no extra params to validate) and
+        // avoids drift if the user toggles modes while the
+        // request is in flight.
+        $heat_data = $renderer->compute_heat_data(
+            $tree,
+            $current_user_id,
+            (int) $row->plan_id
+        );
+        // Augment the render state with heat data so render_tree_node
+        // emits the same attribute set as the page render. We have to
+        // re-call set_render_state because the previous call replaced
+        // the array wholesale.
+        $existing_state = [
+            'viewer_user_id'    => $current_user_id,
+            'display_user_id'   => $effective_root_user_id,
+            'plan_id'           => (int) $row->plan_id,
+            'is_pivoted'        => ($effective_root_user_id !== $current_user_id),
+            'referral_url'      => $referral_url,
+            'goal_level'        => 0,
+            'level_commissions' => $level_commissions,
+            'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
+            'heat_data'         => $heat_data,
+            // mode + heat_metric drive which metric's label is
+            // pre-filled into the visible pill text. We default to
+            // 'structure'/'downline' so the SSR pill is hidden by
+            // default — when the page is in Activity mode, the
+            // matrix:subtree-loaded JS handler immediately rewrites
+            // every newly-arrived pill against the live metric, so
+            // there's no flash of stale or wrong-metric text.
+            'mode'              => 'structure',
+            'heat_metric'       => 'downline',
+        ];
+        $renderer->set_render_state($existing_state);
         $renderer->render_children_inner(
             $tree,
             (int) $row->plan_width,
