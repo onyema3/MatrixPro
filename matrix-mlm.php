@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.9');
+define('MATRIX_MLM_DB_VERSION', '1.0.10');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -66,6 +66,15 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-billing.php'
 
 // Always loaded — used by the self-healing seed in Matrix_MLM_Core::run().
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways.php';
+
+// Always loaded — registers the /genealogy/share/{token}/ public route, the
+// AJAX hooks for minting/revoking share tokens, and the template_redirect
+// intercept that renders the prospect-facing read-only tree page. Has to
+// load on every request (not just admin) because the public route handler
+// fires for anonymous viewers and the AJAX hooks fire on admin-ajax.php
+// before is_admin() becomes meaningful.
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-share.php';
+Matrix_MLM_Share::init();
 
 // Always loaded — registers admin-post handlers and the WP-Cron event
 // for the weekly automatic backup. Has to load on every request (not
