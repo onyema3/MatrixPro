@@ -104,15 +104,41 @@ class Matrix_MLM_Fintava {
 
     /**
      * Default Merchant ID for Fintava Pay.
-     * Override by defining MATRIX_FINTAVA_MERCHANT_ID in wp-config.php.
+     *
+     * Intentionally empty: the merchant ID is install-specific and there is
+     * no safe global default. An earlier revision shipped a literal UUID
+     * here so the gateway would "just work" without configuration, but that
+     * meant any clone of the plugin that never configured its own merchant
+     * ID silently routed every Fintava API call under that fixed identity —
+     * conflating clone activity with the upstream developer's merchant
+     * record on Fintava's side and creating a real compliance and
+     * fund-routing hazard.
+     *
+     * Resolution order is now (first match wins): MATRIX_FINTAVA_MERCHANT_ID
+     * constant -> matrix_mlm_fintava_merchant_id option -> empty string.
+     * When the resolved value is empty, is_active() returns false and the
+     * gateway short-circuits before any outbound call is made.
+     *
+     * Constant is kept (rather than removed) so any third-party code that
+     * referenced it does not fatal at parse time. New code should call
+     * Matrix_MLM_Fintava::resolve_merchant_id() instead.
      */
-    const DEFAULT_MERCHANT_ID = '438555ab-b45c-467d-b0ce-50dee25241b4';
+    const DEFAULT_MERCHANT_ID = '';
 
     /**
      * Default Webhook/Callback URL for Fintava Pay.
-     * Override by defining MATRIX_FINTAVA_CALLBACK_URL in wp-config.php.
+     *
+     * Intentionally empty for the same reason as DEFAULT_MERCHANT_ID: this
+     * URL is what the plugin advertises to Fintava as the destination for
+     * webhook callbacks, and there is no safe global default. An earlier
+     * revision pinned this to a specific upstream domain, which meant any
+     * clone that did not override it would have its merchant configured to
+     * deliver webhooks to a host the clone did not control.
+     *
+     * Resolution order is (first match wins): MATRIX_FINTAVA_CALLBACK_URL
+     * constant -> matrix_mlm_fintava_callback_url option -> empty string.
      */
-    const DEFAULT_CALLBACK_URL = 'https://libertymatrix.ng/webhook/fintava';
+    const DEFAULT_CALLBACK_URL = '';
 
     private $secret_key;
     private $base_url;
@@ -169,22 +195,52 @@ class Matrix_MLM_Fintava {
      * Load API credentials from settings.
      */
     private function load_credentials() {
-        $this->secret_key = trim(get_option('matrix_mlm_fintava_secret_key', ''));
-        $this->base_url   = self::get_base_url();
+        $this->secret_key   = trim(get_option('matrix_mlm_fintava_secret_key', ''));
+        $this->base_url     = self::get_base_url();
+        $this->merchant_id  = self::resolve_merchant_id();
+        $this->callback_url = self::resolve_callback_url();
+    }
 
-        // Merchant ID — stored in wp_options, overridable via wp-config.php.
+    /**
+     * Resolve the active Fintava merchant ID.
+     *
+     * Resolution order (first match wins):
+     *   1. MATRIX_FINTAVA_MERCHANT_ID constant in wp-config.php.
+     *   2. matrix_mlm_fintava_merchant_id option (admin Gateways page).
+     *   3. Empty string.
+     *
+     * Returning '' on the unconfigured path is intentional. is_active()
+     * treats an empty merchant ID as "gateway not configured" and refuses
+     * to dispatch any outbound call, which closes the silent-default
+     * routing hazard documented on DEFAULT_MERCHANT_ID. Sub-gateways
+     * (billing, card) call this helper directly so the resolution rule
+     * lives in exactly one place.
+     *
+     * @return string Trimmed merchant ID, or '' when not configured.
+     */
+    public static function resolve_merchant_id() {
         if (defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID) {
-            $this->merchant_id = MATRIX_FINTAVA_MERCHANT_ID;
-        } else {
-            $this->merchant_id = trim(get_option('matrix_mlm_fintava_merchant_id', self::DEFAULT_MERCHANT_ID));
+            return trim((string) MATRIX_FINTAVA_MERCHANT_ID);
         }
+        return trim((string) get_option('matrix_mlm_fintava_merchant_id', ''));
+    }
 
-        // Callback URL — stored in wp_options, overridable via wp-config.php.
+    /**
+     * Resolve the active Fintava callback (webhook) URL.
+     *
+     * Same resolution semantics as resolve_merchant_id(). Empty result is
+     * acceptable for outbound calls (the plugin will simply not advertise
+     * a webhook destination), but the admin Gateways page surfaces a
+     * warning so operators know inbound webhook delivery requires this
+     * field to be set.
+     *
+     * @return string Trimmed callback URL, or '' when not configured.
+     */
+    public static function resolve_callback_url() {
         if (defined('MATRIX_FINTAVA_CALLBACK_URL') && MATRIX_FINTAVA_CALLBACK_URL) {
-            $this->callback_url = MATRIX_FINTAVA_CALLBACK_URL;
-        } else {
-            $this->callback_url = trim(get_option('matrix_mlm_fintava_callback_url', self::DEFAULT_CALLBACK_URL));
+            return trim((string) MATRIX_FINTAVA_CALLBACK_URL);
         }
+        return trim((string) get_option('matrix_mlm_fintava_callback_url', ''));
     }
 
     /**
@@ -267,12 +323,20 @@ class Matrix_MLM_Fintava {
     /**
      * Check if Fintava is configured and active.
      *
-     * Reads matrix_mlm_fintava_status (the option saved by the admin Gateways
-     * page). Falls back to the legacy matrix_mlm_fintava_enabled option for
-     * existing installs that were configured before the rework.
+     * A gateway is "active" only when:
+     *   - the active toggle is on (matrix_mlm_fintava_status, with a
+     *     legacy fallback to matrix_mlm_fintava_enabled), AND
+     *   - the secret key is present, AND
+     *   - the merchant ID is present.
+     *
+     * The merchant-ID requirement is the M6 fail-closed gate. Without it,
+     * outbound calls used to fall back to a hardcoded UUID (see the
+     * DEFAULT_MERCHANT_ID doc comment); now an unconfigured merchant
+     * disables the gateway end-to-end so no API call is ever dispatched
+     * under the wrong identity.
      */
     public function is_active() {
-        if (empty($this->secret_key)) {
+        if (empty($this->secret_key) || empty($this->merchant_id)) {
             return false;
         }
         $status = get_option('matrix_mlm_fintava_status', null);

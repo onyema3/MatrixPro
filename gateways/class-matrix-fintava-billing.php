@@ -553,10 +553,18 @@ class Matrix_MLM_Fintava_Billing {
             );
         }
 
-        // Merchant ID — same resolution logic as the main Fintava class.
-        $merchant_id = defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID
-            ? MATRIX_FINTAVA_MERCHANT_ID
-            : trim(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID));
+        // Merchant ID — resolved by the main Fintava class so the rule
+        // lives in one place. Empty string means "not configured" and is
+        // a hard error here: dispatching with an empty Merchant-Id header
+        // either fails on Fintava's side or, worse, silently routes under
+        // the wrong identity if Fintava ever defaults it server-side.
+        $merchant_id = Matrix_MLM_Fintava::resolve_merchant_id();
+        if ($merchant_id === '') {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava Pay merchant ID is not configured. Set it in admin under Gateways > Fintava.', 'matrix-mlm')
+            );
+        }
 
         $args = [
             'method' => $method,

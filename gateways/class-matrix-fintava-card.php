@@ -726,9 +726,16 @@ class Matrix_MLM_Fintava_Card {
             );
         }
 
-        $merchant_id = defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID
-            ? MATRIX_FINTAVA_MERCHANT_ID
-            : trim(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID));
+        // Merchant ID — resolved by the main Fintava class. See the
+        // matching block in Matrix_MLM_Fintava_Billing::make_request()
+        // for the rationale.
+        $merchant_id = Matrix_MLM_Fintava::resolve_merchant_id();
+        if ($merchant_id === '') {
+            return new WP_Error(
+                'fintava_not_configured',
+                __('Fintava Pay merchant ID is not configured. Set it in admin under Gateways > Fintava.', 'matrix-mlm')
+            );
+        }
 
         $args = [
             'method'  => $method,
