@@ -468,6 +468,27 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => $user->get_error_message()]);
         }
 
+        // H13: email-verification gate. When the operator-side
+        // 'matrix_mlm_email_verification' toggle is on (default), a
+        // user who registered but never clicked the verification link
+        // cannot complete login — even with the right password. The
+        // matrix_email_verified user_meta flag is set by
+        // handle_email_verification() when the link is clicked. The
+        // root admin's seed account is provisioned with
+        // email_verified=1 in the activator, so the operator never
+        // gets locked out by their own setting.
+        $verification_required = (int) get_option('matrix_mlm_email_verification', 1) === 1;
+        if ($verification_required && !get_user_meta($user->ID, 'matrix_email_verified', true)) {
+            error_log(sprintf(
+                '[Matrix MLM] login rejected: user_id=%d unverified email',
+                $user->ID
+            ));
+            wp_send_json_error([
+                'message' => __('Please verify your email before signing in. Check your inbox for the verification link, or contact support to resend it.', 'matrix-mlm'),
+                'verification_required' => true,
+            ]);
+        }
+
         $two_factor = new Matrix_MLM_Two_Factor();
         if ($two_factor->is_enabled($user->ID)) {
             $token = bin2hex(random_bytes(32));
@@ -537,6 +558,52 @@ class Matrix_MLM_Core {
     }
 
     private function process_registration() {
+        // H13: per-IP rate limit on registration. Throttles bulk fake-
+        // account creation that would otherwise multiply an attacker's
+        // budget across other rate-limited surfaces (login, EPIN
+        // redeem). Default 5 registrations / hour per IP, both
+        // filterable. Per-IP only — there's no per-username concept
+        // here because the username is what's being registered.
+        //
+        // Client-IP resolution: prefer Cloudflare's validated
+        // CF-Connecting-IP header (the de-facto standard for sites
+        // behind their proxy), fall back to REMOTE_ADDR. Operators
+        // behind a different proxy chain can hook the
+        // 'matrix_mlm_register_client_ip' filter to plug in their own
+        // resolver. Deliberately does NOT trust X-Forwarded-For by
+        // default — that header is trivially spoofed when no proxy
+        // chain is actually in front of the site.
+        $client_ip = '';
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+            $client_ip = (string) $_SERVER['HTTP_CF_CONNECTING_IP'];
+        } elseif (!empty($_SERVER['REMOTE_ADDR'])) {
+            $client_ip = (string) $_SERVER['REMOTE_ADDR'];
+        }
+        $client_ip = (string) apply_filters('matrix_mlm_register_client_ip', $client_ip);
+
+        $max_attempts   = (int) apply_filters('matrix_mlm_registration_max_attempts', 5);
+        $window_seconds = (int) apply_filters('matrix_mlm_registration_window_seconds', HOUR_IN_SECONDS);
+        $ip_key         = 'matrix_register_attempts_ip_' . md5($client_ip);
+
+        $ip_attempts = (int) get_transient($ip_key);
+        if ($ip_attempts >= $max_attempts) {
+            error_log(sprintf(
+                '[Matrix MLM] registration throttled: ip=%s, attempts=%d/%d',
+                $client_ip, $ip_attempts, $max_attempts
+            ));
+            wp_send_json_error([
+                'message' => __('Too many sign-up attempts from this network. Please wait an hour and try again.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Increment the counter immediately, before validation, so any
+        // failure path (invalid referral, taken username, taken email,
+        // wp_create_user error) still consumes a slot. Otherwise an
+        // attacker could probe for taken usernames or valid referral
+        // codes without paying the rate-limit cost — a separate
+        // enumeration oracle the same gate is meant to close.
+        set_transient($ip_key, $ip_attempts + 1, $window_seconds);
+
         $username = sanitize_text_field($_POST['username'] ?? '');
         $email = sanitize_email($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
@@ -602,6 +669,23 @@ class Matrix_MLM_Core {
 
         // Send verification email
         Matrix_MLM_Notifications::send_verification_email($user_id);
+
+        // H13: when email verification is required (default on), do
+        // NOT auto-issue an auth cookie. The user must click the
+        // verification link first; until then handle_email_verification
+        // hasn't run, matrix_email_verified is unset, and process_login
+        // refuses the auth cookie below. The corresponding setting is
+        // matrix_mlm_email_verification (default 1), exposed on
+        // Settings -> Notifications.
+        $verification_required = (int) get_option('matrix_mlm_email_verification', 1) === 1;
+
+        if ($verification_required) {
+            wp_send_json_success([
+                'message' => __('Account created. Please check your email and click the verification link to complete sign-up.', 'matrix-mlm'),
+                'verification_required' => true,
+            ]);
+            return;
+        }
 
         wp_set_auth_cookie($user_id);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
