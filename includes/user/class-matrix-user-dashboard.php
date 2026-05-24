@@ -566,6 +566,7 @@ class Matrix_MLM_User_Dashboard {
     private function render_security($user_id) {
         $two_factor = new Matrix_MLM_Two_Factor();
         $is_enabled = $two_factor->is_enabled($user_id);
+        $remaining_codes = $is_enabled ? (int) $two_factor->remaining_recovery_codes($user_id) : 0;
         ?>
         <h2><?php _e('Two-Factor Authentication', 'matrix-mlm'); ?></h2>
         <div class="matrix-security-section">
@@ -574,16 +575,94 @@ class Matrix_MLM_User_Dashboard {
                 <strong><?php _e('Status:', 'matrix-mlm'); ?></strong>
                 <?php if ($is_enabled): ?>
                 <span class="matrix-badge matrix-badge-active"><?php _e('Enabled', 'matrix-mlm'); ?></span>
-                <button class="matrix-btn matrix-btn-danger" onclick="matrixDisable2FA()"><?php _e('Disable 2FA', 'matrix-mlm'); ?></button>
+                <button class="matrix-btn matrix-btn-danger" onclick="matrixToggle2FAForm('disable')"><?php _e('Disable 2FA', 'matrix-mlm'); ?></button>
+                <button class="matrix-btn matrix-btn-secondary" onclick="matrixToggle2FAForm('regen')"><?php _e('Regenerate recovery codes', 'matrix-mlm'); ?></button>
                 <?php else: ?>
                 <span class="matrix-badge matrix-badge-inactive"><?php _e('Disabled', 'matrix-mlm'); ?></span>
-                <button class="matrix-btn matrix-btn-primary" onclick="matrixEnable2FA()"><?php _e('Enable 2FA', 'matrix-mlm'); ?></button>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixToggle2FAForm('enable')"><?php _e('Enable 2FA', 'matrix-mlm'); ?></button>
                 <?php endif; ?>
             </div>
+
+            <?php if ($is_enabled): ?>
+                <p class="matrix-2fa-recovery-status">
+                    <?php
+                    /* translators: %d: number of unused recovery codes remaining on the account. */
+                    printf(
+                        _n(
+                            'You have %d recovery code remaining.',
+                            'You have %d recovery codes remaining.',
+                            $remaining_codes,
+                            'matrix-mlm'
+                        ),
+                        $remaining_codes
+                    );
+                    ?>
+                    <?php if ($remaining_codes <= 2): ?>
+                        <strong><?php _e('Generate a new batch soon to avoid being locked out if you lose your authenticator.', 'matrix-mlm'); ?></strong>
+                    <?php endif; ?>
+                </p>
+            <?php endif; ?>
+
+            <!--
+                Inline reauth form for enable / disable / regenerate.
+                Only one of the three is rendered at a time;
+                matrixToggle2FAForm() shows the right inputs and wires
+                the submit button to the right AJAX action. The
+                password is type=password so masking + autofill behave
+                normally, and the form is rendered server-side rather
+                than built in JS so the password field gets the same
+                browser security treatment (autofill flags,
+                enterprise password-fill rules, etc.) as a regular
+                login form.
+
+                The form intentionally does NOT carry the WP nonce —
+                matrixAjax() injects matrixMLM.nonce on every request,
+                so adding it here would just be a duplicate field that
+                drifts out of sync if the nonce is ever rotated
+                mid-session.
+            -->
+            <div id="matrix-2fa-form" style="display: none;" class="matrix-2fa-form">
+                <h3 id="matrix-2fa-form-title"></h3>
+                <p id="matrix-2fa-form-help" class="matrix-2fa-help"></p>
+
+                <div class="matrix-form-row">
+                    <label for="matrix-2fa-password"><?php _e('Current password', 'matrix-mlm'); ?></label>
+                    <input type="password" id="matrix-2fa-password" autocomplete="current-password">
+                </div>
+
+                <div class="matrix-form-row" id="matrix-2fa-code-row" style="display: none;">
+                    <label for="matrix-2fa-code"><?php _e('Authenticator code or recovery code', 'matrix-mlm'); ?></label>
+                    <input type="text" id="matrix-2fa-code" autocomplete="one-time-code" inputmode="text" maxlength="20">
+                </div>
+
+                <div class="matrix-form-actions">
+                    <button class="matrix-btn matrix-btn-primary" id="matrix-2fa-submit"></button>
+                    <button class="matrix-btn matrix-btn-secondary" type="button" onclick="matrixCancel2FAForm()"><?php _e('Cancel', 'matrix-mlm'); ?></button>
+                </div>
+            </div>
+
+            <!--
+                Post-enrolment surface. Holds the QR + secret AND the
+                one-time recovery codes. Hidden until matrixEnable2FA()
+                or matrixRegenerateRecoveryCodes() succeeds.
+            -->
             <div id="matrix-2fa-setup" style="display: none;">
-                <p><?php _e('Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.):', 'matrix-mlm'); ?></p>
-                <img id="matrix-2fa-qr" src="" alt="QR Code">
-                <p><?php _e('Secret Key:', 'matrix-mlm'); ?> <code id="matrix-2fa-secret"></code></p>
+                <div id="matrix-2fa-setup-qr-block">
+                    <p><?php _e('Scan this QR code with your authenticator app (Google Authenticator, Authy, 1Password, etc.):', 'matrix-mlm'); ?></p>
+                    <img id="matrix-2fa-qr" src="" alt="QR Code">
+                    <p><?php _e('Secret Key:', 'matrix-mlm'); ?> <code id="matrix-2fa-secret"></code></p>
+                </div>
+
+                <div id="matrix-2fa-recovery-block" class="matrix-2fa-recovery-block">
+                    <h3><?php _e('Recovery codes', 'matrix-mlm'); ?></h3>
+                    <p>
+                        <strong><?php _e('Save these codes somewhere safe.', 'matrix-mlm'); ?></strong>
+                        <?php _e('Each code can be used once if you lose access to your authenticator. They will not be shown again.', 'matrix-mlm'); ?>
+                    </p>
+                    <ul id="matrix-2fa-recovery-codes" class="matrix-2fa-codes"></ul>
+                    <button class="matrix-btn matrix-btn-secondary" type="button" onclick="matrixCopyRecoveryCodes()"><?php _e('Copy to clipboard', 'matrix-mlm'); ?></button>
+                    <button class="matrix-btn matrix-btn-primary" type="button" onclick="matrixDismissRecoveryCodes()"><?php _e('I have saved them', 'matrix-mlm'); ?></button>
+                </div>
             </div>
         </div>
         <?php

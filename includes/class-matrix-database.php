@@ -210,6 +210,33 @@ class Matrix_MLM_Database {
             }
         }
 
+        // 1.0.12: defensive ADD COLUMN for two_factor_recovery_codes.
+        // dbDelta will add the column on a fresh CREATE TABLE pass, but
+        // on existing installs the column may already be missing because
+        // dbDelta's ADD COLUMN parsing is order-sensitive and easily
+        // skipped when an unrelated edit further down the spec changes
+        // it. Probe INFORMATION_SCHEMA and ALTER if absent. Idempotent:
+        // the COUNT(*) check skips the ALTER once the column exists.
+        //
+        // Stores a JSON array of password_hash()'d recovery codes —
+        // longtext rather than varchar to avoid ever truncating a future
+        // expansion in code count or hash length.
+        if ($um_exists > 0) {
+            $rc_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'two_factor_recovery_codes'",
+                DB_NAME, $um_table
+            ));
+            if ($rc_col_exists === 0) {
+                $wpdb->query(
+                    "ALTER TABLE {$um_table}
+                       ADD COLUMN two_factor_recovery_codes LONGTEXT DEFAULT NULL
+                       AFTER two_factor_secret"
+                );
+            }
+        }
+
         // 1.0.11: one-time backfill of matrix_position_history with
         // a 'backfilled' row per existing position, dated at the
         // position's joined_at column. Without this, the genealogy
@@ -559,6 +586,7 @@ class Matrix_MLM_Database {
             zip_code varchar(20) DEFAULT NULL,
             two_factor_enabled tinyint(1) NOT NULL DEFAULT 0,
             two_factor_secret varchar(255) DEFAULT NULL,
+            two_factor_recovery_codes longtext DEFAULT NULL,
             email_verified tinyint(1) NOT NULL DEFAULT 0,
             sms_verified tinyint(1) NOT NULL DEFAULT 0,
             kyc_verified tinyint(1) NOT NULL DEFAULT 0,
