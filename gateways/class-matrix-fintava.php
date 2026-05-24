@@ -1816,6 +1816,20 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // M4: bank account-number enumeration oracle. /name/enquiry
+        // returns the account holder's name for a valid (acct, bank)
+        // pair, which is exactly the building block for a "match a
+        // 10-digit NUBAN to a name" attack against the destination
+        // bank. Cap is tighter than the purchase endpoints because
+        // legitimate users only resolve once or twice per payout.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_resolve_account',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 20, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many account lookups. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         $bank_code = sanitize_text_field($_POST['bank_code'] ?? '');
 
@@ -1896,6 +1910,20 @@ class Matrix_MLM_Fintava {
         $user_id = get_current_user_id();
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // M4: bound bank-payout request volume per user. The user's
+        // own balance is the immediate constraint, but unbounded
+        // POSTs expose the upstream /bank/credit/merchant endpoint
+        // (and its 5xx retry budget) to abuse from a compromised
+        // session. Per-user keying is sufficient because every
+        // transfer is auth-gated.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_initiate_transfer',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many transfer attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
         // Withdrawal-policy gate. Single call into the centralised
@@ -2260,6 +2288,18 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // M4: bound matrix->virtual transfer volume per user. Same
+        // threat model as ajax_initiate_transfer; debit-then-refund
+        // pattern means a tight loop here also exercises the wallet
+        // refund path on every Fintava failure response.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_transfer_matrix_to_virtual',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many transfer attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
+        }
+
         // Withdrawal-policy gate. path='matrix_transfer' evaluates
         // the master kill switch, active-account requirement, plan-tier
         // restriction, and the Matrix Transfers toggle on
@@ -2532,6 +2572,19 @@ class Matrix_MLM_Fintava {
 
         if (!is_user_logged_in()) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // M4: legitimate clients poll this from the payout result
+        // screen, so the cap is intentionally generous (120 / 5min
+        // = roughly one poll every 2.5s sustained). Enough headroom
+        // for status updates while a transfer is in-flight; tight
+        // enough to bound the upstream GET /transfer/{id} traffic.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_check_status',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 120, 'window_seconds' => 5 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many status checks. Please wait a moment and try again.', 'matrix-mlm')]);
         }
 
         $reference = sanitize_text_field($_POST['reference'] ?? '');
@@ -5619,6 +5672,22 @@ class Matrix_MLM_Fintava {
         $user_id = get_current_user_id();
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // M4: BVN brute-force / KYC enumeration gate. Tightest cap
+        // in the gateway (5 / 15m). The handler accepts BVN, DOB,
+        // and address as inputs to /create/customer and a wrong BVN
+        // surfaces as a distinct upstream error from a duplicate-
+        // BVN one — without this gate, the response shape is a BVN
+        // validity oracle. Real users only ever create one wallet,
+        // so a cap above 1 is purely for retry on transient
+        // failures.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'fintava_create_virtual_wallet',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error(['message' => __('Too many wallet creation attempts. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
         if (!Matrix_MLM_User::is_active($user_id)) {
