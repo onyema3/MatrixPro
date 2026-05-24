@@ -1233,8 +1233,30 @@ class Matrix_MLM_Database {
 
     /**
      * Create a default root user for the referral system.
+     *
      * Since referral codes are mandatory for registration, this user serves
      * as the top of the referral tree so the first real users can sign up.
+     *
+     * The "default root user" is always an existing WordPress administrator,
+     * never a freshly synthesised account. Resolution order:
+     *
+     *   1. The user activating the plugin (get_current_user_id()).
+     *   2. The first administrator on the install, if any.
+     *   3. Defer. No matrix_user_meta row is created until at least one
+     *      administrator exists; this function is invoked on every plugin
+     *      boot from Matrix_MLM_Core::run(), so the binding self-heals
+     *      automatically the next time the function runs after a real
+     *      admin appears.
+     *
+     * Earlier revisions of this method, on the deferred path, called
+     * wp_create_user('matrix_admin', ...) with a generated password that
+     * was never surfaced. That created a predictable-username admin
+     * account on WP-CLI / headless / cloned installs that no operator
+     * had explicitly provisioned, with a password recoverable only via
+     * the "Lost your password?" flow against admin_email — making the
+     * username a stage-1 enumeration primitive for whoever controlled
+     * (or could read) that mailbox. The block is removed; deferring is
+     * the safer behaviour, and the caller is idempotent anyway.
      */
     public static function create_default_user() {
         global $wpdb;
@@ -1261,15 +1283,13 @@ class Matrix_MLM_Database {
             }
         }
 
-        // If still no admin found, create a dedicated root user
+        // No administrator exists on this install yet. Defer rather than
+        // synthesise an account; the next boot after a real admin is
+        // provisioned will run through this function again and bind the
+        // root referral code to that admin. See the doc comment above
+        // for the rationale.
         if (!$admin_id) {
-            $admin_email = get_option('admin_email', 'admin@' . parse_url(home_url(), PHP_URL_HOST));
-            $admin_id = wp_create_user('matrix_admin', wp_generate_password(16, true), $admin_email);
-            if (is_wp_error($admin_id)) {
-                return; // Cannot create user, skip
-            }
-            $user = new WP_User($admin_id);
-            $user->set_role('administrator');
+            return;
         }
 
         // Check if this user already has a matrix_user_meta entry
