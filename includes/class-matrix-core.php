@@ -725,7 +725,18 @@ class Matrix_MLM_Core {
             $codes = isset($body['error-codes']) && is_array($body['error-codes'])
                 ? implode(',', array_map('sanitize_text_field', $body['error-codes']))
                 : '(none)';
-            error_log('[Matrix Captcha] verify failed for ip=' . $this->get_client_ip() . ' codes=' . $codes);
+            // Hash the IP before it lands in the operator log. The
+            // raw IP isn't useful for triage on this surface (the
+            // failure is between the user and Google's verifier, and
+            // the Login limiter already attributes per-IP via its
+            // own log), and we'd rather not pile PII into error_log
+            // every time a real user fails the challenge. Truncating
+            // the sha1 to 12 hex keeps the log readable while still
+            // letting an operator correlate clusters of failures
+            // from the same source. (audit L4)
+            $ip_tag = sha1($this->get_client_ip());
+            $ip_tag = substr($ip_tag, 0, 12);
+            error_log('[Matrix Captcha] verify failed for ip_h=' . $ip_tag . ' codes=' . $codes);
             wp_send_json_error([
                 'message' => __('Captcha verification failed. Please try again.', 'matrix-mlm'),
             ]);
@@ -733,14 +744,37 @@ class Matrix_MLM_Core {
     }
 
     /**
+     * Normalise a login identifier for rate-limit bucketing.
+     *
+     * Trims whitespace and lowercases. WP usernames are already
+     * case-insensitive on lookup, and email-form logins (which
+     * wp_authenticate also accepts) are case-insensitive on the
+     * mailbox-name part on every mailbox provider that matters.
+     * Without this, "Alice" / "alice" / " alice " all get separate
+     * counters, so an attacker can multiply their cap by simply
+     * varying the casing or padding the identifier with whitespace.
+     * (audit L2)
+     *
+     * Public form (wp_unslash → sanitize_text_field) already strips
+     * tags and trims at the post boundary, but a centralised helper
+     * lets the rate-limit path stay correct even if a future caller
+     * forgets to call sanitize_text_field, and lets the same value
+     * persist into the 2FA challenge token so step 2 scores against
+     * the same bucket as step 1.
+     */
+    private function normalize_login_identifier($username) {
+        return strtolower(trim((string) $username));
+    }
+
+    /**
      * Build the per-username transient key. sha1 normalises the byte
      * shape so usernames with characters outside the option_name
      * charset (rare, but possible on some installs) don't break the
-     * key. Lowercased so 'Alice' and 'alice' share the counter — WP
-     * usernames are case-insensitive on lookup.
+     * key. Lowercased + trimmed (via normalize_login_identifier) so
+     * 'Alice', 'alice', and ' alice ' all share the counter.
      */
     private function login_rate_limit_user_key($username) {
-        return 'matrix_login_user_' . sha1(strtolower((string) $username));
+        return 'matrix_login_user_' . sha1($this->normalize_login_identifier($username));
     }
 
     /**
@@ -759,8 +793,13 @@ class Matrix_MLM_Core {
         $max_user = (int) apply_filters('matrix_mlm_login_max_attempts_per_user', 10);
         $max_ip   = (int) apply_filters('matrix_mlm_login_max_attempts_per_ip',   50);
 
-        if ($username !== '') {
-            $user_count = (int) get_transient($this->login_rate_limit_user_key($username));
+        // Normalise so an empty-after-trim identifier ('' / '   ')
+        // doesn't get a real counter — emit no per-user limit for
+        // that path; the per-IP limiter still bounds it. (audit L2)
+        $normalized = $this->normalize_login_identifier($username);
+
+        if ($normalized !== '') {
+            $user_count = (int) get_transient($this->login_rate_limit_user_key($normalized));
             if ($user_count >= $max_user) {
                 return true;
             }
@@ -790,8 +829,13 @@ class Matrix_MLM_Core {
             $window = MINUTE_IN_SECONDS; // floor — never auto-reset every second
         }
 
-        if ($username !== '') {
-            $user_key = $this->login_rate_limit_user_key($username);
+        // Same normalisation used by is_login_rate_limited so the
+        // increment lands in the same bucket the gate reads from.
+        // (audit L2)
+        $normalized = $this->normalize_login_identifier($username);
+
+        if ($normalized !== '') {
+            $user_key = $this->login_rate_limit_user_key($normalized);
             $user_count = (int) get_transient($user_key);
             set_transient($user_key, $user_count + 1, $window);
         }
@@ -804,7 +848,7 @@ class Matrix_MLM_Core {
 
         error_log(sprintf(
             '[Matrix Login] failed_attempt user=%s ip=%s reason=%s',
-            $username !== '' ? $username : '(empty)',
+            $normalized !== '' ? $normalized : '(empty)',
             $ip !== '' ? $ip : '(empty)',
             $reason !== '' ? $reason : '(unspecified)'
         ));
@@ -815,8 +859,9 @@ class Matrix_MLM_Core {
      * mistyped a couple of times isn't penalised on the next attempt.
      */
     private function clear_login_attempts($username, $ip) {
-        if ($username !== '') {
-            delete_transient($this->login_rate_limit_user_key($username));
+        $normalized = $this->normalize_login_identifier($username);
+        if ($normalized !== '') {
+            delete_transient($this->login_rate_limit_user_key($normalized));
         }
         if ($ip !== '') {
             delete_transient($this->login_rate_limit_ip_key($ip));
@@ -2173,7 +2218,7 @@ class Matrix_MLM_Core {
     private function process_upload_avatar() {
         $user_id = get_current_user_id();
 
-        if (empty($_FILES['avatar'])) {
+        if (empty($_FILES['avatar']) || !isset($_FILES['avatar']['tmp_name'])) {
             wp_send_json_error(['message' => __('No file uploaded', 'matrix-mlm')]);
         }
 
@@ -2182,15 +2227,56 @@ class Matrix_MLM_Core {
         require_once(ABSPATH . 'wp-admin/includes/media.php');
 
         $file = $_FILES['avatar'];
-        $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-        if (!in_array($file['type'], $allowed)) {
-            wp_send_json_error(['message' => __('Invalid file type. Allowed: JPG, PNG, GIF, WebP', 'matrix-mlm')]);
+
+        // PHP-side upload error surface (oversize per ini, partial,
+        // no-file). Filter these out before any further work so the
+        // user sees a clear "no file" message instead of a confusing
+        // mime/size message produced from a half-uploaded tmp file.
+        $err = isset($file['error']) ? (int) $file['error'] : UPLOAD_ERR_NO_FILE;
+        if ($err === UPLOAD_ERR_NO_FILE || empty($file['tmp_name'])) {
+            wp_send_json_error(['message' => __('No file uploaded', 'matrix-mlm')]);
         }
-        if ($file['size'] > 2 * 1024 * 1024) {
+        if ($err !== UPLOAD_ERR_OK) {
+            wp_send_json_error(['message' => __('Upload failed. Please try again.', 'matrix-mlm')]);
+        }
+
+        // Real on-disk size — never trust $_FILES['size'] which is
+        // attacker-controlled (the multipart form field can claim any
+        // value regardless of how many bytes actually landed in
+        // tmp_name). 2 MB cap matches the existing UI copy. (audit L3)
+        $real_size = @filesize($file['tmp_name']);
+        if ($real_size === false || $real_size <= 0) {
+            wp_send_json_error(['message' => __('Could not read uploaded file. Please try again.', 'matrix-mlm')]);
+        }
+        if ($real_size > 2 * 1024 * 1024) {
             wp_send_json_error(['message' => __('File too large. Maximum 2MB', 'matrix-mlm')]);
         }
 
-        $upload = wp_handle_upload($file, ['test_form' => false]);
+        // Server-side MIME detection. wp_check_filetype_and_ext()
+        // inspects file content with fileinfo where available — it
+        // does NOT trust the client-supplied Content-Type header
+        // ($file['type']), which can be spoofed to anything by a curl
+        // attacker. Same allow-list as before, but expressed in the
+        // shape WP wants ('extension-regex' => 'mime'). (audit M4)
+        $allowed_mimes = [
+            'jpg|jpeg|jpe' => 'image/jpeg',
+            'png'          => 'image/png',
+            'gif'          => 'image/gif',
+            'webp'         => 'image/webp',
+        ];
+        $check = wp_check_filetype_and_ext(
+            $file['tmp_name'],
+            $file['name'],
+            $allowed_mimes
+        );
+        if (empty($check['type']) || empty($check['ext']) || !in_array($check['type'], $allowed_mimes, true)) {
+            wp_send_json_error(['message' => __('Invalid file type. Allowed: JPG, PNG, GIF, WebP', 'matrix-mlm')]);
+        }
+
+        $upload = wp_handle_upload($file, [
+            'test_form' => false,
+            'mimes'     => $allowed_mimes,
+        ]);
         if (isset($upload['error'])) {
             wp_send_json_error(['message' => $upload['error']]);
         }
@@ -2540,6 +2626,15 @@ class Matrix_MLM_Core {
 
         $two_factor = new Matrix_MLM_Two_Factor();
 
+        // Password reauth comes BEFORE the is_enabled() probe so a
+        // session-only attacker cannot use this endpoint to learn
+        // whether 2FA is currently on for the account they hijacked
+        // — without this ordering, the already_enabled early-return
+        // would answer that question without requiring a password.
+        // Mirrors the ordering used in process_disable_2fa and
+        // process_regenerate_recovery_codes (audit M2 follow-up).
+        $this->require_password_reauth($user_id);
+
         // Block silent rotation. The disable path is the only way to
         // reach a state where this branch falls through, and that path
         // already requires a current OTP / recovery code.
@@ -2549,8 +2644,6 @@ class Matrix_MLM_Core {
                 'already_enabled' => true,
             ]);
         }
-
-        $this->require_password_reauth($user_id);
 
         // Successful reauth — clear the throttle so a real user who
         // typo'd their password a few times isn't penalised on the
@@ -2768,12 +2861,22 @@ class Matrix_MLM_Core {
             $email
         ));
 
-        if ($exists) {
-            wp_send_json_error(['message' => __('Email already subscribed', 'matrix-mlm')]);
+        // Audit L1: uniform response regardless of pre-existence so
+        // the endpoint stops being a subscriber-list enumeration
+        // oracle. The two pre-existing branches ('already subscribed'
+        // vs 'subscribed successfully') let an unauthenticated caller
+        // probe whether any specific email had ever subscribed —
+        // useful for spear-phishing target lists, especially because
+        // the endpoint has no rate limit beyond the registration one.
+        // We still skip the insert when the row already exists (no
+        // double-counting in the subscribers table) but the response
+        // shape is identical either way.
+        if (!$exists) {
+            $wpdb->insert($wpdb->prefix . 'matrix_subscribers', ['email' => $email]);
         }
-
-        $wpdb->insert($wpdb->prefix . 'matrix_subscribers', ['email' => $email]);
-        wp_send_json_success(['message' => __('Subscribed successfully!', 'matrix-mlm')]);
+        wp_send_json_success([
+            'message' => __('Thanks! If this address isn\'t already on the list, it\'s now subscribed.', 'matrix-mlm'),
+        ]);
     }
 
     public function register_rest_routes() {

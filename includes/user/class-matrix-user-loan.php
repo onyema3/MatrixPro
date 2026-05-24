@@ -496,7 +496,21 @@ class Matrix_MLM_User_Loan {
             ), $field);
         }
 
-        if ((int) $file['size'] > self::MAX_FILE_BYTES) {
+        // Real on-disk size — never trust $_FILES[$field]['size']
+        // which is the multipart content-length the client claimed,
+        // not what actually landed in tmp_name. A curl attacker can
+        // send any value there to bypass the cap, so the previous
+        // ((int) $file['size'] > MAX_FILE_BYTES) check was advisory
+        // at best. (audit L3)
+        $real_size = @filesize($file['tmp_name']);
+        if ($real_size === false || $real_size <= 0) {
+            self::error(sprintf(
+                /* translators: %s: document label */
+                __('Could not read %s. Please re-attach and try again.', 'matrix-mlm'),
+                $spec['label']
+            ), $field);
+        }
+        if ($real_size > self::MAX_FILE_BYTES) {
             self::error(sprintf(
                 /* translators: 1: document label, 2: max MB */
                 __('%1$s is too large. Maximum size is %2$d MB.', 'matrix-mlm'),
@@ -565,31 +579,51 @@ class Matrix_MLM_User_Loan {
     }
 
     /**
-     * Drop deny-execution config files into the loan-uploads subdir
-     * the first time it's used. Both files are idempotent — re-creating
-     * them on every upload is harmless but unnecessary, so we skip if
-     * they already exist.
+     * Drop deny-direct-access config files into the loan-uploads
+     * subdir the first time it's used. v2 (audit M3): the .htaccess
+     * is now strictly Require-all-denied. Direct HTTP fetches to
+     * /uploads/matrix-loan-files/ return 403 — every retrieval of a
+     * KYC document has to go through the signed-URL REST handler in
+     * Matrix_MLM_Attachment_Signer, which streams the file from
+     * disk through PHP after a capability + HMAC + expiry check.
      *
      *   .htaccess  — Apache (and any front-end that respects it)
      *   web.config — IIS
      *
-     * The Apache rules deny direct execution of any PHP script
-     * (.php, .phtml, .php3-7, .phar) and remove any handler/
-     * AddType mapping that might otherwise route the file through
-     * the PHP engine. On Nginx, these files are ignored and the
-     * server admin must add an equivalent location block in their
-     * vhost — that's documented in the README, but the file in
-     * disk also serves as an obvious flag for someone auditing the
-     * directory.
+     * Idempotent: we look for the v2 marker comment in any existing
+     * file and only rewrite if it's missing. That handles the
+     * one-shot migration from the older v1 (deny-script-execution)
+     * format already on disk for installs that uploaded loans
+     * before this PR. New customer installs land on v2 directly.
+     *
+     * On Nginx these files are ignored and the server admin must
+     * add an equivalent `location` block — that's documented in the
+     * README, but the file on disk also serves as an obvious flag
+     * for someone auditing the directory.
      */
     private static function ensure_upload_guards($dir) {
         if (!is_dir($dir)) { return; }
 
+        // v2 marker. Bumping this string forces another rewrite if
+        // we ever need to ship a v3 set of rules.
+        $marker = 'MatrixPro guard v2';
+
         $htaccess = trailingslashit($dir) . '.htaccess';
-        if (!file_exists($htaccess)) {
-            $rules = "# MatrixPro: deny script execution in this directory.\n"
-                   . "# Loan applicants upload PDFs and images here; nothing in\n"
-                   . "# this folder should ever be executed by the PHP engine.\n"
+        $needs_write = !file_exists($htaccess);
+        if (!$needs_write) {
+            $existing = @file_get_contents($htaccess);
+            if (!is_string($existing) || strpos($existing, $marker) === false) {
+                $needs_write = true;
+            }
+        }
+        if ($needs_write) {
+            $rules = "# {$marker}\n"
+                   . "# Loan / healthcare KYC uploads. Direct HTTP access is\n"
+                   . "# denied across the board — admins fetch documents via the\n"
+                   . "# signed-URL endpoint at /wp-json/matrix-mlm/v1/attachment\n"
+                   . "# which validates capability + HMAC + expiry before\n"
+                   . "# streaming the file through PHP. The deny-PHP-execution\n"
+                   . "# rule is kept as defense-in-depth.\n"
                    . "<FilesMatch \"\\.(php|phtml|php3|php4|php5|php6|php7|phar|pht)$\">\n"
                    . "    Require all denied\n"
                    . "</FilesMatch>\n"
@@ -597,13 +631,29 @@ class Matrix_MLM_User_Loan {
                    . "    php_flag engine off\n"
                    . "</IfModule>\n"
                    . "RemoveHandler .php .phtml .phar\n"
-                   . "RemoveType .php .phtml .phar\n";
+                   . "RemoveType .php .phtml .phar\n"
+                   . "# Apache 2.4 (Require) and 2.2 (Order/Deny) for portability.\n"
+                   . "<IfModule mod_authz_core.c>\n"
+                   . "    Require all denied\n"
+                   . "</IfModule>\n"
+                   . "<IfModule !mod_authz_core.c>\n"
+                   . "    Order deny,allow\n"
+                   . "    Deny from all\n"
+                   . "</IfModule>\n";
             @file_put_contents($htaccess, $rules);
         }
 
         $webconfig = trailingslashit($dir) . 'web.config';
-        if (!file_exists($webconfig)) {
+        $needs_write_wc = !file_exists($webconfig);
+        if (!$needs_write_wc) {
+            $existing_wc = @file_get_contents($webconfig);
+            if (!is_string($existing_wc) || strpos($existing_wc, $marker) === false) {
+                $needs_write_wc = true;
+            }
+        }
+        if ($needs_write_wc) {
             $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                 . "<!-- {$marker} -->\n"
                  . "<configuration>\n"
                  . "  <system.webServer>\n"
                  . "    <handlers accessPolicy=\"Read\" />\n"
@@ -615,6 +665,10 @@ class Matrix_MLM_User_Loan {
                  . "          <add fileExtension=\".phar\" allowed=\"false\" />\n"
                  . "        </fileExtensions>\n"
                  . "      </requestFiltering>\n"
+                 . "      <authorization>\n"
+                 . "        <remove users=\"*\" roles=\"\" verbs=\"\" />\n"
+                 . "        <deny users=\"*\" />\n"
+                 . "      </authorization>\n"
                  . "    </security>\n"
                  . "  </system.webServer>\n"
                  . "</configuration>\n";

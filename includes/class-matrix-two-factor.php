@@ -159,7 +159,7 @@ class Matrix_MLM_Two_Factor {
         }
 
         if ($secret !== null) {
-            $ok = $this->verify_totp($secret, $code);
+            $ok = $this->verify_totp($secret, $code, 1, $user_id);
             if ($ok) {
                 // Lazy migration: if the stored value was still plaintext
                 // (no envelope prefix) AND the code verified, upgrade it
@@ -406,19 +406,95 @@ class Matrix_MLM_Two_Factor {
     }
 
     /**
-     * Verify TOTP code
+     * Verify TOTP code.
+     *
+     * Replay protection (audit M1): the window check accepts any of
+     * (t-1, t, t+1) for a 30-second period. Without anti-replay, a
+     * code observed by an attacker (shoulder-surf, phishing relay,
+     * malicious browser extension reading the OTP form) is reusable
+     * for up to ~90 seconds. We bound that by recording the highest
+     * step ever accepted for this user and refusing any subsequent
+     * attempt whose match-step is less than or equal to it. Trade-
+     * off: a real user who quick-fingers two distinct flows (e.g.
+     * disable + re-enable) within the same 30-second tick has the
+     * second one rejected. They wait for the next code, which is
+     * the same UX as already-typed codes everywhere TOTP is in use
+     * (Google, GitHub, etc., enforce the same one-shot-per-step
+     * rule).
+     *
+     * The high-water mark is stored in a transient with a TTL of
+     * (2 * window + 1) * 30 + a small grace, which is the longest
+     * any single match-step could possibly still fall inside the
+     * acceptance window. After that, the row could be safely
+     * forgotten — but the transient TTL is what does the cleanup
+     * for us, no GC needed. user_id of 0 (callers that don't have
+     * a stable identity, e.g. legacy enrol-time self-test paths)
+     * skip the check; in practice every production caller has a
+     * user id.
      */
-    private function verify_totp($secret, $code, $window = 1) {
-        $timestamp = floor(time() / 30);
+    private function verify_totp($secret, $code, $window = 1, $user_id = 0) {
+        $timestamp = (int) floor(time() / 30);
+        $padded    = str_pad((string) $code, 6, '0', STR_PAD_LEFT);
+
+        $last_step = ($user_id > 0) ? $this->get_last_totp_step($user_id) : null;
 
         for ($i = -$window; $i <= $window; $i++) {
-            $calculated = $this->calculate_totp($secret, $timestamp + $i);
-            if (hash_equals($calculated, str_pad($code, 6, '0', STR_PAD_LEFT))) {
-                return true;
+            $step       = $timestamp + $i;
+            $calculated = $this->calculate_totp($secret, $step);
+            if (!hash_equals($calculated, $padded)) {
+                continue;
             }
+            // Constant-time match found at this step.
+            if ($last_step !== null && $step <= $last_step) {
+                // Replay: this step (or a later one within the same
+                // verification call's window) was already accepted.
+                // Don't return false yet — keep walking the window
+                // so a fresh higher step in the same call can still
+                // win if the legitimate user happens to be on the
+                // exact boundary of a tick. We do NOT short-circuit
+                // here because (a) all branches do hash_equals work
+                // already and (b) refusing-on-first-replay-match
+                // would leak via timing whether the replayed step
+                // was the negative or positive offset.
+                continue;
+            }
+            // First fresh match in this call wins.
+            if ($user_id > 0) {
+                $this->set_last_totp_step($user_id, $step, $window);
+            }
+            return true;
         }
 
         return false;
+    }
+
+    /**
+     * Per-user high-water mark for accepted TOTP steps. Returns
+     * null if nothing has been recorded yet (or the previous mark
+     * has expired and the row dropped). int otherwise.
+     */
+    private function get_last_totp_step($user_id) {
+        $val = get_transient($this->totp_step_transient_key($user_id));
+        if ($val === false || $val === null || $val === '') {
+            return null;
+        }
+        return (int) $val;
+    }
+
+    /**
+     * Persist the high-water mark with a TTL just longer than the
+     * full acceptance window plus a small grace so a code that
+     * matched at the +window edge cannot be replayed once the
+     * mark expires. Window is the same shape verify_totp uses
+     * (number of 30-second steps either side of "now").
+     */
+    private function set_last_totp_step($user_id, $step, $window) {
+        $ttl = ((2 * (int) $window) + 1) * 30 + 30; // +30s grace
+        set_transient($this->totp_step_transient_key($user_id), (int) $step, $ttl);
+    }
+
+    private function totp_step_transient_key($user_id) {
+        return 'matrix_2fa_last_step_' . (int) $user_id;
     }
 
     /**

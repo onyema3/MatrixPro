@@ -680,15 +680,23 @@ class Matrix_MLM_Admin_Healthcare {
             <h2 style="margin-top:0;"><?php _e('Documents', 'matrix-mlm'); ?></h2>
             <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;">
                 <?php foreach ($docs as $col => $label):
-                    $url = isset($row->{$col}) ? (string) $row->{$col} : '';
+                    // Same signed-URL treatment as the loan
+                    // documents card — see Matrix_MLM_Admin_Loans::
+                    // render_documents_card for the threat-model
+                    // notes. Healthcare's pre-1.0.7 form persisted
+                    // these columns; the current form doesn't, but
+                    // legacy rows still need to render in the
+                    // admin review UI. (audit M3)
+                    $raw_url    = isset($row->{$col}) ? (string) $row->{$col} : '';
+                    $signed_url = $raw_url !== '' ? Matrix_MLM_Attachment_Signer::sign_url_from_public($raw_url) : '';
+                    $url        = $signed_url !== '' ? $signed_url : $raw_url;
+                    $is_image   = $raw_url !== '' && self::is_image_url($raw_url);
                 ?>
                     <div style="border:1px solid #e5e7eb;border-radius:6px;padding:10px;background:#fafafa;">
                         <div style="font-weight:600;font-size:12px;color:#374151;margin-bottom:6px;">
                             <?php echo esc_html($label); ?>
                         </div>
-                        <?php if ($url !== ''):
-                            $is_image = self::is_image_url($url);
-                        ?>
+                        <?php if ($url !== ''): ?>
                             <?php if ($is_image): ?>
                                 <a href="<?php echo esc_url($url); ?>" target="_blank" rel="noopener noreferrer">
                                     <img src="<?php echo esc_url($url); ?>" alt="<?php echo esc_attr($label); ?>"
