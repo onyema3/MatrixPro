@@ -3532,7 +3532,7 @@ class Matrix_MLM_Fintava {
      * POST /create/customer
      *
      * Registers a Fintava customer record for the user and (with
-     * fundingMethod=static_fund) provisions a permanent virtual account
+     * fundingMethod=STATIC_FUND) provisions a permanent virtual account
      * tied to that customer's identity in the same round-trip.
      *
      * This is the path that causes the bank-side account name to echo
@@ -3550,10 +3550,10 @@ class Matrix_MLM_Fintava {
      *   - lastName      (string, required)
      *   - email         (string, required)
      *   - phone         (string, required)
-     *   - fundingMethod (string, required; we pass 'static_fund' so the
+     *   - fundingMethod (string, required; we pass 'STATIC_FUND' so the
      *                    customer gets a permanent virtual NUBAN that
      *                    can receive funds at any time — the alternative
-     *                    is 'dynamic_fund' which mints one-time-use
+     *                    is 'DYNAMIC_FUND' which mints one-time-use
      *                    account numbers per transaction, not what we
      *                    want for a member-facing wallet)
      *   - merchantReference (string, optional idempotency key)
@@ -3572,7 +3572,7 @@ class Matrix_MLM_Fintava {
      *
      * @param array $customer_data Required: first_name, last_name, email,
      *                             phone. Optional: funding_method
-     *                             (default 'static_fund'), reference.
+     *                             (default 'STATIC_FUND'), reference.
      * @return array|WP_Error      The unwrapped `data` object on success
      *                             (i.e. `{ userInfo, wallet, ... }`).
      */
@@ -3592,7 +3592,7 @@ class Matrix_MLM_Fintava {
             'lastName'      => sanitize_text_field($customer_data['last_name']),
             'email'         => sanitize_email($customer_data['email']),
             'phone'         => sanitize_text_field($customer_data['phone']),
-            'fundingMethod' => sanitize_text_field($customer_data['funding_method'] ?? 'static_fund'),
+            'fundingMethod' => sanitize_text_field($customer_data['funding_method'] ?? 'STATIC_FUND'),
         ];
 
         if (!empty($customer_data['reference'])) {
@@ -4944,7 +4944,7 @@ class Matrix_MLM_Fintava {
 
         $reference = 'MTX-VW-' . $user_id . '-' . time();
 
-        // Primary path: POST /create/customer with fundingMethod=static_fund.
+        // Primary path: POST /create/customer with fundingMethod=STATIC_FUND.
         //
         // This is the only flow that produces a wallet whose bank-side
         // account name resolves to the user's name. Calling
@@ -4969,7 +4969,7 @@ class Matrix_MLM_Fintava {
             'email'          => $email,
             'phone'          => $phone,
             'reference'      => $reference,
-            'funding_method' => 'static_fund',
+            'funding_method' => 'STATIC_FUND',
         ]);
 
         if (!is_wp_error($customer)) {
