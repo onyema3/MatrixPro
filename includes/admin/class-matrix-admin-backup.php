@@ -387,6 +387,110 @@ class Matrix_MLM_Admin_Backup {
      * ------------------------------------------------------------------ */
 
     /**
+     * Validate that a single SQL statement from a restore stream is
+     * (a) one of an allow-list of statement types and (b) scoped to
+     * the {prefix}matrix_* table namespace.
+     *
+     * H16: previously restore_backup() ran every statement in the
+     * dump via $wpdb->query() with no validation. A compromised
+     * admin (or anyone reaching the restore endpoint via a separate
+     * exploit) could upload a hand-crafted .sql with statements like:
+     *
+     *     UPDATE {$prefix}users SET user_pass = '...' WHERE ID = 1
+     *     INSERT INTO {$prefix}usermeta VALUES (1,'wp_capabilities','...')
+     *     DROP TABLE {$prefix}options
+     *     LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE ...
+     *     GRANT ALL ON *.* TO ...
+     *
+     * The restore endpoint is gated on manage_matrix_settings, but
+     * the audit's worry is precisely the compromised-admin /
+     * stolen-cookie case — once you're inside the cap, there is no
+     * second wall. This validator IS the second wall.
+     *
+     * Allowed statement types — exactly what create_backup() emits:
+     *   - SET FOREIGN_KEY_CHECKS = ...
+     *   - SET SQL_MODE = ...
+     *   - DROP TABLE [IF EXISTS] `<table>`
+     *   - CREATE TABLE [IF NOT EXISTS] `<table>` (...)
+     *   - INSERT INTO `<table>` (...) VALUES ...
+     *
+     * Anything else (UPDATE, DELETE, ALTER, GRANT, LOAD DATA,
+     * CREATE PROCEDURE, multi-table DROP, etc.) is rejected.
+     *
+     * Table-scope check: every DROP/CREATE/INSERT must reference a
+     * table whose name starts with {$wpdb->prefix}matrix_. So a dump
+     * cannot touch wp_users / wp_usermeta / wp_options or any
+     * non-Matrix MLM table.
+     *
+     * Returns [true, null] on accept, [false, reason_string] on
+     * reject.
+     */
+    private static function validate_restore_statement($stmt, $matrix_prefix) {
+        $stmt_clean = trim($stmt);
+        if ($stmt_clean === '') {
+            return [true, null]; // empty = no-op, harmless
+        }
+
+        // Strip leading C-style comments (some MySQL dumps emit
+        // /*!40101 ... */ pragma comments before the actual statement).
+        $stmt_clean = preg_replace('/^\s*\/\*.*?\*\/\s*/s', '', $stmt_clean);
+        $stmt_clean = trim($stmt_clean);
+        if ($stmt_clean === '') {
+            return [true, null]; // comment-only is a no-op
+        }
+
+        // Allow-listed session-control SET statements that have no
+        // table references and cannot be used to escalate privilege
+        // or exfiltrate data on their own.
+        if (preg_match('/^SET\s+(FOREIGN_KEY_CHECKS|SQL_MODE|NAMES|CHARACTER\s+SET\s+RESULTS|TIME_ZONE)\b/i', $stmt_clean)) {
+            return [true, null];
+        }
+
+        // DROP TABLE [IF EXISTS] `name`. Reject multi-table DROPs
+        // (DROP TABLE a, b, c) to keep the parser simple — our own
+        // dumps emit one DROP per statement.
+        if (preg_match('/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`?([a-zA-Z0-9_]+)`?\s*$/i', $stmt_clean, $m)) {
+            $table = $m[1];
+            if (strpos($table, $matrix_prefix) !== 0) {
+                return [false, 'DROP TABLE outside Matrix MLM scope: ' . $table];
+            }
+            return [true, null];
+        }
+
+        // CREATE TABLE [IF NOT EXISTS] `name` ( ... )
+        if (preg_match('/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?([a-zA-Z0-9_]+)`?\s*\(/is', $stmt_clean, $m)) {
+            $table = $m[1];
+            if (strpos($table, $matrix_prefix) !== 0) {
+                return [false, 'CREATE TABLE outside Matrix MLM scope: ' . $table];
+            }
+            return [true, null];
+        }
+
+        // INSERT INTO `name` [(...)] VALUES ...
+        // Match the table name first; the column list is optional in
+        // real SQL even though our own dumps always emit it. Catching
+        // the no-column-list form here means an attacker's
+        //   INSERT INTO `wp_options` VALUES (1)
+        // is rejected for the right reason (outside Matrix MLM scope)
+        // rather than landing in the catch-all 'type not allowed'.
+        if (preg_match('/^INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?\b/i', $stmt_clean, $m)) {
+            $table = $m[1];
+            if (strpos($table, $matrix_prefix) !== 0) {
+                return [false, 'INSERT INTO outside Matrix MLM scope: ' . $table];
+            }
+            return [true, null];
+        }
+
+        // Anything else — UPDATE, DELETE, ALTER, GRANT, LOAD DATA,
+        // CREATE PROCEDURE/TRIGGER/EVENT, RENAME TABLE, TRUNCATE,
+        // etc. — is rejected outright. We deliberately do not parse
+        // these; an allow-list is safer than a deny-list against
+        // novel attack shapes.
+        $first_word = preg_match('/^([A-Za-z_]+)/', $stmt_clean, $m) ? strtoupper($m[1]) : '?';
+        return [false, 'Statement type not allowed: ' . $first_word];
+    }
+
+    /**
      * Restore a backup file by re-running its statements against the
      * live database. Designed to round-trip our own dumps; uploaded
      * dumps from other tools may work if they use the same statement
@@ -437,6 +541,40 @@ class Matrix_MLM_Admin_Backup {
         // sequence inside string literals (esc_sql escapes single
         // quotes; multi-line VALUES use `,\n` not `;\n`).
         $statements = preg_split('/;\s*\n/', $sql);
+
+        // H16: pre-validate every statement against the allow-list +
+        // matrix-prefix scope BEFORE opening the transaction. Cheaper
+        // to reject up-front than to start a transaction, partially
+        // execute, and roll back on the first bad statement (DDL
+        // auto-commits in MySQL anyway, so a partial DROP cannot be
+        // rolled back even with our START TRANSACTION wrapper).
+        $matrix_prefix = $wpdb->prefix . 'matrix_';
+        $rejection_reasons = [];
+        foreach ($statements as $i => $stmt) {
+            list($ok, $reason) = self::validate_restore_statement($stmt, $matrix_prefix);
+            if (!$ok) {
+                $rejection_reasons[] = sprintf('statement %d: %s', $i + 1, $reason);
+                if (count($rejection_reasons) >= 5) {
+                    // Report the first handful — operator can read
+                    // the file and find the rest themselves once one
+                    // is known. Don't dump the whole file's worth of
+                    // rejections into the response body.
+                    break;
+                }
+            }
+        }
+
+        if (!empty($rejection_reasons)) {
+            error_log(
+                '[Matrix MLM] Backup restore aborted — disallowed statements found: '
+                . implode(' | ', $rejection_reasons)
+            );
+            return new WP_Error(
+                'matrix_restore_invalid',
+                __('Restore aborted — the file contains statements outside the Matrix MLM scope or of disallowed types. Only restores of dumps generated by this plugin are supported.', 'matrix-mlm'),
+                ['rejections' => $rejection_reasons]
+            );
+        }
 
         $errors   = [];
         $executed = 0;
