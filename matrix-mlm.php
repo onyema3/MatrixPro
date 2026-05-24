@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.10');
+define('MATRIX_MLM_DB_VERSION', '1.0.11');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -45,6 +45,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-activator.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-deactivator.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-core.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-plan-engine.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-position-history.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-user.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-commission.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-epin.php';

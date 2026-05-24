@@ -1773,3 +1773,388 @@
         transition: fill 1.4s ease-out;
     }
 }
+
+
+
+/* ==========================================================================
+   Genealogy time machine — date slider + snapshot view tint
+   --------------------------------------------------------------------------
+   The "time machine" view (?snapshot_at=YYYY-MM-DD) lets members scrub
+   through past tree states. When in snapshot mode the bar is forced
+   open with a sepia banner; in live mode the bar starts collapsed
+   behind a "View past snapshots" disclosure. State is driven by two
+   data attributes the PHP and inline JS share:
+
+       data-snapshot-mode="0|1"   — sepia / banner gate
+       data-time-machine-open="0|1" — slider visibility gate
+
+   Layout philosophy: the bar lives between the search box and the
+   share/export panel above the tree. On desktop it's a single
+   horizontal strip; on mobile (max-width: 768px) it stacks vertically
+   so the slider isn't squeezed against the floor/today labels.
+   ========================================================================== */
+
+.matrix-genealogy-time-machine {
+    margin-bottom: 18px;
+    background: #f8fafc;
+    border: 1px solid var(--matrix-border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--matrix-dark);
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+/*
+ * Snapshot mode: the bar swaps its neutral chrome for a sepia
+ * surface that signals "you are looking at the past". Same trick
+ * the macOS Time Machine UI uses — desaturate-ish background +
+ * warm-tinted accent lines. Strong enough to register at a glance,
+ * subtle enough not to dominate the tree below it.
+ */
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] {
+    background: #fef9e7;
+    border-color: #f59e0b;
+}
+
+/* ----- Disclosure (live-mode collapsed state) ----- */
+
+.mtm-disclosure {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: transparent;
+    border: 1px dashed var(--matrix-border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: var(--matrix-primary);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.mtm-disclosure:hover,
+.mtm-disclosure:focus-visible {
+    background: #eef2ff;
+    border-color: var(--matrix-primary);
+    border-style: solid;
+    outline: none;
+}
+
+.mtm-disclosure .dashicons {
+    width: 16px;
+    height: 16px;
+    font-size: 16px;
+}
+
+.mtm-disclosure-chevron {
+    transition: transform 0.15s ease;
+    font-size: 11px;
+    line-height: 1;
+}
+
+.matrix-genealogy-time-machine[data-time-machine-open="1"] .mtm-disclosure-chevron {
+    transform: rotate(180deg);
+}
+
+/*
+ * Hide the disclosure once the panel is open. The button's job is
+ * pure "show the panel" — keeping it visible alongside an open
+ * panel would be redundant chrome and would compete for attention
+ * with the slider itself.
+ */
+.matrix-genealogy-time-machine[data-time-machine-open="1"] .mtm-disclosure {
+    display: none;
+}
+
+/*
+ * Snapshot mode never has a disclosure button at all — the bar is
+ * permanently open and the snapshot banner takes the disclosure's
+ * spot at the top.
+ */
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-disclosure {
+    display: none;
+}
+
+/* ----- Snapshot banner (snapshot-mode top strip) ----- */
+
+.mtm-snapshot-banner {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 6px 4px 12px;
+    border-bottom: 1px dashed #f59e0b;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.mtm-snapshot-banner-icon {
+    flex: 0 0 36px;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #f59e0b;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px -2px rgba(245, 158, 11, 0.5);
+}
+
+.mtm-snapshot-banner-icon .dashicons {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+}
+
+.mtm-snapshot-banner-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mtm-snapshot-banner-body strong {
+    font-size: 14px;
+    color: #78350f;
+}
+
+.mtm-snapshot-banner-body small {
+    font-size: 12px;
+    color: #92400e;
+    line-height: 1.4;
+}
+
+.mtm-back-to-live {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #92400e;
+    color: #fff;
+    text-decoration: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-weight: 600;
+    font-size: 13px;
+    flex-shrink: 0;
+    transition: background 0.15s ease;
+}
+
+.mtm-back-to-live:hover,
+.mtm-back-to-live:focus {
+    background: #78350f;
+    color: #fff;
+    text-decoration: none;
+}
+
+.mtm-back-to-live .dashicons {
+    font-size: 14px;
+    width: 14px;
+    height: 14px;
+}
+
+/* ----- Slider panel (the actual scrubber) ----- */
+
+.mtm-panel {
+    display: none;
+}
+
+.matrix-genealogy-time-machine[data-time-machine-open="1"] .mtm-panel {
+    display: block;
+}
+
+.mtm-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 4px;
+}
+
+.mtm-slider-end {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: #6b7280;
+    white-space: nowrap;
+}
+
+.mtm-slider {
+    flex: 1 1 auto;
+    height: 24px;
+    cursor: pointer;
+    accent-color: var(--matrix-primary);
+}
+
+/*
+ * Snapshot mode dyes the slider thumb amber to match the banner —
+ * a small consistency win that anchors the slider visually inside
+ * the sepia frame.
+ */
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-slider {
+    accent-color: #f59e0b;
+}
+
+.mtm-slider-readout {
+    margin-top: 8px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.mtm-date-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--matrix-dark);
+}
+
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-date-label {
+    color: #78350f;
+}
+
+.mtm-days-ago {
+    font-size: 12px;
+    color: #6b7280;
+    font-weight: 500;
+}
+
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-days-ago {
+    color: #92400e;
+}
+
+/* ----- Preset buttons row ----- */
+
+.mtm-presets {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+.mtm-preset-btn {
+    background: #fff;
+    border: 1px solid var(--matrix-border);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: #4b5563;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.mtm-preset-btn:hover,
+.mtm-preset-btn:focus-visible {
+    background: #eef2ff;
+    border-color: var(--matrix-primary);
+    color: var(--matrix-primary);
+    outline: none;
+}
+
+.mtm-preset-btn.is-active {
+    background: var(--matrix-primary);
+    border-color: var(--matrix-primary);
+    color: #fff;
+    cursor: default;
+}
+
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-preset-btn.is-active {
+    background: #f59e0b;
+    border-color: #f59e0b;
+}
+
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-preset-btn:hover:not(.is-active),
+.matrix-genealogy-time-machine[data-snapshot-mode="1"] .mtm-preset-btn:focus-visible:not(.is-active) {
+    background: #fef3c7;
+    border-color: #f59e0b;
+    color: #92400e;
+}
+
+.mtm-caveat {
+    margin: 12px 0 0;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.45;
+    font-style: italic;
+}
+
+/* ==========================================================================
+   Snapshot-mode tree tint
+   --------------------------------------------------------------------------
+   When the tree is rendering a historical snapshot, the wrapper carries
+   data-snapshot-mode="1" and we apply a soft sepia filter to the entire
+   tree surface (both classic CSS view and D3 SVG view). The point isn't
+   to recolour every node — that would clash with the relationship and
+   heat-map tints — but to GLOBALLY signal "this is the past" via a
+   sepia overlay that desaturates the page below the time-machine bar.
+
+   Filter approach (rather than per-element overrides) keeps the existing
+   relationship/heat colours intact while giving the whole surface that
+   characteristic time-machine warmth. CSS filter is GPU-accelerated and
+   composite-only — no layout cost.
+   ========================================================================== */
+
+.matrix-genealogy-wrapper[data-snapshot-mode="1"],
+.matrix-genealogy-d3-canvas[data-snapshot-mode="1"] {
+    filter: sepia(0.18) saturate(0.92);
+    transition: filter 0.3s ease;
+}
+
+/*
+ * Snapshot-mode canvas also gets a subtle warm-tinted scrim along the
+ * top so the boundary between the sepia banner above and the tree
+ * below reads as one continuous "past view" rather than two unrelated
+ * regions. linear-gradient overlay over the existing dot grid.
+ */
+.matrix-genealogy-d3-canvas[data-snapshot-mode="1"] {
+    background-image:
+        linear-gradient(180deg, rgba(245, 158, 11, 0.08) 0%, transparent 60px),
+        linear-gradient(rgba(79, 70, 229, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(79, 70, 229, 0.04) 1px, transparent 1px);
+}
+
+/*
+ * Reduced-motion: the sepia transition is short (0.3s) and not
+ * strictly motion, but we drop it under prefers-reduced-motion for
+ * consistency with the rest of the file's reduced-motion blocks. The
+ * filter itself stays — it's a static visual cue, not an animation.
+ */
+@media (prefers-reduced-motion: reduce) {
+    .matrix-genealogy-wrapper[data-snapshot-mode="1"],
+    .matrix-genealogy-d3-canvas[data-snapshot-mode="1"] {
+        transition: none;
+    }
+}
+
+/* ----- Mobile responsive ----- */
+
+@media (max-width: 768px) {
+    .mtm-snapshot-banner {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .mtm-back-to-live {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .mtm-slider-row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
+    }
+
+    .mtm-slider-end {
+        text-align: center;
+    }
+
+    /*
+     * On mobile, the floor/today labels stack above and below the
+     * slider rather than flanking it. Reorder so floor reads as
+     * "older" (top) and today as "newer" (bottom) — matches the
+     * vertical stacking convention of timelines.
+     */
+    .mtm-slider-row .mtm-slider-end-floor  { order: 0; }
+    .mtm-slider-row .mtm-slider            { order: 1; }
+    .mtm-slider-row .mtm-slider-end-today  { order: 2; }
+}

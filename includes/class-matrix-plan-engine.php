@@ -134,6 +134,24 @@ class Matrix_MLM_Plan_Engine {
 
         $position_id = $wpdb->insert_id;
 
+        // Snapshot the freshly-created position into the audit
+        // log. Powers the genealogy "time machine" view —
+        // without a 'created' event captured at insert time,
+        // the time-machine reconstruction wouldn't know whether
+        // a member was in the tree at any given snapshot date
+        // earlier than this join. Defensive class_exists() guard
+        // covers the (vanishingly rare) case where the autoloader
+        // hasn't picked up the helper yet — capture skips
+        // silently rather than blocking the join.
+        if (class_exists('Matrix_MLM_Position_History')) {
+            Matrix_MLM_Position_History::record_event(
+                $position_id,
+                'created',
+                $user_id,
+                ''
+            );
+        }
+
         // Update parent counts
         $this->update_upline_counts($placement['parent_id'], $plan_id);
 
@@ -827,6 +845,23 @@ class Matrix_MLM_Plan_Engine {
             ['status' => 'completed', 'completed_at' => current_time('mysql')],
             ['id' => $position->id]
         );
+
+        // Snapshot the status flip into the audit log so the
+        // time-machine view shows the position as 'active' on
+        // dates before completion and 'completed' afterwards. The
+        // 'completed' event_type is the more specific cousin of
+        // 'status_changed' — kept distinct because the
+        // time-machine UI treats it as a milestone (small trophy
+        // marker on the timeline rather than a generic state-change
+        // tick). See Matrix_MLM_Position_History::EVENT_TYPES.
+        if (class_exists('Matrix_MLM_Position_History')) {
+            Matrix_MLM_Position_History::record_event(
+                $position->id,
+                'completed',
+                null, // no human actor — completion is system-triggered
+                ''
+            );
+        }
 
         // Send notification
         Matrix_MLM_Notifications::send_commission_notification($position->user_id, $plan->matrix_completion_bonus, 'matrix_completion');
@@ -1633,6 +1668,237 @@ class Matrix_MLM_Plan_Engine {
         }
 
         return $node;
+    }
+
+    /**
+     * Build a tree snapshot as it existed at a given point in time.
+     *
+     * Powers the genealogy "time machine" view. Returns the same
+     * node shape build_tree_recursive() returns, with two
+     * snapshot-specific differences:
+     *
+     *   1. Children are filtered by snapshot — a child only
+     *      appears if its joined_at <= $snapshot_at. Members who
+     *      hadn't joined yet on the snapshot date are absent.
+     *   2. total_downline is RECOMPUTED from the snapshot's
+     *      visible descendants rather than read from the live
+     *      column. The live column tracks current state, which is
+     *      the wrong number for a historical view (it would say
+     *      "you had 12 downline on April 15" using today's count
+     *      of 47 — the opposite of useful).
+     *
+     * v1 reconstruction caveat (documented in the time-machine
+     * banner UI): we use the LIVE parent_id to walk the tree, not
+     * the historical parent_id. The audit table captures
+     * parent_id as of each event, but admin Move-in-Genealogy
+     * events aren't captured in v1 (see
+     * Matrix_MLM_Position_History::EVENT_TYPES — 'moved' is in
+     * the enum but no v1 caller emits it). For installs that
+     * never use the admin move tool — the common case — this is
+     * exact. For installs that do, the snapshot shows members at
+     * their CURRENT structural location, not where they actually
+     * were on the snapshot date. The follow-up PR documented in
+     * the time-machine v2 plan adds 'moved' capture and switches
+     * this method to consult the historical parent_id from the
+     * latest matrix_position_history row at <= $snapshot_at.
+     *
+     * @param int    $user_id       WP user id whose tree we're
+     *                              reconstructing — i.e. the root
+     *                              of the snapshot.
+     * @param int    $plan_id       Plan whose tree we're snapshotting.
+     * @param string $snapshot_at   SQL DATETIME (YYYY-MM-DD HH:MM:SS).
+     *                              Use Matrix_MLM_Position_History::
+     *                              snapshot_date_to_datetime() to
+     *                              convert from a YYYY-MM-DD calendar
+     *                              date the URL param carries.
+     * @param int    $max_depth     Same depth cap the live tree uses
+     *                              (typically min(4, plan_depth)). The
+     *                              snapshot view in v1 doesn't expose
+     *                              lazy-expand, so this is the only
+     *                              cap a snapshot ever sees.
+     * @return array|null           Tree node, or null when the user
+     *                              didn't have a position in this plan
+     *                              at the requested snapshot date.
+     */
+    public function build_tree_at_snapshot($user_id, $plan_id, $snapshot_at, $max_depth = 4) {
+        global $wpdb;
+
+        $user_id     = (int) $user_id;
+        $plan_id     = (int) $plan_id;
+        $snapshot_at = (string) $snapshot_at;
+        $max_depth   = max(1, (int) $max_depth);
+
+        if ($user_id <= 0 || $plan_id <= 0 || $snapshot_at === '') {
+            return null;
+        }
+
+        // Find the user's position id IN THIS PLAN as it existed
+        // at the snapshot date. Constraint: the position must
+        // have been joined on or before the snapshot. We pick the
+        // earliest such position because a user can in principle
+        // have multiple historical position ids in the same plan
+        // (rare — the join_plan() flow blocks duplicate active
+        // positions, but legacy imports / completed-then-rejoin
+        // flows can produce them) and the earliest one is the
+        // canonical "their tree" root for that snapshot date.
+        $root_position_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}matrix_positions
+              WHERE user_id = %d
+                AND plan_id = %d
+                AND joined_at <= %s
+              ORDER BY joined_at ASC, id ASC
+              LIMIT 1",
+            $user_id, $plan_id, $snapshot_at
+        ));
+        if ($root_position_id <= 0) {
+            return null;
+        }
+
+        return $this->build_tree_at_snapshot_recursive(
+            $root_position_id,
+            $plan_id,
+            $snapshot_at,
+            1,
+            $max_depth
+        );
+    }
+
+    /**
+     * Recursive partner of build_tree_at_snapshot(). Mirrors the
+     * shape of build_tree_recursive() so the rendering layer can
+     * consume both with the same code path — the genealogy view
+     * doesn't need to know whether the tree it's rendering came
+     * from the live engine or the time-machine reconstruction.
+     *
+     * The two divergences from build_tree_recursive() are
+     * narrow and intentional:
+     *
+     *   - Children query adds an `AND joined_at <= %s` clause so
+     *     members who hadn't joined yet on the snapshot date are
+     *     filtered out at the SQL level (cheaper than walking
+     *     them and discarding in PHP).
+     *   - total_downline is computed bottom-up from the visible
+     *     subtree, NOT read from the live matrix_positions
+     *     column. See the parent method's docblock for why.
+     */
+    private function build_tree_at_snapshot_recursive($position_id, $plan_id, $snapshot_at, $current_depth, $max_depth) {
+        global $wpdb;
+
+        if ($current_depth > $max_depth) {
+            return null;
+        }
+
+        // Position must itself have existed at the snapshot.
+        // Belt-and-braces: the parent's children query already
+        // applied the joined_at filter, but a defensive check
+        // here means the recursive entry from
+        // build_tree_at_snapshot() (which uses the user's own
+        // joined_at directly) doesn't need to duplicate the
+        // existence test.
+        $position = $wpdb->get_row($wpdb->prepare(
+            "SELECT p.*, u.user_login, u.user_email
+               FROM {$wpdb->prefix}matrix_positions p
+               LEFT JOIN {$wpdb->users} u ON p.user_id = u.ID
+              WHERE p.id = %d
+                AND p.joined_at <= %s",
+            $position_id, $snapshot_at
+        ));
+        if (!$position) {
+            return null;
+        }
+
+        // Children at the snapshot date: rows with parent_id
+        // pointing here AND joined_at on or before T. The status
+        // filter we use on the live tree (status='active') is
+        // intentionally NOT applied here: the snapshot needs to
+        // include members whose positions later went 'completed'
+        // — they were active on the snapshot date and the
+        // member's tree-as-of-T is meant to show that history.
+        // For the rare 'inactive' status (which only affects
+        // matrix_user_meta in v1, not matrix_positions, but
+        // documented for safety) we also include — the snapshot
+        // intent is "what was the tree", not "what is the tree
+        // today minus inactives".
+        $children = $wpdb->get_results($wpdb->prepare(
+            "SELECT id
+               FROM {$wpdb->prefix}matrix_positions
+              WHERE parent_id = %d
+                AND plan_id = %d
+                AND joined_at <= %s
+              ORDER BY position ASC",
+            $position_id, $plan_id, $snapshot_at
+        ));
+
+        $node = [
+            'id'             => (int) $position->id,
+            'user_id'        => (int) $position->user_id,
+            'sponsor_id'     => $position->sponsor_id !== null ? (int) $position->sponsor_id : null,
+            'username'       => (string) $position->user_login,
+            'level'          => (int) $current_depth,
+            // Placeholder; recomputed from children below so the
+            // count reflects the snapshot, not today.
+            'total_downline' => 0,
+            'status'         => (string) $position->status,
+            'children'       => [],
+        ];
+
+        $subtree_count = 0;
+        foreach ($children as $child) {
+            $child_node = $this->build_tree_at_snapshot_recursive(
+                (int) $child->id,
+                $plan_id,
+                $snapshot_at,
+                $current_depth + 1,
+                $max_depth
+            );
+            if ($child_node) {
+                $node['children'][] = $child_node;
+                // 1 (the child itself) + the child's own subtree
+                // count. Bottom-up sum without a separate pass.
+                $subtree_count += 1 + (int) $child_node['total_downline'];
+            }
+        }
+
+        $node['total_downline'] = $subtree_count;
+
+        return $node;
+    }
+
+    /**
+     * Earliest snapshot date a member can pick for their time-
+     * machine view, formatted as YYYY-MM-DD. Equals the day they
+     * joined the plan — there's no useful tree snapshot from
+     * before they had a position.
+     *
+     * Returns null when the user has no position in the plan, so
+     * the caller can fall back to a "you have no tree to time-
+     * travel through" empty state instead of rendering an
+     * impossible date range.
+     *
+     * @param int $user_id WP user id.
+     * @param int $plan_id Plan id.
+     * @return string|null YYYY-MM-DD, or null when no position.
+     */
+    public function get_snapshot_floor_date($user_id, $plan_id) {
+        global $wpdb;
+
+        $user_id = (int) $user_id;
+        $plan_id = (int) $plan_id;
+        if ($user_id <= 0 || $plan_id <= 0) {
+            return null;
+        }
+
+        $joined = $wpdb->get_var($wpdb->prepare(
+            "SELECT MIN(joined_at)
+               FROM {$wpdb->prefix}matrix_positions
+              WHERE user_id = %d AND plan_id = %d",
+            $user_id, $plan_id
+        ));
+
+        if (!$joined) return null;
+        $ts = strtotime((string) $joined);
+        if ($ts === false) return null;
+        return date('Y-m-d', $ts);
     }
 
     /**

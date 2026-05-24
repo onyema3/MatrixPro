@@ -68,6 +68,16 @@ class Matrix_MLM_Database {
         // access. Created by self::create_tables() (see the
         // matching block there).
         'matrix_share_tokens',
+        // Append-only audit log of structural changes to
+        // matrix_positions rows. Powers the genealogy "time
+        // machine" view (date slider that reconstructs past tree
+        // state). One row per significant event (create / move /
+        // status change), plus a one-time backfill row per
+        // existing position dated at joined_at so snapshots from
+        // before the audit table existed still work. Read by
+        // Matrix_MLM_Plan_Engine::build_tree_at_snapshot();
+        // written by Matrix_MLM_Position_History::record_event().
+        'matrix_position_history',
     ];
 
     /**
@@ -198,6 +208,34 @@ class Matrix_MLM_Database {
                               NOT NULL DEFAULT 'active'"
                 );
             }
+        }
+
+        // 1.0.11: one-time backfill of matrix_position_history with
+        // a 'backfilled' row per existing position, dated at the
+        // position's joined_at column. Without this, the genealogy
+        // time-machine view would only be able to reconstruct the
+        // tree for snapshots dated *after* the audit table came
+        // online, which would be a useless feature on day one for
+        // any install that already has positions.
+        //
+        // Gated by an option flag rather than by version stamp so
+        // that:
+        //   - A future schema bump doesn't accidentally re-run the
+        //     backfill (which the SQL itself defends against via
+        //     NOT EXISTS, but the flag avoids even probing).
+        //   - An operator can manually trigger a re-backfill by
+        //     deleting the option, then visiting any admin page —
+        //     useful if a partial backfill was interrupted by a
+        //     timeout (rare on small installs, possible on the
+        //     ~12k-member imports the codebase already supports).
+        //
+        // The backfill itself is idempotent at the SQL level too,
+        // so the option flag is belt-and-braces, not load-bearing.
+        if (class_exists('Matrix_MLM_Position_History')
+            && (int) get_option('matrix_mlm_position_history_backfilled', 0) !== 1) {
+            $rows = Matrix_MLM_Position_History::backfill_existing();
+            update_option('matrix_mlm_position_history_backfilled', 1, false);
+            update_option('matrix_mlm_position_history_backfill_count', (int) $rows, false);
         }
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
@@ -933,6 +971,51 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_share_tokens);
 
+        // Genealogy time-machine audit log — one append-only row
+        // per structural change to a matrix_positions row. The
+        // companion class Matrix_MLM_Position_History writes here
+        // on every join_plan() / complete_matrix() / admin move
+        // (admin move capture is deferred to v2 — documented in
+        // that class's docblock). The time-machine view in the
+        // genealogy tab reconstructs past tree states by reading
+        // the latest history row per position id whose
+        // effective_at <= the requested snapshot date.
+        //
+        // Index choice: (position_id, effective_at) is the primary
+        // workhorse for the per-position "state at T" lookup the
+        // reconstruction relies on; (plan_id, effective_at) helps
+        // the future plan-wide diff/admin-history views without
+        // forcing a full-table scan.
+        //
+        // We do NOT add a UNIQUE constraint on (position_id,
+        // effective_at) because two events landing in the same
+        // second on the same position are legitimate (a 'created'
+        // followed by an immediate admin override would be the
+        // canonical example). The primary key is a synthetic id;
+        // ordering ties are broken by id ASC in the reader.
+        $table_position_history = $wpdb->prefix . 'matrix_position_history';
+        $sql_position_history = "CREATE TABLE $table_position_history (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            position_id bigint(20) UNSIGNED NOT NULL,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            plan_id bigint(20) UNSIGNED NOT NULL,
+            sponsor_id bigint(20) UNSIGNED DEFAULT NULL,
+            parent_id bigint(20) UNSIGNED DEFAULT NULL,
+            position int(11) NOT NULL DEFAULT 0,
+            level int(11) NOT NULL DEFAULT 1,
+            total_downline int(11) NOT NULL DEFAULT 0,
+            status enum('active','inactive','completed') NOT NULL DEFAULT 'active',
+            effective_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            event_type enum('created','moved','status_changed','completed','backfilled') NOT NULL DEFAULT 'backfilled',
+            actor_user_id bigint(20) UNSIGNED DEFAULT NULL,
+            notes text,
+            PRIMARY KEY (id),
+            KEY position_effective (position_id, effective_at),
+            KEY plan_effective (plan_id, effective_at),
+            KEY event_type (event_type)
+        ) $charset_collate;";
+        dbDelta($sql_position_history);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -954,6 +1037,7 @@ class Matrix_MLM_Database {
             'matrix_hospitals',
             'matrix_level_completions',
             'matrix_share_tokens',
+            'matrix_position_history',
         ];
 
         foreach ($tables as $table) {
