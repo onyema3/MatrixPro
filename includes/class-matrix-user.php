@@ -199,68 +199,87 @@ class Matrix_MLM_User {
     }
 
     /**
-     * Determine whether a user is currently allowed to withdraw funds.
+     * Determine whether a user is currently allowed to move funds out
+     * of their Matrix wallet on a given path.
      *
-     * Single source of truth for every "money out" surface the admin
-     * wants to gate — the Matrix→Fintava transfer pane, the Fintava
-     * bank-payout pane, and the user-to-user wallet transfer all call
-     * this before letting the request proceed. Centralising the policy
-     * here means the three admin toggles below evaluate identically
-     * regardless of which path the user picked, and lets us add a
-     * fourth gate in one place when the next "stop withdrawals when X"
-     * requirement comes up.
-     *
-     * Evaluates three admin-controlled gates, in order:
+     * Single source of truth for every fund-movement surface the admin
+     * wants to gate. Five toggles, evaluated in order:
      *
      *   1. matrix_mlm_withdrawals_enabled (default: 1)
-     *      Master kill switch. Set to 0 to pause every withdrawal flow
-     *      across the platform — useful during reconciliation, an
-     *      ongoing incident with the payment gateway, or a freeze
-     *      window before a re-import.
+     *      Master kill switch. Set to 0 to pause every fund-movement
+     *      flow across the platform — useful during reconciliation,
+     *      an ongoing incident with the payment gateway, or a freeze
+     *      window before a re-import. Applies to every $path.
      *
      *   2. matrix_mlm_withdraw_require_active_user (default: 1)
      *      When on, only users whose matrix_user_meta.status is
-     *      'active' can withdraw. Closes the long-standing gap where a
-     *      banned user could still hit the wallet-to-wallet and legacy
-     *      /withdraw endpoints (which never checked is_active
-     *      themselves). Defaults ON because every reasonable platform
-     *      treats banned accounts as ineligible — admins can flip it
-     *      off only if they need a banned user to drain their balance
-     *      out as part of a controlled close-out.
+     *      'active' can move funds. Closes the long-standing gap
+     *      where a banned user could still hit the wallet-to-wallet
+     *      and legacy /withdraw endpoints. Applies to every $path.
      *
      *   3. matrix_mlm_withdraw_required_plans (default: '')
-     *      Comma-separated list of plan IDs. When non-empty, the user
-     *      must have at least one ACTIVE position on at least one of
-     *      the listed plans. Empty means no plan restriction (every
-     *      plan is allowed). Lets admins gate withdrawals on tier —
-     *      e.g., "only Premium plan members can cash out".
+     *      Comma-separated list of plan IDs. When non-empty, the
+     *      user must have at least one ACTIVE position on at least
+     *      one of the listed plans. Empty means no plan restriction.
+     *      Applies to every $path — including peer wallet-to-wallet,
+     *      to close the relay loophole where a non-qualifying user
+     *      transfers their balance to an accomplice who does qualify
+     *      and has them cash out.
+     *
+     *   4. matrix_mlm_matrix_transfers_enabled (default: 1)
+     *      Path-specific toggle. Gates Matrix-wallet-sourced flows:
+     *      peer wallet-to-wallet and Matrix → Fintava virtual.
+     *      Applies only when $path === 'matrix_transfer'.
+     *
+     *   5. matrix_mlm_bank_transfers_enabled (default: read legacy
+     *      matrix_mlm_fintava_payouts_enabled, then 1).
+     *      Path-specific toggle. Gates the Fintava virtual → external
+     *      bank flow. Applies only when $path === 'bank_transfer'.
+     *      Reads the legacy key as a fallback so installs that haven't
+     *      re-saved the Settings → Financial page since this option
+     *      moved over from Gateways → Fintava don't lose their
+     *      previous setting.
+     *
+     * The five toggles are intentionally separated:
+     *
+     *   - 5 (master) is the global red button.
+     *   - 3 (active-account) and 2 (plan-tier) are user-eligibility
+     *     gates that apply uniformly to every path so they cannot
+     *     be circumvented by hopping through a peer.
+     *   - 1 (matrix-transfers) and 4 (bank-transfers) are path-
+     *     specific so admins can disable just one cash-out side
+     *     without freezing the other.
      *
      * Returns an array with two keys:
-     *   - allowed (bool): true if the user can withdraw, false otherwise.
-     *   - reason  (string): empty when allowed, otherwise a user-facing
-     *     message explaining which gate blocked the call. Caller is
-     *     expected to surface this verbatim via wp_send_json_error.
+     *   - allowed (bool): true if the user can move funds, else false.
+     *   - reason  (string): empty when allowed, otherwise a user-
+     *     facing localized message explaining which gate blocked
+     *     the call. Caller is expected to surface this verbatim
+     *     via wp_send_json_error.
      *
-     * The reason is INTENTIONALLY a localized user-facing string rather
-     * than a code key. The helper is hot-path (called on every transfer
-     * and payout AJAX) and every caller currently round-trips the
-     * message straight to wp_send_json_error — building it once here
-     * avoids duplicating the copy in three call sites that would
-     * inevitably drift.
-     *
-     * @param int $user_id WP user id.
+     * @param int    $user_id WP user id.
+     * @param string $path    'matrix_transfer' (peer + Matrix→Fintava-
+     *                        virtual) or 'bank_transfer' (Fintava→
+     *                        external bank).
      * @return array{allowed: bool, reason: string}
      */
-    public static function can_withdraw($user_id) {
+    public static function can_move_funds($user_id, $path) {
         $user_id = intval($user_id);
         if ($user_id <= 0) {
             return [
                 'allowed' => false,
-                'reason'  => __('You must be logged in to withdraw funds.', 'matrix-mlm'),
+                'reason'  => __('You must be logged in to move funds.', 'matrix-mlm'),
             ];
         }
 
-        // Gate 1: master kill switch.
+        if (!in_array($path, ['matrix_transfer', 'bank_transfer'], true)) {
+            return [
+                'allowed' => false,
+                'reason'  => __('Unknown transfer type. Please refresh the page and try again.', 'matrix-mlm'),
+            ];
+        }
+
+        // Gate 5: master kill switch.
         if (!(int) get_option('matrix_mlm_withdrawals_enabled', 1)) {
             return [
                 'allowed' => false,
@@ -268,24 +287,28 @@ class Matrix_MLM_User {
             ];
         }
 
-        // Gate 2: active-account requirement.
+        // Gate 3: active-account requirement.
         if ((int) get_option('matrix_mlm_withdraw_require_active_user', 1)) {
             if (!self::is_active($user_id)) {
                 return [
                     'allowed' => false,
-                    'reason'  => __('Your account is not active, so you cannot withdraw funds. Please contact support if you believe this is in error.', 'matrix-mlm'),
+                    'reason'  => __('Your account is not active, so you cannot move funds. Please contact support if you believe this is in error.', 'matrix-mlm'),
                 ];
             }
         }
 
-        // Gate 3: required-plan tier.
+        // Gate 2: required-plan tier. Stored as CSV rather than a
+        // serialized array because the admin Settings save handler
+        // unconditionally runs every field through update_option
+        // without a per-field type map — keeping the value scalar
+        // means it survives that path without bespoke handling, and
+        // the multi-select UI on the financial tab joins/splits with
+        // comma to match.
         //
-        // Stored as CSV rather than a serialized array because the
-        // admin Settings save handler unconditionally runs every field
-        // through update_option without a per-field type map — keeping
-        // the value scalar means it survives that path without
-        // bespoke handling, and the multi-select UI on the financial
-        // tab joins/splits with comma to match.
+        // Applied to peer wallet-to-wallet too, to close the relay
+        // loophole: without this, a non-qualifying user could send
+        // their balance to a qualifying accomplice and have the
+        // accomplice cash out on their behalf.
         $required_csv = trim((string) get_option('matrix_mlm_withdraw_required_plans', ''));
         if ($required_csv !== '') {
             $required_ids = array_values(array_filter(array_map('intval', preg_split('/[,\s]+/', $required_csv))));
@@ -306,6 +329,32 @@ class Matrix_MLM_User {
                         'reason'  => __('Withdrawals are currently restricted to specific membership plans, and none of your active plans qualify. Please contact support.', 'matrix-mlm'),
                     ];
                 }
+            }
+        }
+
+        // Gate 1 / Gate 4: path-specific toggles.
+        if ($path === 'matrix_transfer') {
+            if (!(int) get_option('matrix_mlm_matrix_transfers_enabled', 1)) {
+                return [
+                    'allowed' => false,
+                    'reason'  => __('Matrix wallet transfers are temporarily disabled by the administrator. Please try again later.', 'matrix-mlm'),
+                ];
+            }
+        } else { // bank_transfer
+            // Read the new key first; fall back to the legacy
+            // matrix_mlm_fintava_payouts_enabled key for installs
+            // that haven't re-saved the Settings → Financial page
+            // since the toggle moved there from Gateways → Fintava.
+            // Both default ON (1).
+            $bank_raw = get_option('matrix_mlm_bank_transfers_enabled', null);
+            if ($bank_raw === null || $bank_raw === false || $bank_raw === '') {
+                $bank_raw = get_option('matrix_mlm_fintava_payouts_enabled', 1);
+            }
+            if (!(int) $bank_raw) {
+                return [
+                    'allowed' => false,
+                    'reason'  => __('Bank transfers are temporarily disabled by the administrator. Please try again later.', 'matrix-mlm'),
+                ];
             }
         }
 

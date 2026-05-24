@@ -149,13 +149,16 @@
         });
     });
 
-    // Withdraw form handler removed — see feat/admin-controlled-withdrawals.
-    // The Withdraw tab and #matrix-withdraw-form selector haven't been
-    // rendered for a while; the matrix_action=withdraw endpoint they
-    // posted to has now been removed too. Bank payouts go through
-    // matrix_fintava_initiate_transfer (the bank-payout pane), and
-    // Matrix→Virtual moves go through matrix_transfer_matrix_to_virtual.
-    // Both honour the new admin withdrawal controls.
+    // Withdraw form handler removed — see feat/admin-controlled-withdrawals
+    // and refactor/withdrawal-controls-five-toggles. The Withdraw tab,
+    // #matrix-withdraw-form, and the standalone "Matrix Transfers" pane
+    // are all retired; the matrix_action=withdraw endpoint they posted
+    // to has been removed too. Money out of the platform goes through
+    // matrix_fintava_initiate_transfer (Fintava virtual → external bank,
+    // the "Transfer to Bank" pane) and matrix_transfer_matrix_to_virtual
+    // (Matrix wallet → Fintava virtual, the "Transfer to Own Wallet"
+    // pane). Both honour the five-toggle Withdrawal Controls panel on
+    // Settings → Financial via Matrix_MLM_User::can_move_funds().
 
     // Transfer form
     $(document).on('submit', '#matrix-transfer-form', function(e) {

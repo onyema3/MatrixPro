@@ -75,17 +75,25 @@ class Matrix_MLM_User_Wallet {
         $fintava   = new Matrix_MLM_Fintava();
         $is_active = $fintava->is_active();
 
-        // Dedicated Bank Payouts toggle (matrix_mlm_fintava_payouts_enabled,
-        // default ON). Independent from $is_active so admins can disable
-        // only the Fintava-driven external bank transfer pane without
-        // tearing down the rest of the Fintava integration. See the
-        // toggle's description on Gateways → Fintava for the operator
-        // semantics. The 4th button (Matrix Transfers, instant Matrix
-        // wallet → bank withdrawal) ignores this toggle on purpose —
-        // it's the cash-out path users without a Fintava virtual
-        // wallet take, and stays available regardless of the
-        // Fintava-bank-payouts toggle.
-        $payouts_enabled = $is_active && (int) get_option('matrix_mlm_fintava_payouts_enabled', 1) === 1;
+        // Bank Transfers toggle (matrix_mlm_bank_transfers_enabled,
+        // default ON). Independent from $is_active so admins can
+        // disable only the Fintava-driven external bank-transfer pane
+        // without tearing down the rest of the Fintava integration.
+        // The toggle lives on Settings → Financial under the
+        // Withdrawal Controls panel as one of five separated levers
+        // (master kill switch, active-account, plan-tier, matrix
+        // transfers, bank transfers). When OFF: the External group
+        // and the "Transfer to Bank" button below disappear, and
+        // Matrix_MLM_Fintava::ajax_initiate_transfer rejects with a
+        // clean error as defence-in-depth. The legacy key
+        // matrix_mlm_fintava_payouts_enabled is read as a fallback
+        // for installs that haven't re-saved Settings → Financial
+        // since this option moved over from Gateways → Fintava.
+        $bank_raw = get_option('matrix_mlm_bank_transfers_enabled', null);
+        if ($bank_raw === null || $bank_raw === false || $bank_raw === '') {
+            $bank_raw = get_option('matrix_mlm_fintava_payouts_enabled', 1);
+        }
+        $payouts_enabled = $is_active && (int) $bank_raw === 1;
 
         echo '<h2>' . esc_html__('Wallet', 'matrix-mlm') . '</h2>';
         echo '<p class="matrix-subtitle">' . esc_html__('Your virtual bank account and Matrix wallet, all in one place.', 'matrix-mlm') . '</p>';
@@ -326,16 +334,11 @@ class Matrix_MLM_User_Wallet {
      *
      *   External (Bank) group:
      *     - Transfer to Bank        (Fintava virtual → external Nigerian bank, instant)
-     *     - Matrix Transfers        (Matrix wallet → external Nigerian bank, instant)
      *
      * Each group has its own heading + caption row; the underlying
      * .matrix-wallet-actions grid styling is unchanged so the buttons
      * still flow into a 1/2/3-column responsive layout within their
-     * group. The two `Transfer to Bank` and `Matrix Transfers` buttons
-     * intentionally read as a pair: same destination concept (an
-     * external bank account) with two different funding sources
-     * (Fintava virtual wallet vs Matrix wallet). Both are instant
-     * from the user's POV — no admin gate on either path.
+     * group.
      *
      * Buttons toggle the matching pane below (data-target → data-pane).
      * All panes are rendered server-side so the forms work even if
@@ -345,28 +348,29 @@ class Matrix_MLM_User_Wallet {
      * Visibility rules:
      *
      *   - "Transfer to Bank" (Fintava → external) is hidden when the
-     *     dedicated `matrix_mlm_fintava_payouts_enabled` toggle on
-     *     Gateways → Fintava is OFF, OR when the master Fintava
-     *     integration is inactive ($is_active=false in render()).
-     *     Both states are folded into the $payouts_enabled flag the
-     *     caller passes in.
+     *     dedicated Bank Transfers toggle on Settings → Financial is
+     *     OFF, OR when the master Fintava integration is inactive
+     *     ($is_active=false in render()). Both states are folded into
+     *     the $payouts_enabled flag the caller passes in.
      *
-     *   - "Matrix Transfers" (Matrix wallet → external bank, instant)
-     *     is ALWAYS visible in the wallet-exists state. It's the
-     *     cash-out path users without a Fintava virtual wallet take
-     *     and is independent of the Fintava-bank-payouts toggle —
-     *     the funding source is the user's Matrix wallet, not their
-     *     Fintava balance, so it stays available regardless of
-     *     Fintava's state.
+     * History note: a fourth "Matrix Transfers" button used to live
+     * in the External group, claiming to debit the Matrix wallet
+     * straight to a bank. It was retired in
+     * refactor/withdrawal-controls-five-toggles — the code path
+     * never actually reached a payment rail (the operator settled
+     * bank-side off-platform), so the button was a misleading
+     * shortcut. Users who want money in a bank now go Matrix →
+     * Fintava virtual (Internal group) and then Fintava → Bank
+     * (External group) as two real flows.
      *
      * No button starts in the .is-active state and all panes (see
      * render_panes()) are rendered with the [hidden] attribute, so
      * the wallet page lands in a clean overview state on page load.
      *
-     * @param bool $payouts_enabled Whether the dedicated Fintava bank-
-     *                              payout toggle is on (and Fintava is
-     *                              active). When false, the Transfer
-     *                              to Bank button is suppressed.
+     * @param bool $payouts_enabled Whether the dedicated Bank Transfers
+     *                              toggle is on (and Fintava is active).
+     *                              When false, the Transfer to Bank
+     *                              button is suppressed.
      */
     private function render_action_buttons($payouts_enabled = true) {
         ?>
@@ -393,13 +397,13 @@ class Matrix_MLM_User_Wallet {
             </div>
         </div>
 
+        <?php if ($payouts_enabled): ?>
         <div class="matrix-wallet-action-group matrix-wallet-action-group-external">
             <div class="matrix-wallet-action-group-header">
                 <h3><?php esc_html_e('External Transfers', 'matrix-mlm'); ?></h3>
-                <p><?php esc_html_e('Send funds out of the platform to any Nigerian bank account.', 'matrix-mlm'); ?></p>
+                <p><?php esc_html_e('Send funds out of the platform to a Nigerian bank account.', 'matrix-mlm'); ?></p>
             </div>
             <div class="matrix-wallet-actions">
-                <?php if ($payouts_enabled): ?>
                 <button type="button" class="matrix-wallet-action-btn" data-target="bank">
                     <span class="matrix-wallet-action-icon dashicons dashicons-bank"></span>
                     <span class="matrix-wallet-action-text">
@@ -407,16 +411,9 @@ class Matrix_MLM_User_Wallet {
                         <small><?php esc_html_e('Instant — debited from your Fintava virtual wallet', 'matrix-mlm'); ?></small>
                     </span>
                 </button>
-                <?php endif; ?>
-                <button type="button" class="matrix-wallet-action-btn" data-target="matrix-transfers">
-                    <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
-                    <span class="matrix-wallet-action-text">
-                        <strong><?php esc_html_e('Matrix Transfers', 'matrix-mlm'); ?></strong>
-                        <small><?php esc_html_e('Instant — debited from your Matrix wallet, paid to the bank account you specify', 'matrix-mlm'); ?></small>
-                    </span>
-                </button>
             </div>
         </div>
+        <?php endif; ?>
         <?php
     }
 
@@ -424,20 +421,16 @@ class Matrix_MLM_User_Wallet {
      * Render the action panes (hidden by default; one is shown when
      * its matching action button is clicked).
      *
-     * Four panes total in the wallet-exists state:
+     * Three panes total in the wallet-exists state:
      *   - own-wallet      → render_transfer_to_own_wallet_form()
      *   - user-wallet     → render_wallet_to_wallet_form()
-     *   - bank              → embedded Matrix_MLM_User_Bank_Payout::render()
-     *                         (Fintava → external bank, instant)
-     *   - matrix-transfers  → render_matrix_transfers_form()
-     *                         (Matrix wallet → external bank, instant)
+     *   - bank            → embedded Matrix_MLM_User_Bank_Payout::render()
+     *                       (Fintava → external bank, instant)
      *
      * The bank pane is only rendered when $payouts_enabled is true;
      * otherwise the Transfer to Bank action button is also hidden in
      * render_action_buttons() so the [data-pane="bank"] target never
-     * gets clicked. The matrix-transfers pane is always rendered — it's
-     * the operational fallback that has to stay available regardless
-     * of Fintava state.
+     * gets clicked.
      */
     private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true) {
         ?>
@@ -464,20 +457,11 @@ class Matrix_MLM_User_Wallet {
             // only appears when the user clicks the "Transfer to Bank"
             // action button above (see the click handler in
             // render_scripts() — it removes [hidden] from the matching
-            // pane and adds .is-active to the matching button). An
-            // earlier revision left this pane visible on page load with
-            // .is-active on the matching button, but that read as a
-            // duplicated "Transfer to Bank" UI (the action button label
-            // is identical to the pane's own submit button label), so
-            // we're back to the symmetric "all collapsed" default.
+            // pane and adds .is-active to the matching button).
             (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
             ?>
         </section>
         <?php endif; ?>
-
-        <section class="matrix-wallet-pane" data-pane="matrix-transfers" hidden>
-            <?php $this->render_matrix_transfers_form($user_id, $matrix_balance, $currency); ?>
-        </section>
         <?php
     }
 
@@ -1206,170 +1190,6 @@ class Matrix_MLM_User_Wallet {
     }
 
     /**
-     * Render the Matrix Transfers form + history.
-     *
-     * Instant Matrix wallet → external bank withdrawal — distinct
-     * from the Fintava-instant "Transfer to Bank" pane on two axes:
-     *
-     *   - Source of funds: the user's *Matrix* wallet (debited on
-     *     submit). The Fintava-instant pane debits the user's
-     *     Fintava virtual wallet directly via /bank/credit.
-     *
-     *   - Settlement: the row is written to wp_matrix_withdrawals
-     *     with status='approved' at submit time — no admin gate.
-     *     The Matrix wallet debit and the row insert run inside one
-     *     DB transaction, the user gets an "approved" confirmation
-     *     email, and the operator's off-platform reconciliation
-     *     reads the now-approved row to settle the bank credit on
-     *     their end. The legacy admin Approve / Reject UI is left in
-     *     place for any historical pending rows that pre-date this
-     *     change but no new rows go through that flow.
-     *
-     *   - Availability: this pane stays available even when the
-     *     dedicated Fintava bank-payouts toggle is off (or Fintava
-     *     is down). The funding source is the Matrix wallet, not
-     *     Fintava, so the path is independent of Fintava's state.
-     *
-     * The form posts to the existing matrix_mlm_action AJAX endpoint
-     * with matrix_action=withdraw; the new server-side handler
-     * (Matrix_MLM_Core::process_withdraw) does balance check, debit,
-     * row insert, and notification dispatch atomically. Limits and
-     * charges read from the Settings → Financial tab options
-     * (matrix_mlm_min_withdraw, matrix_mlm_max_withdraw,
-     * matrix_mlm_withdraw_charge_type, matrix_mlm_withdraw_charge)
-     * — the same options the Fintava admin Settings tab references
-     * for its own withdrawal-policy gates, so a single source of
-     * truth governs both paths.
-     */
-    private function render_matrix_transfers_form($user_id, $matrix_balance, $currency) {
-        global $wpdb;
-
-        $min_withdraw   = floatval(get_option('matrix_mlm_min_withdraw', 1000));
-        $max_withdraw   = floatval(get_option('matrix_mlm_max_withdraw', 1000000));
-        $charge_type    = get_option('matrix_mlm_withdraw_charge_type', 'percent');
-        $charge_value   = floatval(get_option('matrix_mlm_withdraw_charge', 5));
-
-        // Ceiling: balance must cover (amount + charge). Same
-        // formula as the wallet-to-wallet form so a user with
-        // exactly $balance available can still type something
-        // (instead of hitting the silent "submit disabled because
-        // amount + charge > balance" trap).
-        if ($charge_type === 'percent') {
-            $rate            = $charge_value / 100;
-            $balance_ceiling = (1 + $rate) > 0 ? $matrix_balance / (1 + $rate) : $matrix_balance;
-        } else {
-            $balance_ceiling = max(0, $matrix_balance - $charge_value);
-        }
-        $balance_ceiling = floor($balance_ceiling * 100) / 100;
-        $effective_max   = min($max_withdraw, $balance_ceiling);
-
-        // History (this user's withdrawal requests). Limited to 10
-        // most-recent rows so the pane stays compact; the dashboard's
-        // standalone "withdraw-history" tab was retired so this is
-        // now the canonical user-facing view of their own requests.
-        $withdrawals = $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_withdrawals
-              WHERE user_id = %d
-              ORDER BY created_at DESC LIMIT 10",
-            $user_id
-        ));
-        ?>
-        <h3><?php esc_html_e('Matrix Transfers', 'matrix-mlm'); ?></h3>
-
-        <div class="matrix-transfer-note">
-            <?php esc_html_e('Send funds straight from your Matrix wallet to any Nigerian bank account. Transfers are instant — your Matrix wallet is debited and the bank account is credited as soon as you submit.', 'matrix-mlm'); ?>
-        </div>
-
-        <div class="matrix-info-box">
-            <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
-            <p><strong><?php esc_html_e('Limits:', 'matrix-mlm'); ?></strong> <?php echo esc_html($currency . number_format($min_withdraw, 0) . ' &ndash; ' . $currency . number_format($max_withdraw, 0)); ?></p>
-            <p><strong><?php esc_html_e('Service Charge:', 'matrix-mlm'); ?></strong> <?php echo esc_html($charge_type === 'percent' ? $charge_value . '%' : $currency . number_format($charge_value, 2)); ?></p>
-            <p><small><?php esc_html_e('Processed instantly. You will receive a confirmation email once the transfer is sent.', 'matrix-mlm'); ?></small></p>
-        </div>
-
-        <div class="matrix-form-card">
-            <form id="matrix-transfers-form" class="matrix-form">
-                <div class="matrix-form-group">
-                    <label><?php esc_html_e('Amount', 'matrix-mlm'); ?> (<?php echo esc_html($currency); ?>)</label>
-                    <input type="number" name="amount" id="matrix-bt-amount"
-                           min="<?php echo esc_attr($min_withdraw); ?>"
-                           max="<?php echo esc_attr($effective_max); ?>"
-                           step="0.01" required
-                           placeholder="<?php echo esc_attr(sprintf(__('Min %s, Max %s', 'matrix-mlm'), number_format($min_withdraw, 0), number_format($effective_max, 2))); ?>">
-                    <div id="matrix-bt-charge-info" class="matrix-charge-info" style="display:none;">
-                        <small>
-                            <?php esc_html_e('Charge:', 'matrix-mlm'); ?> <span id="matrix-bt-charge">-</span> |
-                            <?php esc_html_e('Total Debit:', 'matrix-mlm'); ?> <span id="matrix-bt-total">-</span> |
-                            <?php esc_html_e('You Receive:', 'matrix-mlm'); ?> <span id="matrix-bt-net">-</span>
-                        </small>
-                    </div>
-                </div>
-
-                <div class="matrix-form-group">
-                    <label><?php esc_html_e('Bank Name', 'matrix-mlm'); ?></label>
-                    <input type="text" name="bank_name" id="matrix-bt-bank-name" required
-                           maxlength="80"
-                           placeholder="<?php esc_attr_e('e.g. GTBank, Access Bank', 'matrix-mlm'); ?>">
-                </div>
-
-                <div class="matrix-form-group">
-                    <label><?php esc_html_e('Account Number', 'matrix-mlm'); ?></label>
-                    <input type="text" name="account_number" id="matrix-bt-account-number" required
-                           pattern="\d{10}" maxlength="10"
-                           placeholder="<?php esc_attr_e('10-digit account number', 'matrix-mlm'); ?>">
-                </div>
-
-                <div class="matrix-form-group">
-                    <label><?php esc_html_e('Account Name', 'matrix-mlm'); ?></label>
-                    <input type="text" name="account_name" id="matrix-bt-account-name" required
-                           maxlength="120"
-                           placeholder="<?php esc_attr_e('Account holder name as it appears on the bank statement', 'matrix-mlm'); ?>">
-                </div>
-
-                <div class="matrix-form-group">
-                    <label><?php esc_html_e('Note (optional)', 'matrix-mlm'); ?></label>
-                    <input type="text" name="narration" id="matrix-bt-narration"
-                           maxlength="120"
-                           placeholder="<?php esc_attr_e('Reference / description for this transfer', 'matrix-mlm'); ?>">
-                </div>
-
-                <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="matrix-bt-submit-btn">
-                    <?php esc_html_e('Send Matrix Transfer', 'matrix-mlm'); ?>
-                </button>
-            </form>
-        </div>
-
-        <?php if (!empty($withdrawals)): ?>
-        <h4 class="matrix-wallet-history-heading"><?php esc_html_e('Recent Matrix Transfers', 'matrix-mlm'); ?></h4>
-        <table class="matrix-table">
-            <thead>
-                <tr>
-                    <th><?php esc_html_e('Date', 'matrix-mlm'); ?></th>
-                    <th><?php esc_html_e('Amount', 'matrix-mlm'); ?></th>
-                    <th><?php esc_html_e('Charge', 'matrix-mlm'); ?></th>
-                    <th><?php esc_html_e('Net', 'matrix-mlm'); ?></th>
-                    <th><?php esc_html_e('Account', 'matrix-mlm'); ?></th>
-                    <th><?php esc_html_e('Status', 'matrix-mlm'); ?></th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($withdrawals as $w): ?>
-                <tr>
-                    <td><?php echo esc_html(date('M d, Y H:i', strtotime($w->created_at))); ?></td>
-                    <td><?php echo esc_html($currency . number_format($w->amount, 2)); ?></td>
-                    <td><?php echo esc_html($currency . number_format($w->charge, 2)); ?></td>
-                    <td><?php echo esc_html($currency . number_format($w->net_amount, 2)); ?></td>
-                    <td><small><?php echo esc_html($w->account_details); ?></small></td>
-                    <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($w->status); ?>"><?php echo esc_html(ucfirst($w->status)); ?></span></td>
-                </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-        <?php endif; ?>
-        <?php
-    }
-
-    /**
      * Inline styles. Kept in this class (rather than the plugin's
      * shared CSS) because they're scoped to the Wallet page only and
      * tightly coupled to the markup above — moving them out would just
@@ -1829,7 +1649,6 @@ class Matrix_MLM_User_Wallet {
             if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
                 $('#matrix-transfer-to-own-wallet-form :input').prop('disabled', true);
                 $('#matrix-w2w-form :input').prop('disabled', true);
-                $('#matrix-transfers-form :input').prop('disabled', true);
                 if (window.console && console.error) {
                     console.error('[Matrix MLM] matrixMLM global is not defined — wallet page AJAX handlers not bound.');
                 }
@@ -2098,123 +1917,6 @@ class Matrix_MLM_User_Wallet {
                     error: function(xhr, textStatus, errorMsg) {
                         var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
-                    }
-                });
-            });
-
-            // -----------------------------------------------------------
-            // Matrix Transfers (instant Matrix wallet → bank withdrawal).
-            //
-            // Posts to matrix_mlm_action with matrix_action=withdraw.
-            // The server-side handler (Matrix_MLM_Core::process_withdraw)
-            // re-runs every gate (can_withdraw, balance check, limits)
-            // so this client-side validation is purely for UX — it
-            // catches obvious mistakes (empty fields, amount below min,
-            // amount + charge over balance) before round-tripping.
-            //
-            // Source of funds: the user's Matrix wallet (debited on
-            // submit). Distinct from the Fintava-instant Transfer to
-            // Bank pane which debits the user's Fintava virtual wallet.
-            // The two flows live in the same External group above and
-            // intentionally read as alternative cash-out mechanisms.
-            // -----------------------------------------------------------
-            var btMin         = <?php echo floatval(get_option('matrix_mlm_min_withdraw', 1000)); ?>;
-            var btChargeType  = '<?php echo esc_js(get_option('matrix_mlm_withdraw_charge_type', 'percent')); ?>';
-            var btChargeValue = <?php echo floatval(get_option('matrix_mlm_withdraw_charge', 5)); ?>;
-            var btBalance     = <?php echo floatval($matrix_balance); ?>;
-
-            $('#matrix-bt-amount').on('input', function() {
-                var amount = parseFloat($(this).val()) || 0;
-                if (amount > 0) {
-                    var charge = btChargeType === 'percent'
-                        ? (amount * btChargeValue / 100)
-                        : btChargeValue;
-                    charge = Math.round(charge * 100) / 100;
-                    var total = amount + charge;
-                    var net   = amount; // user receives the requested amount; charge is on top
-                    $('#matrix-bt-charge').text(ownCurrency + charge.toLocaleString());
-                    $('#matrix-bt-total').text(ownCurrency + total.toLocaleString());
-                    $('#matrix-bt-net').text(ownCurrency + net.toLocaleString());
-                    $('#matrix-bt-charge-info').show();
-                } else {
-                    $('#matrix-bt-charge-info').hide();
-                }
-            });
-
-            $('#matrix-transfers-form').on('submit', function(e) {
-                e.preventDefault();
-
-                var amount       = parseFloat($('#matrix-bt-amount').val());
-                var bankName     = ($('#matrix-bt-bank-name').val()     || '').trim();
-                var accountNum   = ($('#matrix-bt-account-number').val() || '').trim();
-                var accountName  = ($('#matrix-bt-account-name').val()  || '').trim();
-                var narration    = ($('#matrix-bt-narration').val()     || '').trim();
-
-                if (!amount || amount < btMin) {
-                    alert('<?php echo esc_js(__('Amount must be at least the minimum withdrawal.', 'matrix-mlm')); ?>');
-                    return;
-                }
-                if (!bankName) {
-                    alert('<?php echo esc_js(__('Please enter the bank name.', 'matrix-mlm')); ?>');
-                    return;
-                }
-                if (!/^\d{10}$/.test(accountNum)) {
-                    alert('<?php echo esc_js(__('Please enter a valid 10-digit account number.', 'matrix-mlm')); ?>');
-                    return;
-                }
-                if (!accountName) {
-                    alert('<?php echo esc_js(__('Please enter the account name.', 'matrix-mlm')); ?>');
-                    return;
-                }
-
-                var charge = btChargeType === 'percent'
-                    ? (amount * btChargeValue / 100)
-                    : btChargeValue;
-                charge = Math.round(charge * 100) / 100;
-                var total = amount + charge;
-                if (total > btBalance) {
-                    alert('<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
-                    return;
-                }
-
-                if (!confirm(
-                    '<?php echo esc_js(__('Submit a Matrix Transfer request for', 'matrix-mlm')); ?> ' + ownCurrency + amount.toLocaleString() +
-                    ' <?php echo esc_js(__('to', 'matrix-mlm')); ?> ' + accountName + ' (' + bankName + ' ' + accountNum + ')?\n\n' +
-                    '<?php echo esc_js(__('Charge:', 'matrix-mlm')); ?> ' + ownCurrency + charge.toFixed(2) + '\n' +
-                    '<?php echo esc_js(__('Total Debit (Matrix Wallet):', 'matrix-mlm')); ?> ' + ownCurrency + total.toFixed(2) + '\n\n' +
-                    '<?php echo esc_js(__('Your Matrix wallet will be debited and the bank account will be credited instantly.', 'matrix-mlm')); ?>'
-                )) {
-                    return;
-                }
-
-                var $btn = $('#matrix-bt-submit-btn');
-                $btn.prop('disabled', true).text('<?php echo esc_js(__('Submitting…', 'matrix-mlm')); ?>');
-
-                $.ajax({
-                    url:  matrixMLM.ajaxUrl,
-                    type: 'POST',
-                    data: {
-                        action:         'matrix_mlm_action',
-                        nonce:          matrixMLM.nonce,
-                        matrix_action:  'withdraw',
-                        amount:         amount,
-                        bank_name:      bankName,
-                        account_number: accountNum,
-                        account_name:   accountName,
-                        narration:      narration
-                    },
-                    success: function(res) {
-                        if (res && res.success) {
-                            alert((res.data && res.data.message) || '<?php echo esc_js(__('Bank transfer request submitted.', 'matrix-mlm')); ?>');
-                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
-                        } else {
-                            alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not submit the bank transfer request.', 'matrix-mlm')); ?>');
-                            $btn.prop('disabled', false).text('<?php echo esc_js(__('Submit Bank Transfer Request', 'matrix-mlm')); ?>');
-                        }
-                    },
-                    error: function(xhr, textStatus, errorMsg) {
-                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
-                        $btn.prop('disabled', false).text('<?php echo esc_js(__('Submit Bank Transfer Request', 'matrix-mlm')); ?>');
                     }
                 });
             });
