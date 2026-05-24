@@ -193,9 +193,89 @@ class Matrix_MLM_User_Genealogy {
         // touch one line.
         $initial_render_depth = min(4, (int) $display_position->depth);
 
+        // Time-machine view: ?snapshot_at=YYYY-MM-DD reconstructs
+        // the tree as it existed on that calendar date. Drives a
+        // sepia-tinted "Viewing snapshot from X" banner above the
+        // toolbar plus a date slider for picking different
+        // snapshots. The slider and the snapshot mode are gated
+        // by the audit table (matrix_position_history) being
+        // present on disk — on a fresh install the
+        // self-healing maybe_upgrade() creates it and backfills
+        // a baseline row per existing position, so this gate is
+        // just defence against an in-flight migration on an
+        // older install.
+        //
+        // Validation ladder rejects bad input and silently falls
+        // through to the live tree:
+        //   1. Snapshot date must look like YYYY-MM-DD
+        //      (snapshot_date_to_datetime() returns NULL otherwise)
+        //   2. Snapshot date must be no later than today
+        //      (a future snapshot is meaningless)
+        //   3. Snapshot date must be no earlier than the
+        //      member's own join date in this plan
+        //      (get_snapshot_floor_date() — earlier dates have no
+        //      tree to show)
+        //   4. The reconstructed tree must be non-null
+        //      (build_tree_at_snapshot returns null when the
+        //      member didn't have a position at the snapshot)
+        //
+        // Snapshot mode also intentionally suppresses the
+        // pivoted-view path: pivoting + snapshotting at once
+        // would multiply the failure modes the reconstruction
+        // has to defend against (was Sarah even visible to me on
+        // April 15?) and the v1 surface keeps both features
+        // independently usable rather than chasing edge cases
+        // in their interaction. The slider hides on pivoted
+        // views and ?snapshot_at is silently ignored when
+        // ?pivot_user_id resolves successfully.
+        $snapshot_at_raw = isset($_GET['snapshot_at'])
+            ? sanitize_text_field((string) $_GET['snapshot_at'])
+            : '';
+        $snapshot_dt        = null;  // SQL datetime for the SQL queries
+        $snapshot_at_ymd    = '';    // canonical YYYY-MM-DD for the UI
+        $snapshot_floor_ymd = $plan_engine->get_snapshot_floor_date(
+            (int) $user_id,
+            (int) $selected_plan_id
+        );
+        $is_snapshot_view = false;
+
+        if (!$is_pivoted
+            && $snapshot_at_raw !== ''
+            && $snapshot_floor_ymd !== null) {
+            $candidate_dt = Matrix_MLM_Position_History::snapshot_date_to_datetime($snapshot_at_raw);
+            $today_ymd    = current_time('Y-m-d');
+            if ($candidate_dt
+                && strtotime($snapshot_at_raw) >= strtotime($snapshot_floor_ymd)
+                && strtotime($snapshot_at_raw) <= strtotime($today_ymd)
+                // Equality case: snapshot_at == today is treated
+                // as "live" — there's no useful difference between
+                // "the tree right now" and "the tree at end of
+                // today", and showing the sepia banner for it would
+                // be silly. Members who pick today via the slider
+                // get the live tree back, which is what they expect.
+                && $snapshot_at_raw !== $today_ymd) {
+                $snapshot_dt     = $candidate_dt;
+                $snapshot_at_ymd = $snapshot_at_raw;
+                $is_snapshot_view = true;
+            }
+        }
+
         // Build the tree rooted at the display user — when pivoted,
         // that's the pivot member; otherwise it's the viewer.
-        $tree = $plan_engine->get_matrix_tree($display_user_id, $selected_plan_id, $initial_render_depth);
+        // Snapshot mode replaces the live builder with the
+        // history-aware one. Both share the node shape contract so
+        // every downstream renderer (level badges, D3 view, classic
+        // tree) consumes them identically.
+        if ($is_snapshot_view) {
+            $tree = $plan_engine->build_tree_at_snapshot(
+                $display_user_id,
+                $selected_plan_id,
+                $snapshot_dt,
+                $initial_render_depth
+            );
+        } else {
+            $tree = $plan_engine->get_matrix_tree($display_user_id, $selected_plan_id, $initial_render_depth);
+        }
         $max_members = Matrix_MLM_Plan_Engine::calculate_max_members($display_position->width, $display_position->depth);
 
         // Per-level fill status for the badge panel below the stats row.
@@ -275,6 +355,19 @@ class Matrix_MLM_User_Genealogy {
             'goal_level'        => $next_goal ? (int) $next_goal['level'] : 0,
             'level_commissions' => $level_commissions_decoded,
             'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
+            // Time-machine flags. The empty-slot CTA renderer
+            // and the D3 bootstrap both need to know they're in
+            // snapshot mode so they can suppress affordances
+            // that don't make sense for a historical view (a
+            // "refer 1 more here" CTA on a snapshot from 6
+            // months ago, a real-time poll firing against a
+            // frozen tree). Threading these through pivot_state
+            // — the existing per-render context bag — is the
+            // cheapest place to expose them to every downstream
+            // renderer without longer parameter lists.
+            'is_snapshot_view'   => $is_snapshot_view,
+            'snapshot_at_ymd'    => $snapshot_at_ymd,
+            'snapshot_floor_ymd' => $snapshot_floor_ymd,
         ];
 
         // Parse the heat-map view-mode URL params and compute per-
@@ -322,6 +415,21 @@ class Matrix_MLM_User_Genealogy {
         <?php endif; ?>
 
         <?php $this->render_search_box($selected_plan_id); ?>
+
+        <?php
+        // Time-machine bar: rendered between the search box and the
+        // share/export panel so members see it as part of the
+        // navigation strip above the tree, not as an afterthought
+        // at the bottom. Hidden on pivoted views (see the snapshot
+        // validation ladder above for the reasoning).
+        if (!$is_pivoted && $snapshot_floor_ymd !== null) {
+            $this->render_time_machine_bar(
+                $is_snapshot_view,
+                $snapshot_at_ymd,
+                $snapshot_floor_ymd
+            );
+        }
+        ?>
 
         <?php $this->render_share_export_panel($selected_plan_id, $is_pivoted ? (int) $pivot_user_id_raw : 0); ?>
 
@@ -380,7 +488,19 @@ class Matrix_MLM_User_Genealogy {
             </div>
         </div>
 
+        <?php
+        // Suppress the next-goal banner in snapshot mode. The
+        // banner is action-oriented ("fill 2 more positions to
+        // earn ₦X") and the relevant action — referring a new
+        // member — only makes sense against the live tree, not
+        // a historical snapshot. Members who are already in
+        // snapshot mode have a clear way back to live (the
+        // "Back to live tree" button on the time-machine bar)
+        // and that's where the banner belongs.
+        if (empty($this->pivot_state['is_snapshot_view'])):
+        ?>
         <?php $this->render_next_goal_banner($next_goal, $referral_url); ?>
+        <?php endif; ?>
 
         <?php $this->render_level_badges($level_status, $levels_completed, $all_levels_complete, $display_position, $next_goal); ?>
 
@@ -399,7 +519,7 @@ class Matrix_MLM_User_Genealogy {
 
         <?php $this->render_d3_view($tree, $display_position, $selected_plan_id, $display_user_id, $initial_render_depth, $active_view); ?>
 
-        <div class="matrix-genealogy-wrapper" data-view-role="classic" data-active-view="<?php echo esc_attr($active_view); ?>"<?php echo $active_view === 'd3' ? ' aria-hidden="true"' : ''; ?>>
+        <div class="matrix-genealogy-wrapper" data-view-role="classic" data-active-view="<?php echo esc_attr($active_view); ?>"<?php echo $is_snapshot_view ? ' data-snapshot-mode="1"' : ''; ?><?php echo $active_view === 'd3' ? ' aria-hidden="true"' : ''; ?>>
             <div class="matrix-genealogy-tree<?php echo $mode_raw === 'activity' ? ' heatmap-active' : ''; ?>" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $display_position->depth; ?>" data-plan-width="<?php echo (int) $display_position->width; ?>" data-root-user-id="<?php echo $display_user_id; ?>" data-active-metric="<?php echo esc_attr($heat_metric); ?>">
                 <?php if ($tree): ?>
                     <?php $this->render_tree_node($tree, $display_position->width, true, $display_user_id, $initial_render_depth); ?>
@@ -536,6 +656,383 @@ class Matrix_MLM_User_Genealogy {
             $args['pivot_user_id'] = (int) $pivot_to_user_id;
         }
         return add_query_arg($args, $base);
+    }
+
+    /**
+     * Render the genealogy "time machine" bar.
+     *
+     * Affordance for picking a past date and re-rendering the tree
+     * as it existed on that date. Sits between the search box and
+     * the share/export panel above the tree.
+     *
+     * Two visual states gated by $is_snapshot_view:
+     *
+     *   - LIVE (default): collapsed disclosure — a single
+     *     "View past snapshots ▼" link. We keep the live view
+     *     visually quiet because most members will never use the
+     *     time machine; making the slider always-visible would
+     *     dominate a crowded toolbar with a feature that's
+     *     mostly noise to typical users. Click expands the
+     *     slider inline (CSS-driven via the wrapper's
+     *     data-time-machine-open attribute, no JS state
+     *     needed beyond the attribute toggle).
+     *
+     *   - SNAPSHOT (?snapshot_at=YYYY-MM-DD active): bar is
+     *     forced open and decorated with a sepia "Viewing
+     *     snapshot from X" banner. Members can't accidentally
+     *     forget they're in snapshot mode because the banner
+     *     and the canvas tint persist as long as the URL param
+     *     is set. The "Back to live tree" button removes the
+     *     param and reloads.
+     *
+     * The slider itself is an HTML5 range input mapped to unix
+     * timestamps (1-day step). On `change` (release, NOT live
+     * `input` — that would fire on every drag tick) the JS in
+     * render_time_machine_script() navigates to the new
+     * snapshot URL. Date display next to the slider updates
+     * live during drag for feedback without firing requests.
+     *
+     * Markup contract — the JS in render_time_machine_script()
+     * depends on these hooks:
+     *   .matrix-genealogy-time-machine                outer wrapper
+     *      [data-snapshot-mode="0"|"1"] for the live/snapshot toggle
+     *      [data-time-machine-open="0"|"1"] disclosure state
+     *   .mtm-disclosure                               the live-mode disclosure link
+     *   .mtm-panel                                    the slider container
+     *   .mtm-slider                                   the range input
+     *   .mtm-date-label                               live date readout
+     *   .mtm-presets button[data-offset-days]         preset jump buttons
+     *   .mtm-back-to-live                             "Back to live tree" link (snapshot mode only)
+     *
+     * Inline CSS lives at the bottom — same single-tab co-location
+     * pattern the rest of the genealogy view uses.
+     */
+    private function render_time_machine_bar($is_snapshot_view, $snapshot_at_ymd, $snapshot_floor_ymd) {
+        $today_ymd  = current_time('Y-m-d');
+        $floor_ts   = strtotime($snapshot_floor_ymd . ' 00:00:00');
+        $today_ts   = strtotime($today_ymd . ' 00:00:00');
+        if ($floor_ts === false || $today_ts === false || $floor_ts > $today_ts) {
+            // Defensive — shouldn't happen given the validation
+            // ladder in render(), but if the floor somehow ended
+            // up after today (clock skew, weird DB data) just
+            // emit nothing rather than a broken slider.
+            return;
+        }
+
+        // The slider value is a unix-timestamp-of-the-day (00:00
+        // local). Members never see the timestamp directly — the
+        // date label translates it back into a friendly
+        // calendar string.
+        $current_ts = $is_snapshot_view
+            ? (int) (strtotime($snapshot_at_ymd . ' 00:00:00') ?: $today_ts)
+            : $today_ts;
+
+        // URL the live JS uses to build snapshot URLs. We pass
+        // the canonical genealogy tab URL minus snapshot_at —
+        // the JS appends ?snapshot_at=YYYY-MM-DD when the slider
+        // changes. add_query_arg with snapshot_at first to
+        // strip it (ensures we don't double up on existing
+        // params).
+        $base_url = add_query_arg(
+            ['plan_id' => (int) $this->pivot_state['plan_id']],
+            class_exists('Matrix_MLM_User_Dashboard')
+                ? Matrix_MLM_User_Dashboard::tab_url('genealogy')
+                : home_url('/matrix-dashboard/?tab=genealogy')
+        );
+        // Strip any existing snapshot_at — the JS rebuilds it.
+        $live_url = remove_query_arg('snapshot_at', $base_url);
+
+        // Friendly date in members' WP-locale. We compute on the
+        // server (not the JS toLocaleDateString) because the
+        // initial render needs to ship the rendered string, and
+        // the JS dragger updates it live thereafter.
+        $current_label = $is_snapshot_view
+            ? date_i18n(get_option('date_format'), $current_ts)
+            : esc_html__('Today', 'matrix-mlm');
+        $floor_label = date_i18n(get_option('date_format'), $floor_ts);
+
+        // Days-ago pill: a glanceable "how far back am I?"
+        // affordance that complements the calendar date.
+        $days_ago = $is_snapshot_view ? max(0, (int) round(($today_ts - $current_ts) / DAY_IN_SECONDS)) : 0;
+        ?>
+        <div class="matrix-genealogy-time-machine"
+             data-snapshot-mode="<?php echo $is_snapshot_view ? '1' : '0'; ?>"
+             data-time-machine-open="<?php echo $is_snapshot_view ? '1' : '0'; ?>"
+             data-floor-ts="<?php echo (int) $floor_ts; ?>"
+             data-today-ts="<?php echo (int) $today_ts; ?>"
+             data-live-url="<?php echo esc_attr($live_url); ?>">
+
+            <?php if (!$is_snapshot_view): ?>
+            <button type="button"
+                    class="mtm-disclosure"
+                    aria-expanded="false"
+                    aria-controls="matrix-time-machine-panel">
+                <span class="dashicons dashicons-backup" aria-hidden="true"></span>
+                <?php esc_html_e('Time machine — view past snapshots', 'matrix-mlm'); ?>
+                <span class="mtm-disclosure-chevron" aria-hidden="true">▾</span>
+            </button>
+            <?php else: ?>
+            <div class="mtm-snapshot-banner" role="status">
+                <span class="mtm-snapshot-banner-icon" aria-hidden="true">
+                    <span class="dashicons dashicons-backup"></span>
+                </span>
+                <div class="mtm-snapshot-banner-body">
+                    <strong><?php
+                        printf(
+                            /* translators: %s: human-readable date in WP locale */
+                            esc_html__('Viewing snapshot from %s', 'matrix-mlm'),
+                            esc_html($current_label)
+                        );
+                    ?></strong>
+                    <small><?php
+                        if ($days_ago === 0) {
+                            esc_html_e('Earlier today.', 'matrix-mlm');
+                        } else {
+                            printf(
+                                /* translators: %d: integer number of days */
+                                esc_html(_n('%d day ago', '%d days ago', $days_ago, 'matrix-mlm')),
+                                (int) $days_ago
+                            );
+                        }
+                        echo ' ';
+                        esc_html_e('Members shown were in your tree on this date.', 'matrix-mlm');
+                    ?></small>
+                </div>
+                <a class="mtm-back-to-live" href="<?php echo esc_url($live_url); ?>">
+                    <span class="dashicons dashicons-controls-skipforward" aria-hidden="true"></span>
+                    <?php esc_html_e('Back to live tree', 'matrix-mlm'); ?>
+                </a>
+            </div>
+            <?php endif; ?>
+
+            <div class="mtm-panel" id="matrix-time-machine-panel" role="group" aria-label="<?php esc_attr_e('Genealogy snapshot date picker', 'matrix-mlm'); ?>">
+                <div class="mtm-slider-row">
+                    <span class="mtm-slider-end mtm-slider-end-floor" title="<?php esc_attr_e('Earliest snapshot — your join date in this plan', 'matrix-mlm'); ?>"><?php echo esc_html($floor_label); ?></span>
+                    <input type="range"
+                           class="mtm-slider"
+                           min="<?php echo (int) $floor_ts; ?>"
+                           max="<?php echo (int) $today_ts; ?>"
+                           step="<?php echo (int) DAY_IN_SECONDS; ?>"
+                           value="<?php echo (int) $current_ts; ?>"
+                           aria-label="<?php esc_attr_e('Snapshot date', 'matrix-mlm'); ?>"
+                           aria-valuetext="<?php echo esc_attr($current_label); ?>">
+                    <span class="mtm-slider-end mtm-slider-end-today" title="<?php esc_attr_e('Latest snapshot — today (the live tree)', 'matrix-mlm'); ?>"><?php esc_html_e('Today', 'matrix-mlm'); ?></span>
+                </div>
+                <div class="mtm-slider-readout">
+                    <span class="mtm-date-label"><?php echo esc_html($current_label); ?></span>
+                    <?php if ($is_snapshot_view && $days_ago > 0): ?>
+                    <span class="mtm-days-ago" aria-hidden="true">
+                        <?php
+                        printf(
+                            /* translators: %d: integer days */
+                            esc_html(_n('%d day ago', '%d days ago', $days_ago, 'matrix-mlm')),
+                            (int) $days_ago
+                        );
+                        ?>
+                    </span>
+                    <?php endif; ?>
+                </div>
+                <div class="mtm-presets" role="group" aria-label="<?php esc_attr_e('Quick snapshot presets', 'matrix-mlm'); ?>">
+                    <?php
+                    // Preset offsets — each gets a button that
+                    // sets the slider to (today minus N days)
+                    // and triggers the same navigation as a
+                    // manual slider release. We compute the
+                    // visible set server-side so a member who
+                    // joined three weeks ago doesn't see a
+                    // useless "1 year ago" button: skip presets
+                    // that fall earlier than the floor.
+                    $presets = [
+                        ['days' => 0,   'label' => __('Today', 'matrix-mlm')],
+                        ['days' => 7,   'label' => __('1 week ago', 'matrix-mlm')],
+                        ['days' => 30,  'label' => __('1 month ago', 'matrix-mlm')],
+                        ['days' => 90,  'label' => __('3 months ago', 'matrix-mlm')],
+                        ['days' => 180, 'label' => __('6 months ago', 'matrix-mlm')],
+                        ['days' => 365, 'label' => __('1 year ago', 'matrix-mlm')],
+                    ];
+                    foreach ($presets as $p):
+                        $preset_ts = $today_ts - ((int) $p['days'] * DAY_IN_SECONDS);
+                        if ($preset_ts < $floor_ts && (int) $p['days'] !== 0) {
+                            // Skip presets that predate the
+                            // member's join. The 0-day preset
+                            // ("Today") always renders so the
+                            // snapshot-mode bar offers a way back
+                            // even when the slider is at minimum.
+                            continue;
+                        }
+                        $is_active = $is_snapshot_view
+                            ? (int) round(($today_ts - $current_ts) / DAY_IN_SECONDS) === (int) $p['days']
+                            : (int) $p['days'] === 0;
+                    ?>
+                    <button type="button"
+                            class="mtm-preset-btn<?php echo $is_active ? ' is-active' : ''; ?>"
+                            data-offset-days="<?php echo (int) $p['days']; ?>">
+                        <?php echo esc_html($p['label']); ?>
+                    </button>
+                    <?php endforeach; ?>
+                </div>
+                <p class="mtm-caveat">
+                    <?php
+                    // Honest disclosure of the v1 capture gap.
+                    // Members who care about move-tracking will
+                    // know to read this; members who don't care
+                    // can ignore it. Either way we don't
+                    // pretend the feature is more than it is.
+                    esc_html_e('Snapshots show structural history from your matrix. Positions moved by an administrator after the snapshot date appear at their current location.', 'matrix-mlm');
+                    ?>
+                </p>
+            </div>
+        </div>
+
+        <?php $this->render_time_machine_script(); ?>
+        <?php
+    }
+
+    /**
+     * Inline JS for the time-machine slider.
+     *
+     * Two responsibilities:
+     *
+     *   1. Live date label updates as the member drags the
+     *      slider. Uses `input` event (fires on every tick) for
+     *      immediate visual feedback. Importantly, this does
+     *      NOT trigger navigation — that would hammer the
+     *      server with a navigation per drag tick.
+     *
+     *   2. Navigation on slider RELEASE (`change` event, fires
+     *      once when the member lets go). Builds the snapshot
+     *      URL from the chosen timestamp and reloads. The
+     *      "Today" preset and slider value at the today end
+     *      both navigate to the live URL (no snapshot_at
+     *      param).
+     *
+     *   3. Preset button click → snap the slider to that
+     *      preset's value, fire the same `change` handler, and
+     *      navigate. Visual active-state of the buttons is
+     *      driven server-side on next pageload so we don't
+     *      need to manage it during the brief navigation
+     *      window.
+     *
+     *   4. Disclosure expand: click the "View past snapshots"
+     *      link to reveal the slider on live view. Pure
+     *      attribute toggle — no animation library, the CSS
+     *      drives the open/closed visual via the wrapper's
+     *      data-time-machine-open attribute.
+     *
+     * Why no AJAX-driven scrubbing: a smooth scrub would mean
+     * a navigation (or AJAX call) on every drag tick. Even
+     * debounced that's a lot of traffic, and the experience of
+     * "pick a date, see the tree settle into that state" reads
+     * exactly the same as scrub-while-dragging at the URL/page
+     * granularity. Documented as a v2 candidate in the PR
+     * description.
+     */
+    private function render_time_machine_script() {
+        ?>
+        <script>
+        (function () {
+            var bar = document.querySelector('.matrix-genealogy-time-machine');
+            if (!bar) return;
+            var slider     = bar.querySelector('.mtm-slider');
+            var dateLabel  = bar.querySelector('.mtm-date-label');
+            var disclosure = bar.querySelector('.mtm-disclosure');
+            var presets    = bar.querySelectorAll('.mtm-preset-btn');
+            var liveUrl    = bar.getAttribute('data-live-url') || '';
+            var todayTs    = parseInt(bar.getAttribute('data-today-ts'), 10) || 0;
+            if (!slider || !dateLabel) return;
+
+            // Format a unix-second timestamp into the member's
+            // locale's calendar date. We don't have access to
+            // the WP date_format string from JS, so we use the
+            // browser's toLocaleDateString — it's not 1:1 with
+            // the server-rendered string, but it's consistent
+            // and the server re-renders authoritatively on the
+            // next pageload anyway.
+            function formatTs(ts) {
+                var d = new Date(ts * 1000);
+                try {
+                    return d.toLocaleDateString(undefined, {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric'
+                    });
+                } catch (e) {
+                    // Locale-string failure (very old browsers) —
+                    // fall back to ISO date.
+                    return d.toISOString().slice(0, 10);
+                }
+            }
+
+            // Convert ts → YYYY-MM-DD for the URL param. We
+            // build the date in LOCAL time so a member in
+            // GMT+8 picking "April 15" gets snapshot_at=2026-04-15,
+            // not 2026-04-14 (which would happen with toISOString
+            // because the slider value is a local-midnight ts).
+            function tsToYmd(ts) {
+                var d = new Date(ts * 1000);
+                var y  = d.getFullYear();
+                var m  = String(d.getMonth() + 1).padStart(2, '0');
+                var dd = String(d.getDate()).padStart(2, '0');
+                return y + '-' + m + '-' + dd;
+            }
+
+            function navigateToTs(ts) {
+                if (!liveUrl) return;
+                if (ts >= todayTs) {
+                    // Today (or somehow above) → live tree.
+                    window.location.href = liveUrl;
+                    return;
+                }
+                var ymd = tsToYmd(ts);
+                // append snapshot_at to liveUrl. liveUrl already
+                // has plan_id; we just bolt snapshot_at on. Use
+                // URL when available for safety, fall back to
+                // string concat for very old browsers.
+                try {
+                    var url = new URL(liveUrl, window.location.href);
+                    url.searchParams.set('snapshot_at', ymd);
+                    window.location.href = url.toString();
+                } catch (e) {
+                    var sep = liveUrl.indexOf('?') === -1 ? '?' : '&';
+                    window.location.href = liveUrl + sep + 'snapshot_at=' + encodeURIComponent(ymd);
+                }
+            }
+
+            // Live drag → label update only. No navigation.
+            slider.addEventListener('input', function () {
+                var ts = parseInt(slider.value, 10) || 0;
+                dateLabel.textContent = (ts >= todayTs)
+                    ? '<?php echo esc_js(__('Today', 'matrix-mlm')); ?>'
+                    : formatTs(ts);
+            });
+
+            // Release → navigation.
+            slider.addEventListener('change', function () {
+                var ts = parseInt(slider.value, 10) || 0;
+                navigateToTs(ts);
+            });
+
+            // Preset buttons.
+            for (var i = 0; i < presets.length; i++) {
+                presets[i].addEventListener('click', function (e) {
+                    var off = parseInt(e.currentTarget.getAttribute('data-offset-days'), 10) || 0;
+                    var ts = todayTs - (off * 86400);
+                    navigateToTs(ts);
+                });
+            }
+
+            // Disclosure (live mode only — snapshot mode has no
+            // disclosure button, the bar is always open).
+            if (disclosure) {
+                disclosure.addEventListener('click', function () {
+                    var open = bar.getAttribute('data-time-machine-open') === '1';
+                    bar.setAttribute('data-time-machine-open', open ? '0' : '1');
+                    disclosure.setAttribute('aria-expanded', open ? 'false' : 'true');
+                });
+            }
+        })();
+        </script>
+        <?php
     }
 
     /**
@@ -1375,6 +1872,22 @@ class Matrix_MLM_User_Genealogy {
             'root_user_id' => (int) $root_user_id,
             'initial_depth' => (int) $initial_depth,
             'active_view'  => $current_view,
+            // Time-machine flag — when true, the JS view skips
+            // affordances that don't make sense for a frozen
+            // historical tree:
+            //   - the new-referral poll loop
+            //   - the lazy-expand badges (no snapshot-aware
+            //     fetch_subtree endpoint exists in v1; the
+            //     snapshot tree is rendered up to plan depth so
+            //     there's nothing to expand anyway)
+            //   - the click-to-details popover (which would
+            //     otherwise show CURRENT member data on the
+            //     historical card — confusing rather than helpful)
+            // Read inside mount() in matrix-genealogy-d3.js.
+            'snapshot_mode' => !empty($this->pivot_state['is_snapshot_view']),
+            'snapshot_at'   => isset($this->pivot_state['snapshot_at_ymd'])
+                ? (string) $this->pivot_state['snapshot_at_ymd']
+                : '',
             // Pre-localised strings the JS module needs. We hand
             // these in rather than re-localise on the JS side
             // because translation belongs in PHP; the JS just
@@ -1492,7 +2005,7 @@ class Matrix_MLM_User_Genealogy {
         <div class="matrix-genealogy-d3-canvas"
              id="matrix-genealogy-d3-canvas"
              data-active-view="<?php echo esc_attr($current_view); ?>"
-             data-mounted="0"
+             data-mounted="0"<?php echo !empty($this->pivot_state['is_snapshot_view']) ? ' data-snapshot-mode="1"' : ''; ?>
              role="region"
              aria-label="<?php esc_attr_e('Interactive genealogy tree (drag to pan, scroll to zoom)', 'matrix-mlm'); ?>"
              tabindex="0">
@@ -2137,6 +2650,19 @@ class Matrix_MLM_User_Genealogy {
 
         $is_cta   = ($referral_url !== '');
         $is_goal  = ($is_cta && $slot_level > 0 && $slot_level === $goal_level);
+        // In time-machine snapshot mode, the empty-slot CTA falls
+        // back to the classic non-clickable "Available" card. The
+        // "Refer 1 more here" framing assumes the slot is still
+        // available *now* — referring someone today wouldn't
+        // retroactively fill a historical slot, so the CTA would
+        // be either misleading or just confusing. Members get the
+        // visual structure (where slots were empty on the
+        // snapshot date) without an action that doesn't apply to
+        // a frozen view.
+        if (!empty($this->pivot_state['is_snapshot_view'])) {
+            $is_cta  = false;
+            $is_goal = false;
+        }
         $per_slot = (int) $slot_level > 0 && isset($level_commissions[$slot_level])
             ? (float) $level_commissions[$slot_level]
             : 0.0;

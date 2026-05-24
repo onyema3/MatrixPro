@@ -253,7 +253,18 @@
         // first AJAX round-trip. The loop is self-rescheduling and
         // shuts itself down implicitly when the page navigates
         // away (the closure references die with the canvas).
-        startPolling();
+        //
+        // Skipped in snapshot mode — a historical view shouldn't
+        // tick forward in real time. The whole point of the time
+        // machine is showing the tree as it was on a frozen date,
+        // and grafting new arrivals into that view would be either
+        // misleading (members appearing on a date they weren't
+        // there) or pointless (we'd have to filter them out by
+        // joined_at against the snapshot date and end up with a
+        // no-op anyway).
+        if (!bootstrap.snapshot_mode) {
+            startPolling();
+        }
 
         // ==============================================================
         // Layout + render.
@@ -485,12 +496,22 @@
             //      (children empty / undefined). If we already
             //      loaded children for it, it's no longer the
             //      bottom — show no badge.
+            //   4. NOT in snapshot mode — there's no
+            //      snapshot-aware fetch_subtree endpoint in v1, so
+            //      a "Show more" click would silently fail. The
+            //      snapshot tree is rendered up to plan depth so
+            //      this is mostly a defensive check; it kicks in
+            //      only when total_downline (recomputed from the
+            //      snapshot subtree in build_tree_at_snapshot) is
+            //      somehow > rendered children, which shouldn't
+            //      happen but we guard anyway.
             var existing = nodeG.select('.mtx-expand-badge');
             var renderedChildren = (d.data.children && d.data.children.length) || 0;
             var hiddenDownline   = (d.data.total_downline || 0) - renderedChildren;
             var shouldShow = d.data.user_id
                 && hiddenDownline > 0
-                && (!d.data.children || d.data.children.length === 0);
+                && (!d.data.children || d.data.children.length === 0)
+                && !bootstrap.snapshot_mode;
 
             if (!shouldShow) {
                 existing.remove();
@@ -652,6 +673,17 @@
         function onNodeClick(event, d) {
             event.stopPropagation();
             if (!d.data.user_id) return; // empty slots — nothing to show
+
+            // Snapshot mode: suppress the click-to-details popover.
+            // The popover queries node_details which returns
+            // CURRENT member data (joined date, current sponsor,
+            // current commission running total) — showing those
+            // figures alongside a historical tree card would be
+            // actively misleading rather than just unhelpful.
+            // Members who want member details navigate back to
+            // the live tree first, which the snapshot banner's
+            // "Back to live tree" button makes one click away.
+            if (bootstrap.snapshot_mode) return;
 
             // If the same node is already showing details, treat the
             // second click as "close" — feels right for a popover.
