@@ -220,6 +220,20 @@ class Matrix_MLM_Fintava_Billing {
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
 
+        // Rate limit: 30 billing-purchases per user per hour, shared
+        // across buy_airtime/buy_data/buy_cable/buy_electricity under
+        // the 'fintava_buy_billing' key. The threat is fraud with a
+        // stolen credential burning the victim's wallet on bill
+        // purchases (airtime to mule numbers in particular). The
+        // shared key prevents an attacker from multiplying their
+        // budget by rotating product types.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_buy_billing',
+            30,
+            HOUR_IN_SECONDS
+        );
+
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);
         $network = sanitize_text_field($_POST['network'] ?? '');
@@ -266,6 +280,15 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
+
+        // Rate limit: shared 'fintava_buy_billing' key. See
+        // ajax_buy_airtime for rationale.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_buy_billing',
+            30,
+            HOUR_IN_SECONDS
+        );
 
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
@@ -323,6 +346,15 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
+
+        // Rate limit: shared 'fintava_buy_billing' key. See
+        // ajax_buy_airtime for rationale.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_buy_billing',
+            30,
+            HOUR_IN_SECONDS
+        );
 
         $smartcard = sanitize_text_field($_POST['smartcard_number'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
@@ -386,6 +418,15 @@ class Matrix_MLM_Fintava_Billing {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
         $user_id = get_current_user_id();
         if (!$user_id) { wp_send_json_error(['message' => __('Auth required', 'matrix-mlm')]); }
+
+        // Rate limit: shared 'fintava_buy_billing' key. See
+        // ajax_buy_airtime for rationale.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_buy_billing',
+            30,
+            HOUR_IN_SECONDS
+        );
 
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);

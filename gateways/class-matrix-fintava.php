@@ -1744,6 +1744,19 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // Rate limit: 60 lookups per user per hour. Resolves a NUBAN
+        // to an account name via Fintava, so an unbounded handler is
+        // a free name-enumeration oracle against arbitrary bank
+        // accounts. Sixty per hour is generous for a real user
+        // building up a beneficiary list and tight enough that a
+        // scraping run is bounded. Filterable; see Matrix_MLM_Rate_Limiter.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) get_current_user_id(),
+            'fintava_resolve_account',
+            60,
+            HOUR_IN_SECONDS
+        );
+
         $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         $bank_code = sanitize_text_field($_POST['bank_code'] ?? '');
 
@@ -1825,6 +1838,20 @@ class Matrix_MLM_Fintava {
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
+
+        // Rate limit: 10 bank-payout initiations per user per hour.
+        // Sits in front of the eligibility checks so a flood of
+        // requests cannot exercise the policy engine itself either.
+        // The same key is used for transfer status checks would
+        // double-count; ajax_check_transfer_status is intentionally
+        // not throttled here because it is a read-only status poll
+        // the UI runs in a tight loop while a transfer settles.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_initiate_transfer',
+            10,
+            HOUR_IN_SECONDS
+        );
 
         // Withdrawal-policy gate. Single call into the centralised
         // five-toggle policy helper. For path='bank_transfer' it
@@ -2187,6 +2214,17 @@ class Matrix_MLM_Fintava {
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
+
+        // Rate limit: 10 Matrix-to-Virtual transfers per user per
+        // hour. Same budget shape as ajax_initiate_transfer because
+        // both move money out of the Matrix wallet and we want a
+        // single mental model for the user.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_transfer_matrix_to_virtual',
+            10,
+            HOUR_IN_SECONDS
+        );
 
         // Withdrawal-policy gate. path='matrix_transfer' evaluates
         // the master kill switch, active-account requirement, plan-tier
@@ -5507,6 +5545,20 @@ class Matrix_MLM_Fintava {
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
+
+        // Rate limit: 3 wallet creation attempts per user per hour.
+        // The handler accepts a BVN as one of its inputs and a
+        // server-side BVN-validity oracle is the worst-case shape:
+        // a real user creates a wallet exactly once, ever. Three
+        // attempts give head room for a typo or a transient Fintava
+        // failure without giving any meaningful budget to a brute-force
+        // loop. Tighter than every other gate in this PR on purpose.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_create_virtual_wallet',
+            3,
+            HOUR_IN_SECONDS
+        );
 
         if (!Matrix_MLM_User::is_active($user_id)) {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);

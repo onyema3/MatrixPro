@@ -430,6 +430,17 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // Rate limit: 5 card-creation attempts per user per hour.
+        // Each attempt hits Fintava's POST /create/card endpoint and
+        // is a real Fintava resource burn even when the call fails;
+        // a real user creates a card exactly once.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_request_card',
+            5,
+            HOUR_IN_SECONDS
+        );
+
         if (!Matrix_MLM_User::is_active($user_id)) {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
         }
@@ -487,6 +498,19 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
+        // Rate limit: 5 PAN-bearing attempts per user per hour, shared
+        // with ajax_link_card and ajax_activate_card under the
+        // 'fintava_card_pan' key. All three handlers accept a PAN and
+        // their distinct Fintava error responses are a server-side
+        // PAN-validity oracle; a unified key keeps an attacker from
+        // multiplying their budget by rotating between handlers.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_card_pan',
+            5,
+            HOUR_IN_SECONDS
+        );
+
         $pan = wp_unslash($_POST['pan'] ?? '');
         $result = $this->setup_card($user_id, $pan);
 
@@ -509,6 +533,15 @@ class Matrix_MLM_Fintava_Card {
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
+
+        // Rate limit: shared 'fintava_card_pan' key with ajax_setup_card
+        // and ajax_activate_card. See ajax_setup_card for rationale.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_card_pan',
+            5,
+            HOUR_IN_SECONDS
+        );
 
         $pan = wp_unslash($_POST['pan'] ?? '');
         $result = $this->link_card($user_id, $pan);
@@ -540,6 +573,15 @@ class Matrix_MLM_Fintava_Card {
         if (!$user_id) {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
+
+        // Rate limit: shared 'fintava_card_pan' key with ajax_setup_card
+        // and ajax_link_card. See ajax_setup_card for rationale.
+        Matrix_MLM_Rate_Limiter::enforce(
+            (int) $user_id,
+            'fintava_card_pan',
+            5,
+            HOUR_IN_SECONDS
+        );
 
         $pan = wp_unslash($_POST['pan'] ?? '');
         $result = $this->activate_card($user_id, $pan);
