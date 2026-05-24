@@ -359,6 +359,9 @@ class Matrix_MLM_Core {
             case 'pay_subscription':
                 $this->process_pay_subscription();
                 break;
+            case 'get_commission_attribution':
+                $this->process_get_commission_attribution();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -1514,6 +1517,101 @@ class Matrix_MLM_Core {
             ],
             'profile_url' => $profile_url,
             'is_self'     => ($node_user_id === $current_user_id),
+        ]);
+    }
+
+    /**
+     * AJAX: per-position commission attribution map for the
+     * genealogy "income map" overlay.
+     *
+     * Backs the toolbar toggle in the D3 genealogy view that turns
+     * every node card into a literal earnings tag — for each
+     * descendant, "this is how much money this person, sitting
+     * exactly where they're sitting, has earned for you". The
+     * recipient/trigger semantics are the same as the hover-card's
+     * branch-commission number (which sums the whole branch); this
+     * endpoint just doesn't collapse the per-member contributions.
+     *
+     * Single round-trip: the helper returns the sparse map for
+     * the entire authorised subtree, regardless of how much of it
+     * the JS has currently rendered. That's important because the
+     * D3 view lazy-loads deeper levels — once a member toggles the
+     * overlay on, expanding a "Show more" badge later should
+     * surface attribution badges on the newly rendered nodes
+     * without re-fetching. The hard cap (5000 by default) is the
+     * only reason the map could ever miss a node, and the
+     * `capped` flag in the response lets the client warn about it.
+     *
+     * Auth: same gate as fetch_subtree_json / node_details. The
+     * viewer must be the position owner or an ancestor.
+     */
+    private function process_get_commission_attribution() {
+        $current_user_id = get_current_user_id();
+        if ($current_user_id <= 0) {
+            wp_send_json_error(['message' => __('You must be logged in.', 'matrix-mlm')]);
+        }
+
+        $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        if ($position_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, plan_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+            $position_id
+        ));
+        if (!$row || !$row->plan_id) {
+            wp_send_json_error(['message' => __('Position not found.', 'matrix-mlm')]);
+        }
+
+        $plan_engine = new Matrix_MLM_Plan_Engine();
+        if (!$plan_engine->user_can_view_position($current_user_id, $position_id)) {
+            wp_send_json_error([
+                'message' => __('You do not have access to this part of the genealogy.', 'matrix-mlm')
+            ]);
+        }
+
+        $result = $plan_engine->get_per_user_commission_attribution(
+            $current_user_id,
+            (int) $row->id,
+            (int) $row->plan_id,
+            5000
+        );
+
+        // Format every amount on the server side so the JS doesn't
+        // have to know about locale-aware thousands/decimal
+        // separators. Mirrors the heatmap's compact-money
+        // convention (no decimals on >= 1000) so the income-map
+        // and the heatmap don't visually fight each other when a
+        // member toggles between them.
+        $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
+        $attribution_payload = [];
+        foreach ($result['attribution'] as $uid => $entry) {
+            $amount = (float) $entry['amount'];
+            $attribution_payload[$uid] = [
+                'amount'         => $amount,
+                'amount_display' => $currency_symbol . number_format_i18n(
+                    $amount,
+                    $amount >= 1000 ? 0 : 2
+                ),
+                'count'          => (int) $entry['count'],
+            ];
+        }
+
+        $total_amount = (float) $result['total']['amount'];
+
+        wp_send_json_success([
+            'currency'    => $currency_symbol,
+            'attribution' => $attribution_payload,
+            'total'       => [
+                'amount'         => $total_amount,
+                'amount_display' => $currency_symbol . number_format_i18n($total_amount, 2),
+                'count'          => (int) $result['total']['count'],
+                'members'        => (int) $result['total']['members'],
+            ],
+            'capped'      => (bool) $result['capped'],
+            'descendants' => (int) $result['descendants'],
         ]);
     }
 

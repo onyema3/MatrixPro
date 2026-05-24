@@ -1919,6 +1919,34 @@ class Matrix_MLM_User_Genealogy {
                 // the count to avoid a 30-name run-on toast).
                 'new_referral_one'  => __('%s just joined your tree!', 'matrix-mlm'),
                 'new_referral_many' => __('%d new referrals just joined your tree!', 'matrix-mlm'),
+                // Per-position commission attribution overlay —
+                // strings consumed by the income-map toggle button,
+                // the per-node badges, and the corner summary chip.
+                // The "%s" tokens are filled in client-side via
+                // format() (see matrix-genealogy-d3.js), so the
+                // ordering and count of placeholders is part of
+                // the JS contract — adding a placeholder here
+                // without updating the JS will silently render
+                // the literal "%s".
+                'commission_overlay_show'    => __('Show income map', 'matrix-mlm'),
+                'commission_overlay_hide'    => __('Hide income map', 'matrix-mlm'),
+                'commission_overlay_loading' => __('Loading income map…', 'matrix-mlm'),
+                'commission_overlay_error'   => __('Could not load commission attribution.', 'matrix-mlm'),
+                // Singular vs plural: members find singular more
+                // "personal" on a small downline so we distinguish
+                // even though many languages would not.
+                'commission_overlay_summary_one'  => __('You\'ve earned %1$s from %2$d member in this tree', 'matrix-mlm'),
+                'commission_overlay_summary_many' => __('You\'ve earned %1$s from %2$d members in this tree', 'matrix-mlm'),
+                'commission_overlay_summary_zero' => __('No paid commissions attributed to this tree yet', 'matrix-mlm'),
+                // Hard-cap warning — we only walk the first 5000
+                // descendants for the attribution map. Members
+                // with bigger trees see this hint so they don't
+                // think a missing badge means a bug.
+                'commission_overlay_capped'  => __('Showing first 5000 descendants — totals are a floor.', 'matrix-mlm'),
+                // Per-node tooltip when a member has triggered
+                // commissions. count is the number of payouts.
+                'commission_overlay_node_tip_one'  => __('%1$s earned from %2$s (%3$d payout)', 'matrix-mlm'),
+                'commission_overlay_node_tip_many' => __('%1$s earned from %2$s (%3$d payouts)', 'matrix-mlm'),
             ],
         ];
 
@@ -1958,6 +1986,33 @@ class Matrix_MLM_User_Genealogy {
                         title="<?php esc_attr_e('Reset view', 'matrix-mlm'); ?>">
                     <span class="dashicons dashicons-image-rotate" aria-hidden="true"></span>
                 </button>
+                <?php
+                /*
+                 * Per-position commission attribution overlay
+                 * toggle. Skipped in snapshot mode because
+                 * commissions are a "now" concept — we don't
+                 * have point-in-time commission data and trying
+                 * to render the income map over a frozen tree
+                 * would be misleading (it'd show today's totals
+                 * over yesterday's structure). The button is
+                 * separated by a thin divider element from the
+                 * zoom/fit/reset cluster because conceptually
+                 * it's a data overlay, not a view-control —
+                 * grouping with the data toggles instead of the
+                 * navigation toggles.
+                 */
+                if (empty($this->pivot_state['is_snapshot_view'])) :
+                ?>
+                <span class="matrix-genealogy-tool-divider" aria-hidden="true"></span>
+                <button type="button"
+                        class="matrix-genealogy-tool-btn matrix-genealogy-tool-btn-toggle"
+                        data-action="commission-overlay"
+                        aria-pressed="false"
+                        aria-label="<?php esc_attr_e('Show income map (commission earned per position)', 'matrix-mlm'); ?>"
+                        title="<?php esc_attr_e('Show income map', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-money-alt" aria-hidden="true"></span>
+                </button>
+                <?php endif; ?>
             </div>
             <div class="matrix-genealogy-toolbar-spacer"></div>
             <a class="matrix-genealogy-view-toggle"

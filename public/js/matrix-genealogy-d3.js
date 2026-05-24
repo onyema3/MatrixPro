@@ -209,6 +209,57 @@
         // requests. Map<positionId, true>.
         var pendingLoads = Object.create(null);
 
+        // ---- Per-position commission attribution overlay state ----
+        //
+        // The "income map" toggle in the toolbar lazy-fetches a
+        // sparse map of {user_id -> {amount, amount_display, count}}
+        // covering the entire authorised subtree (not just the
+        // currently-rendered nodes), so newly lazy-loaded nodes
+        // can find themselves in the map without an extra
+        // round-trip. Lifecycle:
+        //
+        //   - active=false, loaded=false: button shows "Show",
+        //     no badges visible, no fetch in flight.
+        //   - active=true, loading=true: clicked once, fetch
+        //     in flight. We render the toggle as pressed
+        //     immediately so the click feels responsive; the
+        //     summary chip shows a "Loading…" placeholder until
+        //     the response lands.
+        //   - active=true, loaded=true: badges render, summary
+        //     chip shows totals.
+        //   - active=false, loaded=true: clicking again hides
+        //     badges WITHOUT throwing away the cached map — a
+        //     re-toggle is then instant.
+        //
+        // We never invalidate the map on poll or expand because:
+        //   - polled new nodes carry _isNew until the pulse
+        //     clears; they have no commission data yet (joined
+        //     seconds ago), so a missing map entry is correct.
+        //   - lazy-expanded nodes are already covered by the
+        //     server-side BFS that built the map, so a lookup
+        //     by user_id just works.
+        //
+        // The downside is a stale map after a long page session
+        // where new commissions land. We accept that — the
+        // member can refresh the page or toggle off+on to
+        // re-fetch. Optimising for this is a future-day concern.
+        var commissionOverlay = {
+            active:    false,
+            loading:   false,
+            loaded:    false,
+            byUserId:  Object.create(null),
+            total:     null,
+            currency:  (window.matrixMLM && window.matrixMLM.currency) || '',
+            capped:    false
+        };
+        // Cached <div> that lives in the canvas corner and shows
+        // the rolled-up "you've earned X from N members" line
+        // when the overlay is active. Created on demand the
+        // first time the overlay turns on; reused across
+        // toggles. Hidden via display:none rather than
+        // remove()d so its position calc stays cheap.
+        var commissionSummaryEl = null;
+
         // Track the currently-open details card so opening another
         // closes it cleanly (CSS doesn't have first-class
         // accordion semantics for SVG, so we manage it manually).
@@ -421,6 +472,7 @@
             // remove it).
             nodeEnter.each(function (d) {
                 renderExpandBadgeIfNeeded(d3.select(this), d);
+                renderCommissionBadgeIfNeeded(d3.select(this), d);
             });
 
             // Make every clickable node focusable for keyboard nav.
@@ -462,6 +514,7 @@
             // badge needs to vanish.
             nodeSel.each(function (d) {
                 renderExpandBadgeIfNeeded(d3.select(this), d);
+                renderCommissionBadgeIfNeeded(d3.select(this), d);
             });
 
             if (fit) {
@@ -546,6 +599,309 @@
                 .attr('text-anchor', 'middle')
                 .attr('y', 4)
                 .text('+' + formatCount(d.data.total_downline));
+        }
+
+        // ==============================================================
+        // Per-position commission attribution overlay — the "income
+        // map".
+        //
+        // Renders a small green pill at the top-right of any node
+        // whose user_id appears in commissionOverlay.byUserId with a
+        // positive amount. Hidden when commissionOverlay.active is
+        // false (the badge is removed entirely; CSS-driven hiding
+        // would leave layout space allocated). Empty slots and the
+        // viewer's own root card are skipped — empty slots have no
+        // member to attribute, and the root by definition is the
+        // viewer (a member can't earn commission *from themselves*).
+        // ==============================================================
+        function renderCommissionBadgeIfNeeded(nodeG, d) {
+            var existing = nodeG.select('.mtx-commission-overlay');
+            var userId   = d.data.user_id;
+
+            // Bail conditions — same skipping policy as the docblock
+            // above. Note we DO render on spillover/direct alike;
+            // the income-map question is "did this person trigger
+            // any commission for me", which is independent of how
+            // they got into the tree.
+            var shouldShow = commissionOverlay.active
+                && commissionOverlay.loaded
+                && userId
+                && d.data.relationship !== 'you';
+
+            var entry = shouldShow
+                ? commissionOverlay.byUserId[userId]
+                : null;
+
+            // Non-contributors are explicitly NOT badged — the
+            // absence of a badge is itself the signal in an
+            // income-map view. A green pill on every node would
+            // dilute the readability of the contributors.
+            if (!shouldShow || !entry || !(entry.amount > 0)) {
+                if (!existing.empty()) existing.remove();
+                return;
+            }
+
+            // Re-render path: the amount could have changed if the
+            // map was re-fetched after this node was first drawn
+            // (rare today, but cheap to support). If a badge
+            // already exists, just update its text.
+            if (!existing.empty()) {
+                existing.select('text.mtx-commission-overlay-amount')
+                    .text(entry.amount_display || '');
+                return;
+            }
+
+            // Position: top-right corner of the card body, sticking
+            // out a touch (-4px on x, -6px on y from the corner)
+            // so the badge reads as an applied price tag rather
+            // than something baked into the card. Keeps the rect
+            // inside the card visually clean for username + meta.
+            var badge = nodeG.append('g')
+                .attr('class', 'mtx-commission-overlay')
+                .attr('transform', 'translate(' + (NODE_WIDTH / 2 - 4) + ', ' + (-NODE_HEIGHT / 2 - 6) + ')')
+                .attr('aria-hidden', 'true'); // decorative — actual
+                // value is in the title element below for SR users
+
+            // Tooltip line. Browsers render <title> as a hover
+            // tooltip on SVG and screen readers expose it as the
+            // accessible name when aria-hidden is reset. We keep
+            // the badge group aria-hidden because the income map
+            // information is supplementary to the node's primary
+            // identity; an SR user who wants attribution can use
+            // the existing click-to-details flow.
+            var tipTpl = (entry.count === 1)
+                ? (i18n.commission_overlay_node_tip_one  || '%1$s earned from %2$s (%3$d payout)')
+                : (i18n.commission_overlay_node_tip_many || '%1$s earned from %2$s (%3$d payouts)');
+            badge.append('title')
+                .text(tipTpl
+                    .replace('%1$s', String(entry.amount_display || ''))
+                    .replace('%2$s', String(d.data.username || ''))
+                    .replace('%3$d', String(entry.count || 0))
+                );
+
+            // Pill geometry: width sized to text length, capped at
+            // a max so a wildly long currency string doesn't blow
+            // the card layout. The text is right-anchored so the
+            // pill always hugs the card's top-right edge no matter
+            // how long the amount is.
+            var label   = String(entry.amount_display || '');
+            var pillW   = Math.min(96, Math.max(46, 12 + label.length * 6.5));
+            var pillH   = 18;
+
+            badge.append('rect')
+                .attr('class', 'mtx-commission-overlay-pill')
+                .attr('x', -pillW)
+                .attr('y', -pillH / 2)
+                .attr('width', pillW)
+                .attr('height', pillH)
+                .attr('rx', pillH / 2)
+                .attr('ry', pillH / 2);
+
+            badge.append('text')
+                .attr('class', 'mtx-commission-overlay-amount')
+                .attr('text-anchor', 'end')
+                .attr('x', -8)
+                .attr('y', 4)
+                .text(label);
+        }
+
+        // ==============================================================
+        // Toggle the income-map overlay. Triggered by the toolbar
+        // button's data-action="commission-overlay" handler. Three
+        // possible transitions:
+        //
+        //   - off → loading → on  (first activation; fetches map)
+        //   - on  → off            (cached map preserved, instant)
+        //   - off → on             (no fetch, cached map reused)
+        //
+        // The button's aria-pressed and the canvas's
+        // data-show-commissions are kept in sync so CSS can react
+        // to either signal — useful for downstream extensions
+        // (e.g. graying out the heatmap toggle while the income
+        // map is on so members don't pile two overlays on top of
+        // each other).
+        // ==============================================================
+        function toggleCommissionOverlay(btn) {
+            // Fast path: deactivate. Keep the cache around so a
+            // re-toggle is instant.
+            if (commissionOverlay.active) {
+                commissionOverlay.active = false;
+                btn.setAttribute('aria-pressed', 'false');
+                btn.setAttribute('title', i18n.commission_overlay_show || 'Show income map');
+                canvas.removeAttribute('data-show-commissions');
+                updateCommissionSummary();
+                // Re-render to drop the badges. Animate=false
+                // because we want immediate feedback on toggle —
+                // a 400ms fade on a button click feels laggy.
+                layoutAndRender(false, false);
+                return;
+            }
+
+            // Activation path. Two sub-cases:
+            //   - already loaded → just show.
+            //   - not yet loaded → fetch, then show on success.
+            commissionOverlay.active = true;
+            btn.setAttribute('aria-pressed', 'true');
+            btn.setAttribute('title', i18n.commission_overlay_hide || 'Hide income map');
+            canvas.setAttribute('data-show-commissions', '1');
+
+            if (commissionOverlay.loaded) {
+                updateCommissionSummary();
+                layoutAndRender(false, false);
+                return;
+            }
+
+            // First-time fetch. Show the loading line in the
+            // summary chip while the request is in flight; the
+            // badges themselves don't appear until the response
+            // lands and we re-render.
+            commissionOverlay.loading = true;
+            updateCommissionSummary();
+            fetchCommissionAttribution(function (err) {
+                commissionOverlay.loading = false;
+                if (err) {
+                    // Treat fetch failure as if the user toggled
+                    // off — flip the button back, drop the
+                    // canvas flag, surface the message via the
+                    // existing flash UI. Keep loaded=false so a
+                    // retry click triggers a new fetch.
+                    commissionOverlay.active = false;
+                    btn.setAttribute('aria-pressed', 'false');
+                    btn.setAttribute('title', i18n.commission_overlay_show || 'Show income map');
+                    canvas.removeAttribute('data-show-commissions');
+                    updateCommissionSummary();
+                    flashError(i18n.commission_overlay_error || 'Could not load commission attribution.');
+                    return;
+                }
+                commissionOverlay.loaded = true;
+                updateCommissionSummary();
+                layoutAndRender(false, false);
+            });
+        }
+
+        // ==============================================================
+        // Fetch the per-position attribution map. Single round-trip
+        // — the server walks the entire authorised subtree and
+        // returns a sparse {user_id -> {amount, amount_display,
+        // count}} so subsequent lazy-expanded subtrees find their
+        // entries already loaded.
+        //
+        // Callback receives (err) — null on success.
+        // ==============================================================
+        function fetchCommissionAttribution(cb) {
+            var endpoint = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
+            var nonce    = (window.matrixMLM && window.matrixMLM.nonce) || '';
+            // Root position id lives on the bootstrap tree's root
+            // node — that's the position the JSON endpoint will
+            // traverse from. user_can_view_position() on the
+            // server gates against the viewer's own ancestor
+            // chain, so we don't need to pre-validate here.
+            var rootPositionId = (bootstrap.tree && bootstrap.tree.id) || 0;
+            if (!endpoint || !rootPositionId) {
+                cb(new Error('missing endpoint or root'));
+                return;
+            }
+
+            var body = new FormData();
+            body.append('action', 'matrix_mlm_action');
+            body.append('matrix_action', 'get_commission_attribution');
+            body.append('nonce', nonce);
+            body.append('position_id', String(rootPositionId));
+
+            fetch(endpoint, {
+                method: 'POST',
+                body: body,
+                credentials: 'same-origin'
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (response) {
+                if (!response || !response.success || !response.data) {
+                    cb(new Error('bad response'));
+                    return;
+                }
+                var data = response.data;
+                // The server keys attribution by user_id (numeric)
+                // but JSON object keys are strings, so we copy
+                // into a numeric-keyed dict for fast lookup
+                // during render. Object.create(null) keeps the
+                // prototype chain clean — important because some
+                // members have user_ids that collide with
+                // built-in Object members (e.g. user_id 1
+                // matching __proto__'s neighbours on toString).
+                var byUserId = Object.create(null);
+                if (data.attribution && typeof data.attribution === 'object') {
+                    for (var k in data.attribution) {
+                        if (Object.prototype.hasOwnProperty.call(data.attribution, k)) {
+                            var uid = Number(k);
+                            if (uid > 0) {
+                                byUserId[uid] = data.attribution[k];
+                            }
+                        }
+                    }
+                }
+                commissionOverlay.byUserId = byUserId;
+                commissionOverlay.total    = data.total || null;
+                commissionOverlay.currency = data.currency || commissionOverlay.currency;
+                commissionOverlay.capped   = !!data.capped;
+                cb(null);
+            })
+            .catch(function (err) {
+                if (window.console && console.warn) {
+                    console.warn('[matrix-genealogy-d3] commission attribution fetch failed', err);
+                }
+                cb(err || new Error('network'));
+            });
+        }
+
+        // ==============================================================
+        // Maintain the corner summary chip. Created lazily on first
+        // activation and reused across toggles (display:none when
+        // hidden so we don't re-pay layout cost on every toggle).
+        // ==============================================================
+        function updateCommissionSummary() {
+            // Lazy create.
+            if (!commissionSummaryEl) {
+                commissionSummaryEl = document.createElement('div');
+                commissionSummaryEl.className = 'matrix-genealogy-d3-commission-summary';
+                commissionSummaryEl.setAttribute('aria-live', 'polite');
+                canvas.appendChild(commissionSummaryEl);
+            }
+
+            if (!commissionOverlay.active) {
+                commissionSummaryEl.style.display = 'none';
+                commissionSummaryEl.textContent = '';
+                return;
+            }
+
+            commissionSummaryEl.style.display = '';
+
+            if (commissionOverlay.loading) {
+                commissionSummaryEl.textContent = i18n.commission_overlay_loading || 'Loading income map…';
+                return;
+            }
+
+            var total   = commissionOverlay.total || { amount: 0, amount_display: '', members: 0 };
+            var members = total.members || 0;
+            var line;
+            if (members === 0) {
+                line = i18n.commission_overlay_summary_zero || 'No paid commissions attributed to this tree yet';
+            } else {
+                var tpl = (members === 1)
+                    ? (i18n.commission_overlay_summary_one  || 'You\'ve earned %1$s from %2$d member in this tree')
+                    : (i18n.commission_overlay_summary_many || 'You\'ve earned %1$s from %2$d members in this tree');
+                line = tpl
+                    .replace('%1$s', String(total.amount_display || ''))
+                    .replace('%2$d', String(members));
+            }
+            // Append the cap warning when the server told us it
+            // truncated the descendant walk. Members with
+            // smaller trees never see this text — capped is
+            // server-side authoritative.
+            if (commissionOverlay.capped) {
+                var cappedNote = i18n.commission_overlay_capped || '';
+                if (cappedNote) line = line + ' — ' + cappedNote;
+            }
+            commissionSummaryEl.textContent = line;
         }
 
         // ==============================================================
@@ -861,6 +1217,15 @@
                     case 'reset-view':
                         svg.transition().duration(300)
                             .call(zoomBehavior.transform, d3.zoomIdentity);
+                        break;
+                    case 'commission-overlay':
+                        // Lazy-fetch the attribution map on the
+                        // first activation, then just flip the
+                        // visibility flag on subsequent toggles.
+                        // The button itself is the source of
+                        // truth for aria-pressed; toggleCommission
+                        // Overlay() updates it.
+                        toggleCommissionOverlay(btn);
                         break;
                 }
             });

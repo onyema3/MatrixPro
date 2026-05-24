@@ -2158,3 +2158,171 @@
     .mtm-slider-row .mtm-slider            { order: 1; }
     .mtm-slider-row .mtm-slider-end-today  { order: 2; }
 }
+
+
+/* ==========================================================================
+   Per-position commission attribution overlay ("income map")
+   --------------------------------------------------------------------------
+   Toolbar toggle, per-node SVG pill, and corner summary chip for the income
+   map view. Shares the same visual language as the rest of the genealogy
+   toolbar (white surface, var(--matrix-border) strokes) so it reads as part
+   of the same control set rather than a bolt-on. The active pressed state
+   uses the success colour palette so the green per-node pills feel
+   visually rooted in the toggle button itself.
+   ========================================================================== */
+
+/*
+ * Thin vertical divider between the navigation cluster (zoom/fit/reset)
+ * and data-overlay toggles. Functional grouping, not decoration — adding
+ * the divider made the toolbar legible at a glance once we crossed three
+ * buttons. Uses the same border colour as the toolbar chrome so it reads
+ * as a structural separator rather than a coloured accent.
+ */
+.matrix-genealogy-tool-divider {
+    display: inline-block;
+    width: 1px;
+    height: 22px;
+    background: var(--matrix-border);
+    margin: 0 4px;
+    align-self: center;
+}
+
+/*
+ * Active state for any toolbar button that behaves as a sticky toggle
+ * (aria-pressed="true"). Currently used by the commission-overlay
+ * button. Generalised on the .matrix-genealogy-tool-btn-toggle modifier
+ * so a future heatmap-toggle or polling-pause button can opt in by
+ * adding the same modifier without re-declaring colours.
+ */
+.matrix-genealogy-tool-btn-toggle[aria-pressed="true"] {
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.4);
+    color: #047857;
+}
+
+.matrix-genealogy-tool-btn-toggle[aria-pressed="true"]:hover {
+    background: rgba(16, 185, 129, 0.18);
+    border-color: rgba(16, 185, 129, 0.55);
+}
+
+/* ----- Per-node SVG pill ----- */
+
+/*
+ * The pill itself — a small rounded rect at the top-right corner of every
+ * contributing node card. Green to signal "earnings", positioned so it
+ * sticks slightly outside the card body to read as an applied tag rather
+ * than a baked-in element.
+ *
+ * Pointer events are LEFT ENABLED on the pill so the native SVG <title>
+ * tooltip fires on hover (members get the per-node breakdown — amount +
+ * username + payout count). Clicks on the pill bubble up to the host
+ * node group, which already has the click-to-details handler attached,
+ * so clicking a pill behaves identically to clicking the rest of the
+ * card.
+ */
+.mtx-commission-overlay {
+    /* intentionally no pointer-events override */
+}
+
+.mtx-commission-overlay-pill {
+    fill: #10b981;            /* matrix success green */
+    stroke: #047857;          /* darker green border for definition */
+    stroke-width: 1;
+    /*
+     * Subtle drop-shadow so the pill reads as floating above the card
+     * even when the card body is white. SVG filter would be heavier
+     * than this on Safari; box-shadow doesn't apply to SVG, so we
+     * lean on the colour contrast and a thin stroke instead.
+     */
+}
+
+.mtx-commission-overlay-amount {
+    fill: #ffffff;
+    font-size: 11px;
+    font-weight: 700;
+    /*
+     * font-family inherits from the SVG, which inherits from the page —
+     * matches the dashboard's body font so the pill doesn't look pasted
+     * in from a different design system.
+     */
+    letter-spacing: 0.2px;
+}
+
+/*
+ * Slight emphasis on the host node when a contributor pill is rendered
+ * — a thicker border on the card body so the eye finds contributors
+ * even on a dense tree where individual pills can blur together at
+ * zoomed-out scales.
+ *
+ * Scoped via :has() where supported (modern Chromium, Safari 15.4+,
+ * Firefox 121+). Members on older browsers just don't see the
+ * thickening — the green pill is still the primary signal so the
+ * progressive enhancement is acceptable.
+ */
+.mtx-node:has(.mtx-commission-overlay) .mtx-node-body {
+    stroke: #10b981;
+    stroke-width: 2;
+}
+
+/* ----- Corner summary chip ----- */
+
+/*
+ * Floats over the canvas in the bottom-left so it doesn't fight with
+ * the existing flash toast (which lives top-center). Bottom-left is
+ * the conventional spot for "status / legend" content on dashboard
+ * canvases (Tableau, Datadog) so members read it as ambient
+ * information rather than an action.
+ *
+ * z-index sits above the SVG but below the click-to-details popover
+ * (which has z-index: 30 in the existing rules) so the popover wins
+ * a stacking conflict.
+ */
+.matrix-genealogy-d3-commission-summary {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    max-width: calc(100% - 24px);
+    padding: 6px 12px;
+    background: rgba(6, 78, 59, 0.92);   /* dark green, semi-opaque */
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    z-index: 5;
+    /*
+     * Allow long text to wrap (capped warning extends the line) but
+     * keep it on at most two visual lines on narrow viewports so it
+     * never towers over the canvas.
+     */
+    white-space: normal;
+    overflow: hidden;
+}
+
+/* ----- Mobile tweaks ----- */
+
+@media (max-width: 768px) {
+    /*
+     * Pull the summary chip in tighter on mobile so the canvas keeps
+     * room for the actual tree. Members on small screens are more
+     * likely to toggle the overlay briefly to scan totals than to
+     * keep it on while panning, so optimising for "compact and
+     * dismissable" beats "always-readable rich".
+     */
+    .matrix-genealogy-d3-commission-summary {
+        left: 8px;
+        bottom: 8px;
+        font-size: 11px;
+        padding: 5px 10px;
+    }
+
+    /*
+     * Toolbar divider is purely visual — drop it on mobile where the
+     * toolbar wraps anyway and the visual grouping is already
+     * implied by the wrap.
+     */
+    .matrix-genealogy-tool-divider {
+        display: none;
+    }
+}
