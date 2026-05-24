@@ -824,6 +824,14 @@ class Matrix_MLM_Admin_Settings {
         if (!is_array($stored)) {
             $stored = [];
         }
+
+        // Service fee / markup config (item C). Read via the helper
+        // on the gateway class so the admin form, the PHP fee
+        // computation, and the JS preview all see the same shape:
+        // every BILL_CATEGORIES slug present, flat + percent both
+        // numeric, percent capped at 100.
+        $markup   = Matrix_MLM_Fintava_Billing::get_markup_config();
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
         ?>
         <h2><?php _e('Bill Payments — Category Visibility', 'matrix-mlm'); ?></h2>
         <p class="description" style="margin-bottom:14px;">
@@ -859,6 +867,61 @@ class Matrix_MLM_Admin_Settings {
                 </tr>
             <?php endforeach; ?>
         </table>
+
+        <h2 style="margin-top:32px;"><?php _e('Bill Payments — Service Fees / Markup', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('Charge a platform service fee on top of each bill purchase. The user is debited for <em>amount + fee</em> in a single transaction; only the bill amount is sent to Fintava. Fees are recorded separately on each transaction in the <code>service_fee</code> column for revenue reporting. Set both fields to 0 to disable the fee for that category &mdash; that&#39;s the default and matches the pre-fee behaviour exactly.', 'matrix-mlm'); ?>
+        </p>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('Fees are disclosed to the user as a line item on the purchase form before they confirm. Hidden fees attract chargebacks; the disclosure is not configurable.', 'matrix-mlm'); ?>
+        </p>
+        <table class="form-table" style="max-width:760px;">
+            <thead>
+                <tr>
+                    <th scope="col" style="width:30%;"><?php _e('Category', 'matrix-mlm'); ?></th>
+                    <th scope="col" style="width:35%;">
+                        <?php
+                        printf(
+                            /* translators: %s: currency symbol */
+                            esc_html__('Flat fee (%s)', 'matrix-mlm'),
+                            esc_html($currency)
+                        );
+                        ?>
+                    </th>
+                    <th scope="col" style="width:35%;"><?php _e('Percentage fee (%)', 'matrix-mlm'); ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($categories as $slug => $meta):
+                    $flat = $markup[$slug]['flat']    ?? 0;
+                    $pct  = $markup[$slug]['percent'] ?? 0;
+                    ?>
+                    <tr>
+                        <th scope="row"><?php echo esc_html($meta['label']); ?></th>
+                        <td>
+                            <input type="number"
+                                   step="0.01"
+                                   min="0"
+                                   name="matrix_mlm_fintava_billing_markup[<?php echo esc_attr($slug); ?>][flat]"
+                                   value="<?php echo esc_attr(number_format((float) $flat, 2, '.', '')); ?>"
+                                   style="width:140px;">
+                        </td>
+                        <td>
+                            <input type="number"
+                                   step="0.01"
+                                   min="0"
+                                   max="100"
+                                   name="matrix_mlm_fintava_billing_markup[<?php echo esc_attr($slug); ?>][percent]"
+                                   value="<?php echo esc_attr(number_format((float) $pct, 2, '.', '')); ?>"
+                                   style="width:140px;">
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <p class="description" style="margin-top:8px;">
+            <?php _e('Fee = flat + (amount &times; percent &divide; 100), rounded to 2 decimal places. Negative values are coerced to 0 and percentages above 100 are capped at 100.', 'matrix-mlm'); ?>
+        </p>
     <?php }
 
     private function save_settings() {
@@ -974,8 +1037,38 @@ class Matrix_MLM_Admin_Settings {
                     $map[$slug] = !empty($posted_raw[$slug]) ? 1 : 0;
                 }
                 update_option('matrix_mlm_billing_category_visibility', wp_json_encode($map));
-                // Settings stays empty; the JSON blob above is the
-                // only persisted change for this tab.
+
+                // Service-fee / markup config (item C). POST shape:
+                //   matrix_mlm_fintava_billing_markup[<slug>][flat]    = "20.00"
+                //   matrix_mlm_fintava_billing_markup[<slug>][percent] = "1.5"
+                // Sanitised to a clean per-category {flat, percent}
+                // assoc array so the gateway-side computation in
+                // Matrix_MLM_Fintava_Billing::compute_service_fee()
+                // can trust the shape without re-validating.
+                //
+                // All values are coerced to non-negative floats and
+                // percent is capped at 100 — matches the safety
+                // constraints on the read-side helper, so a
+                // hand-edited option row in the DB still computes a
+                // sensible fee.
+                $markup_raw = isset($_POST['matrix_mlm_fintava_billing_markup']) && is_array($_POST['matrix_mlm_fintava_billing_markup'])
+                    ? $_POST['matrix_mlm_fintava_billing_markup']
+                    : [];
+                $markup_clean = [];
+                foreach (Matrix_MLM_Fintava_Billing::BILL_CATEGORIES as $slug) {
+                    $entry   = is_array($markup_raw[$slug] ?? null) ? $markup_raw[$slug] : [];
+                    $flat    = max(0.0, floatval($entry['flat']    ?? 0));
+                    $percent = max(0.0, floatval($entry['percent'] ?? 0));
+                    $percent = min(100.0, $percent);
+                    $markup_clean[$slug] = [
+                        'flat'    => round($flat, 2),
+                        'percent' => round($percent, 2),
+                    ];
+                }
+                update_option('matrix_mlm_fintava_billing_markup', $markup_clean);
+
+                // Settings stays empty; the JSON blobs above are the
+                // only persisted changes for this tab.
                 $settings = [];
                 break;
         }
