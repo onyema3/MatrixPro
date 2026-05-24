@@ -348,6 +348,47 @@
     color: #92400e;
 }
 
+/*
+ * "Viewing" badge variant — only appears on a pivoted view's root
+ * card to flag that this isn't the actual viewer's home tree. Uses
+ * the indigo palette to coordinate with the .matrix-tree-node-you
+ * card styling that always wraps the tree's root, so the colour
+ * cues stay consistent regardless of whether the root is the
+ * viewer themselves or a pivoted member.
+ */
+.tree-node-badge-viewing {
+    background: #e0e7ff;
+    color: #4338ca;
+}
+
+/*
+ * Username pivot link.
+ *
+ * Clicking any non-root, non-empty member's username re-roots the
+ * tree on them via ?pivot_user_id=X. Style is intentionally subtle:
+ * the username should still read as a username, with the link
+ * affordance only emerging on hover / focus. Underline-on-hover is
+ * conventional enough that members understand it as "you can click
+ * this" without a louder cue. Keyboard focus picks up the same
+ * underline plus the standard outline so tab nav stays legible.
+ *
+ * Inherits color so the badge classes (direct/spillover) on the
+ * surrounding node still drive the username's tone.
+ */
+.tree-node-pivot-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dashed transparent;
+    transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.tree-node-pivot-link:hover,
+.tree-node-pivot-link:focus {
+    border-bottom-color: currentColor;
+    color: var(--matrix-primary);
+    text-decoration: none;
+}
+
 .matrix-tree-node-empty {
     border-color: #e5e7eb;
     border-style: dashed;
@@ -485,6 +526,115 @@
 .legend-empty {
     background: #e5e7eb;
     border: 1px dashed #9ca3af;
+}
+
+/*
+ * Pivot breadcrumb bar.
+ *
+ * Sits above the genealogy stats panel on pivoted views. Two halves
+ * inside one container: a "Back to my tree" affordance on the left
+ * (always visible when pivoted) and a horizontal trail of crumbs on
+ * the right showing You › Member1 › … › Pivot. The trail wraps
+ * naturally on narrow viewports — see the mobile media query below
+ * for the responsive collapse behaviour.
+ *
+ * Styling is intentionally chrome-like (light surface, muted text)
+ * so the bar reads as navigation rather than competing with the tree
+ * for attention. The "Back" button picks up the dashboard's primary
+ * indigo because exiting the pivoted view is the most-likely follow-
+ * up action and we want it to feel like the obvious primary control
+ * even though it's left-aligned.
+ */
+.matrix-genealogy-pivot-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    background: #f8fafc;
+    border: 1px solid var(--matrix-border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+}
+
+.matrix-genealogy-pivot-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--matrix-primary);
+    color: #fff;
+    text-decoration: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-weight: 600;
+    transition: background 0.15s ease;
+    white-space: nowrap;
+}
+
+.matrix-genealogy-pivot-back:hover,
+.matrix-genealogy-pivot-back:focus {
+    background: #4338ca;
+    color: #fff;
+    text-decoration: none;
+}
+
+.matrix-genealogy-pivot-back .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+}
+
+.matrix-genealogy-pivot-trail {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    color: #6b7280;
+    /* Lift the trail visually away from the back button so they
+     * don't collide on wide screens. flex-wrap above already lets
+     * the trail drop to a new row when space is tight. */
+    flex: 1 1 auto;
+}
+
+.matrix-genealogy-pivot-crumb {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.matrix-genealogy-pivot-crumb a {
+    color: var(--matrix-primary);
+    text-decoration: none;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background 0.15s ease;
+}
+
+.matrix-genealogy-pivot-crumb a:hover,
+.matrix-genealogy-pivot-crumb a:focus {
+    background: #eef2ff;
+    text-decoration: none;
+}
+
+/*
+ * Current crumb: the pivoted member themselves. Rendered as plain
+ * text (the matching <li> drops its <a> wrapper) so members can't
+ * waste a click "going to" the page they're already on.
+ */
+.matrix-genealogy-pivot-crumb.is-current span {
+    color: var(--matrix-dark);
+    font-weight: 600;
+    padding: 2px 6px;
+}
+
+.matrix-genealogy-pivot-sep {
+    color: #d1d5db;
+    margin: 0 2px;
+    user-select: none;
 }
 
 /*
