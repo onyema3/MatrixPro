@@ -197,4 +197,118 @@ class Matrix_MLM_User {
         ));
         return $status === 'active';
     }
+
+    /**
+     * Determine whether a user is currently allowed to withdraw funds.
+     *
+     * Single source of truth for every "money out" surface the admin
+     * wants to gate — the Matrix→Fintava transfer pane, the Fintava
+     * bank-payout pane, and the user-to-user wallet transfer all call
+     * this before letting the request proceed. Centralising the policy
+     * here means the three admin toggles below evaluate identically
+     * regardless of which path the user picked, and lets us add a
+     * fourth gate in one place when the next "stop withdrawals when X"
+     * requirement comes up.
+     *
+     * Evaluates three admin-controlled gates, in order:
+     *
+     *   1. matrix_mlm_withdrawals_enabled (default: 1)
+     *      Master kill switch. Set to 0 to pause every withdrawal flow
+     *      across the platform — useful during reconciliation, an
+     *      ongoing incident with the payment gateway, or a freeze
+     *      window before a re-import.
+     *
+     *   2. matrix_mlm_withdraw_require_active_user (default: 1)
+     *      When on, only users whose matrix_user_meta.status is
+     *      'active' can withdraw. Closes the long-standing gap where a
+     *      banned user could still hit the wallet-to-wallet and legacy
+     *      /withdraw endpoints (which never checked is_active
+     *      themselves). Defaults ON because every reasonable platform
+     *      treats banned accounts as ineligible — admins can flip it
+     *      off only if they need a banned user to drain their balance
+     *      out as part of a controlled close-out.
+     *
+     *   3. matrix_mlm_withdraw_required_plans (default: '')
+     *      Comma-separated list of plan IDs. When non-empty, the user
+     *      must have at least one ACTIVE position on at least one of
+     *      the listed plans. Empty means no plan restriction (every
+     *      plan is allowed). Lets admins gate withdrawals on tier —
+     *      e.g., "only Premium plan members can cash out".
+     *
+     * Returns an array with two keys:
+     *   - allowed (bool): true if the user can withdraw, false otherwise.
+     *   - reason  (string): empty when allowed, otherwise a user-facing
+     *     message explaining which gate blocked the call. Caller is
+     *     expected to surface this verbatim via wp_send_json_error.
+     *
+     * The reason is INTENTIONALLY a localized user-facing string rather
+     * than a code key. The helper is hot-path (called on every transfer
+     * and payout AJAX) and every caller currently round-trips the
+     * message straight to wp_send_json_error — building it once here
+     * avoids duplicating the copy in three call sites that would
+     * inevitably drift.
+     *
+     * @param int $user_id WP user id.
+     * @return array{allowed: bool, reason: string}
+     */
+    public static function can_withdraw($user_id) {
+        $user_id = intval($user_id);
+        if ($user_id <= 0) {
+            return [
+                'allowed' => false,
+                'reason'  => __('You must be logged in to withdraw funds.', 'matrix-mlm'),
+            ];
+        }
+
+        // Gate 1: master kill switch.
+        if (!(int) get_option('matrix_mlm_withdrawals_enabled', 1)) {
+            return [
+                'allowed' => false,
+                'reason'  => __('Withdrawals are temporarily disabled by the administrator. Please try again later.', 'matrix-mlm'),
+            ];
+        }
+
+        // Gate 2: active-account requirement.
+        if ((int) get_option('matrix_mlm_withdraw_require_active_user', 1)) {
+            if (!self::is_active($user_id)) {
+                return [
+                    'allowed' => false,
+                    'reason'  => __('Your account is not active, so you cannot withdraw funds. Please contact support if you believe this is in error.', 'matrix-mlm'),
+                ];
+            }
+        }
+
+        // Gate 3: required-plan tier.
+        //
+        // Stored as CSV rather than a serialized array because the
+        // admin Settings save handler unconditionally runs every field
+        // through update_option without a per-field type map — keeping
+        // the value scalar means it survives that path without
+        // bespoke handling, and the multi-select UI on the financial
+        // tab joins/splits with comma to match.
+        $required_csv = trim((string) get_option('matrix_mlm_withdraw_required_plans', ''));
+        if ($required_csv !== '') {
+            $required_ids = array_values(array_filter(array_map('intval', preg_split('/[,\s]+/', $required_csv))));
+            if (!empty($required_ids)) {
+                global $wpdb;
+                $placeholders = implode(',', array_fill(0, count($required_ids), '%d'));
+                $params = array_merge([$user_id], $required_ids);
+                $has_position = (int) $wpdb->get_var($wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_positions
+                      WHERE user_id = %d
+                        AND status = 'active'
+                        AND plan_id IN ($placeholders)",
+                    $params
+                ));
+                if ($has_position === 0) {
+                    return [
+                        'allowed' => false,
+                        'reason'  => __('Withdrawals are currently restricted to specific membership plans, and none of your active plans qualify. Please contact support.', 'matrix-mlm'),
+                    ];
+                }
+            }
+        }
+
+        return ['allowed' => true, 'reason' => ''];
+    }
 }

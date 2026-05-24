@@ -294,7 +294,20 @@ class Matrix_MLM_Admin_Settings {
         </script>
     <?php }
 
-    private function render_financial_tab() { ?>
+    private function render_financial_tab() {
+        // Required-plans gate is rendered as a checklist of active
+        // plans. Stored as a CSV string of plan IDs (see save_settings)
+        // because the option-save loop runs sanitize_text_field on
+        // every value, which would mangle an array. CSV survives that
+        // and matches the parsing contract in
+        // Matrix_MLM_User::can_withdraw().
+        global $wpdb;
+        $active_plans = $wpdb->get_results(
+            "SELECT id, name FROM {$wpdb->prefix}matrix_plans WHERE status = 'active' ORDER BY price ASC"
+        );
+        $required_plans_csv = (string) get_option('matrix_mlm_withdraw_required_plans', '');
+        $required_plan_ids  = array_filter(array_map('intval', preg_split('/[,\s]+/', $required_plans_csv)));
+        ?>
         <table class="form-table">
             <tr><th><?php _e('Minimum Deposit', 'matrix-mlm'); ?></th>
                 <td><input type="number" name="matrix_mlm_min_deposit" step="0.01" value="<?php echo esc_attr(get_option('matrix_mlm_min_deposit', 1000)); ?>"></td></tr>
@@ -320,6 +333,58 @@ class Matrix_MLM_Admin_Settings {
                 <td><input type="number" name="matrix_mlm_transfer_charge" step="0.01" value="<?php echo esc_attr(get_option('matrix_mlm_transfer_charge', 100)); ?>"></td></tr>
             <tr><th><?php _e('Minimum Transfer', 'matrix-mlm'); ?></th>
                 <td><input type="number" name="matrix_mlm_min_transfer" step="0.01" value="<?php echo esc_attr(get_option('matrix_mlm_min_transfer', 500)); ?>"></td></tr>
+
+            <tr><td colspan="2" style="padding-top:24px;border-bottom:1px solid #e5e7eb;padding-bottom:8px;">
+                <h3 style="margin:0;color:#1f2937;"><?php _e('Withdrawal Controls', 'matrix-mlm'); ?></h3>
+                <p class="description" style="margin-top:4px;">
+                    <?php _e('These three toggles gate every user-facing money-out flow on the platform — the Wallet tab\'s "Transfer to Own Wallet" pane (Matrix → Fintava virtual) and "Transfer to Bank" pane (Fintava virtual → external bank). All three are evaluated by Matrix_MLM_User::can_withdraw(); changes here take effect immediately on the next request, no cache to bust.', 'matrix-mlm'); ?>
+                </p>
+            </td></tr>
+
+            <tr><th><?php _e('Withdrawals Enabled', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_withdrawals_enabled" value="1" <?php checked(get_option('matrix_mlm_withdrawals_enabled', 1)); ?>>
+                        <?php _e('Allow users to withdraw funds', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Master kill switch. Uncheck to pause every withdrawal flow site-wide — useful during reconciliation, an incident with the payment gateway, or a freeze window before a re-import. Users see a friendly "Withdrawals are temporarily disabled" message; deposits, transfers between users, and admin actions are unaffected.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Require Active Account', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_withdraw_require_active_user" value="1" <?php checked(get_option('matrix_mlm_withdraw_require_active_user', 1)); ?>>
+                        <?php _e('Block withdrawals from banned or inactive accounts', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('When on, only users whose status is "active" in matrix_user_meta can withdraw. Defaults on. Uncheck only if you need to let a banned user drain their balance as part of a controlled close-out.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Restrict to Specific Plans', 'matrix-mlm'); ?></th>
+                <td>
+                    <?php if (empty($active_plans)): ?>
+                        <p style="color:#6b7280;font-style:italic;">
+                            <?php _e('No active plans defined yet. When you add plans on the Plans page, they will appear here as checkboxes.', 'matrix-mlm'); ?>
+                        </p>
+                    <?php else: ?>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px;max-width:600px;">
+                            <?php foreach ($active_plans as $plan):
+                                $pid = (int) $plan->id;
+                                ?>
+                                <label style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:4px;">
+                                    <input type="checkbox" name="matrix_mlm_withdraw_required_plans[]" value="<?php echo $pid; ?>" <?php checked(in_array($pid, $required_plan_ids, true)); ?>>
+                                    <span><?php echo esc_html($plan->name); ?> <small style="color:#9ca3af;">#<?php echo $pid; ?></small></span>
+                                </label>
+                            <?php endforeach; ?>
+                        </div>
+                        <p class="description" style="margin-top:10px;">
+                            <?php _e('When any plans are checked above, only users who have at least one ACTIVE position on one of the selected plans can withdraw. Leave everything unchecked to allow withdrawals from users on any plan (the default). Use this to gate withdrawals on a tier — e.g., check only "Premium" to make withdrawals a Premium-only feature.', 'matrix-mlm'); ?>
+                        </p>
+                    <?php endif; ?>
+                </td></tr>
         </table>
     <?php }
 
@@ -615,7 +680,19 @@ class Matrix_MLM_Admin_Settings {
                 }
                 break;
             case 'financial':
-                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer'];
+                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user'];
+                // Required-plans multi-checkbox is the one field on
+                // this tab whose POST shape is an array, not a scalar.
+                // The generic save loop further down runs every value
+                // through sanitize_text_field, which would coerce the
+                // array to the string "Array". Handle it explicitly
+                // here, store as CSV (matching the parsing contract
+                // in Matrix_MLM_User::can_withdraw()).
+                $required_plans_raw = isset($_POST['matrix_mlm_withdraw_required_plans']) && is_array($_POST['matrix_mlm_withdraw_required_plans'])
+                    ? $_POST['matrix_mlm_withdraw_required_plans']
+                    : [];
+                $required_plans = array_values(array_filter(array_map('intval', $required_plans_raw)));
+                update_option('matrix_mlm_withdraw_required_plans', implode(',', $required_plans));
                 break;
             case 'notifications':
                 $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email', 'matrix_mlm_cug_notification_email', 'matrix_mlm_loan_notification_email', 'matrix_mlm_healthcare_notification_email'];
@@ -668,7 +745,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

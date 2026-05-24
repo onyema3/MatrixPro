@@ -28,8 +28,13 @@ class Matrix_MLM_User_Dashboard {
         // are intentionally absent from the whitelist so any legacy
         // bookmark falls through to overview rather than rendering
         // an orphaned form. The Matrix_MLM_User_Withdrawals class
-        // is kept on disk because admin-side withdrawal management
-        // and the bank-payout flow still depend on its helpers.
+        // and its matrix_action=withdraw AJAX endpoint were removed
+        // entirely in feat/admin-controlled-withdrawals — the live
+        // withdrawal surfaces are now the Wallet tab's "Transfer to
+        // Own Wallet" pane (Matrix → Fintava virtual) and "Transfer
+        // to Bank" pane (Fintava virtual → external bank), both of
+        // which evaluate Matrix_MLM_User::can_withdraw() so admin
+        // toggles for stopping withdrawals apply uniformly.
         //
         // 'transactions' was retired for the same reason: the wallet
         // page now hosts a "Transaction History" pane (the only place
