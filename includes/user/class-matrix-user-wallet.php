@@ -11,10 +11,10 @@
  *      bookmarked, but the slug is removed from the dashboard
  *      whitelist and falls through to overview.
  *
- *   - "Bank Payout"       (matrix wallet → external Nigerian bank via
- *      Fintava) — folded in as the "Transfer to Bank" tab below.
- *      Renders the existing Matrix_MLM_User_Bank_Payout::render() body
- *      with $skip_header=true so this page owns the page-level H2.
+ *   - "Bank Payout"       (Fintava virtual wallet → external Nigerian
+ *      bank via Fintava) — folded in as the "Transfer to Bank" tab
+ *      below. Renders the existing Matrix_MLM_User_Bank_Payout::render()
+ *      body with $skip_header=true so this page owns the page-level H2.
  *
  *   - "Virtual Wallet"    (matrix wallet ↔ user's Fintava virtual
  *      account) — folded in as the page header (account number / name
@@ -24,17 +24,30 @@
  *      matrix_fintava_initiate_transfer, matrix_fintava_create_virtual_wallet)
  *      so no backend rewiring is needed.
  *
- * IMPORTANT — debit semantics for "Transfer to Bank":
- *   The legacy Bank Payout flow debits the user's *Matrix* wallet, not
- *   their Fintava virtual wallet. The merchant's Fintava balance is
- *   what funds the destination bank credit; the local Matrix balance
- *   is the bookkeeping side. The user-facing label on the consolidated
- *   page calls this "Transfer to Bank" because that's the action the
- *   user takes, but the embedded form continues to display "Source:
- *   Matrix Wallet" so there is no surprise about which balance moves.
- *   Switching the debit source to the virtual wallet is a separate
- *   backend change (different Fintava endpoint, different settlement
- *   model) and is intentionally NOT part of this PR.
+ * Debit semantics, by tab:
+ *
+ *   - "Transfer to Own Wallet" debits the *Matrix* wallet and credits
+ *     the user's Fintava virtual wallet (Matrix → Fintava, internal to
+ *     the same user).
+ *
+ *   - "Wallet to Wallet" debits the *Matrix* wallet of the sender and
+ *     credits the *Matrix* wallet of another platform user (internal
+ *     to the platform; never touches Fintava).
+ *
+ *   - "Transfer to Bank" debits the user's *Fintava virtual* wallet
+ *     directly via Fintava's /bank/credit endpoint (sourceId = the
+ *     user's Fintava customer UUID). It does NOT touch the Matrix
+ *     wallet on either side: no Matrix debit, no Matrix bookkeeping
+ *     mirror. Funds must already be on the Fintava side — the user
+ *     gets them there by topping up via "Transfer to Own Wallet"
+ *     above (or by receiving deposits to their virtual account
+ *     number). Fintava also deducts its own transfer fee from the
+ *     same Fintava wallet at the gateway level; the legacy
+ *     matrix_mlm_fintava_charge_* options are ignored on this path.
+ *     The canonical implementation lives in
+ *     Matrix_MLM_Fintava::ajax_initiate_transfer() — see that method
+ *     for the full preflight (customer-id resolution, balance check
+ *     with fee buffer, UUID validation).
  */
 
 if (!defined('ABSPATH')) {

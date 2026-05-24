@@ -1,7 +1,27 @@
 <?php
 /**
  * User Bank Payout (via Fintava)
- * Allows users to transfer funds from their Matrix wallet directly to their bank account
+ *
+ * Allows users to transfer funds from their Fintava virtual wallet
+ * directly to any Nigerian bank account.
+ *
+ * Source of funds: the user's Fintava virtual wallet, NOT the Matrix
+ * wallet. The server-side handler is the source of truth — see
+ * Matrix_MLM_Fintava::ajax_initiate_transfer(), which calls Fintava's
+ * /bank/credit with sourceId = the user's Fintava customer UUID and
+ * never debits Matrix_MLM_Wallet. Funds therefore have to already be
+ * on the Fintava side before this form will work; the user gets them
+ * there via "Transfer to Own Wallet" (Matrix → Fintava) on the
+ * consolidated Wallet page, or by receiving deposits directly to
+ * their virtual account number.
+ *
+ * Fintava deducts its own transfer fee from the same Fintava wallet at
+ * the gateway level. The legacy matrix_mlm_fintava_charge_type /
+ * matrix_mlm_fintava_charge_value options are ignored on this path —
+ * we do NOT show a plugin-side service-charge line in this form, and
+ * the submit-state gate uses a small fee buffer (mirroring the
+ * backend's preflight in ajax_initiate_transfer) instead of a local
+ * charge calculation.
  */
 
 if (!defined('ABSPATH')) {
@@ -29,15 +49,62 @@ class Matrix_MLM_User_Bank_Payout {
      *                           if the slug is ever re-enabled.
      */
     public function render($user_id, $skip_header = false) {
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $min_payout = get_option('matrix_mlm_fintava_min_payout', 1000);
         $max_payout = get_option('matrix_mlm_fintava_max_payout', 5000000);
-        $charge_type = get_option('matrix_mlm_fintava_charge_type', 'fixed');
-        $charge_value = get_option('matrix_mlm_fintava_charge_value', 50);
         $fintava = new Matrix_MLM_Fintava();
         $is_active = $fintava->is_active();
+
+        // Source of funds for this form is the user's Fintava virtual
+        // wallet, not the Matrix wallet (see class-level docblock and
+        // Matrix_MLM_Fintava::ajax_initiate_transfer for the full
+        // rationale). Pull the live virtual-wallet balance now so the
+        // info-box, the amount field's max attribute, and the JS
+        // submit-state gate all compare against the right number.
+        //
+        // Failure modes are surfaced inline rather than blocking the
+        // form, mirroring the resilience pattern in the consolidated
+        // Wallet page header:
+        //
+        //   - Fintava integration disabled → handled below by the
+        //     existing $is_active branch; we never reach the balance
+        //     fetch.
+        //   - User has no Fintava wallet row → balance shown as
+        //     "Unavailable" with a message pointing to the Create
+        //     Fintava Wallet flow. Submit will also fail server-side
+        //     with the same error, so this is purely a UX hint.
+        //   - Live API call errored → fall through to a 0 placeholder
+        //     and surface the gateway's normalised message inline so
+        //     the operator can see why the balance is stale.
+        //
+        // No legacy plugin-side charge calculation: Fintava deducts its
+        // own transfer fee directly from the user's Fintava wallet at
+        // the gateway level, and the matrix_mlm_fintava_charge_*
+        // options are ignored by ajax_initiate_transfer. The "Service
+        // Charge" row that used to live in the info-box is replaced by
+        // a one-line note explaining the gateway-side fee.
+        $user_wallet                = $is_active ? $fintava->get_user_wallet($user_id) : null;
+        $balance                    = 0.0;
+        $balance_unavailable_reason = '';
+        if ($is_active) {
+            if ($user_wallet && !empty($user_wallet->wallet_id)) {
+                $bal_result = $fintava->get_virtual_wallet_balance(
+                    $user_wallet->wallet_id,
+                    $user_wallet->account_number,
+                    $user_wallet->customer_id ?? null
+                );
+                if (is_wp_error($bal_result)) {
+                    $balance_unavailable_reason = Matrix_MLM_Fintava::normalize_api_message(
+                        $bal_result->get_error_message(),
+                        __('Live Fintava balance is unavailable; refresh in a moment.', 'matrix-mlm')
+                    );
+                } elseif (is_array($bal_result) && isset($bal_result['available_balance'])) {
+                    $balance = floatval($bal_result['available_balance']);
+                }
+            } else {
+                $balance_unavailable_reason = __('You do not have a Fintava virtual wallet yet. Create one before you can transfer to a bank.', 'matrix-mlm');
+            }
+        }
 
         // Pre-render the bank list server-side. The previous flow loaded
         // banks with a $.ajax({ action: 'matrix_fintava_get_banks' }) call
@@ -93,20 +160,29 @@ class Matrix_MLM_User_Bank_Payout {
         $payouts = $fintava->get_user_payouts($user_id, 20);
         ?>
         <?php if (!$skip_header): ?>
-        <h2><?php _e('Bank Transfer (Instant Payout)', 'matrix-mlm'); ?></h2>
-        <p class="matrix-subtitle"><?php _e('Transfer funds directly from your wallet to your bank account via Fintava.', 'matrix-mlm'); ?></p>
+        <h2><?php _e('Transfer to Bank', 'matrix-mlm'); ?></h2>
+        <p class="matrix-subtitle"><?php _e('Transfer funds from your Fintava virtual wallet directly to any Nigerian bank account.', 'matrix-mlm'); ?></p>
         <?php endif; ?>
 
         <?php if (!$is_active): ?>
         <div class="matrix-alert matrix-alert-warning">
-            <?php _e('Bank payout is currently unavailable. Please contact support or use the regular withdrawal method.', 'matrix-mlm'); ?>
+            <?php _e('Bank transfer is currently unavailable. Please contact support.', 'matrix-mlm'); ?>
         </div>
         <?php else: ?>
 
         <div class="matrix-info-box">
-            <p><strong><?php _e('Available Balance:', 'matrix-mlm'); ?></strong> <?php echo $currency . number_format($balance, 2); ?></p>
-            <p><strong><?php _e('Transfer Limits:', 'matrix-mlm'); ?></strong> <?php echo $currency . number_format($min_payout) . ' - ' . $currency . number_format($max_payout); ?></p>
-            <p><strong><?php _e('Service Charge:', 'matrix-mlm'); ?></strong> <?php echo $charge_type === 'percent' ? $charge_value . '%' : $currency . number_format($charge_value, 2); ?></p>
+            <p><strong><?php _e('Source:', 'matrix-mlm'); ?></strong> <?php _e('Fintava Virtual Wallet', 'matrix-mlm'); ?></p>
+            <p>
+                <strong><?php _e('Available Balance:', 'matrix-mlm'); ?></strong>
+                <?php echo $currency . number_format($balance, 2); ?>
+                <?php if ($balance_unavailable_reason !== ''): ?>
+                <small style="display:block;margin-top:4px;color:#92400e;">
+                    <?php echo esc_html($balance_unavailable_reason); ?>
+                </small>
+                <?php endif; ?>
+            </p>
+            <p><strong><?php _e('Transfer Limits:', 'matrix-mlm'); ?></strong> <?php echo $currency . number_format($min_payout) . ' – ' . $currency . number_format($max_payout); ?></p>
+            <p><small><?php _e('Note: Fintava deducts its own transfer fee from your Fintava wallet on top of the amount you send. The fee is set by the gateway, not this plugin.', 'matrix-mlm'); ?></small></p>
         </div>
 
         <div class="matrix-form-card">
@@ -181,39 +257,34 @@ class Matrix_MLM_User_Bank_Payout {
                     <label><?php _e('Amount', 'matrix-mlm'); ?> (<?php echo $currency; ?>)</label>
                     <?php
                     // Compute the practical ceiling for the amount field
-                    // up-front so the charge is already subtracted from
-                    // what the user is allowed to type. The previous
-                    // ceiling was min($max_payout, $balance), which
-                    // looked right but actually let the user type
-                    // exactly the available balance — at which point
-                    // (amount + charge) > balance and the submit button
-                    // silently stayed disabled with no visible reason.
-                    // This was the most common "transfer button is not
-                    // active" scenario reported.
+                    // up-front so the gateway-side fee buffer is already
+                    // factored into what the user is allowed to type.
                     //
-                    // For percent charges the upper bound is balance/(1+rate);
-                    // for fixed it's balance - charge. Floor to two
-                    // decimals to stay aligned with step="0.01".
-                    if ($charge_type === 'percent') {
-                        $rate = floatval($charge_value) / 100;
-                        $balance_ceiling = (1 + $rate) > 0 ? floatval($balance) / (1 + $rate) : floatval($balance);
-                    } else {
-                        $balance_ceiling = max(0, floatval($balance) - floatval($charge_value));
-                    }
+                    // The backend's preflight in
+                    // Matrix_MLM_Fintava::ajax_initiate_transfer requires
+                    //     fintava_balance >= amount + max(₦100, 1.5% * amount)
+                    // before sending the /bank/credit call (Fintava
+                    // returns a generic HTTP 500 if the source wallet
+                    // can't fund both the amount and its own transfer
+                    // fee, so we reserve a buffer to surface a clean
+                    // "insufficient" error instead). Inverting that
+                    // inequality gives the maximum amount the user can
+                    // type:
+                    //     amount <= (balance - 100) / 1.015
+                    // Floor to two decimals to stay aligned with
+                    // step="0.01"; never go below zero so a user with
+                    // an unfunded Fintava wallet sees a sane max=0
+                    // rather than a negative value.
+                    $fee_buffer_min  = 100.0;
+                    $balance_ceiling = max(0, ((float) $balance - $fee_buffer_min) / 1.015);
                     $balance_ceiling = floor($balance_ceiling * 100) / 100;
-                    $effective_max   = min($max_payout, $balance_ceiling);
+                    $effective_max   = min((float) $max_payout, $balance_ceiling);
                     ?>
                     <input type="number" name="amount" id="fintava-amount"
                            min="<?php echo $min_payout; ?>"
                            max="<?php echo $effective_max; ?>"
                            step="0.01" required
                            placeholder="<?php echo sprintf(__('Min %s, Max %s', 'matrix-mlm'), number_format($min_payout), number_format($effective_max, 2)); ?>">
-                    <div class="matrix-charge-info" id="fintava-charge-info" style="display:none;">
-                        <small>
-                            <?php _e('Charge:', 'matrix-mlm'); ?> <span id="fintava-charge-amount">-</span> | 
-                            <?php _e('Total Debit:', 'matrix-mlm'); ?> <span id="fintava-total-debit">-</span>
-                        </small>
-                    </div>
                 </div>
 
                 <!-- Narration (Optional) -->
@@ -326,8 +397,6 @@ class Matrix_MLM_User_Bank_Payout {
         .matrix-loading-text { padding: 8px 0; color: #6b7280; font-size: 13px; display: flex; align-items: center; gap: 8px; }
         .matrix-spinner { width: 16px; height: 16px; border: 2px solid #e5e7eb; border-top-color: #4f46e5; border-radius: 50%; animation: matrix-spin 0.6s linear infinite; display: inline-block; }
         @keyframes matrix-spin { to { transform: rotate(360deg); } }
-        .matrix-charge-info { margin-top: 6px; padding: 8px 12px; background: #fefce8; border-radius: 4px; border: 1px solid #fde68a; }
-        .matrix-charge-info small { color: #92400e; }
         .matrix-badge-processing { background: #eff6ff; color: #1e40af; }
         .matrix-badge-refunded { background: #f5f3ff; color: #7c3aed; }
         .matrix-payout-reason { margin-top:6px; padding:6px 8px; background:#fef2f2; border-left:3px solid #dc2626; border-radius:3px; font-size:11px; line-height:1.4; color:#991b1b; word-break:break-word; max-width:280px; }
@@ -407,9 +476,19 @@ class Matrix_MLM_User_Bank_Payout {
                 'use strict';
 
             const currency = '<?php echo esc_js(get_option("matrix_mlm_currency_symbol", "₦")); ?>';
-            const chargeType = '<?php echo esc_js($charge_type); ?>';
-            const chargeValue = <?php echo floatval($charge_value); ?>;
+            // Source-of-funds is the Fintava virtual wallet (see file
+            // docblock). The submit-state gate below mirrors the
+            // backend's preflight in
+            // Matrix_MLM_Fintava::ajax_initiate_transfer:
+            //     fintava_balance >= amount + max(₦100, 1.5% * amount)
+            // No plugin-side charge is applied — Fintava deducts its
+            // own transfer fee from the same Fintava wallet at the
+            // gateway level, and the legacy matrix_mlm_fintava_charge_*
+            // options are ignored on this path.
             const balance = <?php echo floatval($balance); ?>;
+            const balanceUnavailable = <?php echo $balance_unavailable_reason !== '' ? 'true' : 'false'; ?>;
+            const feeBufferMin = 100;
+            const feeBufferRate = 0.015;
             let accountVerified = false;
             // Tracks whether accountVerified was set by the user picking the
             // manual-entry path after Fintava /name/enquiry failed, so the
@@ -659,34 +738,37 @@ class Matrix_MLM_User_Bank_Payout {
                 }
             });
 
-            // Calculate charges on amount input
+            // Per-keystroke amount handler — used to compute and display
+            // a plugin-side service charge, but that charge is no longer
+            // applied (Fintava deducts its own fee from the Fintava
+            // wallet directly, see file docblock). All we need now is
+            // to re-evaluate the submit-state gate so the "amount +
+            // gateway fee buffer exceeds Fintava balance" reason can
+            // appear/disappear as the user types.
             $('#fintava-amount').on('input', function() {
-                const amount = parseFloat($(this).val()) || 0;
-                if (amount > 0) {
-                    let charge = chargeType === 'percent' ? (amount * chargeValue / 100) : chargeValue;
-                    charge = Math.round(charge * 100) / 100;
-                    const total = amount + charge;
-                    $('#fintava-charge-amount').text(currency + charge.toLocaleString());
-                    $('#fintava-total-debit').text(currency + total.toLocaleString());
-                    $('#fintava-charge-info').show();
-                } else {
-                    $('#fintava-charge-info').hide();
-                }
                 updateSubmitButton();
             });
 
             // Enable/disable submit button + render the "why disabled?"
-            // hint. The four gate conditions are checked in order from
+            // hint. The gate conditions are checked in order from
             // top-of-form to bottom so the message points to the field
             // the user should fix next, rather than e.g. shouting about
             // amount when no bank is even picked yet. Once everything
             // passes, the hint clears and the button enables.
+            //
+            // Balance check: this form debits the user's Fintava virtual
+            // wallet (not the Matrix wallet — see file docblock). The
+            // backend's preflight reserves max(₦100, 1.5% * amount) on
+            // top of the requested amount to cover Fintava's own
+            // transfer fee, so we apply the same buffer here to keep
+            // the client-side rejection consistent with what the server
+            // would reject anyway.
             function updateSubmitButton() {
-                const amount   = parseFloat($('#fintava-amount').val()) || 0;
-                const bankCode = $('#fintava-bank-select').val();
-                const charge   = chargeType === 'percent' ? (amount * chargeValue / 100) : chargeValue;
-                const total    = amount + charge;
-                const accNum   = ($('#fintava-account-number').val() || '').trim();
+                const amount     = parseFloat($('#fintava-amount').val()) || 0;
+                const bankCode   = $('#fintava-bank-select').val();
+                const feeBuffer  = Math.max(feeBufferMin, amount * feeBufferRate);
+                const totalNeeded = amount + feeBuffer;
+                const accNum     = ($('#fintava-account-number').val() || '').trim();
 
                 const $status = $('#fintava-submit-status');
                 let reason = '';
@@ -713,15 +795,22 @@ class Matrix_MLM_User_Bank_Payout {
                     }
                 } else if (amount <= 0) {
                     reason = '<?php echo esc_js(__("Enter the amount to transfer.", "matrix-mlm")); ?>';
-                } else if (total > balance) {
-                    // The most common silent-disable path — user types
-                    // exactly their balance, and (amount + charge) ties
-                    // up just over the available number. The amount
-                    // input's max attribute now subtracts the charge
-                    // upfront so this should rarely fire, but it's kept
-                    // as a runtime guard for typed-into-place values
-                    // that bypass the max attribute (e.g., paste).
-                    reason = '<?php echo esc_js(__("Amount + charge exceeds your available balance.", "matrix-mlm")); ?>';
+                } else if (balanceUnavailable) {
+                    // Couldn't resolve the live Fintava balance at
+                    // render time. Don't pretend to gate against zero —
+                    // surface the unavailability so the user knows to
+                    // refresh, and let the server's own preflight be
+                    // the authoritative check on submit.
+                    reason = '<?php echo esc_js(__("Fintava balance is currently unavailable; refresh in a moment.", "matrix-mlm")); ?>';
+                } else if (totalNeeded > balance) {
+                    // Mirrors the backend's "insufficient Fintava
+                    // balance" preflight — keeps the client-side gate
+                    // consistent so users see the same rejection in
+                    // both places. The amount field's max attribute
+                    // should already prevent this for typed values,
+                    // but pasted values can bypass the max attribute,
+                    // so the runtime guard stays.
+                    reason = '<?php echo esc_js(__("Amount plus the Fintava transfer fee exceeds your Fintava wallet balance.", "matrix-mlm")); ?>';
                 }
 
                 $status.text(reason);
