@@ -101,6 +101,34 @@ class Matrix_MLM_Fintava_Billing {
     const MIN_AMOUNT = 50;
 
     /**
+     * Short opaque support-reference token minted by
+     * begin_transaction() when its INSERT into
+     * matrix_billing_transactions fails. process_purchase()'s
+     * begin_failed branch reads this and embeds it in the
+     * user-visible error message so a user reporting "Internal
+     * error. Please try again." can quote the token in a support
+     * ticket and ops can grep the PHP error log for the matching
+     * [Matrix MLM DB] line and recover the underlying $wpdb error
+     * (typically a schema-drift "Unknown column 'X'" after a copy
+     * deploy that didn't trigger dbDelta).
+     *
+     * NULL after a successful begin_transaction or before the
+     * first begin_transaction call. Read-once: process_purchase()
+     * captures the value into a local before invoking
+     * refund_failed_purchase(), because the wallet credit there
+     * does its own DB write that may clobber $wpdb->last_error
+     * (and, hypothetically, a future caller resetting this
+     * property).
+     *
+     * Not static: a single Matrix_MLM_Fintava_Billing instance
+     * processes one AJAX request, so the property's lifetime
+     * matches the failed begin_transaction it describes.
+     *
+     * @var string|null
+     */
+    private $last_begin_support_ref = null;
+
+    /**
      * Canonical list of bill categories. The order here is the
      * display order in the user-facing tab strip and on the admin
      * Bill Payments visibility toggle page. Adding a new category
@@ -1052,16 +1080,36 @@ class Matrix_MLM_Fintava_Billing {
             // collision on client_reference). The wallet was
             // debited; compensate so the user is made whole, then
             // surface a generic error.
+            //
+            // Capture the begin_transaction support-reference
+            // token BEFORE refund_failed_purchase() runs — that
+            // helper performs a wallet credit (its own DB write)
+            // which can clobber $wpdb->last_error, and we want
+            // the token in the user-visible error to point at
+            // the begin_transaction failure, not at any later
+            // wallet-side noise.
+            $support_ref = $this->last_begin_support_ref;
             self::refund_failed_purchase(
                 $user_id, $total, $type, $debit_reference,
                 __('Internal error: could not record transaction.', 'matrix-mlm')
             );
+            // The token is null only on the defensive code path
+            // where begin_transaction() didn't get to mint one
+            // (shouldn't happen given the current implementation,
+            // but a future refactor that returns 0 from a
+            // pre-INSERT validation branch would land here). Fall
+            // back to the legacy generic message in that case so
+            // the user still gets actionable copy.
+            $message = $support_ref
+                ? sprintf(
+                    /* translators: %s: short opaque support-reference token (8 alphanumeric chars), e.g. "Ax7K2pQs". */
+                    __('Internal error. Please try again. Reference: %s', 'matrix-mlm'),
+                    $support_ref
+                )
+                : __('Internal error. Please try again.', 'matrix-mlm');
             return [
                 'kind'     => 'begin_failed',
-                'wp_error' => new WP_Error(
-                    'begin_failed',
-                    __('Internal error. Please try again.', 'matrix-mlm')
-                ),
+                'wp_error' => new WP_Error('begin_failed', $message),
                 'amounts'  => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
             ];
         }
@@ -1277,12 +1325,28 @@ class Matrix_MLM_Fintava_Billing {
             'created_at'       => current_time('mysql'),
         ]);
         if ($inserted === false) {
+            $last_error = (string) $wpdb->last_error;
+            // Existing structured-context line — preserves any ops
+            // grep tooling that keys off the [Matrix Fintava Billing]
+            // tag and the user_id / type / ref columns.
             error_log(sprintf(
                 '[Matrix Fintava Billing] begin_transaction failed user_id=%d type=%s ref=%s last_error=%s',
-                (int) $user_id, $type, $client_reference, $wpdb->last_error
+                (int) $user_id, $type, $client_reference, $last_error
             ));
+            // Mint a short opaque token that goes into the
+            // user-visible "Internal error" message and a paired
+            // [Matrix MLM DB] log line carrying the same $wpdb
+            // error. A user reporting the message via a support
+            // ticket quotes the token; ops greps the log to
+            // recover the real cause without bouncing through
+            // user_id / timestamp triangulation.
+            $this->last_begin_support_ref = Matrix_MLM_DB_Error::log_and_token(
+                'fintava_billing.begin_transaction',
+                $last_error
+            );
             return 0;
         }
+        $this->last_begin_support_ref = null;
         return (int) $wpdb->insert_id;
     }
 
