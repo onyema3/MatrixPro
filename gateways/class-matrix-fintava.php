@@ -3671,6 +3671,279 @@ class Matrix_MLM_Fintava {
     }
 
     /**
+     * Heuristic: does a WP_Error from create_customer() indicate that
+     * Fintava already has a customer record matching the supplied email
+     * or phone?
+     *
+     * Fintava signals this duplicate state in three different shapes
+     * we've observed:
+     *
+     *   - HTTP 500 + body containing "TypeORMError: Customer with email
+     *     or Phone exists" — the database-layer constraint violation
+     *     leaks through when their service-layer dedup check misses.
+     *   - HTTP 409 + "Customer already exists" — the well-behaved path
+     *     on tiers where the dedup check fires before persistence.
+     *   - HTTP 400 + "email already in use" / "phone already taken" —
+     *     class-validator-level dedup on a few merchant tiers.
+     *
+     * Detect all three by string-matching the upstream message rather
+     * than relying on the HTTP status code alone, since the gateway
+     * already collapses upstream status into the WP_Error message
+     * (`API Error (HTTP NNN) calling /create/customer: …`) and we'd
+     * rather miss-positive a recovery attempt (which is a safe
+     * round-trip) than miss-negative and silently fall through to the
+     * merchant-named /virtual-wallet/generate path.
+     *
+     * @param WP_Error $error The error returned by create_customer().
+     * @return bool True if the error looks like a duplicate-customer
+     *              signal worth attempting recovery on.
+     */
+    private function is_duplicate_customer_error($error) {
+        if (!is_wp_error($error)) {
+            return false;
+        }
+        $msg = strtolower(is_array($error->get_error_message())
+            ? implode(' ', $error->get_error_message())
+            : (string) $error->get_error_message());
+        if ($msg === '') {
+            return false;
+        }
+        // Customer-keyed phrasings (most common).
+        if (preg_match('/customer.*(exists|already|duplicate)/i', $msg)) {
+            return true;
+        }
+        // Field-keyed phrasings — class-validator on a few tiers.
+        if (preg_match('/(email|phone).*(exists|already|in use|taken|duplicate)/i', $msg)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Look up an existing Fintava customer that matches the supplied
+     * email or phone, and return their record shaped like
+     * create_customer()'s success envelope (`{ userInfo, wallet, ... }`).
+     *
+     * Used as the recovery path when create_customer() fails with a
+     * duplicate signal (see is_duplicate_customer_error()). Without
+     * this, the AJAX handler falls through to /virtual-wallet/generate
+     * and provisions a second wallet under the merchant master account
+     * — bank-side resolution then shows the merchant's registered
+     * company name (e.g. "LIBERTY HUB INTERNATIONAL LIMITED") instead
+     * of the user's, which is the exact failure mode the KYC PR was
+     * meant to prevent.
+     *
+     * Lookup chain (each step is gated on the previous one missing):
+     *
+     *   1. GET /customers/details?phone=<normalized>. Single round-trip,
+     *      returns the customer with embedded wallet directly. This is
+     *      the same fast path resolve_customer_id()'s Strategy 1 uses
+     *      and lines up with the duplicate that triggered us, since
+     *      Fintava's dedup keys are email AND phone.
+     *
+     *   2. GET /customers/list (via get_customer_list()) and scan for
+     *      any record whose userInfo.email matches case-insensitively
+     *      OR whose userInfo.phoneNumber matches the normalized phone.
+     *      Covers tiers where /customers/details isn't exposed, and
+     *      gives us an email-keyed lookup that Fintava itself does
+     *      not provide as a dedicated endpoint.
+     *
+     * Wallet extraction follows the same deepest-first unwrap order
+     * the rest of the gateway uses (`userInfo.wallet` -> `wallet` ->
+     * flat fields on the customer object) so the result drops into
+     * the existing ajax_create_virtual_wallet extraction code without
+     * any shape-translation.
+     *
+     * Return values, by code:
+     *   - array on success — `{ userInfo, wallet, ... }` — drop-in
+     *     replacement for create_customer()'s success return.
+     *   - WP_Error('existing_customer_no_wallet', …) — we found the
+     *     customer but they have no embedded wallet. The handler
+     *     should ask an admin to use the Migration → Link tool to
+     *     attach the existing customer to the user, then re-trigger
+     *     wallet provisioning. (Edge case: shouldn't normally happen
+     *     since /create/customer with STATIC_FUND provisions both at
+     *     once, but possible if the original create call partially
+     *     succeeded — which is almost certainly what's behind the
+     *     11:56 UTC duplicate that triggered this work.)
+     *   - WP_Error('existing_customer_not_found', …) — neither lookup
+     *     turned up a matching record. Unexpected when Fintava just
+     *     told us a duplicate exists, but possible if their list
+     *     endpoint is paginated and the match sits past the first
+     *     page on a tier where we don't paginate. Handler should
+     *     fall through to a clear admin-facing error rather than
+     *     the merchant-named /virtual-wallet/generate path.
+     *   - WP_Error('fintava_lookup_error', …) — both endpoints
+     *     errored at the transport layer. Same handling as above.
+     *
+     * @param string $email      Email submitted on the create form.
+     * @param string $phone      Phone submitted on the create form
+     *                           (any shape — normalized internally).
+     * @param string $first_name First name (used only for logging).
+     * @param string $last_name  Last name (used only for logging).
+     * @return array|WP_Error
+     */
+    private function recover_existing_customer_wallet($email, $phone, $first_name = '', $last_name = '') {
+        $email_norm = strtolower(trim((string) $email));
+        $phone_norm = self::normalize_ng_phone((string) $phone);
+
+        // Helper: pull a wallet object out of a customer record using
+        // the gateway's standard deepest-first unwrap order. Returns
+        // an array (possibly empty) so callers can test with empty().
+        $extract_wallet = function ($customer) {
+            if (!is_array($customer)) {
+                return [];
+            }
+            if (isset($customer['userInfo']['wallet']) && is_array($customer['userInfo']['wallet'])) {
+                return $customer['userInfo']['wallet'];
+            }
+            if (isset($customer['wallet']) && is_array($customer['wallet'])) {
+                return $customer['wallet'];
+            }
+            // Flat-fields fallback: only return the customer itself if
+            // it carries something that looks wallet-shaped, otherwise
+            // an empty wallet would mask a "no wallet" state.
+            if (isset($customer['accountNumber']) || isset($customer['account_number'])
+                || isset($customer['virtualAcctNo']) || isset($customer['virtualAcctName'])) {
+                return $customer;
+            }
+            return [];
+        };
+
+        // Reshape a found customer record into the create_customer()
+        // success envelope so the AJAX handler's existing extraction
+        // logic (`$customer['wallet']`, `$customer['userInfo']['id']`)
+        // works without modification.
+        $reshape = function ($customer, $wallet) {
+            if (!is_array($customer)) {
+                $customer = [];
+            }
+            // userInfo: keep the existing one if present; otherwise
+            // synthesize a minimal one carrying the customer ID so
+            // the AJAX handler can find it under userInfo.id.
+            if (!isset($customer['userInfo']) || !is_array($customer['userInfo'])) {
+                $cid = self::extract_customer_id($customer);
+                $customer['userInfo'] = $cid !== '' ? ['id' => $cid] : [];
+            }
+            $customer['wallet'] = is_array($wallet) ? $wallet : [];
+            return $customer;
+        };
+
+        $details_error = null;
+        $list_error    = null;
+
+        // ---- Step 1: /customers/details?phone=... ------------------------
+        // Fast path. The endpoint accepts a phone query param and returns
+        // the customer record directly. We use the normalized E.164
+        // phone since that's what Fintava stores internally (the same
+        // form is sent on /create/customer's phoneNumber field).
+        if ($phone_norm !== '') {
+            $response = $this->make_request(
+                'GET',
+                '/customers/details?phone=' . urlencode($phone_norm),
+                null,
+                null,
+                true
+            );
+            if (!is_wp_error($response)) {
+                $data = (isset($response['data']) && is_array($response['data']))
+                    ? $response['data']
+                    : (is_array($response) ? $response : []);
+                $cid = self::extract_customer_id($data);
+                if ($cid !== '') {
+                    $wallet = $extract_wallet($data);
+                    if (!empty($wallet)) {
+                        return $reshape($data, $wallet);
+                    }
+                    // Customer found but no wallet attached — surface
+                    // distinctly so the handler tells the user/admin
+                    // to use Migration -> Link rather than retrying.
+                    return new WP_Error(
+                        'existing_customer_no_wallet',
+                        sprintf(
+                            __('Fintava already has a customer record for this phone (%s) but no wallet is attached to it. An administrator needs to attach it via Migration -> Link.', 'matrix-mlm'),
+                            $phone_norm
+                        ),
+                        ['customer_id' => $cid]
+                    );
+                }
+            } else {
+                $details_error = $response;
+            }
+        }
+
+        // ---- Step 2: /customers/list -------------------------------------
+        // Email-keyed lookup. Fintava doesn't expose a dedicated
+        // /customers/details?email=... endpoint, so we pull the full
+        // list and scan. List response shapes vary across tiers but
+        // get_customer_list() already normalizes them to a flat array
+        // of customer records.
+        $list = $this->get_customer_list();
+        if (is_wp_error($list)) {
+            $list_error = $list;
+        } elseif (is_array($list)) {
+            foreach ($list as $customer) {
+                if (!is_array($customer)) {
+                    continue;
+                }
+                $info = (isset($customer['userInfo']) && is_array($customer['userInfo']))
+                    ? $customer['userInfo']
+                    : $customer;
+                $remote_email = strtolower(trim((string) ($info['email'] ?? '')));
+                $remote_phone = self::normalize_ng_phone((string) ($info['phoneNumber'] ?? $info['phone'] ?? ''));
+
+                $email_match = $email_norm !== '' && $remote_email !== '' && $remote_email === $email_norm;
+                $phone_match = $phone_norm !== '' && $remote_phone !== '' && $remote_phone === $phone_norm;
+                if (!$email_match && !$phone_match) {
+                    continue;
+                }
+
+                $wallet = $extract_wallet($customer);
+                if (!empty($wallet)) {
+                    return $reshape($customer, $wallet);
+                }
+                // Found the dup but no wallet on it. Same message as
+                // step 1 but keyed off whichever field matched, so
+                // support knows which way the dedup landed.
+                $hit = $email_match ? $email_norm : $phone_norm;
+                $cid = self::extract_customer_id($customer);
+                return new WP_Error(
+                    'existing_customer_no_wallet',
+                    sprintf(
+                        __('Fintava already has a customer record for %s but no wallet is attached to it. An administrator needs to attach it via Migration -> Link.', 'matrix-mlm'),
+                        $hit
+                    ),
+                    ['customer_id' => $cid]
+                );
+            }
+        }
+
+        // ---- No match anywhere -------------------------------------------
+        // Unexpected when create_customer just told us a duplicate
+        // exists, but possible on paginated list endpoints or when
+        // the dedup happens against a soft-deleted record. Carry the
+        // underlying transport errors (if any) into the message so
+        // support can tell whether we missed because of pagination
+        // vs a 5xx during the lookup itself.
+        $detail_msg = '';
+        if (is_wp_error($details_error)) {
+            $detail_msg = ' /customers/details: ' . $details_error->get_error_message() . '.';
+        }
+        if (is_wp_error($list_error)) {
+            $detail_msg .= ' /customers/list: ' . $list_error->get_error_message() . '.';
+        }
+        return new WP_Error(
+            'existing_customer_not_found',
+            trim(sprintf(
+                __('Fintava reported a duplicate customer for email=%1$s or phone=%2$s, but neither /customers/details nor /customers/list returned a match.%3$s', 'matrix-mlm'),
+                $email_norm,
+                $phone_norm,
+                $detail_msg
+            ))
+        );
+    }
+
+    /**
      * POST /virtual-wallet/generate
      *
      * NOTE: This is now the FALLBACK path. The primary wallet-creation
@@ -5103,6 +5376,72 @@ class Matrix_MLM_Fintava {
             );
         }
         // ---- END TEMPORARY DIAGNOSTIC LOG --------------------------------
+
+        // Duplicate-customer recovery.
+        //
+        // When create_customer fails with a "Customer with email or
+        // Phone exists" / "already exists" / "in use" signal, Fintava
+        // already has a customer record (and usually a wallet) for
+        // this user — it just blocked the second registration. Without
+        // recovery, we'd fall through to /virtual-wallet/generate and
+        // provision a SECOND wallet under the merchant master account
+        // (the merchant-named wallet path). The user would then have
+        // two wallets at Fintava: the original customer-attached one
+        // they can't see, and a new merchant-named one wired into our
+        // local row.
+        //
+        // recover_existing_customer_wallet() reshapes the existing
+        // customer into create_customer()'s success envelope, so on a
+        // successful recovery we just swap $customer and the rest of
+        // the extraction block runs unchanged. On recovery failure we
+        // surface a clear admin-facing error (telling the user/admin
+        // to use Migration -> Link) instead of provisioning the
+        // merchant-named wallet — that wrong wallet would then need
+        // to be deleted by hand at Fintava AND in our DB to recover.
+        if (is_wp_error($customer) && $this->is_duplicate_customer_error($customer)) {
+            error_log(
+                '[Matrix Fintava] Duplicate customer detected for user_id=' . $user_id
+                . ' (' . $email . '). Attempting recovery via /customers lookup.'
+            );
+
+            $recovered = $this->recover_existing_customer_wallet(
+                $email,
+                $phone,
+                $first_name,
+                $last_name
+            );
+
+            if (!is_wp_error($recovered)) {
+                error_log(
+                    '[Matrix Fintava] Recovery succeeded for user_id=' . $user_id
+                    . '; reusing existing Fintava customer/wallet.'
+                );
+                $customer = $recovered;
+            } else {
+                // Recovery failed. DO NOT fall through to
+                // /virtual-wallet/generate — that path produces a
+                // merchant-named wallet which would then need to be
+                // unwound at both Fintava and in our local row. It's
+                // safer to fail loudly and route the user to the
+                // admin-mediated Migration -> Link tool.
+                error_log(
+                    '[Matrix Fintava] Recovery failed for user_id=' . $user_id
+                    . ' code=' . $recovered->get_error_code()
+                    . ' message=' . $recovered->get_error_message()
+                );
+
+                wp_send_json_error([
+                    'message' => sprintf(
+                        /* translators: %s: support contact / admin instructions */
+                        __('We detected an existing Fintava record for this email or phone, but could not recover the wallet automatically. Please contact an administrator to use Migration -> Link to attach the existing wallet to your account. (Reason: %s)', 'matrix-mlm'),
+                        $recovered->get_error_message()
+                    ),
+                    'recovery_error_code' => $recovered->get_error_code(),
+                    'duplicate_signal'    => $customer->get_error_message(),
+                ]);
+                return;
+            }
+        }
 
         if (!is_wp_error($customer)) {
             $wallet_data = (isset($customer['wallet']) && is_array($customer['wallet']))
