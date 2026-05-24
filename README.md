@@ -121,6 +121,74 @@ Configure these in your payment gateway dashboards:
 - **Paystack Webhook:** `https://yoursite.com/wp-json/matrix-mlm/v1/payment/callback/paystack`
 - **Flutterwave Webhook:** `https://yoursite.com/wp-json/matrix-mlm/v1/payment/callback/flutterwave`
 
+## KYC Upload Hardening (Operator Notes)
+
+Loan and healthcare applications upload sensitive personal documents (NIN slips,
+utility bills, ID cards, passport photos, guarantor IDs, medical history) into
+
+```
+wp-content/uploads/matrix-loan-files/<user_id>/
+wp-content/uploads/matrix-healthcare-files/<user_id>/
+```
+
+As of the audit M3 fix, **direct HTTP access to those directories is denied**.
+Admins fetch each document through a short-lived HMAC-signed REST URL
+(`/wp-json/matrix-mlm/v1/attachment`, 10-minute TTL) that re-checks the
+`manage_matrix_mlm` capability and streams the file through PHP. The plugin
+auto-writes `.htaccess` and `web.config` files into each upload directory the
+first time it's used, so Apache and IIS installs are covered out of the box.
+
+### Nginx — operator action required
+
+Nginx ignores `.htaccess`. Operators on Nginx (or any front-end Nginx fronting
+PHP-FPM directly) **must add an explicit deny block** to their server config,
+or the upload directories will be world-readable despite the plugin's guards.
+Drop one of the following into your `server { ... }` block (or a snippets
+include):
+
+```nginx
+# Deny direct HTTP access to KYC upload directories.
+# Admin retrieval goes through /wp-json/matrix-mlm/v1/attachment which
+# enforces capability + HMAC + expiry before streaming the file.
+location ~ ^/wp-content/uploads/matrix-(loan|healthcare)-files/ {
+    deny all;
+    return 403;
+}
+```
+
+If you only run loans and not healthcare, narrow the regex to
+`^/wp-content/uploads/matrix-loan-files/`. Reload Nginx after the change
+(`nginx -t && systemctl reload nginx`).
+
+### Migrating legacy upload directories
+
+`Matrix_MLM_User_Loan::ensure_upload_guards()` is idempotent and uses a `v2`
+marker comment inside the generated config files. On the next upload into a
+given user's directory it will detect a missing or pre-`v2` marker and rewrite
+both `.htaccess` and `web.config`.
+
+If a legacy directory hasn't seen a new upload since the v2 marker shipped, it
+will still have the older deny-PHP-execution-only `.htaccess` from before the
+audit. To force the migration without waiting for the next upload, simply
+delete the old `.htaccess` (and `web.config`) files in those directories — the
+next request that calls `ensure_upload_guards()` will regenerate them in the
+hardened v2 shape:
+
+```bash
+# Run from the WordPress install root. Dry run first.
+find wp-content/uploads/matrix-loan-files -maxdepth 2 -name '.htaccess' -print
+find wp-content/uploads/matrix-loan-files -maxdepth 2 -name 'web.config' -print
+
+# Then, once you're happy with the list:
+find wp-content/uploads/matrix-loan-files -maxdepth 2 -name '.htaccess' -delete
+find wp-content/uploads/matrix-loan-files -maxdepth 2 -name 'web.config' -delete
+```
+
+The Nginx `location` block above is independent of the per-directory files
+and protects legacy and v2 directories alike, so installs on Nginx don't
+strictly need the file-level migration — but Apache / IIS installs do, since
+those servers rely on the per-directory configuration.
+
 ## File Structure
 
 ```
