@@ -3537,9 +3537,7 @@ class Matrix_MLM_Fintava {
      * a 400 with messages like "property X should not exist" — and the
      * whole request is rejected, not just the offending field.
      *
-     * Whitelisted fields (camelCase, per the DTO):
-     *   - firstName        (string, required)
-     *   - lastName         (string, required)
+     * Whitelisted fields (camelCase, per the current DTO):
      *   - email            (string, required)
      *   - phone            (string, required)
      *   - amount           (number, required by the DTO; we send a tiny
@@ -3550,10 +3548,21 @@ class Matrix_MLM_Fintava {
      *   - expireTimeInMin  (number, required; 525600 = 1 year)
      *   - merchantReference(string, idempotency key)
      *
-     * Fields that historically lived on this payload but were rejected
-     * by the live API and have therefore been removed from the request:
-     *   - first_name / last_name (snake_case spellings of the above —
-     *     the DTO is camelCase only)
+     * Fields that historically lived on this payload but are no longer
+     * on the DTO and now produce "property X should not exist" 400s:
+     *   - firstName / lastName (camelCase form — used to be required
+     *                     here; Fintava removed them from the DTO and
+     *                     the live API now rejects them outright. The
+     *                     account_name on the wallet is resolved by
+     *                     Fintava server-side from BVN/NIN and echoed
+     *                     back on the response; we still accept the
+     *                     local first_name/last_name as inputs and
+     *                     fall back to "$first $last" for the cached
+     *                     account_name if the response doesn't include
+     *                     a resolved name.)
+     *   - first_name / last_name (snake_case spellings — never on the
+     *                     DTO; the camelCase variants above were the
+     *                     correct spelling but they too are gone now.)
      *   - currency       (Fintava virtual wallets are NGN-only, no
      *                     currency selector exposed on this endpoint)
      *   - bvn, nin       (KYC data was forwarded here for /virtual-
@@ -3563,12 +3572,18 @@ class Matrix_MLM_Fintava {
      *   - date_of_birth, gender, address (same — not on the DTO)
      *
      * The legacy form (render_create_form) used to collect BVN/DOB/
-     * gender; those inputs were removed at the same time as this
+     * gender; those inputs were removed at the same time as that
      * payload cleanup so the UI doesn't ask users for PII that the
-     * gateway has no path for.
+     * gateway has no path for. We keep first_name/last_name in the
+     * form because they're still useful for the local account_name
+     * fallback even though the gateway doesn't accept them.
      */
     public function generate_virtual_wallet($customer_data) {
-        $required_fields = ['first_name', 'last_name', 'email', 'phone'];
+        // first_name / last_name are no longer required by the API
+        // (Fintava removed them from the DTO and 400s on their
+        // presence). They remain optional inputs that we use only
+        // for the local account_name fallback below.
+        $required_fields = ['email', 'phone'];
         foreach ($required_fields as $field) {
             if (empty($customer_data[$field])) {
                 return new WP_Error('missing_field', sprintf(__('Missing required field: %s', 'matrix-mlm'), $field));
@@ -3576,8 +3591,6 @@ class Matrix_MLM_Fintava {
         }
 
         $payload = [
-            'firstName'         => sanitize_text_field($customer_data['first_name']),
-            'lastName'          => sanitize_text_field($customer_data['last_name']),
             'email'             => sanitize_email($customer_data['email']),
             'phone'             => sanitize_text_field($customer_data['phone']),
             'amount'            => intval($customer_data['amount'] ?? 100),
@@ -3612,7 +3625,7 @@ class Matrix_MLM_Fintava {
                 'wallet_id' => self::extract_wallet_id($data) ?: ($data['id'] ?? null),
                 'customer_id' => $customer_id,
                 'account_number' => self::extract_account_number($data),
-                'account_name' => $extracted_name !== '' ? $extracted_name : ($customer_data['first_name'] . ' ' . $customer_data['last_name']),
+                'account_name' => $extracted_name !== '' ? $extracted_name : trim((string) ($customer_data['first_name'] ?? '') . ' ' . (string) ($customer_data['last_name'] ?? '')),
                 'bank_name' => self::extract_bank_name($data) ?: 'Fintava',
                 'bank_code' => $data['bank_code'] ?? $data['bankCode'] ?? null,
                 'currency' => $data['currency'] ?? 'NGN',
@@ -4833,6 +4846,13 @@ class Matrix_MLM_Fintava {
         // form inputs were removed at the same time; the AJAX handler
         // therefore no longer reads or stores them. KYC, if needed, is
         // collected out-of-band on the merchant dashboard.
+        //
+        // firstName/lastName were also removed from the DTO in a later
+        // Fintava change, so generate_virtual_wallet() no longer puts
+        // them on the request payload either. We still collect first_name
+        // and last_name here because they're useful for the locally
+        // cached account_name fallback when Fintava's response doesn't
+        // include a server-resolved name (BVN/NIN-derived).
         $result = $this->generate_virtual_wallet([
             'first_name' => $first_name,
             'last_name' => $last_name,
