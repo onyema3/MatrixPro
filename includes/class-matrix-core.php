@@ -2146,17 +2146,82 @@ class Matrix_MLM_Core {
     }
 
     public function register_rest_routes() {
+        // Webhook callback (server-to-server, signed).
+        //
+        // permission_callback runs BEFORE the handler. The handler
+        // (Matrix_MLM_Paystack::handle_webhook / Matrix_MLM_Flutterwave::
+        // handle_webhook) is the authority on the signature itself —
+        // it does the constant-time hash_equals check and gates the
+        // deposit credit on a successful match. This permission_callback
+        // is defense-in-depth on the route shape: refuse the request at
+        // the framework boundary if the signature header is structurally
+        // missing, so a future refactor that accidentally weakens the
+        // handler check still has a second line of defense at the route
+        // layer. (Audit H18: webhook routes used permission_callback =>
+        // '__return_true' so the per-gateway handler was the SOLE gate.)
         register_rest_route('matrix-mlm/v1', '/payment/callback/(?P<gateway>[a-z]+)', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_payment_callback'],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [$this, 'check_payment_callback_permission'],
         ]);
 
+        // User-facing verify endpoint.
+        //
+        // This is the URL the gateway redirects the user's browser to
+        // AFTER they complete (or abandon) checkout. There's no signature
+        // — it's a GET hit by the user, with a reference query param.
+        // The handler then makes an authenticated server-to-server call
+        // to the gateway's /verify endpoint to confirm payment status,
+        // and only credits on a positive verification. No way to forge
+        // a credit through this endpoint without first compromising the
+        // gateway's API key, which would give the attacker much more
+        // direct routes to fraud than this one. Keeping it open
+        // intentionally; documenting the rationale so a future reviewer
+        // doesn't re-flag it.
         register_rest_route('matrix-mlm/v1', '/payment/verify/(?P<gateway>[a-z]+)', [
             'methods' => 'GET',
             'callback' => [$this, 'handle_payment_verify'],
             'permission_callback' => '__return_true',
         ]);
+    }
+
+    /**
+     * Webhook permission pre-check — verifies the signature header is
+     * structurally present BEFORE we hand off to the gateway handler.
+     *
+     * Returns WP_Error (which REST renders as 401) if the header is
+     * missing for the gateway type, or true to let the handler proceed.
+     * The handler then performs the actual constant-time hash_equals
+     * comparison against the configured secret. This two-stage gate
+     * means a misconfigured route, a future handler refactor, or a
+     * silent change to the underlying signature-verification code can't
+     * accidentally make the route accept anonymous webhooks.
+     *
+     * Unknown gateway names fall through to the handler's existing 400
+     * branch — it's the right place to surface "unsupported gateway",
+     * not 401 "forbidden", since the failure mode is configuration
+     * rather than auth.
+     */
+    public function check_payment_callback_permission($request) {
+        $gateway = (string) $request->get_param('gateway');
+        switch ($gateway) {
+            case 'paystack':
+                $signature = $request->get_header('x-paystack-signature');
+                break;
+            case 'flutterwave':
+                $signature = $request->get_header('verif-hash');
+                break;
+            default:
+                return true;
+        }
+        if (!is_string($signature) || $signature === '') {
+            return new WP_Error(
+                'rest_forbidden',
+                __('Webhook signature header is missing.', 'matrix-mlm'),
+                ['status' => 401]
+            );
+        }
+        return true;
     }
 
     public function handle_payment_callback($request) {
