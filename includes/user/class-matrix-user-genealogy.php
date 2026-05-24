@@ -5002,42 +5002,87 @@ class Matrix_MLM_User_Genealogy {
                 form.addEventListener('submit', function(e) {
                     e.preventDefault();
                     var btn = panel.querySelector('#msep-create-btn');
+
+                    // Defensive prerequisites check. If
+                    // matrix-mlm-public failed to enqueue (theme
+                    // override, plugin conflict, etc.) we'd
+                    // otherwise POST to "" with empty nonce and
+                    // get a generic 0/-1 admin-ajax response that
+                    // looks like a silent failure to the member.
+                    // Surface a real error toast + console line
+                    // instead.
+                    var ajaxUrl = getAjaxUrl();
+                    var nonce   = getNonce();
+                    if (!ajaxUrl || !nonce) {
+                        if (window.console && console.error) {
+                            console.error('[matrix-share-export] matrixMLM globals missing (ajaxUrl=' + ajaxUrl + ', nonce=' + (nonce ? '<set>' : '<empty>') + '). Is matrix-mlm-public enqueued on this page?');
+                        }
+                        showToast('<?php echo esc_js(__('Could not create link: page assets missing. Please reload and try again.', 'matrix-mlm')); ?>', true);
+                        return;
+                    }
+                    if (typeof window.jQuery === 'undefined') {
+                        if (window.console && console.error) {
+                            console.error('[matrix-share-export] jQuery missing — cannot POST to admin-ajax.');
+                        }
+                        showToast('<?php echo esc_js(__('Could not create link: required script missing. Please reload and try again.', 'matrix-mlm')); ?>', true);
+                        return;
+                    }
+
                     btn.disabled = true;
                     btn.textContent = '<?php echo esc_js(__('Creating…', 'matrix-mlm')); ?>';
 
-                    jQuery.post(getAjaxUrl(), {
-                        action: 'matrix_create_share_token',
-                        nonce: getNonce(),
-                        plan_id:       panel.querySelector('#msep-plan-id').value,
-                        pivot_user_id: panel.querySelector('#msep-pivot-user-id').value,
-                        expiry_days:   panel.querySelector('#msep-expiry').value,
-                        label:         panel.querySelector('#msep-label').value
-                    }, function(res) {
-                        btn.disabled = false;
-                        btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
-                        if (!res || !res.success) {
-                            showToast((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not create link.', 'matrix-mlm')); ?>', true);
-                            return;
-                        }
+                    try {
+                        jQuery.post(ajaxUrl, {
+                            action: 'matrix_create_share_token',
+                            nonce: nonce,
+                            plan_id:       panel.querySelector('#msep-plan-id').value,
+                            pivot_user_id: panel.querySelector('#msep-pivot-user-id').value,
+                            expiry_days:   panel.querySelector('#msep-expiry').value,
+                            label:         panel.querySelector('#msep-label').value
+                        }, function(res) {
+                            btn.disabled = false;
+                            btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
+                            if (!res || !res.success) {
+                                if (window.console && console.warn) {
+                                    console.warn('[matrix-share-export] create_token rejected', res);
+                                }
+                                showToast((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not create link.', 'matrix-mlm')); ?>', true);
+                                return;
+                            }
 
-                        // Insert the new row at the top of the list,
-                        // converting the empty-state placeholder to
-                        // a real list if this is the first token.
-                        var ul = listEl.querySelector('.msep-token-list');
-                        if (!ul) {
-                            if (emptyMsg) emptyMsg.remove();
-                            ul = document.createElement('ul');
-                            ul.className = 'msep-token-list';
-                            listEl.appendChild(ul);
-                        }
-                        ul.insertBefore(tokenRowHtml(res.data), ul.firstChild);
-                        panel.querySelector('#msep-label').value = '';
-                        showToast('<?php echo esc_js(__('Share link created.', 'matrix-mlm')); ?>');
-                    }).fail(function() {
+                            // Insert the new row at the top of the list,
+                            // converting the empty-state placeholder to
+                            // a real list if this is the first token.
+                            var ul = listEl.querySelector('.msep-token-list');
+                            if (!ul) {
+                                if (emptyMsg) emptyMsg.remove();
+                                ul = document.createElement('ul');
+                                ul.className = 'msep-token-list';
+                                listEl.appendChild(ul);
+                            }
+                            ul.insertBefore(tokenRowHtml(res.data), ul.firstChild);
+                            panel.querySelector('#msep-label').value = '';
+                            showToast('<?php echo esc_js(__('Share link created.', 'matrix-mlm')); ?>');
+                        }).fail(function(xhr, status, err) {
+                            btn.disabled = false;
+                            btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
+                            if (window.console && console.error) {
+                                console.error('[matrix-share-export] create_token AJAX failed', { status: status, error: err, response: xhr && xhr.responseText });
+                            }
+                            showToast('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>', true);
+                        });
+                    } catch (postErr) {
+                        // Defensive: a thrown error before AJAX
+                        // dispatch (e.g., serialisation) would
+                        // otherwise leave the button disabled and
+                        // produce no feedback. Re-enable + toast.
                         btn.disabled = false;
                         btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
-                        showToast('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>', true);
-                    });
+                        if (window.console && console.error) {
+                            console.error('[matrix-share-export] create_token threw', postErr);
+                        }
+                        showToast('<?php echo esc_js(__('Could not create link.', 'matrix-mlm')); ?>', true);
+                    }
                 });
             }
 
@@ -5069,11 +5114,25 @@ class Matrix_MLM_User_Genealogy {
                         if (!window.confirm('<?php echo esc_js(__('Revoke this share link? Anyone holding it will lose access immediately.', 'matrix-mlm')); ?>')) {
                             return;
                         }
+
+                        // Same prerequisites check the create
+                        // path uses — fail loud rather than POST
+                        // to "" with empty nonce.
+                        var ajaxUrl = getAjaxUrl();
+                        var nonce   = getNonce();
+                        if (!ajaxUrl || !nonce || typeof window.jQuery === 'undefined') {
+                            if (window.console && console.error) {
+                                console.error('[matrix-share-export] revoke prerequisites missing', { ajaxUrl: ajaxUrl, hasNonce: !!nonce, hasJQuery: typeof window.jQuery !== 'undefined' });
+                            }
+                            showToast('<?php echo esc_js(__('Could not revoke link: page assets missing. Please reload and try again.', 'matrix-mlm')); ?>', true);
+                            return;
+                        }
+
                         var tokenId = parseInt(li.getAttribute('data-token-id'), 10) || 0;
                         revokeBtn.disabled = true;
-                        jQuery.post(getAjaxUrl(), {
+                        jQuery.post(ajaxUrl, {
                             action: 'matrix_revoke_share_token',
-                            nonce: getNonce(),
+                            nonce: nonce,
                             token_id: tokenId
                         }, function(res) {
                             if (res && res.success) {
@@ -5093,10 +5152,16 @@ class Matrix_MLM_User_Genealogy {
                                 showToast('<?php echo esc_js(__('Share link revoked.', 'matrix-mlm')); ?>');
                             } else {
                                 revokeBtn.disabled = false;
+                                if (window.console && console.warn) {
+                                    console.warn('[matrix-share-export] revoke rejected', res);
+                                }
                                 showToast((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not revoke link.', 'matrix-mlm')); ?>', true);
                             }
-                        }).fail(function() {
+                        }).fail(function(xhr, status, err) {
                             revokeBtn.disabled = false;
+                            if (window.console && console.error) {
+                                console.error('[matrix-share-export] revoke AJAX failed', { status: status, error: err, response: xhr && xhr.responseText });
+                            }
                             showToast('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>', true);
                         });
                     }
@@ -5150,14 +5215,25 @@ class Matrix_MLM_User_Genealogy {
                     // user is on the D3 view we capture the
                     // matrix-genealogy-d3-canvas (which contains
                     // the SVG render); if classic, we capture the
-                    // matrix-genealogy-wrapper.
+                    // *inner* #genealogy-tree element — NOT the
+                    // outer .matrix-genealogy-wrapper.
                     //
-                    // Earlier versions of this handler always
-                    // captured `.matrix-genealogy-wrapper` —
-                    // which produced a blank PNG on the D3 tab
-                    // because that wrapper has display:none
-                    // there. Selecting by visibility makes both
-                    // tabs export usable output.
+                    // Why the inner element matters in classic:
+                    // .matrix-genealogy-wrapper has overflow-x:
+                    // auto + a viewport-constrained width, so a
+                    // wide tree gets clipped to whatever's
+                    // currently in view. html2canvas would then
+                    // export only that horizontal slice. The
+                    // inner #genealogy-tree has min-width:
+                    // fit-content, so capturing it gets the
+                    // entire layout regardless of viewport size.
+                    //
+                    // (Earlier versions of this handler captured
+                    // the wrapper unconditionally and produced
+                    // half-empty PNGs on any tree wider than the
+                    // viewport — exactly the symptom members
+                    // reported as "PNG export doesn't work in
+                    // classic view".)
                     var tree = pickVisibleTreeNode();
                     if (!tree) {
                         showToast('<?php echo esc_js(__('No tree to export.', 'matrix-mlm')); ?>', true);
@@ -5168,7 +5244,60 @@ class Matrix_MLM_User_Genealogy {
                     btnPng.textContent = '<?php echo esc_js(__('Capturing…', 'matrix-mlm')); ?>';
 
                     loadHtml2Canvas().then(function(h2c) {
-                        return h2c(tree, { backgroundColor: '#ffffff', useCORS: true, scale: window.devicePixelRatio > 1 ? 2 : 1 });
+                        // Capture options:
+                        //   - backgroundColor white so transparent
+                        //     gradient fills don't render to black.
+                        //   - useCORS so Gravatars served with
+                        //     Access-Control-Allow-Origin can be
+                        //     drawn to the canvas without tainting.
+                        //     If a CORS image fails, html2canvas
+                        //     skips it silently rather than throw.
+                        //   - imageTimeout 15s — Gravatar can be
+                        //     slow on cold networks; the 0 default
+                        //     waits forever, which is also wrong.
+                        //   - logging false so we don't spam the
+                        //     console for members who happen to
+                        //     have devtools open.
+                        //   - scale 2 on HiDPI to keep the PNG
+                        //     readable when zoomed.
+                        //   - onclone: html2canvas renders from a
+                        //     cloned offscreen DOM. We use the
+                        //     hook to neutralise the scroll
+                        //     container so the captured copy
+                        //     shows the full tree even if the
+                        //     live one is mid-scroll.
+                        var nodeWidth  = Math.max(tree.scrollWidth,  tree.offsetWidth);
+                        var nodeHeight = Math.max(tree.scrollHeight, tree.offsetHeight);
+                        return h2c(tree, {
+                            backgroundColor: '#ffffff',
+                            useCORS:         true,
+                            imageTimeout:    15000,
+                            logging:         false,
+                            scale:           window.devicePixelRatio > 1 ? 2 : 1,
+                            width:           nodeWidth,
+                            height:          nodeHeight,
+                            windowWidth:     Math.max(nodeWidth, document.documentElement.clientWidth),
+                            windowHeight:    Math.max(nodeHeight, document.documentElement.clientHeight),
+                            onclone: function(clonedDoc) {
+                                // Strip the wrapper's overflow so
+                                // the cloned document lays out
+                                // the full tree without clipping.
+                                var wrappers = clonedDoc.querySelectorAll('.matrix-genealogy-wrapper');
+                                for (var i = 0; i < wrappers.length; i++) {
+                                    wrappers[i].style.overflow = 'visible';
+                                    wrappers[i].style.maxWidth = 'none';
+                                }
+                                // Make sure the inner tree also
+                                // expands rather than honouring
+                                // any scroll-pinned width.
+                                var inners = clonedDoc.querySelectorAll('#genealogy-tree, .matrix-genealogy-tree');
+                                for (var j = 0; j < inners.length; j++) {
+                                    inners[j].style.overflow = 'visible';
+                                    inners[j].style.maxWidth = 'none';
+                                    inners[j].style.width    = 'auto';
+                                }
+                            }
+                        });
                     }).then(function(canvas) {
                         var url = canvas.toDataURL('image/png');
                         var a = document.createElement('a');
@@ -5177,7 +5306,15 @@ class Matrix_MLM_User_Genealogy {
                         document.body.appendChild(a);
                         a.click();
                         a.remove();
-                    }).catch(function() {
+                    }).catch(function(err) {
+                        // Surface the real reason in console so
+                        // a member who reports "PNG export
+                        // doesn't work" can paste devtools output
+                        // for support. The toast stays
+                        // user-friendly.
+                        if (window.console && console.error) {
+                            console.error('[matrix-share-export] PNG export failed', err);
+                        }
                         showToast('<?php echo esc_js(__('PNG export unavailable. Use the PDF export instead.', 'matrix-mlm')); ?>', true);
                     }).then(function() {
                         btnPng.disabled = false;
@@ -5191,12 +5328,30 @@ class Matrix_MLM_User_Genealogy {
             // none). Returns null if neither is on screen, which
             // can happen during a tab switch animation or before
             // the D3 module has finished mounting.
+            //
+            // Classic mode prefers #genealogy-tree (the inner
+            // element) over the outer wrapper, because the
+            // wrapper has overflow-x:auto and would clip a wide
+            // tree to the viewport — see the export click
+            // handler above for the full rationale.
             function pickVisibleTreeNode() {
                 var candidates = [
+                    // D3 view: capture the canvas (which contains
+                    // the SVG and pan/zoom transform).
                     document.querySelector('.matrix-genealogy-d3-canvas[data-active-view="d3"]'),
-                    document.querySelector('.matrix-genealogy-wrapper[data-active-view="classic"]'),
-                    // Last-resort fallback for older markup that
-                    // didn't carry data-active-view attributes.
+                    // Classic view: capture the inner tree, NOT
+                    // the wrapper. The inner element has
+                    // min-width:fit-content so it carries the
+                    // tree's full layout regardless of viewport
+                    // width.
+                    document.querySelector('.matrix-genealogy-wrapper[data-active-view="classic"] #genealogy-tree'),
+                    document.querySelector('.matrix-genealogy-wrapper[data-active-view="classic"] .matrix-genealogy-tree'),
+                    // Last-resort fallbacks for older markup that
+                    // didn't carry data-active-view attributes,
+                    // and for the print-mode tree which lives
+                    // outside the data-active-view scope.
+                    document.querySelector('#genealogy-tree'),
+                    document.querySelector('.matrix-genealogy-tree'),
                     document.querySelector('.matrix-genealogy-wrapper')
                 ];
                 for (var i = 0; i < candidates.length; i++) {

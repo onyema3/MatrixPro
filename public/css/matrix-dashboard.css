@@ -232,8 +232,20 @@
 }
 
 .matrix-genealogy-wrapper {
+    /*
+     * Mirrors the public share page's tree wrapper
+     * (.mma-share-tree-wrapper) so the classic dashboard view
+     * and a prospect's share link look like the same product:
+     * a panel with a thin border and rounded corners, the tree
+     * centred inside, scrollable horizontally only when the
+     * tree itself is wider than the panel.
+     */
+    background: #fff;
+    border: 1px solid var(--matrix-border);
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
     overflow-x: auto;
-    padding: 20px 0;
+    padding: 18px;
     margin-bottom: 20px;
 }
 
@@ -249,21 +261,29 @@
     flex-direction: column;
     align-items: center;
     position: relative;
+    padding: 0 6px;
 }
 
-/* Tree Node */
+/* Tree Node
+ *
+ * Sized to match the public share page's .mma-share-node so the
+ * two surfaces look consistent. Slightly thinner border (1.5px)
+ * and tighter padding than the previous dashboard-only style;
+ * the avatar + info layout is preserved because the dashboard's
+ * classic view is interactive in ways the share page is not.
+ */
 .matrix-tree-node {
     display: flex;
     align-items: center;
     gap: 10px;
     background: #fff;
-    border: 2px solid var(--matrix-border);
-    border-radius: 10px;
-    padding: 10px 14px;
+    border: 2px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 8px 12px;
     min-width: 160px;
     transition: all 0.2s;
     cursor: default;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
 
 .matrix-tree-node:hover {
@@ -435,33 +455,52 @@
     color: #6b7280;
 }
 
-/* Tree Children / Lines */
+/* Tree Children / Lines
+ *
+ * Connector styling deliberately mirrors the public share page
+ * (.mma-share-* in includes/class-matrix-share.php) so the
+ * dashboard's classic view and a prospect-facing share link
+ * look like the same product. The two surfaces should converge
+ * visually — the only differences are the cards (the dashboard
+ * keeps avatars + interactive pivot links, the public page is
+ * read-only), not the connector geometry.
+ *
+ * Geometry: a thin 1px slate-300 line drops from the parent
+ * card's bottom edge (::before on .matrix-tree-children), then
+ * each child reaches up with its own 1px riser (::before on
+ * the child .matrix-tree-item) and joins a horizontal sibling
+ * bar (::after on the child). The first child's sibling bar is
+ * trimmed back to start at 50%, the last child's is trimmed to
+ * end at 50%, so the bar only ever spans between the children
+ * — giving the centred-T look the share page uses, instead of
+ * the previous over-extended T-bar.
+ *
+ * For a single child we still get a clean straight drop because
+ * the sibling bar is collapsed away by the :only-child rule
+ * below.
+ */
 .matrix-tree-children {
     display: flex;
     gap: 12px;
     padding-top: 24px;
+    margin-top: 0;
     position: relative;
+    justify-content: center;
 }
 
+/* Vertical drop line FROM the parent card down into the
+ * children block. Anchored to the top of .matrix-tree-children
+ * so it visually emerges from underneath the parent node.
+ */
 .matrix-tree-children::before {
     content: '';
     position: absolute;
     top: 0;
     left: 50%;
-    width: 2px;
+    width: 1px;
     height: 12px;
-    background: var(--matrix-border);
+    background: #cbd5e1;
     transform: translateX(-50%);
-}
-
-.matrix-tree-children::after {
-    content: '';
-    position: absolute;
-    top: 12px;
-    left: 24px;
-    right: 24px;
-    height: 2px;
-    background: var(--matrix-border);
 }
 
 .matrix-tree-children > .matrix-tree-item {
@@ -469,18 +508,51 @@
     padding-top: 12px;
 }
 
+/* Each child's vertical riser, joining the horizontal sibling
+ * bar to the child's card. Same colour + 1px weight as the
+ * parent drop so the network reads as one continuous line.
+ */
 .matrix-tree-children > .matrix-tree-item::before {
     content: '';
     position: absolute;
     top: 0;
     left: 50%;
-    width: 2px;
+    width: 1px;
     height: 12px;
-    background: var(--matrix-border);
+    background: #cbd5e1;
     transform: translateX(-50%);
 }
 
-/* Single child - straight line */
+/* Horizontal sibling bar segment that ties this child to its
+ * neighbours. Each .matrix-tree-item draws the segment for its
+ * own half of the bar; first/last children trim the outer half
+ * so the bar only spans between children rather than poking out
+ * past the leftmost/rightmost card.
+ */
+.matrix-tree-children > .matrix-tree-item:not(:only-child)::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: #cbd5e1;
+}
+
+.matrix-tree-children > .matrix-tree-item:first-child:not(:only-child)::after {
+    left: 50%;
+}
+
+.matrix-tree-children > .matrix-tree-item:last-child:not(:only-child)::after {
+    right: 50%;
+}
+
+/* Single child: no horizontal bar — just the straight drop
+ * (parent ::before) + the child's riser (item ::before). The
+ * :has() rule kept the previous behaviour for browsers that
+ * support it; the :only-child gate above does the same job
+ * universally.
+ */
 .matrix-tree-children:has(> .matrix-tree-item:only-child)::after {
     display: none;
 }
