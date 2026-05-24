@@ -801,6 +801,56 @@ class Matrix_MLM_Admin_Settings {
      * before this tab even renders.
      */
     private function render_bill_payments_tab() {
+        // One-shot notice surfaced after the markup save handler
+        // clamped a value the operator entered (typically a flat
+        // fee that exceeded resolve_max_flat_fee()'s default of
+        // 1000). Saving silently after a clamp would leave the
+        // operator confused about why the value they see on
+        // reload isn't the value they typed. The transient is
+        // keyed on the current user so two admins editing
+        // settings at the same time don't see each other's
+        // clamp notices.
+        $clamped_key = 'matrix_mlm_billing_markup_clamped_' . get_current_user_id();
+        $clamped     = get_transient($clamped_key);
+        if (is_array($clamped) && !empty($clamped)) {
+            delete_transient($clamped_key);
+            $currency = get_option('matrix_mlm_currency_symbol', '₦');
+            ?>
+            <div class="notice notice-warning" style="margin:10px 0 20px;">
+                <p style="margin:8px 0;"><strong><?php _e('Some markup values were capped on save:', 'matrix-mlm'); ?></strong></p>
+                <ul style="margin:0 0 10px 20px;list-style:disc;">
+                    <?php foreach ($clamped as $row):
+                        if (!is_array($row)) continue;
+                        $slug    = (string) ($row['slug'] ?? '');
+                        $field   = (string) ($row['field'] ?? '');
+                        $entered = (float) ($row['entered'] ?? 0);
+                        $capped  = (float) ($row['capped']  ?? 0);
+                        ?>
+                        <li>
+                            <?php
+                            printf(
+                                /* translators: 1: category, 2: field name (flat), 3: entered value, 4: capped value */
+                                esc_html__('%1$s — %2$s: you entered %3$s, saved as %4$s.', 'matrix-mlm'),
+                                '<code>' . esc_html($slug) . '</code>',
+                                '<code>' . esc_html($field) . '</code>',
+                                '<strong>' . esc_html($currency . number_format($entered, 2)) . '</strong>',
+                                '<strong>' . esc_html($currency . number_format($capped,  2)) . '</strong>'
+                            );
+                            ?>
+                        </li>
+                    <?php endforeach; ?>
+                </ul>
+                <p style="margin:8px 0;"><?php
+                    printf(
+                        /* translators: 1: filter name */
+                        esc_html__('To raise the cap for a legitimate use case, hook the %1$s filter. Otherwise, this is most likely a typo — please double-check the value before saving again.', 'matrix-mlm'),
+                        '<code>matrix_mlm_fintava_billing_max_flat_fee</code>'
+                    );
+                ?></p>
+            </div>
+            <?php
+        }
+
         $categories = [
             'airtime'     => [
                 'label'       => __('Airtime', 'matrix-mlm'),
@@ -1046,26 +1096,66 @@ class Matrix_MLM_Admin_Settings {
                 // Matrix_MLM_Fintava_Billing::compute_service_fee()
                 // can trust the shape without re-validating.
                 //
-                // All values are coerced to non-negative floats and
-                // percent is capped at 100 — matches the safety
-                // constraints on the read-side helper, so a
-                // hand-edited option row in the DB still computes a
-                // sensible fee.
+                // All values are coerced to non-negative floats and:
+                //   - percent is capped at 100
+                //   - flat is capped at the per-category max
+                //     resolved by Matrix_MLM_Fintava_Billing::resolve_max_flat_fee()
+                //     (default 1000, filterable). The flat cap closes
+                //     the footgun where a typo (e.g. 14000 in
+                //     airtime's flat field) silently broke every
+                //     member purchase below ~14k balance with only
+                //     a generic "Insufficient wallet balance" error
+                //     to debug from. compute_service_fee() also
+                //     clamps at compute time as a self-heal for
+                //     options stored before this cap landed.
+                //
+                // When a clamp fires we collect the (slug, raw,
+                // clamped) tuples and surface them to the operator
+                // via a one-shot transient that the next admin
+                // pageload renders as a notice. Saving silently
+                // would leave the operator confused why the value
+                // they typed isn't the value displayed on reload.
                 $markup_raw = isset($_POST['matrix_mlm_fintava_billing_markup']) && is_array($_POST['matrix_mlm_fintava_billing_markup'])
                     ? $_POST['matrix_mlm_fintava_billing_markup']
                     : [];
                 $markup_clean = [];
+                $clamped_notices = [];
                 foreach (Matrix_MLM_Fintava_Billing::BILL_CATEGORIES as $slug) {
                     $entry   = is_array($markup_raw[$slug] ?? null) ? $markup_raw[$slug] : [];
                     $flat    = max(0.0, floatval($entry['flat']    ?? 0));
                     $percent = max(0.0, floatval($entry['percent'] ?? 0));
                     $percent = min(100.0, $percent);
+
+                    $flat_max = Matrix_MLM_Fintava_Billing::resolve_max_flat_fee($slug);
+                    if ($flat > $flat_max) {
+                        $clamped_notices[] = [
+                            'slug'    => $slug,
+                            'field'   => 'flat',
+                            'entered' => $flat,
+                            'capped'  => $flat_max,
+                        ];
+                        $flat = $flat_max;
+                    }
+
                     $markup_clean[$slug] = [
                         'flat'    => round($flat, 2),
                         'percent' => round($percent, 2),
                     ];
                 }
                 update_option('matrix_mlm_fintava_billing_markup', $markup_clean);
+
+                if (!empty($clamped_notices)) {
+                    // Transient lives 60s — long enough to survive the
+                    // POST-redirect-GET that WordPress's settings save
+                    // typically does, short enough that a stale notice
+                    // never lingers if the operator navigates away
+                    // before reading it.
+                    set_transient(
+                        'matrix_mlm_billing_markup_clamped_' . get_current_user_id(),
+                        $clamped_notices,
+                        60
+                    );
+                }
 
                 // Settings stays empty; the JSON blobs above are the
                 // only persisted changes for this tab.
