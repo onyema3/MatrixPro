@@ -46,6 +46,36 @@
  *   revenue reporting can sum service_fee without parsing JSON.
  *   When markup is unconfigured (default) the fee is 0 and the
  *   flow collapses to the pre-C single-amount path.
+ *
+ * Idempotency lifecycle (added in item E):
+ *   Every bill-purchase request now generates a stable
+ *   client_reference BEFORE the upstream call, persists a
+ *   `pending` transaction row carrying that reference, then
+ *   transitions the row based on the upstream outcome:
+ *
+ *     pending  -> completed   (HTTP 2xx)
+ *     pending  -> failed      (HTTP 4xx/5xx with body, refund wallet)
+ *     pending  -> pending     (transport-level error, DON'T refund)
+ *
+ *   The transport-level / HTTP-level distinction is the central
+ *   correctness change of E: a connection timeout is ambiguous
+ *   ("did Fintava get the call or not?"), so we leave the wallet
+ *   debited and the row pending. A reconciliation worker (out
+ *   of scope here, deferred to a follow-up) replays the
+ *   client_reference against Fintava and finalises the row.
+ *
+ *   Auto-refunding on transport errors is the OLD behaviour and
+ *   was the silent-double-spend bug E closes: if Fintava DID
+ *   get the call but the connection died on the response, an
+ *   auto-refund credits the user back AND lets the upstream
+ *   purchase complete, so they get the airtime AND keep the money.
+ *
+ *   The reference is sent under both `client_reference` (snake_case,
+ *   matching the rest of the billing endpoints' field naming) and
+ *   `clientReference` (camelCase, matching the card-API's DTO
+ *   conventions). Fintava ignores unknown JSON keys, so dual-key
+ *   is robust against either internal convention without a
+ *   downside on the wire.
  */
 
 if (!defined('ABSPATH')) {
@@ -253,6 +283,78 @@ class Matrix_MLM_Fintava_Billing {
         return $out;
     }
 
+    /**
+     * Build a stable, collision-resistant client_reference for an
+     * outbound Fintava billing call. Format:
+     *
+     *     MTRX-BILL-{type}-{user_id}-{base32_random}
+     *
+     * Components:
+     *   - "MTRX-BILL"  : namespace prefix so a Fintava operator
+     *                    eyeballing a transaction can attribute it
+     *                    to MatrixPro instantly. Mirrors the
+     *                    BILL-/REFUND-BILL- prefixes already in use
+     *                    on matrix_wallet auditor rows.
+     *   - {type}       : airtime|data|cable|electricity. Lets a log
+     *                    grep narrow to a single category without
+     *                    joining back to the transactions table.
+     *   - {user_id}    : the matrix user id. Useful both for grep
+     *                    and as a partial namespace — even in the
+     *                    extraordinarily unlikely event the
+     *                    base32_random component collided, the
+     *                    per-user namespacing means the collision
+     *                    would have to happen for the same user,
+     *                    making it harmless under our UNIQUE index.
+     *   - base32_random: 13 base32 chars (RFC 4648 alphabet) of 8
+     *                    random bytes (64 bits of entropy). The full
+     *                    13-char encoding fits within the 64-char
+     *                    column budget after the prefix and is
+     *                    case-flat / URL-safe.
+     *
+     * 64 bits of entropy means a 1-in-1.8e19 collision per generation
+     * — the column's UNIQUE index is the belt; this is the braces.
+     * Failing-loud on a UNIQUE collision (rather than retrying) is
+     * the deliberate choice: if it ever fires, something more
+     * interesting than a coincidence is going on (e.g. a clock skew
+     * messing with random_bytes() seeding) and we want to know.
+     *
+     * @param string $type    One of self::BILL_CATEGORIES.
+     * @param int    $user_id The matrix user initiating the purchase.
+     * @return string A reference string, max 64 chars.
+     */
+    public static function build_client_reference($type, $user_id) {
+        // 8 bytes = 64 bits = 13 base32 chars after encoding.
+        // random_bytes() is the canonical CSPRNG; the openssl_*
+        // fallback handles the (rare) install where random_bytes is
+        // unavailable, e.g. PHP without the standard /dev/urandom
+        // accessor on a hardened container.
+        $bytes = function_exists('random_bytes')
+            ? random_bytes(8)
+            : openssl_random_pseudo_bytes(8);
+
+        // RFC 4648 base32 alphabet. Case-flat (all uppercase),
+        // confusables-removed (no 0/O, 1/I/L), URL-safe.
+        static $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        $bits = 0;
+        $bits_count = 0;
+        $out = '';
+        for ($i = 0, $len = strlen($bytes); $i < $len; $i++) {
+            $bits = ($bits << 8) | ord($bytes[$i]);
+            $bits_count += 8;
+            while ($bits_count >= 5) {
+                $bits_count -= 5;
+                $out .= $alphabet[($bits >> $bits_count) & 0x1F];
+            }
+        }
+        // The last partial group (1 bit left after 8 bytes -> 13
+        // chars) gets flushed by left-padding the residual bits.
+        if ($bits_count > 0) {
+            $out .= $alphabet[($bits << (5 - $bits_count)) & 0x1F];
+        }
+
+        return sprintf('MTRX-BILL-%s-%d-%s', $type, (int) $user_id, $out);
+    }
+
     private function register_hooks() {
         // Airtime
         add_action('wp_ajax_matrix_fintava_buy_airtime', [$this, 'ajax_buy_airtime']);
@@ -276,13 +378,25 @@ class Matrix_MLM_Fintava_Billing {
     /**
      * Buy Airtime
      * POST /billing/airtime
+     *
+     * @param string      $phone
+     * @param float       $amount
+     * @param string      $network
+     * @param string|null $client_reference Item E. When supplied, sent on the
+     *                                      request body for upstream
+     *                                      idempotency. When NULL the call
+     *                                      is sent without a reference,
+     *                                      which preserves backward compat
+     *                                      for any non-AJAX caller (none in
+     *                                      tree today, but the contract is
+     *                                      kept stable).
      */
-    public function buy_airtime($phone, $amount, $network) {
-        return $this->make_request('POST', '/billing/airtime', [
+    public function buy_airtime($phone, $amount, $network, $client_reference = null) {
+        return $this->make_request('POST', '/billing/airtime', $this->with_client_reference([
             'phone' => $phone,
             'amount' => floatval($amount),
             'network' => $network,
-        ]);
+        ], $client_reference));
     }
 
     /**
@@ -326,13 +440,19 @@ class Matrix_MLM_Fintava_Billing {
     /**
      * Buy cable subscription
      * POST /billing/cable-subscription
+     *
+     * @param string      $smartcard_number
+     * @param string      $plan_id
+     * @param string      $provider
+     * @param string|null $client_reference Item E. See buy_airtime() for
+     *                                      semantics.
      */
-    public function buy_cable($smartcard_number, $plan_id, $provider) {
-        return $this->make_request('POST', '/billing/cable-subscription', [
+    public function buy_cable($smartcard_number, $plan_id, $provider, $client_reference = null) {
+        return $this->make_request('POST', '/billing/cable-subscription', $this->with_client_reference([
             'smartcard_number' => $smartcard_number,
             'plan_id' => $plan_id,
             'provider' => $provider,
-        ]);
+        ], $client_reference));
     }
 
     /**
@@ -357,13 +477,19 @@ class Matrix_MLM_Fintava_Billing {
     /**
      * Buy data bundle
      * POST /billing/data-bundle
+     *
+     * @param string      $phone
+     * @param string      $plan_id
+     * @param string      $network
+     * @param string|null $client_reference Item E. See buy_airtime() for
+     *                                      semantics.
      */
-    public function buy_data($phone, $plan_id, $network) {
-        return $this->make_request('POST', '/billing/data-bundle', [
+    public function buy_data($phone, $plan_id, $network, $client_reference = null) {
+        return $this->make_request('POST', '/billing/data-bundle', $this->with_client_reference([
             'phone' => $phone,
             'plan_id' => $plan_id,
             'network' => $network,
-        ]);
+        ], $client_reference));
     }
 
     /**
@@ -400,14 +526,51 @@ class Matrix_MLM_Fintava_Billing {
     /**
      * Buy electricity
      * POST /billing/electricity
+     *
+     * @param string      $meter_number
+     * @param float       $amount
+     * @param string      $disco
+     * @param string      $meter_type
+     * @param string|null $client_reference Item E. See buy_airtime() for
+     *                                      semantics.
      */
-    public function buy_electricity($meter_number, $amount, $disco, $meter_type) {
-        return $this->make_request('POST', '/billing/electricity', [
+    public function buy_electricity($meter_number, $amount, $disco, $meter_type, $client_reference = null) {
+        return $this->make_request('POST', '/billing/electricity', $this->with_client_reference([
             'meter_number' => $meter_number,
             'amount' => floatval($amount),
             'disco' => $disco,
             'meter_type' => $meter_type,
-        ]);
+        ], $client_reference));
+    }
+
+    /**
+     * Add the client_reference to a Fintava request body under both
+     * snake_case and camelCase keys so the API accepts it regardless
+     * of which convention the upstream parser expects.
+     *
+     * Existing billing endpoints (this class) take snake_case
+     * (smartcard_number, plan_id, meter_number); the card endpoints
+     * (Matrix_MLM_Fintava_Card) take camelCase (cardMapId, cardBrand).
+     * Fintava's billing docs are silent on the idempotency-key field
+     * name at time of writing, so we send both — Fintava ignores
+     * unknown JSON keys, so the dual-key emit costs us nothing and
+     * gives us robustness against either internal convention.
+     *
+     * NULL / empty reference is a no-op so legacy callers (none in
+     * tree, but the public buy_* methods take a nullable param) keep
+     * the pre-E payload shape exactly.
+     *
+     * @param array       $body
+     * @param string|null $client_reference
+     * @return array Body with both keys added (or unchanged if null).
+     */
+    private function with_client_reference(array $body, $client_reference) {
+        if ($client_reference === null || $client_reference === '') {
+            return $body;
+        }
+        $body['client_reference'] = (string) $client_reference;
+        $body['clientReference']  = (string) $client_reference;
+        return $body;
     }
 
     // =========================================================================
@@ -450,63 +613,32 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        // Service fee (item C). Computed server-side from the
-        // matrix_mlm_fintava_billing_markup option — the client may
-        // have shown a preview, but the wallet is debited and the
-        // transaction is logged based on this value alone. Defaults
-        // to 0 for installs that haven't configured markup, in which
-        // case nominal == total and the flow is identical to pre-C.
-        $nominal = round($amount, 2);
-        $fee     = self::compute_service_fee('airtime', $nominal);
-        $total   = round($nominal + $fee, 2);
-
-        // Debit the TOTAL (nominal + fee). Fintava is called with
-        // the NOMINAL only — the telco doesn't know about our fee.
-        $debit = self::debit_for_purchase($user_id, $total, 'airtime', sprintf(__('Airtime purchase to %s', 'matrix-mlm'), $phone));
-        if (is_wp_error($debit)) {
-            wp_send_json_error(['message' => $debit->get_error_message()]);
-        }
-        $debit_reference = $debit;
-
-        $result = $this->buy_airtime($phone, $nominal, $network);
-        if (is_wp_error($result)) {
-            // Refund the TOTAL — user is made whole including fee.
-            // The fee never accrued because no upstream call landed.
-            self::refund_failed_purchase($user_id, $total, 'airtime', $debit_reference, $result->get_error_message());
-            wp_send_json_error(['message' => $result->get_error_message()]);
-            return;
-        }
-
-        $this->log_transaction($user_id, 'airtime', [
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ], ['phone' => $phone, 'network' => $network, 'debit_ref' => $debit_reference], $result);
-
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        $message  = sprintf(
-            /* translators: %1$s: currency symbol, %2$s: nominal amount, %3$s: phone */
-            __('%1$s%2$s airtime sent to %3$s.', 'matrix-mlm'),
-            $currency,
-            number_format($nominal, 2),
-            $phone
+        // Hand off to the centralised lifecycle (debit -> begin
+        // pending row -> upstream call -> finalize). The closure
+        // captures the per-category upstream call shape so the
+        // helper can stay generic.
+        $outcome = $this->process_purchase(
+            'airtime',
+            round($amount, 2),
+            $user_id,
+            sprintf(__('Airtime purchase to %s', 'matrix-mlm'), $phone),
+            ['phone' => $phone, 'network' => $network],
+            function ($nominal, $client_reference) use ($phone, $network) {
+                return $this->buy_airtime($phone, $nominal, $network, $client_reference);
+            }
         );
-        if ($fee > 0) {
-            $message .= ' ' . sprintf(
-                /* translators: %1$s: currency symbol + total, %2$s: currency symbol + fee */
-                __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
-                $currency . number_format($total, 2),
-                $currency . number_format($fee, 2)
-            );
-        } else {
-            $message .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
-        }
-        wp_send_json_success([
-            'message' => $message,
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ]);
+
+        $this->respond_to_outcome(
+            $outcome,
+            'airtime',
+            sprintf(
+                /* translators: %1$s: currency symbol, %2$s: nominal amount, %3$s: phone */
+                __('%1$s%2$s airtime sent to %3$s.', 'matrix-mlm'),
+                get_option('matrix_mlm_currency_symbol', '₦'),
+                number_format(round($amount, 2), 2),
+                $phone
+            )
+        );
     }
 
     public function ajax_list_data_bundles() {
@@ -552,49 +684,18 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        // Service fee (item C). See ajax_buy_airtime for the
-        // nominal/fee/total contract — same rules apply here, only
-        // the category and the upstream call differ.
-        $nominal = round($amount, 2);
-        $fee     = self::compute_service_fee('data', $nominal);
-        $total   = round($nominal + $fee, 2);
+        $outcome = $this->process_purchase(
+            'data',
+            round($amount, 2),
+            $user_id,
+            sprintf(__('Data bundle to %s', 'matrix-mlm'), $phone),
+            ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id],
+            function ($nominal, $client_reference) use ($phone, $plan_id, $network) {
+                return $this->buy_data($phone, $plan_id, $network, $client_reference);
+            }
+        );
 
-        $debit = self::debit_for_purchase($user_id, $total, 'data', sprintf(__('Data bundle to %s', 'matrix-mlm'), $phone));
-        if (is_wp_error($debit)) {
-            wp_send_json_error(['message' => $debit->get_error_message()]);
-        }
-        $debit_reference = $debit;
-
-        $result = $this->buy_data($phone, $plan_id, $network);
-        if (is_wp_error($result)) {
-            self::refund_failed_purchase($user_id, $total, 'data', $debit_reference, $result->get_error_message());
-            wp_send_json_error(['message' => $result->get_error_message()]);
-            return;
-        }
-
-        $this->log_transaction($user_id, 'data', [
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ], ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id, 'debit_ref' => $debit_reference], $result);
-
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        $message  = __('Data bundle purchased successfully!', 'matrix-mlm');
-        if ($fee > 0) {
-            $message .= ' ' . sprintf(
-                __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
-                $currency . number_format($total, 2),
-                $currency . number_format($fee, 2)
-            );
-        } else {
-            $message .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
-        }
-        wp_send_json_success([
-            'message' => $message,
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ]);
+        $this->respond_to_outcome($outcome, 'data', __('Data bundle purchased successfully!', 'matrix-mlm'));
     }
 
     public function ajax_list_cable_providers() {
@@ -648,48 +749,18 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        // Service fee (item C). See ajax_buy_airtime for the
-        // nominal/fee/total contract.
-        $nominal = round($amount, 2);
-        $fee     = self::compute_service_fee('cable', $nominal);
-        $total   = round($nominal + $fee, 2);
+        $outcome = $this->process_purchase(
+            'cable',
+            round($amount, 2),
+            $user_id,
+            sprintf(__('Cable subscription %s', 'matrix-mlm'), $provider),
+            ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id],
+            function ($nominal, $client_reference) use ($smartcard, $plan_id, $provider) {
+                return $this->buy_cable($smartcard, $plan_id, $provider, $client_reference);
+            }
+        );
 
-        $debit = self::debit_for_purchase($user_id, $total, 'cable', sprintf(__('Cable subscription %s', 'matrix-mlm'), $provider));
-        if (is_wp_error($debit)) {
-            wp_send_json_error(['message' => $debit->get_error_message()]);
-        }
-        $debit_reference = $debit;
-
-        $result = $this->buy_cable($smartcard, $plan_id, $provider);
-        if (is_wp_error($result)) {
-            self::refund_failed_purchase($user_id, $total, 'cable', $debit_reference, $result->get_error_message());
-            wp_send_json_error(['message' => $result->get_error_message()]);
-            return;
-        }
-
-        $this->log_transaction($user_id, 'cable', [
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ], ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id, 'debit_ref' => $debit_reference], $result);
-
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        $message  = __('Cable subscription purchased successfully!', 'matrix-mlm');
-        if ($fee > 0) {
-            $message .= ' ' . sprintf(
-                __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
-                $currency . number_format($total, 2),
-                $currency . number_format($fee, 2)
-            );
-        } else {
-            $message .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
-        }
-        wp_send_json_success([
-            'message' => $message,
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ]);
+        $this->respond_to_outcome($outcome, 'cable', __('Cable subscription purchased successfully!', 'matrix-mlm'));
     }
 
     public function ajax_list_discos() {
@@ -765,51 +836,457 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        // Service fee (item C). See ajax_buy_airtime for the
-        // nominal/fee/total contract.
-        $nominal = round($amount, 2);
-        $fee     = self::compute_service_fee('electricity', $nominal);
-        $total   = round($nominal + $fee, 2);
+        $outcome = $this->process_purchase(
+            'electricity',
+            round($amount, 2),
+            $user_id,
+            sprintf(__('Electricity purchase for meter %s', 'matrix-mlm'), $meter_number),
+            ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type],
+            function ($nominal, $client_reference) use ($meter_number, $disco, $meter_type) {
+                return $this->buy_electricity($meter_number, $nominal, $disco, $meter_type, $client_reference);
+            }
+        );
 
-        $debit = self::debit_for_purchase($user_id, $total, 'electricity', sprintf(__('Electricity purchase for meter %s', 'matrix-mlm'), $meter_number));
+        // Electricity is the one category whose success message
+        // surfaces an upstream-issued field (the prepaid token).
+        // respond_to_outcome handles the standard pending/error
+        // paths; on success we tack the token on to the success
+        // payload here.
+        $this->respond_to_outcome(
+            $outcome,
+            'electricity',
+            __('Electricity purchased successfully!', 'matrix-mlm'),
+            function ($api_response) {
+                $token = $api_response['data']['token'] ?? $api_response['token'] ?? '';
+                return [
+                    'token' => $token,
+                    'message_suffix' => $token !== '' ? ' Token: ' . $token : '',
+                ];
+            }
+        );
+    }
+
+    // =========================================================================
+    // INTERNAL: PURCHASE LIFECYCLE (item E)
+    // =========================================================================
+
+    /**
+     * Run the full debit -> upstream call -> finalize cycle for one
+     * bill purchase. Returns a structured outcome that callers
+     * (typically the four ajax_buy_<type> handlers) hand to
+     * respond_to_outcome() for the JSON response.
+     *
+     * Outcome shapes:
+     *
+     *   ['kind' => 'wallet_error',  'wp_error'   => WP_Error]
+     *      Wallet debit refused (insufficient balance, locked, etc).
+     *      Nothing else has happened — no row written, no upstream
+     *      call. Caller surfaces the WP_Error message.
+     *
+     *   ['kind' => 'begin_failed',  'wp_error'   => WP_Error]
+     *      Wallet was debited but the pending row INSERT failed.
+     *      We've already issued a compensating refund. Caller
+     *      surfaces a generic "internal error" — the underlying
+     *      WP_Error (typically a UNIQUE collision, see
+     *      build_client_reference's docblock for the odds) is in
+     *      the error log for ops.
+     *
+     *   ['kind' => 'http_error',    'wp_error'   => WP_Error,
+     *    'transaction_id' => int,   'amounts'    => [...]]
+     *      Fintava returned 4xx/5xx with a body. The transaction
+     *      row is now `failed` and the wallet has been refunded.
+     *      Caller surfaces the upstream error message.
+     *
+     *   ['kind' => 'transport_error', 'wp_error' => WP_Error,
+     *    'transaction_id' => int,    'amounts'  => [...],
+     *    'client_reference' => string]
+     *      The HTTP request itself failed (timeout, DNS, connection
+     *      refused). We DON'T know whether Fintava processed the
+     *      call. The row is left `pending`, the wallet stays
+     *      debited. Caller surfaces the "verifying" message — a
+     *      reconciliation worker (out of scope) will resolve later.
+     *      THIS IS THE CENTRAL CORRECTNESS CHANGE OF ITEM E.
+     *
+     *   ['kind' => 'success', 'transaction_id' => int,
+     *    'api_response' => array, 'amounts' => [...]]
+     *      Fintava returned 2xx. Row is `completed`, completed_at
+     *      stamped, api_response persisted.
+     *
+     * The `amounts` map is always {nominal, fee, total} so the
+     * caller can format consistent success / status messages.
+     *
+     * @param string   $type             One of self::BILL_CATEGORIES.
+     * @param float    $nominal          The bill amount (already rounded 2dp).
+     * @param int      $user_id          The matrix user.
+     * @param string   $debit_description Wallet auditor description.
+     * @param array    $details          Per-category details (phone, meter, etc.).
+     *                                   Stored on the transactions row's JSON.
+     * @param callable $api_call         function($nominal, $client_reference) -> array|WP_Error
+     */
+    private function process_purchase($type, $nominal, $user_id, $debit_description, array $details, callable $api_call) {
+        $fee   = self::compute_service_fee($type, $nominal);
+        $total = round($nominal + $fee, 2);
+
+        // 1. Debit the user's wallet for the full total.
+        $debit = self::debit_for_purchase($user_id, $total, $type, $debit_description);
         if (is_wp_error($debit)) {
-            wp_send_json_error(['message' => $debit->get_error_message()]);
+            return [
+                'kind'     => 'wallet_error',
+                'wp_error' => $debit,
+                'amounts'  => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+            ];
         }
         $debit_reference = $debit;
+        $details['debit_ref'] = $debit_reference;
 
-        $result = $this->buy_electricity($meter_number, $nominal, $disco, $meter_type);
-        if (is_wp_error($result)) {
-            self::refund_failed_purchase($user_id, $total, 'electricity', $debit_reference, $result->get_error_message());
-            wp_send_json_error(['message' => $result->get_error_message()]);
-            return;
-        }
-
-        $token = $result['data']['token'] ?? $result['token'] ?? '';
-        $this->log_transaction($user_id, 'electricity', [
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
-        ], ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type, 'token' => $token, 'debit_ref' => $debit_reference], $result);
-
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        $msg      = __('Electricity purchased successfully!', 'matrix-mlm');
-        if ($fee > 0) {
-            $msg .= ' ' . sprintf(
-                __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
-                $currency . number_format($total, 2),
-                $currency . number_format($fee, 2)
+        // 2. Generate the idempotency reference and INSERT a
+        //    `pending` row BEFORE the upstream call. The unique
+        //    index on client_reference makes a re-submit (e.g. an
+        //    AJAX retry triggered by a transient-error message)
+        //    fail loudly at the DB layer if the same reference is
+        //    re-used — and a fresh reference per invocation makes
+        //    that essentially never happen in practice. The row
+        //    being persisted before the call is what lets the
+        //    reconciliation worker find pending rows after a
+        //    transport failure.
+        $client_reference = self::build_client_reference($type, $user_id);
+        $tx_id = $this->begin_transaction(
+            $user_id,
+            $type,
+            ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+            $details,
+            $client_reference
+        );
+        if ($tx_id === 0) {
+            // Row insert failed (DB error or, vanishingly, UNIQUE
+            // collision on client_reference). The wallet was
+            // debited; compensate so the user is made whole, then
+            // surface a generic error.
+            self::refund_failed_purchase(
+                $user_id, $total, $type, $debit_reference,
+                __('Internal error: could not record transaction.', 'matrix-mlm')
             );
-        } else {
-            $msg .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
+            return [
+                'kind'     => 'begin_failed',
+                'wp_error' => new WP_Error(
+                    'begin_failed',
+                    __('Internal error. Please try again.', 'matrix-mlm')
+                ),
+                'amounts'  => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+            ];
         }
-        if ($token) { $msg .= ' Token: ' . $token; }
-        wp_send_json_success([
-            'message' => $msg,
-            'token'   => $token,
-            'nominal' => $nominal,
-            'fee'     => $fee,
-            'total'   => $total,
+
+        // 3. Make the upstream call. The closure captures the
+        //    per-category buy_<type>() invocation.
+        $result = $api_call($nominal, $client_reference);
+
+        // 4. Branch on outcome. Transport-level errors (the
+        //    `http_request_failed` code) leave the row pending and
+        //    the wallet debited. HTTP-level errors (everything
+        //    else) flip the row to failed and refund the wallet.
+        //    See the file-level docblock for why this distinction
+        //    is the central correctness change of E.
+        if (is_wp_error($result)) {
+            if ($this->is_transport_error($result)) {
+                $this->mark_pending_with_error($tx_id, $result);
+                return [
+                    'kind'             => 'transport_error',
+                    'wp_error'         => $result,
+                    'transaction_id'   => $tx_id,
+                    'client_reference' => $client_reference,
+                    'amounts'          => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+                ];
+            }
+            $this->fail_transaction($tx_id, $result);
+            self::refund_failed_purchase(
+                $user_id, $total, $type, $debit_reference, $result->get_error_message()
+            );
+            return [
+                'kind'           => 'http_error',
+                'wp_error'       => $result,
+                'transaction_id' => $tx_id,
+                'amounts'        => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+            ];
+        }
+
+        // 5. Success. Finalize the row.
+        $this->complete_transaction($tx_id, $result);
+        return [
+            'kind'           => 'success',
+            'transaction_id' => $tx_id,
+            'api_response'   => is_array($result) ? $result : [],
+            'amounts'        => ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
+        ];
+    }
+
+    /**
+     * Format the outcome of process_purchase() into a JSON response
+     * and emit it via wp_send_json_*. Centralises the success-message
+     * shape (including the optional service-fee disclosure) so the
+     * four ajax_buy_<type> handlers stay short.
+     *
+     * @param array         $outcome           The structured outcome
+     *                                         from process_purchase().
+     * @param string        $type              Category — used in the
+     *                                         pending-row fallback
+     *                                         message.
+     * @param string        $success_message   Category-specific
+     *                                         success line (e.g.
+     *                                         "Cable subscription
+     *                                         purchased successfully!").
+     * @param callable|null $extra_success     Optional closure that
+     *                                         can derive extra
+     *                                         payload fields and a
+     *                                         message-suffix from the
+     *                                         api_response. Used by
+     *                                         electricity to surface
+     *                                         the prepaid token.
+     */
+    private function respond_to_outcome(array $outcome, $type, $success_message, ?callable $extra_success = null) {
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $amounts  = $outcome['amounts'] ?? ['nominal' => 0, 'fee' => 0, 'total' => 0];
+
+        switch ($outcome['kind']) {
+            case 'wallet_error':
+            case 'begin_failed':
+            case 'http_error':
+                /** @var WP_Error $err */
+                $err = $outcome['wp_error'];
+                wp_send_json_error(['message' => $err->get_error_message()]);
+                return;
+
+            case 'transport_error':
+                // The user's wallet IS still debited — make sure the
+                // surfaced message reflects that. The "your wallet
+                // will be refunded if it didn't go through" wording
+                // sets the right expectation: reconciliation may
+                // refund, but it also may finalize the purchase as
+                // completed.
+                wp_send_json_success([
+                    'message' => __('Your purchase is being verified. Please check Bill Payments History in a few minutes — your wallet will be refunded if the purchase did not go through.', 'matrix-mlm'),
+                    'pending' => true,
+                    'transaction_id'   => $outcome['transaction_id'],
+                    'client_reference' => $outcome['client_reference'],
+                    'nominal' => $amounts['nominal'],
+                    'fee'     => $amounts['fee'],
+                    'total'   => $amounts['total'],
+                ]);
+                return;
+
+            case 'success':
+                $message = $success_message;
+                if ($amounts['fee'] > 0) {
+                    $message .= ' ' . sprintf(
+                        /* translators: %1$s: currency symbol + total, %2$s: currency symbol + fee */
+                        __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
+                        $currency . number_format($amounts['total'], 2),
+                        $currency . number_format($amounts['fee'], 2)
+                    );
+                } else {
+                    $message .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
+                }
+
+                $payload = [
+                    'message'        => $message,
+                    'transaction_id' => $outcome['transaction_id'],
+                    'nominal'        => $amounts['nominal'],
+                    'fee'            => $amounts['fee'],
+                    'total'          => $amounts['total'],
+                ];
+                if ($extra_success !== null) {
+                    $extra = $extra_success($outcome['api_response']);
+                    if (is_array($extra)) {
+                        if (!empty($extra['message_suffix'])) {
+                            $payload['message'] .= $extra['message_suffix'];
+                            unset($extra['message_suffix']);
+                        }
+                        $payload = array_merge($payload, $extra);
+                    }
+                }
+                wp_send_json_success($payload);
+                return;
+        }
+
+        // Defensive fallback — should never run given the cases above.
+        wp_send_json_error(['message' => __('Unknown purchase state.', 'matrix-mlm')]);
+    }
+
+    /**
+     * Decide whether a WP_Error returned from a Fintava call is a
+     * transport-level failure (timeout / DNS / connection refused)
+     * versus an HTTP-level failure (4xx / 5xx with a body).
+     *
+     * Transport-level: leave the row pending, do NOT refund. We
+     *   don't know whether Fintava processed the call.
+     * HTTP-level: flip the row to failed, refund the wallet.
+     *   Fintava said "no" with a clear status code.
+     *
+     * `wp_remote_request` is documented to return WP_Error with code
+     * `http_request_failed` for cURL-level errors. WordPress has
+     * historically been consistent on this — the inner cURL error
+     * code is exposed via $err->get_error_data() — but we match by
+     * code to keep the logic readable.
+     *
+     * `fintava_billing_error` is the code make_request() emits when
+     * Fintava returns a 4xx/5xx with a JSON envelope; that's an
+     * HTTP-level error.
+     *
+     * @param WP_Error $err
+     * @return bool TRUE iff the row should stay pending.
+     */
+    private function is_transport_error(WP_Error $err) {
+        return $err->get_error_code() === 'http_request_failed';
+    }
+
+    /**
+     * INSERT a `pending` row on matrix_billing_transactions BEFORE
+     * the upstream Fintava call. Carries the client_reference so a
+     * reconciliation worker can later cross-reference the row
+     * against Fintava's record.
+     *
+     * Returns the row's id, or 0 on failure (typically a UNIQUE
+     * collision on client_reference, which is essentially
+     * impossible — see build_client_reference's docblock — but the
+     * caller compensates anyway).
+     *
+     * Item E: replaces the old log_transaction() insert, which
+     * happened post-success and unconditionally wrote
+     * status='completed'. The pre-call insert is what makes the
+     * row visible to the reconciliation worker before any upstream
+     * outcome is known.
+     *
+     * @param int    $user_id
+     * @param string $type
+     * @param array  $amounts {nominal, fee, total}
+     * @param array  $details Per-category map serialised to the
+     *                       details JSON column.
+     * @param string $client_reference Generated by build_client_reference.
+     * @return int row id or 0 on failure
+     */
+    private function begin_transaction($user_id, $type, array $amounts, array $details, $client_reference) {
+        global $wpdb;
+
+        $nominal = round((float) ($amounts['nominal'] ?? 0), 2);
+        $fee     = round((float) ($amounts['fee']     ?? 0), 2);
+        $total   = round((float) ($amounts['total']   ?? ($nominal + $fee)), 2);
+
+        $inserted = $wpdb->insert($wpdb->prefix . 'matrix_billing_transactions', [
+            'user_id'          => (int) $user_id,
+            'type'             => (string) $type,
+            // Legacy `amount` column kept in sync with nominal so a
+            // third-party reader that hardcoded `SELECT amount`
+            // continues to see the user-facing bill amount.
+            'amount'           => $nominal,
+            'nominal_amount'   => $nominal,
+            'service_fee'      => $fee,
+            'total_charged'    => $total,
+            'details'          => json_encode($details),
+            'api_response'     => null,
+            'status'           => 'pending',
+            'client_reference' => (string) $client_reference,
+            'created_at'       => current_time('mysql'),
         ]);
+        if ($inserted === false) {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] begin_transaction failed user_id=%d type=%s ref=%s last_error=%s',
+                (int) $user_id, $type, $client_reference, $wpdb->last_error
+            ));
+            return 0;
+        }
+        return (int) $wpdb->insert_id;
+    }
+
+    /**
+     * UPDATE a pending row to `completed` after a successful
+     * Fintava call. Stamps completed_at and persists the upstream
+     * response so support has the wire data without rebuilding
+     * the request.
+     *
+     * Idempotent at the DB layer — if the row has already been
+     * finalized (e.g. by a future reconciliation worker that ran
+     * concurrently), the WHERE status='pending' clause will match
+     * zero rows and we no-op. We log the no-op because it should
+     * never happen in the synchronous path, only with the
+     * reconciler in the loop.
+     */
+    private function complete_transaction($tx_id, $api_response) {
+        global $wpdb;
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_billing_transactions',
+            [
+                'status'       => 'completed',
+                'completed_at' => current_time('mysql'),
+                'api_response' => json_encode($api_response),
+            ],
+            ['id' => (int) $tx_id, 'status' => 'pending'],
+            ['%s', '%s', '%s'],
+            ['%d', '%s']
+        );
+        if ($rows !== 1) {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] complete_transaction expected 1 row, got %s tx_id=%d',
+                var_export($rows, true), (int) $tx_id
+            ));
+        }
+    }
+
+    /**
+     * UPDATE a pending row to `failed` after Fintava returned an
+     * HTTP-level error (4xx/5xx with body). The wallet refund is
+     * the caller's responsibility — this just records the row's
+     * post-call state and the upstream response for support.
+     *
+     * Same idempotent-update pattern as complete_transaction().
+     */
+    private function fail_transaction($tx_id, WP_Error $err) {
+        global $wpdb;
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_billing_transactions',
+            [
+                'status'       => 'failed',
+                'api_response' => json_encode([
+                    'error_code'    => $err->get_error_code(),
+                    'error_message' => $err->get_error_message(),
+                    'error_data'    => $err->get_error_data(),
+                ]),
+            ],
+            ['id' => (int) $tx_id, 'status' => 'pending'],
+            ['%s', '%s'],
+            ['%d', '%s']
+        );
+        if ($rows !== 1) {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] fail_transaction expected 1 row, got %s tx_id=%d',
+                var_export($rows, true), (int) $tx_id
+            ));
+        }
+    }
+
+    /**
+     * Persist the transport-level WP_Error onto a pending row's
+     * api_response WITHOUT changing its status. Used after a
+     * transport-level failure — the row stays pending so a
+     * reconciliation worker can finalize it later, but we still
+     * want the error data on disk for ops to grep.
+     *
+     * Same idempotency note as complete/fail_transaction.
+     */
+    private function mark_pending_with_error($tx_id, WP_Error $err) {
+        global $wpdb;
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_billing_transactions',
+            [
+                'api_response' => json_encode([
+                    'transport_error_code' => $err->get_error_code(),
+                    'transport_error_msg'  => $err->get_error_message(),
+                    'transport_error_data' => $err->get_error_data(),
+                    'recorded_at'          => current_time('mysql'),
+                ]),
+            ],
+            ['id' => (int) $tx_id, 'status' => 'pending'],
+            ['%s'],
+            ['%d', '%s']
+        );
     }
 
     // =========================================================================
@@ -916,43 +1393,6 @@ class Matrix_MLM_Fintava_Billing {
     // HELPERS
     // =========================================================================
 
-    private function log_transaction($user_id, $type, $amounts, $details, $api_response) {
-        global $wpdb;
-
-        // $amounts is the breakdown computed by the calling
-        // ajax_buy_<type> handler. Defensive: accept missing keys
-        // and a legacy scalar (single $amount) so an older caller
-        // — or a hand-rolled invocation in dev — keeps working.
-        // Production callers in this file always pass the full
-        // associative form.
-        if (is_array($amounts)) {
-            $nominal = round(floatval($amounts['nominal'] ?? 0), 2);
-            $fee     = round(floatval($amounts['fee']     ?? 0), 2);
-            $total   = round(floatval($amounts['total']   ?? ($nominal + $fee)), 2);
-        } else {
-            $nominal = round(floatval($amounts), 2);
-            $fee     = 0.0;
-            $total   = $nominal;
-        }
-
-        $wpdb->insert($wpdb->prefix . 'matrix_billing_transactions', [
-            'user_id'        => $user_id,
-            'type'           => $type,
-            // Legacy column kept in sync with nominal so any
-            // third-party reader that selects `amount` (and the
-            // existing user-history template) keeps working until
-            // the readers migrate to nominal_amount.
-            'amount'         => $nominal,
-            'nominal_amount' => $nominal,
-            'service_fee'    => $fee,
-            'total_charged'  => $total,
-            'details'        => json_encode($details),
-            'api_response'   => json_encode($api_response),
-            'status'         => 'completed',
-            'created_at'     => current_time('mysql'),
-        ]);
-    }
-
     private function make_request($method, $endpoint, $body = null) {
         // Delegate base URL resolution to Matrix_MLM_Fintava so the billing
         // sub-gateway always honours the same environment selector (and any
@@ -1022,29 +1462,33 @@ class Matrix_MLM_Fintava_Billing {
      *   - service_fee     — platform markup (>= 0)
      *   - total_charged   — what was actually debited from the user
      * The legacy `amount` column is kept and written to (via
-     * log_transaction) in lock-step with nominal_amount so any
+     * begin_transaction) in lock-step with nominal_amount so any
      * third-party reader that hardcoded `SELECT amount` keeps
      * working until they migrate.
      *
-     * Item D (this PR) adds:
+     * Item D (PR #261) added:
      *   - refunded_amount column on matrix_billing_transactions
-     *     (per-row cumulative sum of admin-initiated refunds; the
-     *     refund-cap on every new refund is total_charged minus
-     *     this value).
-     *   - Two new statuses on the status enum: `refunded` (cumulative
-     *     refunds == total_charged) and `partial_refund` (0 <
-     *     refunded_amount < total_charged). The pre-D `completed`
-     *     status no longer covers refunded rows, which is the
-     *     intended semantic — any third-party reader that compared
-     *     `status === 'completed'` will correctly stop counting a
-     *     refunded row toward "completed" totals.
-     *   - matrix_billing_refunds: append-only audit table, one row
-     *     per admin refund click. Holds admin_user_id + reason +
-     *     wallet_credit_reference so reconciliation can trace the
-     *     wallet credit back to the billing row that triggered it.
-     *     A separate table (vs. extending the transactions row) is
-     *     load-bearing because partial refunds emit multiple rows
-     *     against one transaction.
+     *     (per-row cumulative sum of admin-initiated refunds).
+     *   - Two new statuses on the status enum: `refunded` and
+     *     `partial_refund`.
+     *   - matrix_billing_refunds audit table.
+     *
+     * Item E (this PR) adds:
+     *   - client_reference VARCHAR(64) UNIQUE — the idempotency
+     *     key sent on the upstream Fintava call. Reconciliation
+     *     workers (deferred) use this column to cross-reference a
+     *     local pending row with Fintava's record.
+     *   - completed_at DATETIME — stamped when a row transitions
+     *     from pending to completed. Useful both for ops
+     *     timing-data (latency between INSERT and Fintava 2xx) and
+     *     for the reconciliation worker's "rows older than X
+     *     minutes still pending" probe.
+     *   - The status enum's DEFAULT flips from 'completed' to
+     *     'pending' so a row that's INSERTed without the
+     *     transition logic explicitly setting status (e.g. a
+     *     legacy code path or a hand-rolled DB tool) lands in the
+     *     safer pending state instead of falsely claiming the
+     *     upstream call succeeded.
      */
     public static function create_table() {
         global $wpdb;
@@ -1072,11 +1516,14 @@ class Matrix_MLM_Fintava_Billing {
             service_fee decimal(12,2) NOT NULL DEFAULT 0.00,
             total_charged decimal(12,2) NOT NULL DEFAULT 0.00,
             refunded_amount decimal(12,2) NOT NULL DEFAULT 0.00,
+            client_reference varchar(64) DEFAULT NULL,
             details text,
             api_response text,
-            status enum('pending','completed','failed','refunded','partial_refund') NOT NULL DEFAULT 'completed',
+            status enum('pending','completed','failed','refunded','partial_refund') NOT NULL DEFAULT 'pending',
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            completed_at datetime DEFAULT NULL,
             PRIMARY KEY (id),
+            UNIQUE KEY client_reference (client_reference),
             KEY user_id (user_id),
             KEY type (type),
             KEY status (status)
@@ -1086,15 +1533,7 @@ class Matrix_MLM_Fintava_Billing {
         dbDelta($sql);
 
         // First-run migration only: seed the C-era columns from the
-        // legacy `amount` column on every existing row. Guarded by
-        // the COLUMN_NAME probe above so this never runs twice — on
-        // subsequent pageloads the column exists and $needs_backfill
-        // is false.
-        //
-        // We touch only rows whose nominal_amount is still the
-        // dbDelta default (0). New rows post-C always insert with
-        // the real values, so the WHERE clause is also a defence
-        // against accidentally clobbering a legitimate 0-row.
+        // legacy `amount` column on every existing row.
         if ($needs_backfill) {
             $wpdb->query(
                 "UPDATE $table
@@ -1106,13 +1545,8 @@ class Matrix_MLM_Fintava_Billing {
         }
 
         // D-migration step 1: ensure the refunded_amount column
-        // exists. dbDelta DOES add the column reliably on tables
-        // that already had the table CREATE run — but the matching
-        // belt-and-braces probe-and-ALTER pattern is what the rest
-        // of the schema uses (see matrix-database.php's
-        // two_factor_recovery_codes block) so we mirror it here.
-        // Idempotent: the COUNT(*) skips the ALTER once the column
-        // exists.
+        // exists. Idempotent: COUNT(*) skips the ALTER once the
+        // column exists.
         $refunded_col_exists = (int) $wpdb->get_var($wpdb->prepare(
             "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
@@ -1130,12 +1564,7 @@ class Matrix_MLM_Fintava_Billing {
         // D-migration step 2: widen the status enum to include
         // 'refunded' and 'partial_refund'. dbDelta does not
         // reliably extend enum values on an existing column across
-        // MySQL versions (the parser sometimes treats the enum
-        // spec as a no-op when the column already exists), so we
-        // probe COLUMN_TYPE directly. Same idiom matrix-database
-        // uses for the matrix_user_meta `inactive` enum widening.
-        // Idempotent: the strpos() check skips the ALTER once both
-        // values are already in the enum.
+        // MySQL versions, so we probe COLUMN_TYPE directly.
         $status_col = $wpdb->get_row($wpdb->prepare(
             "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'status'",
@@ -1147,12 +1576,11 @@ class Matrix_MLM_Fintava_Billing {
             $wpdb->query(
                 "ALTER TABLE {$table}
                    MODIFY status ENUM('pending','completed','failed','refunded','partial_refund')
-                          NOT NULL DEFAULT 'completed'"
+                          NOT NULL DEFAULT 'pending'"
             );
         }
 
         // D-migration step 3: create the refunds audit table.
-        // CREATE TABLE IF NOT EXISTS via dbDelta is idempotent.
         $refunds_sql = "CREATE TABLE $refunds_table (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             transaction_id bigint(20) UNSIGNED NOT NULL,
@@ -1167,6 +1595,78 @@ class Matrix_MLM_Fintava_Billing {
             KEY admin_user_id (admin_user_id)
         ) $charset_collate;";
         dbDelta($refunds_sql);
+
+        // E-migration step 1: ensure the client_reference column
+        // exists with its UNIQUE index. Two-step (column then
+        // index) so the ALTER is reversible if the index step
+        // fails — matches the rest of the migration's idempotency
+        // pattern.
+        $client_ref_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+               AND COLUMN_NAME = 'client_reference'",
+            DB_NAME, $table
+        ));
+        if ($client_ref_exists === 0) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   ADD COLUMN client_reference VARCHAR(64) DEFAULT NULL
+                   AFTER refunded_amount"
+            );
+        }
+        $client_ref_index_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+               AND INDEX_NAME = 'client_reference'",
+            DB_NAME, $table
+        ));
+        if ($client_ref_index_exists === 0) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   ADD UNIQUE KEY client_reference (client_reference)"
+            );
+        }
+
+        // E-migration step 2: ensure the completed_at column
+        // exists. Stamped by complete_transaction(); useful for
+        // both ops latency analytics and the reconciliation
+        // worker's "stale pending" probe.
+        $completed_at_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+               AND COLUMN_NAME = 'completed_at'",
+            DB_NAME, $table
+        ));
+        if ($completed_at_exists === 0) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   ADD COLUMN completed_at DATETIME DEFAULT NULL
+                   AFTER created_at"
+            );
+        }
+
+        // E-migration step 3: flip the status DEFAULT from
+        // 'completed' to 'pending'. dbDelta does NOT reliably
+        // change a column's DEFAULT on an existing column across
+        // MySQL versions (it considers the column "already there"
+        // and skips the spec), so we probe COLUMN_DEFAULT and
+        // ALTER if needed. The enum value list itself is unchanged
+        // from the D step above — we just need the DEFAULT to
+        // shift so any code path that INSERTs without setting
+        // status explicitly lands in the safer pending state
+        // rather than falsely claiming completion.
+        $status_default = $wpdb->get_var($wpdb->prepare(
+            "SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'status'",
+            DB_NAME, $table
+        ));
+        if ($status_default !== 'pending') {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   MODIFY status ENUM('pending','completed','failed','refunded','partial_refund')
+                          NOT NULL DEFAULT 'pending'"
+            );
+        }
     }
 
     /**

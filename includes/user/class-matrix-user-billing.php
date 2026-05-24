@@ -211,7 +211,15 @@ class Matrix_MLM_User_Billing {
                     <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
                     <td>
                         <span class="matrix-badge"><?php echo ucfirst($tx->type); ?></span>
-                        <?php if ($tx_status === 'refunded' || $tx_status === 'partial_refund'): ?>
+                        <?php if ($tx_status === 'pending'): ?>
+                            <span class="matrix-badge matrix-badge-pending" style="margin-left:4px;font-size:10px;">
+                                <?php esc_html_e('Verifying', 'matrix-mlm'); ?>
+                            </span>
+                        <?php elseif ($tx_status === 'failed'): ?>
+                            <span class="matrix-badge matrix-badge-failed" style="margin-left:4px;font-size:10px;">
+                                <?php esc_html_e('Failed', 'matrix-mlm'); ?>
+                            </span>
+                        <?php elseif ($tx_status === 'refunded' || $tx_status === 'partial_refund'): ?>
                             <span class="matrix-badge matrix-badge-<?php echo esc_attr($tx_status); ?>" style="margin-left:4px;font-size:10px;">
                                 <?php echo $tx_status === 'refunded' ? esc_html__('Refunded', 'matrix-mlm') : esc_html__('Partial Refund', 'matrix-mlm'); ?>
                             </span>
