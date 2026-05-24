@@ -290,6 +290,37 @@
 
         svg.call(zoomBehavior);
 
+        // ---- Connector path generator ----
+        // Defined BEFORE the first layoutAndRender() call below
+        // because that call ends up wiring linkPath into the
+        // d3 selection's .attr('d', linkPath) — and linkPath in
+        // turn dereferences linkGen via closure. linkGen is
+        // declared with `var`, so its NAME is hoisted to the top
+        // of mount() but its ASSIGNMENT runs in source order.
+        // Keeping the declaration further down (its previous
+        // home) made linkGen `undefined` at the moment linkPath
+        // first ran, throwing "linkGen is not a function" and
+        // tripping the mount-failed catch block, which then
+        // failed over to classic. Hoisting the var by hand
+        // avoids the scope-vs-init mismatch entirely.
+        //
+        // Curved parent → child connectors read more naturally
+        // than straight lines on a hierarchy view; we use
+        // d3.linkVertical with the standard {x, y} accessors.
+        var linkGen = d3.linkVertical()
+            .x(function (d) { return d.x; })
+            .y(function (d) { return d.y; });
+
+        function linkPath(d) {
+            // Adjust source y so the line emerges from the bottom
+            // edge of the parent card, and target y so it lands on
+            // the top edge of the child card — otherwise the curve
+            // visually overlaps the cards.
+            var src = { x: d.source.x, y: d.source.y + NODE_HEIGHT / 2 };
+            var tgt = { x: d.target.x, y: d.target.y - NODE_HEIGHT / 2 };
+            return linkGen({ source: src, target: tgt });
+        }
+
         // ---- First render ----
         layoutAndRender(/* animate = */ false, /* fit = */ true);
 
@@ -520,24 +551,6 @@
             if (fit) {
                 fitToScreen(/* animate = */ false);
             }
-        }
-
-        // SVG path generator for parent → child connector lines.
-        // Curved paths read more naturally than straight lines on a
-        // hierarchy view; we use d3.linkVertical with the standard
-        // {x, y} accessors.
-        var linkGen = d3.linkVertical()
-            .x(function (d) { return d.x; })
-            .y(function (d) { return d.y; });
-
-        function linkPath(d) {
-            // Adjust source y so the line emerges from the bottom
-            // edge of the parent card, and target y so it lands on
-            // the top edge of the child card — otherwise the curve
-            // visually overlaps the cards.
-            var src = { x: d.source.x, y: d.source.y + NODE_HEIGHT / 2 };
-            var tgt = { x: d.target.x, y: d.target.y - NODE_HEIGHT / 2 };
-            return linkGen({ source: src, target: tgt });
         }
 
         // ---- Expand badge ("Show more") ----
