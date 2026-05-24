@@ -50,9 +50,75 @@ class Matrix_MLM_User_Billing {
         // warning rather than a magic number that could drift.
         $min_amount = Matrix_MLM_Fintava_Billing::MIN_AMOUNT;
         $low_balance = ($balance < $min_amount);
+
+        // Service fee config (item C). Inlined as a JSON blob on the
+        // page so each form can render a client-side fee preview
+        // ("Amount / Service fee / Total") without an extra AJAX
+        // round-trip. The server still recomputes the fee at submit
+        // time via Matrix_MLM_Fintava_Billing::compute_service_fee(),
+        // which is the single source of truth — this client value is
+        // a UX hint only. Markup is also user-visible by design (we
+        // disclose the line item before they confirm), so there's no
+        // secrecy concern with putting it in the rendered HTML.
+        $markup_config = Matrix_MLM_Fintava_Billing::get_markup_config();
         ?>
         <h2><?php _e('Bill Payments', 'matrix-mlm'); ?></h2>
         <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Matrix wallet.', 'matrix-mlm'); ?></p>
+
+        <script>
+        // Exposed once for all four bill forms on this page. Each
+        // form's render method binds its preview update to this map.
+        window.matrixBillingConfig = {
+            markup: <?php echo wp_json_encode($markup_config); ?>,
+            currencySymbol: <?php echo wp_json_encode($currency); ?>
+        };
+        // Pure-function fee calculator. Mirrors
+        // Matrix_MLM_Fintava_Billing::compute_service_fee() in PHP —
+        // any algorithm change MUST be made in both places. The PHP
+        // copy is authoritative for billing; this copy is for the
+        // preview UI only.
+        window.matrixBillingComputeFee = function(type, nominal) {
+            var n = parseFloat(nominal);
+            if (!isFinite(n) || n <= 0) return 0;
+            var cfg = (window.matrixBillingConfig.markup || {})[type];
+            if (!cfg) return 0;
+            var flat = Math.max(0, parseFloat(cfg.flat || 0));
+            var pct  = Math.max(0, Math.min(100, parseFloat(cfg.percent || 0)));
+            return Math.round((flat + n * pct / 100) * 100) / 100;
+        };
+        // Format helper kept here so the four forms render the
+        // breakdown identically (and so a future locale swap is
+        // a one-line change).
+        window.matrixBillingFormatMoney = function(v) {
+            var n = parseFloat(v);
+            if (!isFinite(n)) n = 0;
+            return window.matrixBillingConfig.currencySymbol +
+                n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        };
+        // Update the .matrix-fee-preview block inside `formSelector`
+        // based on the current value of its `[name=amount]` field
+        // and `dataType`. Hides the block entirely when fee = 0.
+        window.matrixBillingUpdatePreview = function(formSelector, dataType) {
+            var $form = jQuery(formSelector);
+            if (!$form.length) return;
+            var nominal = parseFloat($form.find('[name=amount]').val());
+            var preview = $form.find('.matrix-fee-preview');
+            if (!isFinite(nominal) || nominal <= 0) {
+                preview.hide();
+                return;
+            }
+            var fee = window.matrixBillingComputeFee(dataType, nominal);
+            var total = Math.round((nominal + fee) * 100) / 100;
+            if (fee <= 0) {
+                preview.hide();
+                return;
+            }
+            preview.find('.matrix-fee-nominal').text(window.matrixBillingFormatMoney(nominal));
+            preview.find('.matrix-fee-amount').text(window.matrixBillingFormatMoney(fee));
+            preview.find('.matrix-fee-total').text(window.matrixBillingFormatMoney(total));
+            preview.show();
+        };
+        </script>
 
         <?php
         // Note: bill payments do NOT require a Fintava virtual wallet.
@@ -122,11 +188,36 @@ class Matrix_MLM_User_Billing {
             <tbody>
                 <?php foreach ($history as $tx):
                     $details = json_decode($tx->details, true);
+                    // After item C, transactions carry a separate
+                    // service_fee + total_charged. Legacy rows (pre-C)
+                    // have these as 0 with `amount` populated, and the
+                    // create_table() backfill seeds nominal_amount /
+                    // total_charged from `amount` so post-migration
+                    // every row displays consistently. Belt-and-braces:
+                    // fall back to `amount` if total_charged is 0/null,
+                    // which only happens before the migration runs once.
+                    $display_total = isset($tx->total_charged) && floatval($tx->total_charged) > 0
+                        ? floatval($tx->total_charged)
+                        : floatval($tx->amount);
+                    $display_fee = isset($tx->service_fee) ? floatval($tx->service_fee) : 0.0;
                 ?>
                 <tr>
                     <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
                     <td><span class="matrix-badge"><?php echo ucfirst($tx->type); ?></span></td>
-                    <td><?php echo $currency . number_format($tx->amount, 2); ?></td>
+                    <td>
+                        <?php echo esc_html($currency . number_format($display_total, 2)); ?>
+                        <?php if ($display_fee > 0): ?>
+                            <small style="display:block;color:#6b7280;font-size:11px;">
+                                <?php
+                                printf(
+                                    /* translators: %s: currency-formatted service fee */
+                                    esc_html__('inc. %s service fee', 'matrix-mlm'),
+                                    esc_html($currency . number_format($display_fee, 2))
+                                );
+                                ?>
+                            </small>
+                        <?php endif; ?>
+                    </td>
                     <td><small><?php echo $this->render_history_details($tx->type, $details); ?></small></td>
                 </tr>
                 <?php endforeach; ?>
@@ -140,6 +231,15 @@ class Matrix_MLM_User_Billing {
         .matrix-billing-tabs a { padding: 10px 20px; text-decoration: none; color: #6b7280; font-weight: 500; font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all .2s; }
         .matrix-billing-tabs a.active { color: #4f46e5; border-bottom-color: #4f46e5; }
         .matrix-billing-tabs a:hover { color: #4f46e5; }
+        /* Fee preview block — shown on each bill form once the user
+           enters / picks an amount and the configured markup yields
+           a non-zero fee. Hidden by default and when fee = 0 so the
+           pre-C single-amount UX is preserved when no markup is
+           configured. */
+        .matrix-fee-preview { display:none; margin:12px 0; padding:12px 14px; background:#f9fafb; border:1px solid #e5e7eb; border-radius:6px; font-size:13px; color:#374151; }
+        .matrix-fee-preview .matrix-fee-row { display:flex; justify-content:space-between; padding:2px 0; }
+        .matrix-fee-preview .matrix-fee-row.matrix-fee-row-total { margin-top:6px; padding-top:8px; border-top:1px solid #e5e7eb; font-weight:600; color:#111827; }
+        .matrix-fee-preview .matrix-fee-label { color:#6b7280; }
         </style>
         <?php
     }
@@ -233,12 +333,46 @@ class Matrix_MLM_User_Billing {
         return implode(' &middot; ', $rows);
     }
 
+    /**
+     * Render the inline fee preview block used by all four bill
+     * forms. Hidden by default; the per-form JS calls
+     * window.matrixBillingUpdatePreview() to compute the current
+     * fee + total based on the form's amount field and the markup
+     * config blob shared at the top of render(), and shows the
+     * block only when fee > 0.
+     *
+     * Mirrored across all forms so a markup-config tweak (e.g.
+     * adding a new line item, changing wording) is a single edit
+     * here rather than four duplicate copies. Only the binding
+     * (input vs. plan-select) differs per form.
+     *
+     * The block lives between the last form field and the submit
+     * button so the user sees the breakdown right before the
+     * commit click.
+     */
+    private function render_fee_preview_block() { ?>
+        <div class="matrix-fee-preview" aria-live="polite">
+            <div class="matrix-fee-row">
+                <span class="matrix-fee-label"><?php _e('Amount', 'matrix-mlm'); ?></span>
+                <span class="matrix-fee-nominal">&mdash;</span>
+            </div>
+            <div class="matrix-fee-row">
+                <span class="matrix-fee-label"><?php _e('Service fee', 'matrix-mlm'); ?></span>
+                <span class="matrix-fee-amount">&mdash;</span>
+            </div>
+            <div class="matrix-fee-row matrix-fee-row-total">
+                <span class="matrix-fee-label"><?php _e('Total to debit', 'matrix-mlm'); ?></span>
+                <span class="matrix-fee-total">&mdash;</span>
+            </div>
+        </div>
+    <?php }
+
     // =========================================================================
     // AIRTIME
     // =========================================================================
     private function render_airtime() { ?>
         <h3><?php _e('Buy Airtime', 'matrix-mlm'); ?></h3>
-        <form id="matrix-billing-airtime" class="matrix-form">
+        <form id="matrix-billing-airtime" class="matrix-form" data-bill-type="airtime">
             <div class="matrix-form-group">
                 <label><?php _e('Network', 'matrix-mlm'); ?></label>
                 <select name="network" required>
@@ -257,10 +391,17 @@ class Matrix_MLM_User_Billing {
                 <label><?php _e('Amount (₦)', 'matrix-mlm'); ?></label>
                 <input type="number" name="amount" min="50" max="50000" required placeholder="100">
             </div>
+            <?php $this->render_fee_preview_block(); ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Buy Airtime', 'matrix-mlm'); ?></button>
         </form>
         <script>
         (function($){
+            // Recompute the fee preview as the user types.
+            // matrixBillingUpdatePreview is defined once in render()
+            // and shared across all four bill forms.
+            $('#matrix-billing-airtime [name=amount]').on('input change', function(){
+                window.matrixBillingUpdatePreview('#matrix-billing-airtime', 'airtime');
+            });
             $('#matrix-billing-airtime').on('submit', function(e){
                 e.preventDefault(); var f=$(this), b=f.find('button');
                 b.prop('disabled',true).text('Processing...');
@@ -277,7 +418,7 @@ class Matrix_MLM_User_Billing {
     // =========================================================================
     private function render_data() { ?>
         <h3><?php _e('Buy Data Bundle', 'matrix-mlm'); ?></h3>
-        <form id="matrix-billing-data" class="matrix-form">
+        <form id="matrix-billing-data" class="matrix-form" data-bill-type="data">
             <div class="matrix-form-group">
                 <label><?php _e('Network', 'matrix-mlm'); ?></label>
                 <select name="network" id="data-network" required>
@@ -299,6 +440,7 @@ class Matrix_MLM_User_Billing {
                 </select>
             </div>
             <input type="hidden" name="amount" id="data-amount" value="0">
+            <?php $this->render_fee_preview_block(); ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Buy Data', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -316,7 +458,17 @@ class Matrix_MLM_User_Billing {
                     sel.prop('disabled',false);
                 });
             });
-            $('#data-plan').on('change',function(){ var a=$(this).find(':selected').data('amount')||0; $('#data-amount').val(a); $('button[type=submit]').prop('disabled',!a); });
+            $('#data-plan').on('change',function(){
+                var a=$(this).find(':selected').data('amount')||0;
+                $('#data-amount').val(a);
+                $('button[type=submit]').prop('disabled',!a);
+                // Plan selection IS the amount picker for data —
+                // recompute the fee preview every time the plan
+                // changes. Airtime/electricity bind on `input`
+                // because the user types directly; data and cable
+                // bind here because the amount field is hidden.
+                window.matrixBillingUpdatePreview('#matrix-billing-data', 'data');
+            });
             $('#matrix-billing-data').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val()},function(r){
@@ -332,7 +484,7 @@ class Matrix_MLM_User_Billing {
     // =========================================================================
     private function render_cable() { ?>
         <h3><?php _e('Cable TV Subscription', 'matrix-mlm'); ?></h3>
-        <form id="matrix-billing-cable" class="matrix-form">
+        <form id="matrix-billing-cable" class="matrix-form" data-bill-type="cable">
             <div class="matrix-form-group">
                 <label><?php _e('Provider', 'matrix-mlm'); ?></label>
                 <select name="provider" id="cable-provider" required>
@@ -350,6 +502,7 @@ class Matrix_MLM_User_Billing {
                 </select>
             </div>
             <input type="hidden" name="amount" id="cable-amount" value="0">
+            <?php $this->render_fee_preview_block(); ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Subscribe', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -378,7 +531,14 @@ class Matrix_MLM_User_Billing {
                     sel.prop('disabled',false);
                 });
             });
-            $('#cable-plan').on('change',function(){ var a=$(this).find(':selected').data('amount')||0; $('#cable-amount').val(a); $('button[type=submit]').prop('disabled',!a); });
+            $('#cable-plan').on('change',function(){
+                var a=$(this).find(':selected').data('amount')||0;
+                $('#cable-amount').val(a);
+                $('button[type=submit]').prop('disabled',!a);
+                // Plan selection IS the amount picker for cable —
+                // see render_data() for the rationale.
+                window.matrixBillingUpdatePreview('#matrix-billing-cable', 'cable');
+            });
             $('#matrix-billing-cable').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val()},function(r){
@@ -394,7 +554,7 @@ class Matrix_MLM_User_Billing {
     // =========================================================================
     private function render_electricity() { ?>
         <h3><?php _e('Pay Electricity Bill', 'matrix-mlm'); ?></h3>
-        <form id="matrix-billing-electricity" class="matrix-form">
+        <form id="matrix-billing-electricity" class="matrix-form" data-bill-type="electricity">
             <div class="matrix-form-group">
                 <label><?php _e('Disco (Provider)', 'matrix-mlm'); ?></label>
                 <select name="disco" id="elec-disco" required>
@@ -418,6 +578,7 @@ class Matrix_MLM_User_Billing {
                 <label><?php _e('Amount (₦)', 'matrix-mlm'); ?></label>
                 <input type="number" name="amount" min="500" required placeholder="1000">
             </div>
+            <?php $this->render_fee_preview_block(); ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Pay Electricity', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -441,6 +602,10 @@ class Matrix_MLM_User_Billing {
                         $('#meter-info').html(info).show();
                     } else { alert(r.data.message); }
                 });
+            });
+            // Recompute the fee preview as the user types the amount.
+            $('#matrix-billing-electricity [name=amount]').on('input change', function(){
+                window.matrixBillingUpdatePreview('#matrix-billing-electricity', 'electricity');
             });
             $('#matrix-billing-electricity').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button[type=submit]'); b.prop('disabled',true).text('Processing...');
