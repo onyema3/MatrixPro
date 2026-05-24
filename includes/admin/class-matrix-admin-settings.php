@@ -434,7 +434,14 @@ class Matrix_MLM_Admin_Settings {
         ?>
         <table class="form-table">
             <tr><th><?php _e('Email Verification', 'matrix-mlm'); ?></th>
-                <td><label><input type="checkbox" name="matrix_mlm_email_verification" value="1" <?php checked(get_option('matrix_mlm_email_verification', 1)); ?>> <?php _e('Require email verification on registration', 'matrix-mlm'); ?></label></td></tr>
+                <td><label><input type="checkbox" name="matrix_mlm_email_verification" value="1" <?php checked(get_option('matrix_mlm_email_verification', 1)); ?>> <?php _e('Send verification email on registration', 'matrix-mlm'); ?></label></td></tr>
+            <tr><th><?php _e('Block login until verified', 'matrix-mlm'); ?></th>
+                <td>
+                    <label><input type="checkbox" name="matrix_mlm_require_email_verification" value="1" <?php checked(get_option('matrix_mlm_require_email_verification', 0)); ?>> <?php _e('Refuse login for accounts whose email has not been verified', 'matrix-mlm'); ?></label>
+                    <p class="description" style="margin-top:6px;">
+                        <?php _e('Audit H13 hardening. When enabled, users who register cannot log in until they click the verification link in the email. Pre-existing accounts with email_verified=0 will also be blocked once enabled — verify your existing user state before turning this on.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
             <tr><th><?php _e('SMS Verification', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_sms_verification" value="1" <?php checked(get_option('matrix_mlm_sms_verification', 0)); ?>> <?php _e('Require SMS verification', 'matrix-mlm'); ?></label></td></tr>
 
@@ -732,7 +739,7 @@ class Matrix_MLM_Admin_Settings {
                 update_option('matrix_mlm_withdraw_required_plans', implode(',', $required_plans));
                 break;
             case 'notifications':
-                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email', 'matrix_mlm_cug_notification_email', 'matrix_mlm_loan_notification_email', 'matrix_mlm_healthcare_notification_email'];
+                $settings = ['matrix_mlm_email_verification', 'matrix_mlm_require_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email', 'matrix_mlm_cug_notification_email', 'matrix_mlm_loan_notification_email', 'matrix_mlm_healthcare_notification_email'];
                 break;
             case 'security':
                 $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
@@ -782,7 +789,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_require_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

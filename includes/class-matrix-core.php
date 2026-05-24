@@ -119,6 +119,21 @@ class Matrix_MLM_Core {
         // screen, which doesn't match the plugin's branded UI.
         add_filter('logout_redirect', [$this, 'filter_logout_redirect'], 10, 3);
 
+        // Default captcha verifier for the registration form (audit
+        // H13). Hooks into the new matrix_mlm_register_captcha_passed
+        // filter and wires the existing matrix_mlm_captcha_enabled +
+        // matrix_mlm_captcha_secret_key settings to Google
+        // reCAPTCHA's siteverify endpoint. This closes the latent
+        // bug where the reCAPTCHA widget was being rendered on the
+        // login/register templates with no server-side check at all
+        // — the widget gave operators a false sense of security
+        // because the form would happily accept submissions whose
+        // g-recaptcha-response was missing or invalid. Operators
+        // who want a different captcha provider (hCaptcha,
+        // Turnstile, etc.) wire their own verifier into the same
+        // filter at a higher priority.
+        add_filter('matrix_mlm_register_captcha_passed', [__CLASS__, 'default_recaptcha_check'], 10, 2);
+
         // Suppress HTTP-level caching of any page that hosts the
         // [matrix_dashboard] shortcode. Reported symptom: after a
         // successful Wallet→Wallet transfer or e-pin recharge the
@@ -432,6 +447,93 @@ class Matrix_MLM_Core {
         }
     }
 
+    /**
+     * Default Google reCAPTCHA v2 verifier wired into the
+     * matrix_mlm_register_captcha_passed filter. Activates only
+     * when the operator has flipped on the existing
+     * matrix_mlm_captcha_enabled setting AND configured the secret
+     * key. When either is absent we fail OPEN (return true) so an
+     * unconfigured install isn't suddenly broken by this PR — the
+     * rate limit + email-verification gate are still in force on
+     * top of the captcha layer.
+     *
+     * Three failure modes are distinguished:
+     *
+     *   - Missing g-recaptcha-response in POST: hard refusal with a
+     *     "captcha required" message. Counts as a throttle failure
+     *     in the caller.
+     *
+     *   - Service unreachable (WP HTTP error): fail OPEN. Don't
+     *     block legitimate users on a transient Google outage; the
+     *     other defences are still in force.
+     *
+     *   - reCAPTCHA siteverify returned success=false: hard refusal
+     *     with a generic "verification failed" message. Counts as
+     *     a throttle failure.
+     *
+     * Filter callbacks at higher priority can short-circuit by
+     * returning a non-true value; we honour that by returning their
+     * value unchanged. This lets ops wire hCaptcha / Cloudflare
+     * Turnstile / their own custom verifier in front of this default
+     * without removing the filter.
+     *
+     * @param bool|string $passed Filter chain accumulator. true =
+     *                            previous callbacks had nothing to say.
+     *                            non-true = previous callback rejected
+     *                            and we should pass the value through.
+     * @param array       $post   The original $_POST.
+     * @return bool|string        true on pass; non-true (string message
+     *                            or false) on refusal.
+     */
+    public static function default_recaptcha_check($passed, $post) {
+        // A higher-priority filter already rejected — preserve.
+        if ($passed !== true) {
+            return $passed;
+        }
+
+        if (!get_option('matrix_mlm_captcha_enabled', 0)) {
+            return true; // Captcha disabled at the option level.
+        }
+
+        $secret = (string) get_option('matrix_mlm_captcha_secret_key', '');
+        if ($secret === '') {
+            // Captcha turned on but secret key missing: fail open
+            // rather than locking out registration. The site admin
+            // should configure the secret; surfacing the error
+            // through the registration form would be a worse UX
+            // (legitimate users blocked by an admin oversight).
+            return true;
+        }
+
+        $response = isset($post['g-recaptcha-response']) ? (string) $post['g-recaptcha-response'] : '';
+        if ($response === '') {
+            return __('Captcha verification is required.', 'matrix-mlm');
+        }
+
+        $verify = wp_remote_post('https://www.google.com/recaptcha/api/siteverify', [
+            'timeout' => 5,
+            'body' => [
+                'secret'   => $secret,
+                'response' => $response,
+                'remoteip' => Matrix_MLM_Rate_Limit::get_client_ip(),
+            ],
+        ]);
+
+        if (is_wp_error($verify)) {
+            // Transient outage — log and fail open. Rate limit + the
+            // rest of the registration validators still apply.
+            error_log('[Matrix MLM] reCAPTCHA siteverify unreachable: ' . $verify->get_error_message());
+            return true;
+        }
+
+        $body = json_decode((string) wp_remote_retrieve_body($verify), true);
+        if (!is_array($body) || empty($body['success'])) {
+            return __('Captcha verification failed. Please try again.', 'matrix-mlm');
+        }
+
+        return true;
+    }
+
     private function process_login() {
         // 2FA-aware login. The flow is:
         //
@@ -452,6 +554,33 @@ class Matrix_MLM_Core {
         // but actually enforced for those who turn it on — the previous
         // implementation displayed a "2FA active" badge but never called
         // verify(), so the second factor was purely cosmetic (audit C5).
+        //
+        // Audit H12 hardening:
+        //
+        //   - Per-username + per-IP failure throttle (default 5/min/user,
+        //     20/min/IP). All limits are filterable. The per-user counter
+        //     is keyed on the lowercased username — case-insensitive so
+        //     an attacker can't dodge by varying case.
+        //
+        //   - Uniform "Invalid username or password" message on every
+        //     credential-failure branch. The previous code returned
+        //     wp_authenticate's WP_Error message verbatim, which
+        //     distinguished "unknown user" ("Unknown username") from
+        //     "wrong password" ("Incorrect password"). That was a free
+        //     username-enumeration oracle: an attacker could test
+        //     candidate usernames against the login endpoint and learn
+        //     which existed without knowing any password.
+        //
+        // Audit H13 hardening (email-verification gate):
+        //
+        //   When the matrix_mlm_require_email_verification option is
+        //   ON (off by default for backward compatibility — operators
+        //   must explicitly opt in), accounts whose
+        //   matrix_user_meta.email_verified is 0 cannot complete
+        //   login. They get a "please verify" message; the auth
+        //   cookie is never issued. This closes the H13 attack where
+        //   an attacker registers a fake account and uses it
+        //   immediately, regardless of email control.
 
         $challenge_token = isset($_POST['challenge_token']) ? sanitize_text_field($_POST['challenge_token']) : '';
 
@@ -463,9 +592,59 @@ class Matrix_MLM_Core {
         $username = sanitize_text_field($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
 
+        // Throttle gate. Per-user is keyed on the LOWERCASED username
+        // so capitalisation can't be used to dodge the counter. The
+        // ceiling is purposely tighter for users than for IPs: a real
+        // user typing into one form rarely makes 5 mistakes in 60s,
+        // but a NAT'd corporate gateway might legitimately host
+        // dozens of simultaneous sign-ins.
+        $window       = (int) apply_filters('matrix_mlm_login_window', 60);
+        $max_per_user = (int) apply_filters('matrix_mlm_login_max_failures_per_user', 5);
+        $max_per_ip   = (int) apply_filters('matrix_mlm_login_max_failures_per_ip', 20);
+        $rl_user_key  = strtolower(trim($username));
+
+        $rl_check = Matrix_MLM_Rate_Limit::check('login', $rl_user_key, $max_per_user, $max_per_ip, $window);
+        if (is_wp_error($rl_check)) {
+            wp_send_json_error(['message' => $rl_check->get_error_message()]);
+        }
+
         $user = wp_authenticate($username, $password);
         if (is_wp_error($user)) {
-            wp_send_json_error(['message' => $user->get_error_message()]);
+            // Count this as a failure under both axes BEFORE responding,
+            // so a fast attacker can't burn through the keyspace by
+            // pipelining requests faster than transient writes settle.
+            Matrix_MLM_Rate_Limit::record_failure('login', $rl_user_key, $window);
+            // Uniform message — does NOT distinguish "unknown user"
+            // from "wrong password". This costs us a small amount of
+            // user-friendliness (a real user who typoed their username
+            // gets the same message as a real user who typoed their
+            // password) but closes the username-enumeration oracle.
+            wp_send_json_error(['message' => __('Invalid username or password.', 'matrix-mlm')]);
+        }
+
+        // Email-verification gate (audit H13). Filterable so ops can
+        // pin it on independently of the option, and so an emergency
+        // bypass is one filter away.
+        $require_verify = (bool) apply_filters(
+            'matrix_mlm_require_email_verification',
+            (bool) get_option('matrix_mlm_require_email_verification', 0)
+        );
+        if ($require_verify) {
+            global $wpdb;
+            $email_verified = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT email_verified FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
+                $user->ID
+            ));
+            if (!$email_verified) {
+                // No record_failure here — successful credential auth
+                // shouldn't poison the throttle just because verify
+                // hasn't happened yet. We do NOT clear either; the
+                // counter just rolls off at the window expiry.
+                wp_send_json_error([
+                    'message' => __('Please verify your email address before signing in. Check your inbox (and spam folder) for the verification link from when you registered.', 'matrix-mlm'),
+                    'requires_email_verification' => true,
+                ]);
+            }
         }
 
         $two_factor = new Matrix_MLM_Two_Factor();
@@ -479,6 +658,11 @@ class Matrix_MLM_Core {
                 'created_at' => time(),
             ], 5 * MINUTE_IN_SECONDS);
 
+            // Successful credential check + 2FA pending. Don't clear
+            // the throttle yet — clear in process_login_2fa_step()
+            // after the OTP also passes, so a leaked password
+            // doesn't reset the counter and let an attacker
+            // pipeline OTP guesses.
             wp_send_json_success([
                 'requires_2fa' => true,
                 'challenge_token' => $token,
@@ -486,6 +670,11 @@ class Matrix_MLM_Core {
             ]);
             return;
         }
+
+        // Successful login, no 2FA. Clear the throttle for this
+        // (user, IP) so a legitimate user who fat-fingered their
+        // password isn't locked out for the rest of the window.
+        Matrix_MLM_Rate_Limit::clear('login', $rl_user_key);
 
         wp_set_auth_cookie($user->ID);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
@@ -532,11 +721,74 @@ class Matrix_MLM_Core {
             ]);
         }
 
+        // OTP passed — credential auth + second factor both verified.
+        // Clear the login throttle for this (user, IP) tuple now that
+        // we know the request was legitimate. We key the clear on the
+        // user_login (lowercased) to match what process_login() used.
+        $u = get_userdata($user_id);
+        if ($u && !empty($u->user_login)) {
+            Matrix_MLM_Rate_Limit::clear('login', strtolower((string) $u->user_login));
+        }
+
         wp_set_auth_cookie($user_id);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
     }
 
     private function process_registration() {
+        // Audit H13 hardening:
+        //
+        //   1. Per-IP rate limit. Registration is unauthenticated and
+        //      creates DB rows + sends an email per request, so the
+        //      ceiling is much tighter than for login: default 3
+        //      attempts per IP per minute. Filterable. There is no
+        //      per-user counter here because the username/email
+        //      doesn't yet exist on the platform.
+        //
+        //   2. Captcha hook. Provides a filter
+        //      'matrix_mlm_register_captcha_passed' that defaults to
+        //      true so an install without a captcha integration keeps
+        //      working. Operators wire in hCaptcha / Turnstile /
+        //      reCAPTCHA / etc. by returning true/false from the
+        //      filter based on the inbound POST. We deliberately do
+        //      NOT bundle a captcha provider — choosing one is an
+        //      operational decision.
+        //
+        //   3. Email-verification gate. The matrix_user_meta row is
+        //      now created with email_verified=0 (unchanged from
+        //      before, so existing operators who don't opt in see no
+        //      behaviour change). When the
+        //      matrix_mlm_require_email_verification option is ON,
+        //      registration completes WITHOUT issuing an auth cookie
+        //      — the redirect goes to /matrix-login?registered=verify
+        //      so the login page can show a "check your inbox"
+        //      banner, and login itself refuses unverified accounts
+        //      (process_login() above). When the option is OFF,
+        //      backwards-compatible behaviour: auth cookie is issued
+        //      immediately, same as the pre-PR flow.
+
+        $window     = (int) apply_filters('matrix_mlm_register_window', 60);
+        $max_per_ip = (int) apply_filters('matrix_mlm_register_max_failures_per_ip', 3);
+
+        $rl_check = Matrix_MLM_Rate_Limit::check('register', '', 0, $max_per_ip, $window);
+        if (is_wp_error($rl_check)) {
+            wp_send_json_error(['message' => $rl_check->get_error_message()]);
+        }
+
+        // Captcha hook. Default-true means existing installs keep
+        // working without a captcha provider; operators enabling a
+        // captcha plug their verifier into the filter.
+        $captcha_ok = apply_filters('matrix_mlm_register_captcha_passed', true, $_POST);
+        if ($captcha_ok !== true) {
+            // Non-true return means the captcha verifier rejected this
+            // request. Count it as a failure so a captcha bypass
+            // attempt also burns the throttle.
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
+            $msg = is_string($captcha_ok) && $captcha_ok !== ''
+                ? $captcha_ok
+                : __('Captcha verification failed. Please refresh the page and try again.', 'matrix-mlm');
+            wp_send_json_error(['message' => $msg]);
+        }
+
         $username = sanitize_text_field($_POST['username'] ?? '');
         $email = sanitize_email($_POST['email'] ?? '');
         $password = $_POST['password'] ?? '';
@@ -546,14 +798,17 @@ class Matrix_MLM_Core {
         $last_name = sanitize_text_field($_POST['last_name'] ?? '');
 
         if (empty($username) || empty($email) || empty($password)) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
         if (empty($phone)) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => __('Phone number is required', 'matrix-mlm')]);
         }
 
         if (empty($referral_code)) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => __('Referral code is required. Please ask the person who invited you for their code.', 'matrix-mlm')]);
         }
 
@@ -565,15 +820,18 @@ class Matrix_MLM_Core {
         ));
 
         if (!$referrer) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => __('Invalid referral code. Please check and try again.', 'matrix-mlm')]);
         }
 
         if (username_exists($username) || email_exists($email)) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => __('Username or email already exists', 'matrix-mlm')]);
         }
 
         $user_id = wp_create_user($username, $password, $email);
         if (is_wp_error($user_id)) {
+            Matrix_MLM_Rate_Limit::record_failure('register', '', $window);
             wp_send_json_error(['message' => $user_id->get_error_message()]);
         }
 
@@ -597,12 +855,42 @@ class Matrix_MLM_Core {
             'referred_by' => $referrer->user_id,
             'phone' => $phone,
             'balance' => 0.00,
-            'status' => 'active'
+            'status' => 'active',
+            // email_verified default is 0 in the schema; we set it
+            // explicitly to make the contract obvious to readers.
+            // The handler at /?action=matrix_verify_email flips it
+            // to 1 once the user clicks the link in the verification
+            // email below.
+            'email_verified' => 0,
         ]);
 
-        // Send verification email
+        // Send verification email. Even when the require-verify
+        // option is off, we still send the email so a future operator
+        // who turns the gate on isn't left with a fleet of
+        // unverified-but-active accounts that suddenly can't log in.
         Matrix_MLM_Notifications::send_verification_email($user_id);
 
+        $require_verify = (bool) apply_filters(
+            'matrix_mlm_require_email_verification',
+            (bool) get_option('matrix_mlm_require_email_verification', 0)
+        );
+
+        if ($require_verify) {
+            // Don't auth-cookie. Send the user to the login page with
+            // a "check your inbox" banner; login itself refuses
+            // unverified accounts. Frontend doesn't need to change —
+            // it just navigates to data.redirect like every other
+            // path.
+            wp_send_json_success([
+                'redirect' => add_query_arg('registered', 'verify', home_url('/matrix-login')),
+                'requires_email_verification' => true,
+                'message' => __('Account created. Please verify your email before signing in.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Backwards-compatible path: operator hasn't opted in to the
+        // verification gate. Auth-cookie + redirect to dashboard,
+        // same as the pre-H13 flow.
         wp_set_auth_cookie($user_id);
         wp_send_json_success(['redirect' => home_url('/matrix-dashboard')]);
     }

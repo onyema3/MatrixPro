@@ -53,6 +53,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-support.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-notifications.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-crypto.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-rate-limit.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-qr-svg.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-two-factor.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-gdpr.php';
