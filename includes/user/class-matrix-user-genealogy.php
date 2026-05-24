@@ -323,6 +323,36 @@ class Matrix_MLM_User_Genealogy {
 
         <?php $this->render_search_box($selected_plan_id); ?>
 
+        <?php $this->render_share_export_panel($selected_plan_id, $is_pivoted ? (int) $pivot_user_id_raw : 0); ?>
+
+        <?php
+        // Print-friendly short circuit: when ?print=1 is set we
+        // emit *only* the tree (plus a tiny header strip + a
+        // "Print / Save as PDF" button hidden by @media print) and
+        // skip everything else — stats grid, level badges, mode
+        // toggle, hovercard, etc. — so the resulting page prints
+        // cleanly to a single PDF without dashboard chrome.
+        //
+        // Lives here (after the search box render but before the
+        // stat grid) because the stats and tree are the two pieces
+        // a prospect cares about; everything else is dashboard
+        // ergonomics that don't translate to print. The hidden
+        // share-export panel above this point still renders
+        // (so the panel's CSS doesn't FOUC into view) but is
+        // also hidden via the @media print rules in
+        // render_share_export_panel.
+        //
+        // Mirrors how Matrix_MLM_Share's public route presents the
+        // tree: the two surfaces converge on the same minimal
+        // print layout so a member exporting their own tree gets
+        // the same PDF a prospect would see via a share link.
+        $print_mode = isset($_GET['print']) && $_GET['print'] !== '0' && $_GET['print'] !== '';
+        if ($print_mode) {
+            $this->render_print_mode_view($display_position, $tree, $is_pivoted);
+            return;
+        }
+        ?>
+
         <div class="matrix-stats-grid" style="margin-bottom: 20px;">
             <div class="matrix-stat-card primary">
                 <div class="stat-value"><?php echo $display_position->width . 'x' . $display_position->depth; ?></div>
@@ -3619,6 +3649,694 @@ class Matrix_MLM_User_Genealogy {
                 handle(triggerEl);
             });
         })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "Share & Export" panel above the tree.
+     *
+     * Two columns of affordances stacked under a single card:
+     *
+     *   - LEFT: Export controls. PDF opens the same view rendered
+     *     with ?print=1 (which short-circuits to a stripped-down
+     *     tree-only layout below) and triggers window.print() on
+     *     load — same pattern the admin reports/import pages use,
+     *     so members get a familiar "your browser's print dialog
+     *     is your save-as-PDF dialog" experience. PNG uses
+     *     html2canvas, lazy-loaded from a CDN on first click; if
+     *     the CDN fails the JS surfaces a graceful "use PDF
+     *     instead" message rather than failing silently.
+     *   - RIGHT: Share-link controls. A "Create share link" button
+     *     mints a token via AJAX and renders it into the list
+     *     below; existing tokens (active and revoked) are
+     *     rendered server-side from list_tokens_for_user() so
+     *     the panel is interactive on first paint, no spinner.
+     *
+     * Hides on print so a member exporting their tree doesn't
+     * get the panel's chrome printed alongside it.
+     *
+     * @param int $current_plan_id  The plan currently being viewed —
+     *                               pre-selects on the share form so a
+     *                               member who's already on Plan 3
+     *                               doesn't have to pick it again.
+     * @param int $pivot_user_id    Non-zero when the operator is
+     *                               viewing someone else's branch via
+     *                               ?pivot_user_id=X. We pass it
+     *                               through to the share form so the
+     *                               minted token captures the same
+     *                               pivot.
+     */
+    private function render_share_export_panel($current_plan_id, $pivot_user_id) {
+        // Pull existing tokens server-side. Cheap query (indexed on
+        // user_id) and avoids a spinner-on-first-paint UX.
+        $tokens = class_exists('Matrix_MLM_Share')
+            ? Matrix_MLM_Share::list_tokens_for_user((int) $this->pivot_state['viewer_user_id'])
+            : [];
+        $current_plan_id = (int) $current_plan_id;
+        $pivot_user_id   = (int) $pivot_user_id;
+        ?>
+        <div class="matrix-share-export-panel" id="matrix-share-export-panel">
+            <div class="msep-row">
+                <div class="msep-col msep-col-export">
+                    <h3><?php esc_html_e('Export', 'matrix-mlm'); ?></h3>
+                    <p class="msep-help">
+                        <?php esc_html_e('Save the visible tree as a PDF or PNG to share with a prospect or upload to a presentation.', 'matrix-mlm'); ?>
+                    </p>
+                    <div class="msep-actions">
+                        <a class="button" id="msep-export-pdf"
+                           href="<?php echo esc_url(add_query_arg('print', '1')); ?>"
+                           target="_blank"
+                           rel="noopener">
+                            <?php esc_html_e('Export PDF', 'matrix-mlm'); ?>
+                        </a>
+                        <button type="button" class="button" id="msep-export-png">
+                            <?php esc_html_e('Export PNG', 'matrix-mlm'); ?>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="msep-col msep-col-share">
+                    <h3><?php esc_html_e('Share read-only link', 'matrix-mlm'); ?></h3>
+                    <p class="msep-help">
+                        <?php esc_html_e('Create a public link a prospect can open without logging in. Revoke any time.', 'matrix-mlm'); ?>
+                    </p>
+
+                    <form class="msep-form" id="msep-share-form" onsubmit="return false;">
+                        <input type="hidden" id="msep-plan-id" value="<?php echo $current_plan_id; ?>">
+                        <input type="hidden" id="msep-pivot-user-id" value="<?php echo $pivot_user_id; ?>">
+
+                        <label class="msep-field">
+                            <span><?php esc_html_e('Label', 'matrix-mlm'); ?></span>
+                            <input type="text" id="msep-label" maxlength="120"
+                                   placeholder="<?php esc_attr_e('e.g. For Sarah\'s prospect demo', 'matrix-mlm'); ?>">
+                        </label>
+                        <label class="msep-field">
+                            <span><?php esc_html_e('Expires', 'matrix-mlm'); ?></span>
+                            <select id="msep-expiry">
+                                <option value="0"><?php esc_html_e('Never', 'matrix-mlm'); ?></option>
+                                <option value="1"><?php esc_html_e('1 day', 'matrix-mlm'); ?></option>
+                                <option value="7" selected><?php esc_html_e('7 days', 'matrix-mlm'); ?></option>
+                                <option value="30"><?php esc_html_e('30 days', 'matrix-mlm'); ?></option>
+                                <option value="90"><?php esc_html_e('90 days', 'matrix-mlm'); ?></option>
+                                <option value="365"><?php esc_html_e('1 year', 'matrix-mlm'); ?></option>
+                            </select>
+                        </label>
+                        <button type="submit" class="button button-primary" id="msep-create-btn">
+                            <?php esc_html_e('Create link', 'matrix-mlm'); ?>
+                        </button>
+                    </form>
+
+                    <div class="msep-tokens" id="msep-tokens">
+                        <?php if (!empty($tokens)): ?>
+                            <ul class="msep-token-list">
+                                <?php foreach ($tokens as $tk): ?>
+                                    <?php $this->render_share_token_row($tk); ?>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php else: ?>
+                            <p class="msep-empty"><?php esc_html_e('No share links yet.', 'matrix-mlm'); ?></p>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+
+            <div id="msep-toast" class="msep-toast" role="status" aria-live="polite"></div>
+        </div>
+
+        <style>
+        .matrix-share-export-panel {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin: 0 0 18px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+            position: relative;
+        }
+        .matrix-share-export-panel h3 {
+            margin: 0 0 6px;
+            font-size: 14px;
+            color: #111827;
+        }
+        .matrix-share-export-panel .msep-help {
+            margin: 0 0 10px;
+            font-size: 12px;
+            color: #6b7280;
+            line-height: 1.45;
+        }
+        .matrix-share-export-panel .msep-row {
+            display: grid;
+            grid-template-columns: 1fr 1.4fr;
+            gap: 28px;
+        }
+        @media (max-width: 768px) {
+            .matrix-share-export-panel .msep-row { grid-template-columns: 1fr; }
+        }
+        .matrix-share-export-panel .msep-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .matrix-share-export-panel .msep-form {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            margin-bottom: 12px;
+        }
+        .matrix-share-export-panel .msep-field {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            font-size: 11px;
+            color: #4b5563;
+            flex: 1 1 140px;
+        }
+        .matrix-share-export-panel .msep-field input[type="text"],
+        .matrix-share-export-panel .msep-field select {
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-size: 13px;
+            min-width: 0;
+        }
+        .matrix-share-export-panel .msep-tokens {
+            border-top: 1px dashed #e5e7eb;
+            padding-top: 10px;
+        }
+        .matrix-share-export-panel .msep-empty {
+            margin: 0;
+            font-size: 12px;
+            color: #9ca3af;
+            font-style: italic;
+        }
+        .matrix-share-export-panel .msep-token-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .matrix-share-export-panel .msep-token {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 12px;
+            flex-wrap: wrap;
+        }
+        .matrix-share-export-panel .msep-token.is-revoked,
+        .matrix-share-export-panel .msep-token.is-expired {
+            opacity: 0.55;
+        }
+        .matrix-share-export-panel .msep-token-label {
+            font-weight: 600;
+            color: #111827;
+            flex: 1 1 140px;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .matrix-share-export-panel .msep-token-meta {
+            color: #6b7280;
+            font-size: 11px;
+        }
+        .matrix-share-export-panel .msep-token-status {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .matrix-share-export-panel .msep-status-active   { background: #d1fae5; color: #065f46; }
+        .matrix-share-export-panel .msep-status-revoked  { background: #fee2e2; color: #991b1b; }
+        .matrix-share-export-panel .msep-status-expired  { background: #f3f4f6; color: #4b5563; }
+        .matrix-share-export-panel .msep-token-url {
+            flex-basis: 100%;
+            margin-top: 2px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: #1f2937;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .matrix-share-export-panel .msep-toast {
+            position: absolute;
+            top: 8px;
+            right: 16px;
+            background: #111827;
+            color: #fff;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            opacity: 0;
+            transform: translateY(-4px);
+            transition: opacity 0.15s, transform 0.15s;
+            pointer-events: none;
+        }
+        .matrix-share-export-panel .msep-toast.is-shown {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .matrix-share-export-panel .msep-toast.is-error { background: #b91c1c; }
+
+        @media print {
+            .matrix-share-export-panel { display: none !important; }
+        }
+        </style>
+
+        <?php $this->render_share_export_script(); ?>
+        <?php
+    }
+
+    /**
+     * Render a single token row inside the panel's list. Pulled
+     * out so the AJAX "create" path can synthesise the same
+     * markup client-side without the server having to round-trip
+     * the full HTML — see the `tokenRowHtml()` helper in the
+     * inline script.
+     */
+    private function render_share_token_row($tk) {
+        $status_label = ucfirst($tk->status);
+        $expiry_text = !empty($tk->expires_at)
+            ? esc_html(sprintf(
+                /* translators: %s: localized date/time */
+                __('expires %s', 'matrix-mlm'),
+                date_i18n('M j, Y', strtotime($tk->expires_at))
+            ))
+            : esc_html__('no expiry', 'matrix-mlm');
+
+        $views_text = sprintf(
+            /* translators: %d: number of times the link has been viewed */
+            _n('%d view', '%d views', (int) $tk->view_count, 'matrix-mlm'),
+            (int) $tk->view_count
+        );
+        ?>
+        <li class="msep-token is-<?php echo esc_attr($tk->status); ?>" data-token-id="<?php echo (int) $tk->id; ?>">
+            <span class="msep-token-status msep-status-<?php echo esc_attr($tk->status); ?>"><?php echo esc_html($status_label); ?></span>
+            <span class="msep-token-label">
+                <?php echo esc_html(!empty($tk->label) ? $tk->label : __('(unlabeled)', 'matrix-mlm')); ?>
+            </span>
+            <span class="msep-token-meta">
+                <?php echo $expiry_text; ?> · <?php echo esc_html($views_text); ?>
+            </span>
+            <?php if ($tk->status === 'active'): ?>
+                <button type="button" class="button button-small msep-copy-btn" data-url="<?php echo esc_attr($tk->url); ?>">
+                    <?php esc_html_e('Copy link', 'matrix-mlm'); ?>
+                </button>
+                <button type="button" class="button button-small msep-revoke-btn">
+                    <?php esc_html_e('Revoke', 'matrix-mlm'); ?>
+                </button>
+            <?php endif; ?>
+            <span class="msep-token-url"><?php echo esc_html($tk->url); ?></span>
+        </li>
+        <?php
+    }
+
+    /**
+     * Inline JS for the share/export panel.
+     *
+     * Three responsibilities, all in one closure to keep the
+     * surface area small:
+     *
+     *   - Mint a token via the matrix_create_share_token AJAX
+     *     endpoint and prepend the resulting row to the list.
+     *   - Revoke an existing token via
+     *     matrix_revoke_share_token, with optimistic styling
+     *     on the row + a rollback on error.
+     *   - PNG export. Lazy-load html2canvas from a CDN on first
+     *     click so the dashboard's initial page weight is
+     *     unaffected by a feature most members will never use.
+     *     Falls back to a "use PDF instead" toast if the CDN
+     *     fetch fails (ad-blocker, offline, etc.).
+     *
+     * jQuery is used only for the AJAX call (matches the rest of
+     * the dashboard's AJAX pattern); the dnd handlers and
+     * clipboard interactions are vanilla JS so the panel works
+     * even on minimal jQuery deferments.
+     */
+    private function render_share_export_script() {
+        ?>
+        <script>
+        (function() {
+            var ajaxUrl = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
+            var nonce   = (window.matrixMLM && window.matrixMLM.nonce)   || '';
+
+            var panel = document.getElementById('matrix-share-export-panel');
+            if (!panel) return;
+            var form     = panel.querySelector('#msep-share-form');
+            var listEl   = panel.querySelector('#msep-tokens');
+            var emptyMsg = listEl ? listEl.querySelector('.msep-empty') : null;
+            var toast    = panel.querySelector('#msep-toast');
+            var btnPng   = panel.querySelector('#msep-export-png');
+
+            function showToast(msg, isError) {
+                if (!toast) return;
+                toast.textContent = msg;
+                toast.classList.toggle('is-error', !!isError);
+                toast.classList.add('is-shown');
+                setTimeout(function() { toast.classList.remove('is-shown'); }, 2400);
+            }
+
+            // ---------- Token row factory ----------
+            // Mirrors the server-side render_share_token_row()
+            // markup so freshly-minted tokens look identical to
+            // server-rendered ones without a page reload.
+            function tokenRowHtml(t) {
+                var labelText = t.label ? t.label : '<?php echo esc_js(__('(unlabeled)', 'matrix-mlm')); ?>';
+                var expiryText = t.expires_at
+                    ? ('<?php echo esc_js(__('expires', 'matrix-mlm')); ?> ' + new Date(t.expires_at.replace(' ', 'T')).toLocaleDateString())
+                    : '<?php echo esc_js(__('no expiry', 'matrix-mlm')); ?>';
+                var li = document.createElement('li');
+                li.className = 'msep-token is-active';
+                li.setAttribute('data-token-id', t.id);
+                li.innerHTML =
+                    '<span class="msep-token-status msep-status-active">Active</span>' +
+                    '<span class="msep-token-label"></span>' +
+                    '<span class="msep-token-meta"></span>' +
+                    '<button type="button" class="button button-small msep-copy-btn"><?php echo esc_js(__('Copy link', 'matrix-mlm')); ?></button>' +
+                    '<button type="button" class="button button-small msep-revoke-btn"><?php echo esc_js(__('Revoke', 'matrix-mlm')); ?></button>' +
+                    '<span class="msep-token-url"></span>';
+                li.querySelector('.msep-token-label').textContent = labelText;
+                li.querySelector('.msep-token-meta').textContent  = expiryText + ' · 0 <?php echo esc_js(__('views', 'matrix-mlm')); ?>';
+                li.querySelector('.msep-copy-btn').setAttribute('data-url', t.url);
+                li.querySelector('.msep-token-url').textContent = t.url;
+                return li;
+            }
+
+            // ---------- Create token ----------
+            if (form) {
+                form.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    var btn = panel.querySelector('#msep-create-btn');
+                    btn.disabled = true;
+                    btn.textContent = '<?php echo esc_js(__('Creating…', 'matrix-mlm')); ?>';
+
+                    jQuery.post(ajaxUrl, {
+                        action: 'matrix_create_share_token',
+                        nonce: nonce,
+                        plan_id:       panel.querySelector('#msep-plan-id').value,
+                        pivot_user_id: panel.querySelector('#msep-pivot-user-id').value,
+                        expiry_days:   panel.querySelector('#msep-expiry').value,
+                        label:         panel.querySelector('#msep-label').value
+                    }, function(res) {
+                        btn.disabled = false;
+                        btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
+                        if (!res || !res.success) {
+                            showToast((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not create link.', 'matrix-mlm')); ?>', true);
+                            return;
+                        }
+
+                        // Insert the new row at the top of the list,
+                        // converting the empty-state placeholder to
+                        // a real list if this is the first token.
+                        var ul = listEl.querySelector('.msep-token-list');
+                        if (!ul) {
+                            if (emptyMsg) emptyMsg.remove();
+                            ul = document.createElement('ul');
+                            ul.className = 'msep-token-list';
+                            listEl.appendChild(ul);
+                        }
+                        ul.insertBefore(tokenRowHtml(res.data), ul.firstChild);
+                        panel.querySelector('#msep-label').value = '';
+                        showToast('<?php echo esc_js(__('Share link created.', 'matrix-mlm')); ?>');
+                    }).fail(function() {
+                        btn.disabled = false;
+                        btn.textContent = '<?php echo esc_js(__('Create link', 'matrix-mlm')); ?>';
+                        showToast('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>', true);
+                    });
+                });
+            }
+
+            // ---------- Copy / Revoke (delegated) ----------
+            if (listEl) {
+                listEl.addEventListener('click', function(e) {
+                    var copyBtn   = e.target.closest('.msep-copy-btn');
+                    var revokeBtn = e.target.closest('.msep-revoke-btn');
+
+                    if (copyBtn) {
+                        var url = copyBtn.getAttribute('data-url') || '';
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(url).then(function() {
+                                showToast('<?php echo esc_js(__('Link copied to clipboard.', 'matrix-mlm')); ?>');
+                            }, function() {
+                                showToast('<?php echo esc_js(__('Could not copy. Long-press the URL to copy manually.', 'matrix-mlm')); ?>', true);
+                            });
+                        } else {
+                            // Fallback for older browsers — surface
+                            // the URL in a prompt for manual copy.
+                            window.prompt('<?php echo esc_js(__('Copy this link:', 'matrix-mlm')); ?>', url);
+                        }
+                        return;
+                    }
+
+                    if (revokeBtn) {
+                        var li = revokeBtn.closest('.msep-token');
+                        if (!li) return;
+                        if (!window.confirm('<?php echo esc_js(__('Revoke this share link? Anyone holding it will lose access immediately.', 'matrix-mlm')); ?>')) {
+                            return;
+                        }
+                        var tokenId = parseInt(li.getAttribute('data-token-id'), 10) || 0;
+                        revokeBtn.disabled = true;
+                        jQuery.post(ajaxUrl, {
+                            action: 'matrix_revoke_share_token',
+                            nonce: nonce,
+                            token_id: tokenId
+                        }, function(res) {
+                            if (res && res.success) {
+                                // Soft-revoke styling — keep the row
+                                // visible (matches the server-side
+                                // history list) but greyed out.
+                                li.classList.remove('is-active');
+                                li.classList.add('is-revoked');
+                                var status = li.querySelector('.msep-token-status');
+                                if (status) {
+                                    status.className = 'msep-token-status msep-status-revoked';
+                                    status.textContent = 'Revoked';
+                                }
+                                var copyB = li.querySelector('.msep-copy-btn');
+                                if (copyB) copyB.remove();
+                                revokeBtn.remove();
+                                showToast('<?php echo esc_js(__('Share link revoked.', 'matrix-mlm')); ?>');
+                            } else {
+                                revokeBtn.disabled = false;
+                                showToast((res && res.data && res.data.message) || '<?php echo esc_js(__('Could not revoke link.', 'matrix-mlm')); ?>', true);
+                            }
+                        }).fail(function() {
+                            revokeBtn.disabled = false;
+                            showToast('<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>', true);
+                        });
+                    }
+                });
+            }
+
+            // ---------- PNG export (lazy html2canvas) ----------
+            // We don't bundle html2canvas in the plugin because it
+            // adds ~200KB to the initial dashboard payload for a
+            // feature most members will use rarely. Lazy-loading
+            // from a well-known CDN at click time keeps the
+            // baseline page weight unchanged.
+            //
+            // Failure modes covered: CDN blocked (ad-blocker / no
+            // network) and html2canvas itself throwing during
+            // capture (font/CORS issues). Both surface a "use PDF
+            // instead" toast rather than an opaque console error.
+            var html2canvasPromise = null;
+            function loadHtml2Canvas() {
+                if (html2canvasPromise) return html2canvasPromise;
+                html2canvasPromise = new Promise(function(resolve, reject) {
+                    if (window.html2canvas) { resolve(window.html2canvas); return; }
+                    var s = document.createElement('script');
+                    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+                    s.async = true;
+                    s.onload = function() {
+                        if (window.html2canvas) resolve(window.html2canvas);
+                        else reject(new Error('html2canvas missing after load'));
+                    };
+                    s.onerror = function() { reject(new Error('Failed to load html2canvas')); };
+                    document.head.appendChild(s);
+                });
+                return html2canvasPromise;
+            }
+
+            if (btnPng) {
+                btnPng.addEventListener('click', function() {
+                    var tree = document.querySelector('.matrix-genealogy-wrapper');
+                    if (!tree) {
+                        showToast('<?php echo esc_js(__('No tree to export.', 'matrix-mlm')); ?>', true);
+                        return;
+                    }
+                    var origLabel = btnPng.textContent;
+                    btnPng.disabled = true;
+                    btnPng.textContent = '<?php echo esc_js(__('Capturing…', 'matrix-mlm')); ?>';
+
+                    loadHtml2Canvas().then(function(h2c) {
+                        return h2c(tree, { backgroundColor: '#ffffff', useCORS: true, scale: window.devicePixelRatio > 1 ? 2 : 1 });
+                    }).then(function(canvas) {
+                        var url = canvas.toDataURL('image/png');
+                        var a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'genealogy-' + new Date().toISOString().slice(0, 10) + '.png';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                    }).catch(function() {
+                        showToast('<?php echo esc_js(__('PNG export unavailable. Use the PDF export instead.', 'matrix-mlm')); ?>', true);
+                    }).then(function() {
+                        btnPng.disabled = false;
+                        btnPng.textContent = origLabel;
+                    });
+                });
+            }
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Tree-only print view. Reached by appending ?print=1 to the
+     * Genealogy URL — the export button does this in a new tab so
+     * the member's regular dashboard view is left intact.
+     *
+     * Renders just enough chrome for a recognisable PDF (top bar
+     * with member identity + plan info, the tree itself, and a
+     * Print button hidden via @media print) and reuses the same
+     * recursive renderer the regular dashboard view uses so the
+     * PDF and dashboard tree shapes are identical.
+     *
+     * Auto-fires window.print() on load so the export button is a
+     * single click → save dialog interaction. The print button at
+     * the top is the safety net for browsers that block the
+     * automatic print() (Safari can prompt) or for when a member
+     * dismisses the print dialog and wants to retry.
+     */
+    private function render_print_mode_view($display_position, $tree, $is_pivoted) {
+        $owner_id = (int) $display_position->user_id;
+        $owner = get_userdata($owner_id);
+        $owner_name = $owner ? ($owner->display_name !== '' ? $owner->display_name : $owner->user_login) : ('User #' . $owner_id);
+        ?>
+        <style>
+        /* Print-specific styles — scoped to the .matrix-genealogy-print
+           wrapper so they can't leak into the rest of the dashboard
+           if a host page accidentally renders this with print=1
+           inline. The @media print rules complete the picture by
+           hiding everything that's not the tree. */
+        .matrix-genealogy-print {
+            background: #fff;
+            padding: 16px 0;
+        }
+        .matrix-genealogy-print .mgp-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #4f46e5;
+            color: #fff;
+            padding: 10px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .matrix-genealogy-print .mgp-bar h2 {
+            margin: 0;
+            font-size: 15px;
+            color: #fff;
+        }
+        .matrix-genealogy-print .mgp-bar .mgp-stats {
+            font-size: 12px;
+            opacity: 0.92;
+        }
+        @media print {
+            /* Hide every dashboard chrome surface — nav bar, sidebar,
+               level-badges (already gone via early return), share
+               panel, etc. The dashboard layout is theme-driven so
+               we cast a wide net using common WP admin/template
+               selectors. */
+            body * { visibility: hidden !important; }
+            .matrix-genealogy-print, .matrix-genealogy-print * { visibility: visible !important; }
+            .matrix-genealogy-print { position: absolute; left: 0; top: 0; width: 100%; padding: 0; }
+            .matrix-genealogy-print .no-print { display: none !important; }
+            .matrix-genealogy-print .mgp-bar { background: #4f46e5 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        }
+        </style>
+
+        <div class="matrix-genealogy-print">
+            <div class="mgp-bar">
+                <h2>
+                    <?php
+                    printf(
+                        /* translators: 1: member display name, 2: plan name, 3: WxD shape */
+                        esc_html__('%1$s — %2$s (%3$s)', 'matrix-mlm'),
+                        esc_html($owner_name),
+                        esc_html($display_position->plan_name),
+                        esc_html((int) $display_position->width . 'x' . (int) $display_position->depth)
+                    );
+                    ?>
+                </h2>
+                <div class="mgp-stats">
+                    <?php
+                    printf(
+                        /* translators: 1: downline count, 2: max members, 3: completion percent */
+                        esc_html__('Downline %1$s · Capacity %2$s', 'matrix-mlm'),
+                        number_format((int) $display_position->total_downline),
+                        number_format(Matrix_MLM_Plan_Engine::calculate_max_members(
+                            (int) $display_position->width,
+                            (int) $display_position->depth
+                        ))
+                    );
+                    ?>
+                </div>
+                <button type="button" class="no-print"
+                        onclick="window.print()"
+                        style="background:#fff;color:#4f46e5;border:0;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;">
+                    <?php esc_html_e('Print / Save as PDF', 'matrix-mlm'); ?>
+                </button>
+            </div>
+
+            <div class="matrix-genealogy-wrapper">
+                <div class="matrix-genealogy-tree" id="genealogy-tree-print">
+                    <?php
+                    if ($tree) {
+                        // Reuse the regular dashboard tree renderer
+                        // for visual fidelity. The renderer reads
+                        // $this->pivot_state for context, which was
+                        // set in render() before we short-circuited
+                        // here, so it has everything it needs.
+                        $this->render_tree_node(
+                            $tree,
+                            (int) $display_position->width,
+                            true,
+                            (int) $display_position->user_id,
+                            min(4, (int) $display_position->depth)
+                        );
+                    } else {
+                        echo '<p>' . esc_html__('No tree data available yet.', 'matrix-mlm') . '</p>';
+                    }
+                    ?>
+                </div>
+            </div>
+        </div>
+        <script>
+        // Auto-trigger the print dialog so opening the URL is a
+        // single-click → save-as-PDF interaction. Wrapped in a
+        // setTimeout to give the browser one paint cycle to lay
+        // out the tree before snapshotting it.
+        window.addEventListener('load', function() {
+            setTimeout(function() { window.print(); }, 300);
+        });
         </script>
         <?php
     }

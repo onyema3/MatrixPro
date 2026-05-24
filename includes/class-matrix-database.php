@@ -60,6 +60,14 @@ class Matrix_MLM_Database {
         // self::create_tables() at the bottom of the dbDelta sequence
         // (see the matching block there).
         'matrix_level_completions',
+        // Public read-only share tokens for the genealogy view —
+        // one row per token a member has minted, with revoke
+        // tracking and view-count instrumentation. Powers the
+        // /genealogy/share/{token}/ public URL so members can
+        // demo their tree to a prospect without granting login
+        // access. Created by self::create_tables() (see the
+        // matching block there).
+        'matrix_share_tokens',
     ];
 
     /**
@@ -874,6 +882,57 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_level_completions);
 
+        // Genealogy share tokens — public read-only links to a
+        // member's tree, used to demo their downline to a prospect
+        // without granting login access. One row per minted token;
+        // revocation is soft (revoked_at != NULL) rather than a
+        // hard delete so the dashboard can show a grayed-out
+        // "Revoked on Sept 14" history entry instead of having the
+        // row vanish without trace.
+        //
+        // Tokens are 64-char URL-safe random strings (32 bytes hex
+        // from random_bytes()). UNIQUE KEY on token so a duplicate
+        // INSERT — which random_bytes(32) makes vanishingly
+        // unlikely but not impossible — fails loudly rather than
+        // silently overwriting another member's link.
+        //
+        // expires_at is nullable: a member who picks "no expiry"
+        // gets a token that lives until they explicitly revoke it.
+        // The lookup path checks `revoked_at IS NULL AND (expires_at
+        // IS NULL OR expires_at > NOW())` so both knobs gate access
+        // independently.
+        //
+        // plan_id is nullable so a member can mint a single share
+        // link that always points at their currently-most-recent
+        // plan; pivot_user_id is nullable so the default share is
+        // the member's own tree, with an optional override for
+        // sharing a sub-branch.
+        //
+        // last_viewed_at + view_count are written every time the
+        // public route resolves the token successfully, giving the
+        // member a basic "is anyone using this link?" signal on the
+        // dashboard panel. Not security-critical — the lookup is
+        // already bounded by the WHERE clause above; this is purely
+        // engagement instrumentation.
+        $table_share_tokens = $wpdb->prefix . 'matrix_share_tokens';
+        $sql_share_tokens = "CREATE TABLE $table_share_tokens (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            plan_id bigint(20) UNSIGNED DEFAULT NULL,
+            pivot_user_id bigint(20) UNSIGNED DEFAULT NULL,
+            token varchar(64) NOT NULL,
+            label varchar(120) DEFAULT NULL,
+            expires_at datetime DEFAULT NULL,
+            revoked_at datetime DEFAULT NULL,
+            last_viewed_at datetime DEFAULT NULL,
+            view_count int(10) UNSIGNED NOT NULL DEFAULT 0,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY token (token),
+            KEY user_id (user_id)
+        ) $charset_collate;";
+        dbDelta($sql_share_tokens);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -894,6 +953,7 @@ class Matrix_MLM_Database {
             'matrix_healthcare_applications',
             'matrix_hospitals',
             'matrix_level_completions',
+            'matrix_share_tokens',
         ];
 
         foreach ($tables as $table) {

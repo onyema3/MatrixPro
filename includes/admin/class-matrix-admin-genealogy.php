@@ -197,6 +197,33 @@ class Matrix_MLM_Admin_Genealogy {
             );
             ?>
         </p>
+
+        <?php
+        // Print-friendly short circuit. ?print=1 produces a tree-only
+        // page for the admin's own PDF export needs (audit trails,
+        // capturing tree state before a structural change, sharing a
+        // snapshot with a colleague). PNG export uses the same
+        // html2canvas-on-demand pattern as the member-side panel.
+        $print_mode = isset($_GET['print']) && $_GET['print'] !== '' && $_GET['print'] !== '0';
+        ?>
+
+        <div class="mma-tree-export-bar no-print" style="margin:0 0 14px;display:flex;gap:8px;align-items:center;">
+            <strong style="font-size:12px;color:#4b5563;">
+                <?php esc_html_e('Export this view:', 'matrix-mlm'); ?>
+            </strong>
+            <a class="button"
+               href="<?php echo esc_url(add_query_arg('print', '1')); ?>"
+               target="_blank"
+               rel="noopener">
+                <?php esc_html_e('PDF', 'matrix-mlm'); ?>
+            </a>
+            <button type="button" class="button" id="mma-tree-export-png">
+                <?php esc_html_e('PNG', 'matrix-mlm'); ?>
+            </button>
+            <span style="color:#6b7280;font-size:11px;">
+                <?php esc_html_e('PDF opens a print-friendly view; PNG captures the visible tree as an image.', 'matrix-mlm'); ?>
+            </span>
+        </div>
         <?php
 
         if (!$root_position) {
@@ -306,6 +333,7 @@ class Matrix_MLM_Admin_Genealogy {
         <?php $this->render_inline_styles(); ?>
         <?php $this->render_preview_modal(); ?>
         <?php $this->render_inline_script(); ?>
+        <?php $this->render_export_script($print_mode); ?>
         </div><!-- .wrap -->
         <?php
     }
@@ -865,6 +893,34 @@ class Matrix_MLM_Admin_Genealogy {
             color: #6b7280;
             font-style: italic;
             padding: 10px 0;
+        }
+
+        /* Print: hide every WP admin chrome surface and the export
+           toolbar itself, leave just the tree. The wp-admin selectors
+           cover the menu sidebar (#adminmenuwrap), the top admin bar
+           (#wpadminbar), screen options (#screen-meta), and the
+           page heading we don't want in the PDF. */
+        @media print {
+            #adminmenuwrap, #adminmenuback, #wpadminbar, #screen-meta,
+            #screen-meta-links, .update-nag, .notice, .wrap > h1,
+            form[method="get"], .mma-tree-export-bar, .mma-tree-stat-strip,
+            .mma-tree-legend, .mma-modal-backdrop, .mma-tree-node-drag-hint,
+            .no-print { display: none !important; }
+            #wpcontent, #wpbody, #wpbody-content, .wrap {
+                margin: 0 !important; padding: 0 !important;
+            }
+            html.wp-toolbar { padding-top: 0 !important; }
+            body.wp-admin { background: #fff !important; }
+            .mma-tree-wrapper {
+                border: 0 !important; padding: 0 !important;
+                max-height: none !important; overflow: visible !important;
+            }
+            .mma-tree-node-root, .mma-tree-node-direct, .mma-tree-node-spillover {
+                /* Force colored backgrounds to print so the legend
+                   meaning is preserved on paper / PDF. */
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
         }
         </style>
         <?php
@@ -1475,6 +1531,89 @@ class Matrix_MLM_Admin_Genealogy {
         // All checks passed — green-light the commit.
         $payload['safe_to_move'] = true;
         return $payload;
+    }
+
+    /**
+     * Inline JS for the admin Export buttons (PDF + PNG) plus the
+     * auto-print trigger for ?print=1 mode.
+     *
+     * Mirrors the user-side share/export panel's export logic
+     * (lazy-load html2canvas from a CDN on first PNG click; auto
+     * fire window.print() in print mode). Lives on the admin page
+     * directly because the admin genealogy view doesn't reuse the
+     * member-side panel's class — the two surfaces have different
+     * top-of-page tooling and we'd rather keep their JS close to
+     * the markup that triggers it than DRY-it-up via a shared
+     * helper neither team would think to look in.
+     *
+     * @param bool $print_mode True when ?print=1 is in the URL —
+     *                         we then auto-fire window.print() on
+     *                         load so the URL is a one-click
+     *                         save-as-PDF interaction.
+     */
+    private function render_export_script($print_mode) {
+        ?>
+        <script>
+        (function() {
+            var btn = document.getElementById('mma-tree-export-png');
+            var html2canvasPromise = null;
+            function loadHtml2Canvas() {
+                if (html2canvasPromise) return html2canvasPromise;
+                html2canvasPromise = new Promise(function(resolve, reject) {
+                    if (window.html2canvas) { resolve(window.html2canvas); return; }
+                    var s = document.createElement('script');
+                    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+                    s.async = true;
+                    s.onload = function() {
+                        if (window.html2canvas) resolve(window.html2canvas);
+                        else reject(new Error('html2canvas missing after load'));
+                    };
+                    s.onerror = function() { reject(new Error('Failed to load html2canvas')); };
+                    document.head.appendChild(s);
+                });
+                return html2canvasPromise;
+            }
+
+            if (btn) {
+                btn.addEventListener('click', function() {
+                    var tree = document.querySelector('.mma-tree-wrapper');
+                    if (!tree) {
+                        alert('<?php echo esc_js(__('No tree to export.', 'matrix-mlm')); ?>');
+                        return;
+                    }
+                    var origLabel = btn.textContent;
+                    btn.disabled = true;
+                    btn.textContent = '<?php echo esc_js(__('Capturing…', 'matrix-mlm')); ?>';
+
+                    loadHtml2Canvas().then(function(h2c) {
+                        return h2c(tree, { backgroundColor: '#ffffff', useCORS: true, scale: window.devicePixelRatio > 1 ? 2 : 1 });
+                    }).then(function(canvas) {
+                        var url = canvas.toDataURL('image/png');
+                        var a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'genealogy-' + new Date().toISOString().slice(0, 10) + '.png';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                    }).catch(function() {
+                        alert('<?php echo esc_js(__('PNG export unavailable. Use the PDF export instead.', 'matrix-mlm')); ?>');
+                    }).then(function() {
+                        btn.disabled = false;
+                        btn.textContent = origLabel;
+                    });
+                });
+            }
+
+            <?php if ($print_mode): ?>
+            // Auto-fire print dialog so the ?print=1 URL is a
+            // single-interaction "save as PDF" flow.
+            window.addEventListener('load', function() {
+                setTimeout(function() { window.print(); }, 300);
+            });
+            <?php endif; ?>
+        })();
+        </script>
+        <?php
     }
 
     /**
