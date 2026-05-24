@@ -147,7 +147,9 @@ class Matrix_MLM_Fintava_Card {
         if (!Matrix_MLM_Fintava::is_api_success($response)) {
             return new WP_Error(
                 'fintava_card_error',
-                $response['message'] ?? __('Failed to create card', 'matrix-mlm')
+                self::stringify_error_message(
+                    $response['message'] ?? __('Failed to create card', 'matrix-mlm')
+                )
             );
         }
 
@@ -219,7 +221,9 @@ class Matrix_MLM_Fintava_Card {
         if (!Matrix_MLM_Fintava::is_api_success($response)) {
             return new WP_Error(
                 'fintava_card_link_error',
-                $response['message'] ?? __('Failed to link card', 'matrix-mlm')
+                self::stringify_error_message(
+                    $response['message'] ?? __('Failed to link card', 'matrix-mlm')
+                )
             );
         }
 
@@ -288,7 +292,9 @@ class Matrix_MLM_Fintava_Card {
         if (!Matrix_MLM_Fintava::is_api_success($response)) {
             return new WP_Error(
                 'fintava_card_state_error',
-                $response['message'] ?? __('Card state change failed', 'matrix-mlm')
+                self::stringify_error_message(
+                    $response['message'] ?? __('Card state change failed', 'matrix-mlm')
+                )
             );
         }
 
@@ -361,7 +367,9 @@ class Matrix_MLM_Fintava_Card {
 
         return new WP_Error(
             'fintava_card_fetch_error',
-            $response['message'] ?? __('Could not retrieve card details', 'matrix-mlm')
+            self::stringify_error_message(
+                $response['message'] ?? __('Could not retrieve card details', 'matrix-mlm')
+            )
         );
     }
 
@@ -705,15 +713,105 @@ class Matrix_MLM_Fintava_Card {
         }
 
         $status_code = wp_remote_retrieve_response_code($response);
-        $payload     = json_decode(wp_remote_retrieve_body($response), true);
+        $raw_body    = wp_remote_retrieve_body($response);
+        $payload     = json_decode($raw_body, true);
 
         if ($status_code >= 400) {
-            $error_message = $payload['message']
-                ?? sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
+            // Log the full response body so operators can see Fintava's
+            // actual error shape — Fintava sometimes returns `message`
+            // as a structured object (per-field validation errors,
+            // nested `errors[]`, etc.) which used to surface in the UI
+            // as the literal string "[object Object]". The log line
+            // includes endpoint, status, and raw body for grepping.
+            // Gated on WP_DEBUG so production noise stays low.
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                error_log(sprintf(
+                    '[Matrix Fintava Card] %s %s -> HTTP %d, body=%s',
+                    $method,
+                    $endpoint,
+                    $status_code,
+                    is_string($raw_body) ? substr($raw_body, 0, 2000) : '(non-string)'
+                ));
+            }
+
+            $error_message = isset($payload['message'])
+                ? self::stringify_error_message($payload['message'])
+                : '';
+            if ($error_message === '') {
+                $error_message = sprintf(
+                    __('API Error (HTTP %d) calling %s', 'matrix-mlm'),
+                    $status_code,
+                    $endpoint
+                );
+            }
             return new WP_Error('fintava_card_api_error', $error_message);
         }
 
         return $payload;
+    }
+
+    /**
+     * Coerce a Fintava `message` field into a human-readable string.
+     *
+     * Fintava is inconsistent across endpoints and tiers: `message` is
+     * usually a string, but on validation/business-rule failures it can
+     * arrive as:
+     *
+     *   - An associative array describing one field
+     *       e.g. ['field' => 'accountNumber', 'issue' => 'not found']
+     *   - A flat list of error strings
+     *       e.g. ['accountNumber is required', 'cardName too long']
+     *   - A nested `{errors: [...]}` envelope
+     *       e.g. ['errors' => ['...', '...']]
+     *
+     * Without coercion these flow into WP_Error verbatim, get
+     * json_encoded by wp_send_json_error, and surface in the browser as
+     * the literal string "[object Object]" — useless for diagnosis.
+     *
+     * The strategy is intentionally conservative: stringify recursively,
+     * skip empties, join on ", ". Anything truly opaque falls back to
+     * a JSON dump so at least the shape survives the trip to the UI.
+     */
+    public static function stringify_error_message($message) {
+        if (is_string($message)) {
+            return $message;
+        }
+        if (is_numeric($message) || is_bool($message)) {
+            return (string) $message;
+        }
+        if ($message === null) {
+            return '';
+        }
+
+        // Treat WP_Error transparently — callers occasionally pass one in.
+        if (is_wp_error($message)) {
+            return self::stringify_error_message($message->get_error_message());
+        }
+
+        if (is_array($message)) {
+            // Nested {errors: [...]} envelope — unwrap and recurse.
+            if (isset($message['errors']) && is_array($message['errors'])) {
+                return self::stringify_error_message($message['errors']);
+            }
+
+            $parts = [];
+            foreach ($message as $key => $value) {
+                $piece = self::stringify_error_message($value);
+                if ($piece === '') {
+                    continue;
+                }
+                // Preserve string keys ("field: issue") but drop numeric
+                // ones to keep flat lists clean.
+                $parts[] = is_string($key) ? sprintf('%s: %s', $key, $piece) : $piece;
+            }
+            if (!empty($parts)) {
+                return implode(', ', $parts);
+            }
+        }
+
+        // Last resort: stash the raw shape so it isn't silently dropped.
+        $encoded = wp_json_encode($message);
+        return is_string($encoded) ? $encoded : '';
     }
 
     /**
