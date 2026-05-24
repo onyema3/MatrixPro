@@ -1453,6 +1453,130 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Pick the most-actionable incomplete level for a member's matrix
+     * and pair it with the per-slot commission so the genealogy
+     * "next goal" banner can quote a concrete earnings number.
+     *
+     * Selection priority — two-pass:
+     *
+     *   1. Levels that already have at least one filled slot
+     *      (filled > 0, complete = false). Among those, pick the one
+     *      with the smallest remaining count. These are
+     *      psychologically the "closest finish line": the member has
+     *      already started building them and a few more recruits
+     *      tip them over.
+     *
+     *   2. Fall back to the shallowest level that's still incomplete
+     *      and has slots to fill. Catches the all-empty signup-day
+     *      case (every level is at 0/W^L) so the banner still has
+     *      something to say.
+     *
+     * Returns null when every level is already complete — in that
+     * state the existing "Matrix Master" banner already supplies the
+     * congratulations and rendering both would be redundant.
+     *
+     * The level commission comes from wp_matrix_plans.level_commission
+     * which is a JSON map keyed 1..D. We don't try to also include the
+     * plan's referral_commission in the per-slot figure because not
+     * every level-1 fill is a direct referral (some are spillover from
+     * upline) — quoting referral_commission * remaining would
+     * over-promise. The bonus is exposed separately on the returned
+     * array so the renderer can mention it as an extra hint on level 1.
+     *
+     * @param array<int, array{level:int, filled:int, expected:int, complete:bool}> $level_status
+     *        Output of self::get_level_completion_status().
+     * @param object $plan Row from wp_matrix_plans. Must carry the
+     *        level_commission and referral_commission columns; the
+     *        genealogy renderer extends its SELECT to include them.
+     * @return array{
+     *     level:int,
+     *     slots_remaining:int,
+     *     expected:int,
+     *     filled:int,
+     *     commission_per_slot:float,
+     *     total_earnable:float,
+     *     referral_commission:float,
+     *     is_in_progress:bool
+     * }|null
+     */
+    public function get_next_level_goal(array $level_status, $plan) {
+        if (empty($level_status) || empty($plan)) {
+            return null;
+        }
+
+        // Decode the plan's level_commission JSON. Map is 1-indexed
+        // (level => commission per fill). We normalise to (int =>
+        // float) so the renderer can do straight arithmetic without
+        // re-casting on each slot.
+        $level_commissions = [];
+        if (!empty($plan->level_commission)) {
+            $decoded = json_decode((string) $plan->level_commission, true);
+            if (is_array($decoded)) {
+                foreach ($decoded as $k => $v) {
+                    $level_commissions[(int) $k] = (float) $v;
+                }
+            }
+        }
+
+        // Two-pass scan over the level status rows. We don't trust
+        // the array's outer keys to be 1..D in order (the caller
+        // builds it that way today, but the priority logic should
+        // hold even if a future caller passes them out of order).
+        $best_in_progress           = null;
+        $best_in_progress_remaining = PHP_INT_MAX;
+        $shallowest_incomplete      = null;
+        $shallowest_level           = PHP_INT_MAX;
+
+        foreach ($level_status as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            if (!empty($row['complete'])) {
+                continue;
+            }
+            $remaining = max(0, (int) $row['expected'] - (int) $row['filled']);
+            if ($remaining <= 0) {
+                continue;
+            }
+
+            $row_level = (int) $row['level'];
+
+            if ($row_level < $shallowest_level) {
+                $shallowest_level      = $row_level;
+                $shallowest_incomplete = $row;
+            }
+
+            if ((int) $row['filled'] > 0 && $remaining < $best_in_progress_remaining) {
+                $best_in_progress           = $row;
+                $best_in_progress_remaining = $remaining;
+            }
+        }
+
+        $goal_row = $best_in_progress ?: $shallowest_incomplete;
+        if (!$goal_row) {
+            // Everything is complete or the matrix has no levels —
+            // banner shouldn't render.
+            return null;
+        }
+
+        $level     = (int) $goal_row['level'];
+        $remaining = max(0, (int) $goal_row['expected'] - (int) $goal_row['filled']);
+        $per_slot  = isset($level_commissions[$level]) ? (float) $level_commissions[$level] : 0.0;
+        $referral  = isset($plan->referral_commission) ? (float) $plan->referral_commission : 0.0;
+
+        return [
+            'level'                => $level,
+            'slots_remaining'      => $remaining,
+            'expected'             => (int) $goal_row['expected'],
+            'filled'               => (int) $goal_row['filled'],
+            'commission_per_slot'  => $per_slot,
+            'total_earnable'       => $remaining * $per_slot,
+            'referral_commission'  => $referral,
+            'is_in_progress'       => ((int) $goal_row['filled'] > 0),
+        ];
+    }
+
+    /**
      * Build tree recursively
      */
     private function build_tree_recursive($position_id, $plan_id, $current_depth, $max_depth) {

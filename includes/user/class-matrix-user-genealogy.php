@@ -36,12 +36,39 @@ class Matrix_MLM_User_Genealogy {
      */
     private $pivot_state = null;
 
+    /**
+     * Public setter for the per-render state shared with
+     * render_tree_node() / render_children_inner() / render_empty_slot()
+     * and the lazy-load AJAX handler.
+     *
+     * Exists so Matrix_MLM_Core::process_fetch_subtree() can hydrate
+     * the same context the page render uses without going through a
+     * full render() pass — the AJAX path doesn't have $_GET state and
+     * doesn't compute the level-status badges, but it still needs
+     * referral_url, plan_id, level_commissions, etc. to emit the
+     * "Refer 1 more here →" empty-slot CTAs introduced by the
+     * next-goal feature.
+     *
+     * Validation is intentionally minimal: we trust the AJAX caller
+     * to pass a well-shaped array because every reader inside this
+     * class uses isset() / sensible defaults when fields are missing.
+     * Keeping it permissive lets us extend the state shape later
+     * (more fields) without forcing the AJAX side to update lockstep.
+     *
+     * @param array $state See $pivot_state docblock for the keys.
+     * @return void
+     */
+    public function set_render_state(array $state) {
+        $this->pivot_state = $state;
+    }
+
     public function render($user_id) {
         global $wpdb;
 
         // Get user's active plans/positions
         $positions = $wpdb->get_results($wpdb->prepare(
-            "SELECT p.*, pl.name as plan_name, pl.width, pl.depth 
+            "SELECT p.*, pl.name as plan_name, pl.width, pl.depth,
+                    pl.level_commission, pl.referral_commission
              FROM {$wpdb->prefix}matrix_positions p 
              JOIN {$wpdb->prefix}matrix_plans pl ON p.plan_id = pl.id 
              WHERE p.user_id = %d AND p.status = 'active' 
@@ -130,7 +157,8 @@ class Matrix_MLM_User_Genealogy {
                 // on this render. Single roundtrip; the genealogy tab
                 // is dashboard-page-cached anyway.
                 $pivot_position = $wpdb->get_row($wpdb->prepare(
-                    "SELECT p.*, pl.name as plan_name, pl.width, pl.depth
+                    "SELECT p.*, pl.name as plan_name, pl.width, pl.depth,
+                            pl.level_commission, pl.referral_commission
                        FROM {$wpdb->prefix}matrix_positions p
                        JOIN {$wpdb->prefix}matrix_plans pl ON p.plan_id = pl.id
                       WHERE p.id = %d",
@@ -151,15 +179,6 @@ class Matrix_MLM_User_Genealogy {
         $is_pivoted        = ($pivot_position !== null);
         $display_position  = $is_pivoted ? $pivot_position : $current_position;
         $display_user_id   = (int) $display_position->user_id;
-
-        // Cache the per-render state for the recursive renderer and
-        // the lazy-load script to read without long param lists.
-        $this->pivot_state = [
-            'viewer_user_id'  => (int) $user_id,
-            'display_user_id' => $display_user_id,
-            'plan_id'         => (int) $selected_plan_id,
-            'is_pivoted'      => $is_pivoted,
-        ];
 
         // Get tree data — initial render is capped at 4 levels to keep
         // the page payload bounded. Levels deeper than this are
@@ -199,6 +218,64 @@ class Matrix_MLM_User_Genealogy {
             }
         }
         $all_levels_complete = ($levels_completed === intval($display_position->depth));
+
+        // Compute the genealogy "next goal" — the most-actionable
+        // incomplete level — so the renderer can surface a goal
+        // banner right above the level-badge grid AND highlight
+        // empty slots at that level. See
+        // Matrix_MLM_Plan_Engine::get_next_level_goal() for the
+        // priority logic. Returns null when the matrix is fully
+        // complete; the existing Matrix Master banner already
+        // covers that congratulatory state.
+        $next_goal = $plan_engine->get_next_level_goal($level_status, $display_position);
+
+        // Decode the level-commission map once and stash it on
+        // pivot_state so render_children_inner() can quote per-slot
+        // earnings on each empty-slot CTA without re-decoding the
+        // JSON for every slot in a wide matrix.
+        $level_commissions_decoded = [];
+        if (!empty($display_position->level_commission)) {
+            $tmp = json_decode((string) $display_position->level_commission, true);
+            if (is_array($tmp)) {
+                foreach ($tmp as $k => $v) {
+                    $level_commissions_decoded[(int) $k] = (float) $v;
+                }
+            }
+        }
+
+        // Referral URL belongs to the VIEWER, not the displayed
+        // pivot user — when the tree is pivoted onto Sarah's view,
+        // an "invite to fill this slot" CTA should still hand out
+        // the viewer's invite link, since the viewer is the one who
+        // earns the commission. Empty string means "no invite link
+        // available" (the user has no matrix_user_meta row, which
+        // shouldn't happen post-registration but is defensive).
+        $referral_url = '';
+        if (class_exists('Matrix_MLM_User')) {
+            $maybe = (string) Matrix_MLM_User::get_referral_link((int) $user_id);
+            // get_referral_link returns ".../matrix-register/?ref=" with
+            // an empty code if the row is missing — guard against
+            // shipping a useless URL.
+            if ($maybe !== '' && substr($maybe, -4) !== 'ref=') {
+                $referral_url = $maybe;
+            }
+        }
+
+        // Cache the per-render state for the recursive renderer and
+        // the lazy-load script to read without long param lists.
+        $this->pivot_state = [
+            'viewer_user_id'    => (int) $user_id,
+            'display_user_id'   => $display_user_id,
+            'plan_id'           => (int) $selected_plan_id,
+            'is_pivoted'        => $is_pivoted,
+            'referral_url'      => $referral_url,
+            // Goal level: 0 means "no goal" (Matrix Master state or
+            // missing data). Empty slots check this to apply the
+            // is-goal-level highlight.
+            'goal_level'        => $next_goal ? (int) $next_goal['level'] : 0,
+            'level_commissions' => $level_commissions_decoded,
+            'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
+        ];
         ?>
 
         <?php if ($is_pivoted): ?>
@@ -234,7 +311,9 @@ class Matrix_MLM_User_Genealogy {
             </div>
         </div>
 
-        <?php $this->render_level_badges($level_status, $levels_completed, $all_levels_complete, $display_position); ?>
+        <?php $this->render_next_goal_banner($next_goal, $referral_url); ?>
+
+        <?php $this->render_level_badges($level_status, $levels_completed, $all_levels_complete, $display_position, $next_goal); ?>
 
         <div class="matrix-genealogy-wrapper">
             <div class="matrix-genealogy-tree" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $display_position->depth; ?>" data-plan-width="<?php echo (int) $display_position->width; ?>" data-root-user-id="<?php echo $display_user_id; ?>">
@@ -257,6 +336,7 @@ class Matrix_MLM_User_Genealogy {
         <?php $this->render_search_script($selected_plan_id); ?>
         <?php $this->render_hovercard($selected_plan_id); ?>
         <?php $this->render_hovercard_script($selected_plan_id); ?>
+        <?php $this->render_referral_copy_script(); ?>
 
         <?php endif; ?>
         <?php
@@ -498,12 +578,18 @@ class Matrix_MLM_User_Genealogy {
      * @param bool  $all_levels_complete  Whether every level is filled.
      * @param object $current_position    Row from wp_matrix_positions for context
      *                                    (depth, plan name, etc.).
+     * @param array|null $next_goal       Output of
+     *                                    Matrix_MLM_Plan_Engine::get_next_level_goal(),
+     *                                    used to flag the goal-level pill so the eye
+     *                                    is drawn from the next-goal banner straight
+     *                                    to the matching badge.
      */
-    private function render_level_badges($level_status, $levels_completed, $all_levels_complete, $current_position) {
+    private function render_level_badges($level_status, $levels_completed, $all_levels_complete, $current_position, $next_goal = null) {
         if (empty($level_status)) {
             return;
         }
         $total_levels = count($level_status);
+        $goal_level   = ($next_goal && !empty($next_goal['level'])) ? (int) $next_goal['level'] : 0;
         ?>
         <div class="matrix-level-badges">
             <div class="matrix-level-badges-header">
@@ -543,8 +629,17 @@ class Matrix_MLM_User_Genealogy {
                     $filled      = intval($row['filled']);
                     $progress    = min(100, round(($filled / $expected) * 100));
                     $pill_class  = $is_complete ? 'is-complete' : ($filled > 0 ? 'is-progress' : 'is-empty');
+                    $is_goal     = ($goal_level > 0 && intval($row['level']) === $goal_level);
+                    if ($is_goal) {
+                        $pill_class .= ' is-goal';
+                    }
                 ?>
-                <div class="matrix-level-badge <?php echo esc_attr($pill_class); ?>">
+                <div class="matrix-level-badge <?php echo esc_attr($pill_class); ?>"<?php echo $is_goal ? ' aria-current="step"' : ''; ?>>
+                    <?php if ($is_goal): ?>
+                    <span class="matrix-level-badge-flag" aria-label="<?php esc_attr_e('Next goal', 'matrix-mlm'); ?>" title="<?php esc_attr_e('Your next genealogy goal', 'matrix-mlm'); ?>">
+                        <span class="dashicons dashicons-flag" aria-hidden="true"></span>
+                    </span>
+                    <?php endif; ?>
                     <div class="matrix-level-badge-icon" aria-hidden="true">
                         <?php if ($is_complete): ?>
                             <span class="dashicons dashicons-yes-alt"></span>
@@ -645,6 +740,45 @@ class Matrix_MLM_User_Genealogy {
         }
         .matrix-level-badge.is-complete .matrix-level-badge-status { color: #047857; }
         .matrix-level-badge.is-progress .matrix-level-badge-status { color: #6d28d9; }
+
+        /* Goal-level pill: subtle ring + pulse so the eye is drawn
+           from the next-goal banner straight to the matching badge.
+           Layered ON TOP of the existing is-progress / is-empty
+           style so the level's actual progress colour stays visible
+           — we're flagging *which* level matters next, not
+           overriding the per-level state. */
+        .matrix-level-badge.is-goal {
+            position: relative;
+            border-color: #8b5cf6;
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+            animation: matrix-goal-pulse 2.4s ease-in-out infinite;
+        }
+        .matrix-level-badge-flag {
+            position: absolute;
+            top: -10px;
+            right: -10px;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #8b5cf6;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 10px -2px rgba(139, 92, 246, 0.45);
+        }
+        .matrix-level-badge-flag .dashicons {
+            font-size: 14px;
+            width: 14px;
+            height: 14px;
+        }
+        @keyframes matrix-goal-pulse {
+            0%, 100% { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15); }
+            50%      { box-shadow: 0 0 0 6px rgba(139, 92, 246, 0.10); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .matrix-level-badge.is-goal { animation: none; }
+        }
         </style>
         <?php
     }
@@ -871,22 +1005,128 @@ class Matrix_MLM_User_Genealogy {
 
         // Empty placeholder slots so an underbuilt level reads as a
         // matrix instead of a sparse list. Width minus existing
-        // children = how many filler cards to draw.
+        // children = how many filler cards to draw. The slot's
+        // absolute level is parent.level + 1 — we use that to look
+        // up the per-slot commission and to decide whether this
+        // particular slot sits on the goal level (in which case it
+        // gets the highlighted "is-goal-level" treatment).
+        $slot_level = isset($node['level']) ? ((int) $node['level'] + 1) : 0;
         for ($i = 0; $i < $width - $child_count; $i++) {
-            ?>
-            <div class="matrix-tree-item">
-                <div class="matrix-tree-node matrix-tree-node-empty">
-                    <div class="tree-node-avatar tree-node-empty-avatar">
-                        <span class="dashicons dashicons-plus-alt2"></span>
-                    </div>
-                    <div class="tree-node-info">
-                        <strong><?php _e('Empty Slot', 'matrix-mlm'); ?></strong>
-                        <small><?php _e('Available', 'matrix-mlm'); ?></small>
-                    </div>
+            $this->render_empty_slot($slot_level);
+        }
+    }
+
+    /**
+     * Render a single empty-slot placeholder, optionally as a
+     * "Refer 1 more here →" CTA.
+     *
+     * Empty slots are the most actionable affordance in the tree —
+     * they're literally where the next member goes. Wiring them as a
+     * clickable CTA that copies the viewer's invite link turns the
+     * tree from a passive read into a goal-oriented dashboard, which
+     * is what the per-level "Next goal" banner is also pushing toward.
+     *
+     * Three visual states, gated by what's available in pivot_state:
+     *
+     *   - With a referral_url available, the slot becomes a button-
+     *     styled card. Click / Enter / Space copies the invite URL
+     *     (handled by render_referral_copy_script's delegated JS).
+     *     The subtitle reads "Refer 1 more here →" and a `title`
+     *     tooltip quotes the level number plus the per-slot
+     *     commission when the plan defines one.
+     *   - With slot_level === pivot_state.goal_level, the same card
+     *     additionally gets the `is-goal-level` modifier — a soft
+     *     pulsing ring that ties this empty slot to the matching
+     *     "Next goal" banner above the tree, so the eye lands here
+     *     first.
+     *   - With no referral_url (defensive: matrix_user_meta row
+     *     missing), we fall through to the classic "Empty Slot /
+     *     Available" card with a plain `title`. Same DOM shape, no
+     *     click behavior — keeps the tree visually intact even on
+     *     legacy accounts.
+     *
+     * @param int $slot_level Absolute level of this slot in the tree
+     *                        (parent's level + 1). 0 means "unknown",
+     *                        which suppresses the level-aware tooltip.
+     */
+    private function render_empty_slot($slot_level) {
+        $referral_url       = isset($this->pivot_state['referral_url'])      ? (string) $this->pivot_state['referral_url']      : '';
+        $goal_level         = isset($this->pivot_state['goal_level'])        ? (int)    $this->pivot_state['goal_level']        : 0;
+        $level_commissions  = isset($this->pivot_state['level_commissions']) ? (array)  $this->pivot_state['level_commissions'] : [];
+        $currency           = isset($this->pivot_state['currency_symbol'])
+            ? (string) $this->pivot_state['currency_symbol']
+            : (string) get_option('matrix_mlm_currency_symbol', '₦');
+
+        $is_cta   = ($referral_url !== '');
+        $is_goal  = ($is_cta && $slot_level > 0 && $slot_level === $goal_level);
+        $per_slot = (int) $slot_level > 0 && isset($level_commissions[$slot_level])
+            ? (float) $level_commissions[$slot_level]
+            : 0.0;
+
+        // Build the subtitle and tooltip copy in one place so the
+        // accessible name (aria-label) stays in lockstep with the
+        // visible hint.
+        if ($is_cta) {
+            $subtitle = __('Refer 1 more here →', 'matrix-mlm');
+            if ($slot_level > 0 && $per_slot > 0) {
+                $tooltip = sprintf(
+                    /* translators: 1: level number, 2: per-slot commission (e.g. "₦100.00") */
+                    __('Refer 1 more person here at Level %1$d to earn %2$s. Click to copy your invite link.', 'matrix-mlm'),
+                    $slot_level,
+                    $currency . number_format($per_slot, 2)
+                );
+            } elseif ($slot_level > 0) {
+                $tooltip = sprintf(
+                    /* translators: %d: level number */
+                    __('Refer 1 more person here at Level %d. Click to copy your invite link.', 'matrix-mlm'),
+                    $slot_level
+                );
+            } else {
+                $tooltip = __('Refer 1 more person here. Click to copy your invite link.', 'matrix-mlm');
+            }
+        } else {
+            $subtitle = __('Available', 'matrix-mlm');
+            $tooltip  = __('Empty slot — open for a new member.', 'matrix-mlm');
+        }
+
+        $classes = 'matrix-tree-node matrix-tree-node-empty';
+        if ($is_cta)  { $classes .= ' matrix-tree-node-empty-cta'; }
+        if ($is_goal) { $classes .= ' is-goal-level'; }
+        ?>
+        <div class="matrix-tree-item">
+            <?php if ($is_cta): ?>
+            <div class="<?php echo esc_attr($classes); ?>"
+                 role="button"
+                 tabindex="0"
+                 data-slot-level="<?php echo (int) $slot_level; ?>"
+                 data-referral-url="<?php echo esc_attr($referral_url); ?>"
+                 data-action="copy-referral"
+                 aria-label="<?php echo esc_attr($tooltip); ?>"
+                 title="<?php echo esc_attr($tooltip); ?>">
+                <div class="tree-node-avatar tree-node-empty-avatar">
+                    <span class="dashicons dashicons-plus-alt2"></span>
+                </div>
+                <div class="tree-node-info">
+                    <strong><?php esc_html_e('Empty Slot', 'matrix-mlm'); ?></strong>
+                    <small><?php echo esc_html($subtitle); ?></small>
+                </div>
+                <span class="matrix-tree-empty-cta-toast" aria-live="polite" hidden><?php
+                    esc_html_e('Copied!', 'matrix-mlm');
+                ?></span>
+            </div>
+            <?php else: ?>
+            <div class="<?php echo esc_attr($classes); ?>" title="<?php echo esc_attr($tooltip); ?>">
+                <div class="tree-node-avatar tree-node-empty-avatar">
+                    <span class="dashicons dashicons-plus-alt2"></span>
+                </div>
+                <div class="tree-node-info">
+                    <strong><?php esc_html_e('Empty Slot', 'matrix-mlm'); ?></strong>
+                    <small><?php echo esc_html($subtitle); ?></small>
                 </div>
             </div>
-            <?php
-        }
+            <?php endif; ?>
+        </div>
+        <?php
     }
 
     /**
@@ -2202,6 +2442,453 @@ class Matrix_MLM_User_Genealogy {
             }
             window.addEventListener('scroll',  scheduleReposition, true);
             window.addEventListener('resize',  scheduleReposition);
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the "Next goal" banner above the level-badge grid.
+     *
+     * Single most-prominent affordance on the genealogy view after
+     * the breadcrumb / search bar — it tells a member exactly what
+     * to do next and what they'll earn for it. Only emitted when the
+     * plan engine returns a non-null next-goal (i.e., at least one
+     * incomplete level still has slots to fill); when the matrix is
+     * fully complete, the existing Matrix Master banner inside
+     * render_level_badges() supplies the congratulatory state and
+     * this banner stays out of the way.
+     *
+     * The "Copy invite link" CTA is rendered only when the viewer
+     * has a usable referral URL. Empty referral URL means the
+     * matrix_user_meta row is missing (legacy import / partial
+     * registration) — in that case the banner still surfaces the
+     * goal and earnings number, just without a one-click copy
+     * affordance, which is better than rendering a button that
+     * does nothing.
+     *
+     * Copy framing rules (so the banner reads naturally for every
+     * combination of slot count and commission state):
+     *   - 1 vs N+ slots remaining: pluralise "position(s)".
+     *   - Plan defines a level commission (commission_per_slot > 0):
+     *     append "and earn ₦X.XX". The figure is `slots_remaining ×
+     *     commission_per_slot` — a guaranteed minimum, since level
+     *     commissions are paid on every fill regardless of whether
+     *     the fill is a direct referral or spillover from upline.
+     *   - Plan has no commission for that level: drop the earnings
+     *     hint entirely and just frame the goal as "complete this
+     *     level". Honest framing trumps clickbait — quoting ₦0.00
+     *     would just confuse.
+     *
+     * @param array|null $goal         Output of
+     *                                 Matrix_MLM_Plan_Engine::get_next_level_goal().
+     * @param string     $referral_url Viewer's invite URL, or '' when
+     *                                 unavailable.
+     */
+    private function render_next_goal_banner($goal, $referral_url) {
+        if (!$goal) {
+            return;
+        }
+
+        $level   = (int)   $goal['level'];
+        $slots   = (int)   $goal['slots_remaining'];
+        $earning = (float) $goal['total_earnable'];
+        if ($slots <= 0 || $level <= 0) {
+            return;
+        }
+
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        $earning_label = $currency . number_format($earning, 2);
+        $has_earning   = ($earning > 0);
+
+        // Build the localised sentence with bold accents on the
+        // numbers a glanceable read should land on. Each branch
+        // formats its own translator-friendly string so plural
+        // forms and earnings-on/off flow through esc_html__ /
+        // _n correctly.
+        $level_label = sprintf(
+            /* translators: %d: level number */
+            esc_html__('Level %d', 'matrix-mlm'),
+            $level
+        );
+        $bold_level = '<strong>' . $level_label . '</strong>';
+        $bold_count = '<strong>' . esc_html(
+            sprintf(
+                /* translators: %s: localised slot count (number_format_i18n) */
+                _n(
+                    '%s more position',
+                    '%s more positions',
+                    $slots,
+                    'matrix-mlm'
+                ),
+                number_format_i18n($slots)
+            )
+        ) . '</strong>';
+        $bold_earning = '<strong>' . esc_html($earning_label) . '</strong>';
+
+        if ($has_earning) {
+            // Two-line copy: headline calls out the action; the
+            // inline earning is the carrot.
+            $copy = sprintf(
+                /* translators: 1: bold "<N> more positions", 2: bold "Level X", 3: bold currency amount */
+                esc_html__('Fill %1$s on %2$s to complete this level and earn %3$s.', 'matrix-mlm'),
+                $bold_count,
+                $bold_level,
+                $bold_earning
+            );
+        } else {
+            $copy = sprintf(
+                /* translators: 1: bold "<N> more positions", 2: bold "Level X" */
+                esc_html__('Fill %1$s on %2$s to complete this level.', 'matrix-mlm'),
+                $bold_count,
+                $bold_level
+            );
+        }
+        ?>
+        <div class="matrix-next-goal" role="region" aria-label="<?php esc_attr_e('Your next genealogy goal', 'matrix-mlm'); ?>">
+            <div class="matrix-next-goal-icon" aria-hidden="true">
+                <span class="dashicons dashicons-flag"></span>
+            </div>
+            <div class="matrix-next-goal-body">
+                <strong class="matrix-next-goal-title"><?php esc_html_e('Next goal', 'matrix-mlm'); ?></strong>
+                <p class="matrix-next-goal-copy">
+                    <?php
+                    // The %s tokens above are HTML wrappers we built
+                    // ourselves (esc_html__ / esc_html on each user-
+                    // facing fragment). Echo unescaped here so the
+                    // bolds render — the actual content is already
+                    // sanitised piecewise above.
+                    echo $copy; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+                    ?>
+                </p>
+                <?php if (!empty($goal['is_in_progress'])): ?>
+                <p class="matrix-next-goal-hint">
+                    <?php
+                    printf(
+                        /* translators: 1: filled count, 2: expected count */
+                        esc_html__('You have %1$s of %2$s slots filled — almost there.', 'matrix-mlm'),
+                        '<strong>' . esc_html(number_format_i18n((int) $goal['filled'])) . '</strong>',
+                        '<strong>' . esc_html(number_format_i18n((int) $goal['expected'])) . '</strong>'
+                    );
+                    ?>
+                </p>
+                <?php endif; ?>
+            </div>
+            <?php if ($referral_url !== ''): ?>
+            <button type="button"
+                    class="matrix-next-goal-cta"
+                    data-action="copy-referral"
+                    data-referral-url="<?php echo esc_attr($referral_url); ?>">
+                <span class="dashicons dashicons-admin-links" aria-hidden="true"></span>
+                <span class="matrix-next-goal-cta-default"><?php esc_html_e('Copy invite link', 'matrix-mlm'); ?></span>
+                <span class="matrix-next-goal-cta-success" hidden><?php esc_html_e('Copied!', 'matrix-mlm'); ?></span>
+            </button>
+            <?php endif; ?>
+        </div>
+
+        <style>
+        .matrix-next-goal {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%);
+            border: 1px solid #8b5cf6;
+            border-radius: 12px;
+            padding: 14px 18px;
+            margin: 0 0 18px;
+            color: #4c1d95;
+        }
+        .matrix-next-goal-icon {
+            flex: 0 0 44px;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: #8b5cf6;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px -2px rgba(139, 92, 246, 0.45);
+        }
+        .matrix-next-goal-icon .dashicons { font-size: 22px; width: 22px; height: 22px; }
+        .matrix-next-goal-body {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+        .matrix-next-goal-title {
+            display: block;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: #6d28d9;
+            margin-bottom: 2px;
+        }
+        .matrix-next-goal-copy {
+            margin: 0;
+            font-size: 14px;
+            line-height: 1.45;
+            color: #4c1d95;
+        }
+        .matrix-next-goal-copy strong { color: #4c1d95; font-weight: 700; }
+        .matrix-next-goal-hint {
+            margin: 4px 0 0;
+            font-size: 12px;
+            color: #6d28d9;
+        }
+        .matrix-next-goal-cta {
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #8b5cf6;
+            color: #fff;
+            border: 0;
+            padding: 9px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color .15s ease, transform .15s ease;
+        }
+        .matrix-next-goal-cta:hover { background: #7c3aed; transform: translateY(-1px); }
+        .matrix-next-goal-cta:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.3);
+        }
+        .matrix-next-goal-cta .dashicons { font-size: 16px; width: 16px; height: 16px; }
+        .matrix-next-goal-cta.is-success { background: #10b981; }
+        .matrix-next-goal-cta.is-success:hover { background: #059669; }
+
+        /* Empty-slot CTA: the avatar circle inherits its existing
+           dashed-pill look from matrix-dashboard.css; we layer a
+           cursor + hover tint so it reads as actionable, plus a
+           goal-level pulse synced with the level-badge highlight. */
+        .matrix-tree-node.matrix-tree-node-empty-cta {
+            cursor: pointer;
+            position: relative;
+            transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease, background-color .15s ease;
+        }
+        .matrix-tree-node.matrix-tree-node-empty-cta:hover,
+        .matrix-tree-node.matrix-tree-node-empty-cta:focus-visible {
+            transform: translateY(-1px);
+            border-color: #8b5cf6;
+            background: #f5f3ff;
+            box-shadow: 0 6px 16px -6px rgba(139, 92, 246, 0.35);
+            outline: none;
+        }
+        .matrix-tree-node.matrix-tree-node-empty-cta .tree-node-info small {
+            color: #6d28d9;
+            font-weight: 600;
+        }
+        .matrix-tree-node.matrix-tree-node-empty-cta.is-goal-level {
+            border-color: #8b5cf6;
+            background: #ede9fe;
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+            animation: matrix-empty-cta-pulse 2.4s ease-in-out infinite;
+        }
+        .matrix-tree-node.matrix-tree-node-empty-cta.is-goal-level .tree-node-empty-avatar {
+            background: #8b5cf6;
+            color: #fff;
+        }
+        .matrix-tree-node.matrix-tree-node-empty-cta.is-goal-level .tree-node-empty-avatar .dashicons {
+            color: #fff;
+        }
+        @keyframes matrix-empty-cta-pulse {
+            0%, 100% { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18); }
+            50%      { box-shadow: 0 0 0 7px rgba(139, 92, 246, 0.10); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .matrix-tree-node.matrix-tree-node-empty-cta.is-goal-level { animation: none; }
+        }
+
+        /* Inline "Copied!" toast that floats up from the slot card
+           on a successful clipboard write. Lives inside the slot
+           markup so positioning stays anchored to the trigger
+           regardless of scroll. */
+        .matrix-tree-empty-cta-toast {
+            position: absolute;
+            bottom: 4px;
+            right: 8px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #047857;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 2px 6px;
+            border-radius: 4px;
+            box-shadow: 0 2px 6px -1px rgba(0, 0, 0, 0.12);
+            pointer-events: none;
+        }
+        .matrix-tree-empty-cta-toast[hidden] { display: none; }
+
+        /* Mobile: indented vertical layout makes the next-goal
+           banner stack on the right side awkwardly. Wrap the CTA
+           below the body so the banner stays readable and the
+           button sits on its own line. */
+        @media (max-width: 767px) {
+            .matrix-next-goal {
+                flex-wrap: wrap;
+            }
+            .matrix-next-goal-cta {
+                width: 100%;
+                justify-content: center;
+            }
+        }
+        </style>
+        <?php
+    }
+
+    /**
+     * Inline JS that handles the "Copy invite link" affordance —
+     * shared by the next-goal banner button and every empty-slot
+     * CTA in the tree. Single delegated listener on the body so
+     * both the page-rendered slots and the AJAX-injected lazy-load
+     * slots get the behaviour without rebinding.
+     *
+     * Behaviour:
+     *   - Click / Enter / Space on any [data-action="copy-referral"]
+     *     element triggers a clipboard write of its data-referral-url
+     *     attribute. We use navigator.clipboard.writeText when
+     *     available and fall back to the textarea+execCommand trick
+     *     for older browsers (Safari < 13.1, IE) so the affordance
+     *     still works on the long tail.
+     *   - On success the trigger flashes a "Copied!" indicator for
+     *     1.6 seconds. The next-goal CTA swaps its label inline; an
+     *     empty-slot CTA shows the inline toast pinned inside its
+     *     card. Both auto-revert so the UI doesn't get stuck on the
+     *     success state.
+     *   - On failure (clipboard API blocked, no permissions) we fall
+     *     back to opening the URL in a new tab so the user has a
+     *     manual path to grab the link from the address bar.
+     *   - Empty-slot CTAs ALSO need to play nicely with the
+     *     hover-card from PR #170: the hover-card click handler
+     *     skips empty slots already (it bails on
+     *     matrix-tree-node-empty), so the two affordances can
+     *     coexist on the same DOM tree without fighting over events.
+     *
+     * Why inline rather than enqueued: same single-tab co-location
+     * pattern the rest of the genealogy view's JS uses
+     * (render_lazy_load_script, render_search_script,
+     * render_hovercard_script). Keeps one tab's behaviour beside
+     * its markup; matrix-public.js stays a place for cross-page
+     * helpers.
+     */
+    private function render_referral_copy_script() {
+        // No referral URL means there's nothing to copy and no
+        // CTAs were rendered — skip emitting the script entirely.
+        $referral_url = isset($this->pivot_state['referral_url'])
+            ? (string) $this->pivot_state['referral_url']
+            : '';
+        if ($referral_url === '') {
+            return;
+        }
+        ?>
+        <script>
+        (function() {
+            var STR_COPIED = '<?php echo esc_js(__('Copied!', 'matrix-mlm')); ?>';
+            var STR_COPY   = '<?php echo esc_js(__('Copy invite link', 'matrix-mlm')); ?>';
+            var TOAST_MS   = 1600;
+
+            // Native clipboard with execCommand fallback. Returns a
+            // promise so callers can chain success/error UI without
+            // caring which path was used.
+            function writeToClipboard(text) {
+                if (!text) return Promise.reject(new Error('empty'));
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    return navigator.clipboard.writeText(text);
+                }
+                // Fallback path: temporary off-screen textarea +
+                // execCommand. Required for Safari < 13.1 / IE and
+                // also for non-secure-context loads.
+                return new Promise(function(resolve, reject) {
+                    try {
+                        var ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.style.position = 'fixed';
+                        ta.style.top = '-9999px';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.focus();
+                        ta.select();
+                        var ok = document.execCommand('copy');
+                        document.body.removeChild(ta);
+                        if (ok) resolve(); else reject(new Error('execCommand failed'));
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            }
+
+            function flashSuccess(triggerEl) {
+                // Two flavours of trigger flash, both auto-revert:
+                //
+                //   - .matrix-next-goal-cta carries two child spans;
+                //     we swap visibility so the button label changes
+                //     to "Copied!" inline.
+                //   - .matrix-tree-node-empty-cta has a pinned
+                //     <span class="matrix-tree-empty-cta-toast">
+                //     inside the card; we just unhide it.
+                triggerEl.classList.add('is-success');
+
+                var bannerDefault = triggerEl.querySelector('.matrix-next-goal-cta-default');
+                var bannerSuccess = triggerEl.querySelector('.matrix-next-goal-cta-success');
+                if (bannerDefault && bannerSuccess) {
+                    bannerDefault.hidden = true;
+                    bannerSuccess.hidden = false;
+                }
+
+                var toast = triggerEl.querySelector('.matrix-tree-empty-cta-toast');
+                if (toast) toast.hidden = false;
+
+                setTimeout(function() {
+                    triggerEl.classList.remove('is-success');
+                    if (bannerDefault && bannerSuccess) {
+                        bannerDefault.hidden = false;
+                        bannerSuccess.hidden = true;
+                    }
+                    if (toast) toast.hidden = true;
+                }, TOAST_MS);
+            }
+
+            function handle(triggerEl) {
+                var url = triggerEl.getAttribute('data-referral-url') || '';
+                if (!url) return;
+                writeToClipboard(url)
+                    .then(function() { flashSuccess(triggerEl); })
+                    .catch(function() {
+                        // Last-resort fallback: open in a new tab so
+                        // the user can copy from the address bar.
+                        // Better than a silent no-op when the
+                        // clipboard API is locked down.
+                        try { window.open(url, '_blank', 'noopener'); }
+                        catch (_e) { /* ignore */ }
+                    });
+            }
+
+            // Single body-level delegated listener — catches both
+            // the always-present next-goal banner CTA and every
+            // empty-slot CTA, including the ones AJAX-injected by
+            // the lazy-load endpoint into tree branches that
+            // weren't on the page at first render.
+            document.addEventListener('click', function(e) {
+                var triggerEl = e.target.closest && e.target.closest('[data-action="copy-referral"]');
+                if (!triggerEl) return;
+                e.preventDefault();
+                e.stopPropagation();
+                handle(triggerEl);
+            });
+            document.addEventListener('keydown', function(e) {
+                if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+                var triggerEl = e.target.closest && e.target.closest('[data-action="copy-referral"]');
+                if (!triggerEl) return;
+                // Empty-slot CTAs are role="button" tabindex="0" divs
+                // — Space on a div would otherwise scroll the page,
+                // so swallow the default. The next-goal CTA is a
+                // real <button>, where Space would activate anyway,
+                // but preventDefault is harmless there.
+                e.preventDefault();
+                e.stopPropagation();
+                handle(triggerEl);
+            });
         })();
         </script>
         <?php
