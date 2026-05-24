@@ -176,7 +176,20 @@
             password: form.find('[name="password"]').val(),
             referral_code: form.find('[name="referral_code"]').val()
         }, function(data) {
-            showNotification('Registration successful!', 'success');
+            // Two server responses:
+            //  - {redirect: '/matrix-dashboard'}  -> auto-login flow
+            //    (matrix_mlm_email_verification disabled site-wide)
+            //  - {verify_pending: true, message: '...'}  -> H13 gate:
+            //    user must click the verification link in their email
+            //    before logging in. Show the message and route to the
+            //    login page so the verified flag is the next thing
+            //    they see after clicking through.
+            if (data && data.verify_pending) {
+                showNotification(data.message || 'Account created. Check your email to verify.', 'success');
+                window.location.href = '/matrix-login?registered=1';
+                return;
+            }
+            showNotification(data && data.message ? data.message : 'Registration successful!', 'success');
             window.location.href = data.redirect;
         }, function() {
             btn.prop('disabled', false).text('Create Account');
