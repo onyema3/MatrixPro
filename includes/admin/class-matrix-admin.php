@@ -431,8 +431,27 @@ class Matrix_MLM_Admin {
 
     /**
      * Export E-Pins
+     *
+     * Audit H8: this method is reached only via render_epins(), which
+     * is registered as a submenu page with the manage_matrix_mlm cap,
+     * AND the caller checks a wp_verify_nonce on _wpnonce. So in the
+     * normal flow, only an authenticated admin with that capability
+     * can fire this. The defense-in-depth current_user_can() check
+     * here makes the function safe against any future refactor that
+     * surfaces it through a different route (a custom REST endpoint,
+     * an admin-ajax shortcut, a CLI binding) — E-Pins are bearer
+     * tokens for wallet credit, so leaking even a single batch hands
+     * the attacker free balance equal to the sum of those pins'
+     * amounts.
      */
     private function export_epins($format) {
+        if (!current_user_can('manage_matrix_mlm')) {
+            wp_die(
+                esc_html__('You do not have permission to export E-Pins.', 'matrix-mlm'),
+                esc_html__('Forbidden', 'matrix-mlm'),
+                ['response' => 403]
+            );
+        }
         global $wpdb;
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $status_filter = sanitize_text_field($_GET['pin_status'] ?? '');
