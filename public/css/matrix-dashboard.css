@@ -1695,3 +1695,81 @@
         max-width: none;
     }
 }
+
+
+/* ==========================================================================
+   D3 Genealogy — Real-time updates (polling + new-referral pulse)
+   --------------------------------------------------------------------------
+   Visual celebration for nodes that arrive via the polling endpoint
+   (fetch_new_descendants). The JS adds `mtx-node-new` to entering
+   <g> elements and removes it after PULSE_DURATION_MS (~4s); the
+   keyframes here drive a soft green "ring pulse" around the card
+   body for two cycles, then settle. The colour matches
+   .mtx-node-direct's success-green palette so the highlight reads
+   as "good news arrived" without introducing a new accent hue.
+
+   Why drop-shadow (and not box-shadow): we're targeting an SVG
+   <rect>, where box-shadow has no effect; filter: drop-shadow is
+   the SVG-native equivalent and respects the rect's rounded
+   corners cleanly across browsers.
+   ========================================================================== */
+
+.mtx-node-new .mtx-node-body {
+    /* Two 1.4s cycles + a small fade. Kept short so the pulse
+     * registers as "look here" without becoming distracting on a
+     * wide tree where multiple new nodes might arrive together. */
+    animation: mtx-node-pulse 1.4s ease-out 0s 2;
+    transform-origin: center center;
+}
+
+@keyframes mtx-node-pulse {
+    0% {
+        filter: drop-shadow(0 0 0 rgba(16, 185, 129, 0));
+    }
+    35% {
+        /* Same green as --matrix-success at 55% alpha — strong
+         * enough to read on the existing card backgrounds without
+         * dominating the page. */
+        filter: drop-shadow(0 0 18px rgba(16, 185, 129, 0.55));
+    }
+    100% {
+        filter: drop-shadow(0 0 0 rgba(16, 185, 129, 0));
+    }
+}
+
+/*
+ * Success-flavoured variant of the existing flash toast.
+ * Reuses the .matrix-genealogy-d3-flash sizing/positioning rules
+ * above and only swaps the colour story. Members thus see the
+ * same shape & lifetime for both error ("could not load deeper
+ * levels") and success ("Alice just joined!") feedback — a tiny
+ * but consistent UX detail.
+ */
+.matrix-genealogy-d3-flash.matrix-genealogy-d3-flash--success {
+    background: var(--matrix-success);
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+}
+
+/*
+ * Reduced-motion fallback. Members who've opted out of motion at
+ * the OS level shouldn't see a 1.4s drop-shadow pulse — that's
+ * exactly the kind of effect the preference exists to silence.
+ * We keep a brief background tint so the new-arrival cue still
+ * lands visually, but no animated pulse.
+ *
+ * Mirrors the existing prefers-reduced-motion blocks already in
+ * this file (matrix-tree-spin, mtx-details-in) so we degrade
+ * consistently across every animated surface.
+ */
+@media (prefers-reduced-motion: reduce) {
+    .mtx-node-new .mtx-node-body {
+        animation: none;
+        /* Soft mint tint, then transitions back to whatever the
+         * relationship-class fill is on the next render. The
+         * 1.4s transition matches the would-have-been animation
+         * duration so the visual "settle time" feels equivalent.
+         */
+        fill: #ecfdf5;
+        transition: fill 1.4s ease-out;
+    }
+}

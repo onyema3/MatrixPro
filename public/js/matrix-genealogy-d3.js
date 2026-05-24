@@ -247,6 +247,14 @@
 
         canvas.setAttribute('data-mounted', '1');
 
+        // ---- Real-time polling ----
+        // Start the new-referral poll loop after first paint so the
+        // initial render isn't competing for resources with the
+        // first AJAX round-trip. The loop is self-rescheduling and
+        // shuts itself down implicitly when the page navigates
+        // away (the closure references die with the canvas).
+        startPolling();
+
         // ==============================================================
         // Layout + render.
         // ==============================================================
@@ -303,11 +311,20 @@
             var nodeEnter = nodeSel.enter()
                 .append('g')
                 .attr('class', function (d) {
-                    return [
+                    var classes = [
                         'mtx-node',
                         'mtx-node-' + (d.data.relationship || 'spillover'),
                         d.data.user_id ? 'mtx-node-clickable' : 'mtx-node-empty'
-                    ].join(' ');
+                    ];
+                    // Polling-grafted nodes carry a transient _isNew
+                    // flag; tagging them with `mtx-node-new` triggers
+                    // the CSS pulse keyframe defined in
+                    // matrix-dashboard.css. The flag is cleared by
+                    // schedulePulseClear() after PULSE_DURATION_MS so
+                    // a later re-render doesn't re-pulse the same
+                    // node.
+                    if (d.data._isNew) classes.push('mtx-node-new');
+                    return classes.join(' ');
                 })
                 .attr('transform', function (d) { return 'translate(' + d.x + ',' + d.y + ')'; })
                 .style('opacity', 0)
@@ -408,6 +425,25 @@
                 .transition().duration(animate ? TRANSITION_MS : 0)
                 .style('opacity', 1)
                 .attr('transform', function (d) { return 'translate(' + d.x + ',' + d.y + ')'; });
+
+            // Refresh meta line text on every redraw so the
+            // polling-driven total_downline updates ("3 downline"
+            // → "4 downline") tick visibly on the parent cards
+            // when a new descendant is grafted in. Without this,
+            // the meta would stay frozen at whatever the bootstrap
+            // emitted — defeating the whole "watch your tree
+            // grow live" intent.
+            nodeEnter.merge(nodeSel)
+                .select('text.mtx-node-meta')
+                .text(function (d) {
+                    if (!d.data.user_id) return '';
+                    var parts = [];
+                    if (d.data.level) {
+                        parts.push((i18n.level || 'Level') + ' ' + d.data.level);
+                    }
+                    parts.push(d.data.total_downline + ' ' + (i18n.downline || 'downline'));
+                    return parts.join(' \u00b7 ');
+                });
 
             // Refresh expand badges on existing nodes — important
             // because a node we previously rendered an expand badge
@@ -934,6 +970,335 @@
 
         function escapeAttr(s) {
             return escapeHtml(s);
+        }
+
+        // ==============================================================
+        // Real-time polling — fetch_new_descendants every ~45s.
+        //
+        // Detail: the server returns the full set of descendants that
+        // joined since the last poll's `server_time`, scoped to the
+        // currently-displayed root and gated by the same
+        // user_can_view_position auth check the rest of the genealogy
+        // endpoints use. We graft each new node into the local
+        // `dataRoot` keyed by parent_id, refresh ancestor
+        // total_downline counts, and re-run layoutAndRender(true,
+        // false). The CSS pulse keyframe (`.mtx-node-new`, defined in
+        // matrix-dashboard.css) handles the visual celebration.
+        //
+        // Lifecycle guards:
+        //   - Pause when document.visibilityState === 'hidden' so a
+        //     buried tab doesn't keep hammering admin-ajax for nothing.
+        //   - Pause when navigator.onLine === false to avoid futile
+        //     fetches that would just throw.
+        //   - Single in-flight guard: never two polls overlapping.
+        //   - On visibility/online restore: fire one immediate poll so
+        //     a member returning to the tab gets caught up without
+        //     waiting for the next interval.
+        //
+        // The `since` value we send is always the previous response's
+        // server_time, never a client clock — keeps the contract free
+        // of clock-skew ambiguity. The server caps `since` to the last
+        // 24 hours regardless.
+        // ==============================================================
+        var POLL_INTERVAL_MS    = 45000;          // 45s — middle of the
+                                                  // 30–60s "feels live"
+                                                  // band without
+                                                  // hammering the server.
+        var POLL_REQUEST_TIMEOUT_MS = 15000;
+        var PULSE_DURATION_MS   = 4000;           // matches the CSS
+                                                  // keyframe duration
+                                                  // (1.4s × 2 cycles +
+                                                  // a small grace).
+
+        var pollTimer       = null;
+        var pollInFlight    = false;
+        var lastServerTime  = 0;
+        var documentVisible = !document.hidden;
+
+        function startPolling() {
+            // Defensive: if the bootstrap is missing the fields we
+            // need (root position id, plan id), there's nothing to
+            // poll against. Fail open — the static tree still
+            // works, members just won't get live updates.
+            if (!bootstrap || !bootstrap.tree || !bootstrap.tree.id || !bootstrap.plan_id) {
+                return;
+            }
+
+            // Seed `since` to ~60s before now so the first poll
+            // catches anyone who joined in the gap between the
+            // server-side page render and the first poll firing.
+            // Subsequent polls overwrite this with the response's
+            // server_time, which is the authoritative tick.
+            lastServerTime = Math.floor(Date.now() / 1000) - 60;
+
+            document.addEventListener('visibilitychange', onVisibilityChange);
+            window.addEventListener('online', onConnectivityRestored);
+
+            pollTimer = setTimeout(pollTick, POLL_INTERVAL_MS);
+        }
+
+        function pollTick() {
+            pollTimer = null;
+
+            // Skip-but-reschedule when conditions aren't right. We
+            // don't drop the loop entirely on a single skip because
+            // the conditions can flip mid-interval (member
+            // unhides the tab) and we want the next interval to
+            // re-evaluate naturally.
+            if (!documentVisible
+                || (typeof navigator !== 'undefined' && navigator.onLine === false)
+                || pollInFlight) {
+                pollTimer = setTimeout(pollTick, POLL_INTERVAL_MS);
+                return;
+            }
+
+            pollInFlight = true;
+            pollNewDescendants()
+                .catch(function (err) {
+                    // Silent retry — a transient network blip
+                    // shouldn't surface a toast to the member.
+                    // The error flash is reserved for explicit
+                    // failures that block functionality
+                    // (lazy-expand failures, etc.). Polling
+                    // failures degrade gracefully into "you'll
+                    // see it on next reload".
+                    if (window.console && console.warn) {
+                        console.warn('[matrix-genealogy-d3] poll failed', err);
+                    }
+                })
+                .then(function () {
+                    pollInFlight = false;
+                    pollTimer = setTimeout(pollTick, POLL_INTERVAL_MS);
+                });
+        }
+
+        function pollNewDescendants() {
+            var endpoint = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
+            var nonce    = (window.matrixMLM && window.matrixMLM.nonce) || '';
+            if (!endpoint || !nonce) return Promise.resolve();
+
+            var body = new FormData();
+            body.append('action', 'matrix_mlm_action');
+            body.append('matrix_action', 'fetch_new_descendants');
+            body.append('nonce', nonce);
+            body.append('plan_id',     String(bootstrap.plan_id));
+            body.append('position_id', String(bootstrap.tree.id));
+            body.append('since',       String(lastServerTime));
+
+            // AbortController-based timeout so a slow-network
+            // poll doesn't pile up across intervals. Older
+            // browsers without AbortController just skip the
+            // timeout — fetch's own implicit timeout will catch
+            // pathological cases.
+            var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            var timeoutId = null;
+            if (ctrl) {
+                timeoutId = setTimeout(function () { ctrl.abort(); }, POLL_REQUEST_TIMEOUT_MS);
+            }
+
+            return fetch(endpoint, {
+                method: 'POST',
+                body: body,
+                credentials: 'same-origin',
+                signal: ctrl ? ctrl.signal : undefined
+            })
+            .then(function (r) {
+                if (timeoutId) clearTimeout(timeoutId);
+                return r.json();
+            })
+            .then(function (response) {
+                if (!response || !response.success || !response.data) return;
+                applyPollResponse(response.data);
+            });
+        }
+
+        function applyPollResponse(data) {
+            // Advance the polling cursor BEFORE any work — even if
+            // the graft logic throws, the next poll should still
+            // pick up where this one was meant to leave off, not
+            // re-fetch the same window. The server already capped
+            // server_time at request time, so this can't drift
+            // forward.
+            if (typeof data.server_time === 'number' && data.server_time > 0) {
+                lastServerTime = data.server_time;
+            }
+
+            var newNodes      = Array.isArray(data.new_nodes) ? data.new_nodes : [];
+            var parentUpdates = Array.isArray(data.updated_parents) ? data.updated_parents : [];
+
+            if (!newNodes.length && !parentUpdates.length) return;
+
+            // Build a fast id→node map over the live tree. Cheaper
+            // than running selectAll().filter() for every graft on
+            // a wide matrix.
+            var nodeIndex = indexNodesById(dataRoot);
+
+            // Apply parent updates first — even when no new visible
+            // nodes are returned (e.g. the descendant joined under
+            // an unexpanded branch), the ancestor counts still tick
+            // up and the meta-line refresh in layoutAndRender will
+            // surface the change.
+            parentUpdates.forEach(function (p) {
+                var n = nodeIndex[p.id];
+                if (n) {
+                    var fresh = Number(p.total_downline);
+                    if (!isNaN(fresh)) n.total_downline = fresh;
+                }
+            });
+
+            var insertedCount = 0;
+            var insertedRows  = [];
+            newNodes.forEach(function (raw) {
+                var id = Number(raw.id) || 0;
+                if (id <= 0) return;
+
+                if (nodeIndex[id]) {
+                    // Race: this node already arrived via a
+                    // lazy-expand that fired between the server
+                    // building the response and the client
+                    // applying it. Treat the poll's data as the
+                    // freshest source for total_downline only —
+                    // never overwrite the local children array
+                    // (we may have additional descendants loaded
+                    // that this poll doesn't include).
+                    var existing = nodeIndex[id];
+                    var fresh    = Number(raw.total_downline);
+                    if (!isNaN(fresh)) existing.total_downline = fresh;
+                    return;
+                }
+
+                var parentId = raw.parent_id ? Number(raw.parent_id) : 0;
+                var parent   = parentId > 0 ? nodeIndex[parentId] : null;
+                if (!parent) {
+                    // Parent isn't on screen — sits below the
+                    // currently-rendered depth (e.g. a deep
+                    // spillover landed under a branch we haven't
+                    // expanded). The ancestor parent_updates we
+                    // already applied will surface the bumped
+                    // count on the closest visible ancestor; we
+                    // skip the per-node graft to avoid creating
+                    // an orphan.
+                    return;
+                }
+
+                if (!Array.isArray(parent.children)) parent.children = [];
+
+                var grafted = {
+                    id:             id,
+                    user_id:        Number(raw.user_id || 0),
+                    sponsor_id:     raw.sponsor_id ? Number(raw.sponsor_id) : null,
+                    username:       String(raw.username || ('User #' + (raw.user_id || 0))),
+                    level:          Number(raw.level || 0),
+                    total_downline: Number(raw.total_downline || 0),
+                    status:         String(raw.status || ''),
+                    relationship:   String(raw.relationship || 'spillover'),
+                    children:       [],
+                    _isNew:         true
+                };
+                parent.children.push(grafted);
+                nodeIndex[id] = grafted;
+                insertedCount++;
+                insertedRows.push(raw);
+            });
+
+            if (insertedCount > 0 || parentUpdates.length > 0) {
+                // Animate the relayout when there's a visible new
+                // node — the smooth shift makes the pulse feel like
+                // a natural arrival rather than a snap. For
+                // count-only updates (parents bumped but no new
+                // visible node), skip the transition: the meta line
+                // text just updates in place, and animating
+                // identical positions would be a confusing no-op.
+                layoutAndRender(insertedCount > 0, false);
+            }
+
+            if (insertedCount > 0) {
+                announceNewMembers(insertedCount, insertedRows);
+                schedulePulseClear();
+            }
+        }
+
+        // Announce N new members via a success-flavoured toast pinned
+        // at the top of the canvas. Mirrors the error toast's lifetime
+        // (~4.5s) so the two feel like the same affordance with
+        // different semantics.
+        function announceNewMembers(count, rows) {
+            // Reuse the same DOM slot as the error flash so the
+            // newest message always wins — no stacking.
+            var existing = canvas.querySelector('.matrix-genealogy-d3-flash');
+            if (existing) existing.parentNode.removeChild(existing);
+
+            var template;
+            var msg;
+            if (count === 1) {
+                template = i18n.new_referral_one || '%s just joined your tree!';
+                msg = template.replace(/%s/g, (rows[0] && rows[0].username) ? rows[0].username : 'A new member');
+            } else {
+                template = i18n.new_referral_many || '%d new referrals just joined your tree!';
+                msg = template.replace(/%d/g, String(count));
+            }
+
+            var el = document.createElement('div');
+            el.className = 'matrix-genealogy-d3-flash matrix-genealogy-d3-flash--success';
+            // role=status + aria-live=polite means screen readers
+            // will announce the toast without interrupting whatever
+            // the member is reading — same dopamine for AT users.
+            el.setAttribute('role', 'status');
+            el.setAttribute('aria-live', 'polite');
+            el.textContent = msg;
+            canvas.appendChild(el);
+
+            setTimeout(function () {
+                if (el.parentNode) el.parentNode.removeChild(el);
+            }, 4500);
+        }
+
+        // Clear `_isNew` flags after the pulse animation completes
+        // and synchronise the SVG class list. Without this step a
+        // future re-render (lazy expand, resize, another poll) would
+        // re-pulse the same nodes, which would feel chaotic.
+        function schedulePulseClear() {
+            setTimeout(function () {
+                walkData(dataRoot, function (n) {
+                    if (n && n._isNew) delete n._isNew;
+                });
+                nodesLayer.selectAll('g.mtx-node.mtx-node-new')
+                    .classed('mtx-node-new', false);
+            }, PULSE_DURATION_MS);
+        }
+
+        function walkData(node, fn) {
+            if (!node) return;
+            fn(node);
+            if (node.children && node.children.length) {
+                for (var i = 0; i < node.children.length; i++) {
+                    walkData(node.children[i], fn);
+                }
+            }
+        }
+
+        function indexNodesById(root) {
+            var idx = Object.create(null);
+            walkData(root, function (n) {
+                if (n && n.id) idx[n.id] = n;
+            });
+            return idx;
+        }
+
+        function onVisibilityChange() {
+            documentVisible = !document.hidden;
+            if (documentVisible && !pollTimer && !pollInFlight) {
+                // Fire immediately so a member returning from
+                // another tab gets the "your tree grew while you
+                // were gone" hit without a 45s wait.
+                pollTimer = setTimeout(pollTick, 0);
+            }
+        }
+
+        function onConnectivityRestored() {
+            if (documentVisible && !pollTimer && !pollInFlight) {
+                pollTimer = setTimeout(pollTick, 0);
+            }
         }
 
         // Re-fit on window resize so the tree stays usable when
