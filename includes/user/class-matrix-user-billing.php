@@ -17,6 +17,33 @@ class Matrix_MLM_User_Billing {
         $billing = new Matrix_MLM_Fintava_Billing();
         $history = $billing->get_user_history($user_id, null, 10);
         $sub_tab = sanitize_text_field($_GET['service'] ?? 'airtime');
+
+        // Per-category visibility — admins can disable individual
+        // categories (e.g. pause Electricity during a disco outage)
+        // via Settings -> Bill Payments. Build the visible list once
+        // here and reuse it for both the sub-tab nav and the
+        // current-tab fall-through, so a category that was disabled
+        // mid-session can't render an orphan form.
+        $categories = [
+            'airtime'     => __('Airtime', 'matrix-mlm'),
+            'data'        => __('Data', 'matrix-mlm'),
+            'cable'       => __('Cable TV', 'matrix-mlm'),
+            'electricity' => __('Electricity', 'matrix-mlm'),
+        ];
+        $enabled_categories = [];
+        foreach ($categories as $slug => $label) {
+            if (Matrix_MLM_Fintava_Billing::is_category_enabled($slug)) {
+                $enabled_categories[$slug] = $label;
+            }
+        }
+        $all_disabled = empty($enabled_categories);
+        // If the requested sub_tab is disabled (or unknown), fall
+        // through to the first enabled category. Mirrors the
+        // existing precedent on dashboard tabs where retired slugs
+        // fall through to overview rather than rendering empty.
+        if (!isset($enabled_categories[$sub_tab])) {
+            $sub_tab = $all_disabled ? '' : array_key_first($enabled_categories);
+        }
         // Matrix_MLM_Fintava_Billing::MIN_AMOUNT is the floor every
         // upstream call enforces (see validate_amount), so use it as
         // the threshold for the "your balance is too low" inline
@@ -61,23 +88,31 @@ class Matrix_MLM_User_Billing {
         </div>
 
         <!-- Service Tabs -->
-        <div class="matrix-billing-tabs">
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=billing&service=airtime'); ?>" class="<?php echo $sub_tab === 'airtime' ? 'active' : ''; ?>"><?php _e('Airtime', 'matrix-mlm'); ?></a>
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=billing&service=data'); ?>" class="<?php echo $sub_tab === 'data' ? 'active' : ''; ?>"><?php _e('Data', 'matrix-mlm'); ?></a>
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=billing&service=cable'); ?>" class="<?php echo $sub_tab === 'cable' ? 'active' : ''; ?>"><?php _e('Cable TV', 'matrix-mlm'); ?></a>
-            <a href="<?php echo home_url('/matrix-dashboard/?tab=billing&service=electricity'); ?>" class="<?php echo $sub_tab === 'electricity' ? 'active' : ''; ?>"><?php _e('Electricity', 'matrix-mlm'); ?></a>
-        </div>
+        <?php if ($all_disabled): ?>
+            <div class="matrix-alert matrix-alert-warning" style="margin-top:8px;">
+                <?php _e('Bill payments are temporarily unavailable. Please check back later or contact support.', 'matrix-mlm'); ?>
+            </div>
+        <?php else: ?>
+            <div class="matrix-billing-tabs">
+                <?php foreach ($enabled_categories as $slug => $label): ?>
+                    <a href="<?php echo esc_url(home_url('/matrix-dashboard/?tab=billing&service=' . $slug)); ?>" class="<?php echo $sub_tab === $slug ? 'active' : ''; ?>"><?php echo esc_html($label); ?></a>
+                <?php endforeach; ?>
+            </div>
 
-        <div class="matrix-form-card">
-        <?php
-        switch ($sub_tab) {
-            case 'data': $this->render_data(); break;
-            case 'cable': $this->render_cable(); break;
-            case 'electricity': $this->render_electricity(); break;
-            default: $this->render_airtime(); break;
-        }
-        ?>
-        </div>
+            <div class="matrix-form-card">
+            <?php
+            switch ($sub_tab) {
+                case 'data': $this->render_data(); break;
+                case 'cable': $this->render_cable(); break;
+                case 'electricity': $this->render_electricity(); break;
+                case 'airtime':
+                default:
+                    $this->render_airtime();
+                    break;
+            }
+            ?>
+            </div>
+        <?php endif; ?>
 
         <!-- Transaction History -->
         <?php if (!empty($history)): ?>
