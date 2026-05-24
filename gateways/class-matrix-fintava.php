@@ -2002,7 +2002,7 @@ class Matrix_MLM_Fintava {
 
         wp_send_json_success([
             'message' => sprintf(
-                __('Transfer of %s%s initiated to %s (%s). It will be processed shortly.', 'matrix-mlm'),
+                __('Transfer of %s%s to %s (%s) sent instantly. Funds land in the recipient account within seconds.', 'matrix-mlm'),
                 $currency_symbol, number_format($amount, 2), $account_name, $bank_name
             ),
             'reference' => $reference,
