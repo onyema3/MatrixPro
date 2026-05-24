@@ -398,8 +398,24 @@ class Matrix_MLM_Admin_Settings {
         </table>
     <?php }
 
-    private function render_appearance_tab() { ?>
+    private function render_appearance_tab() {
+        $login_logo_url = get_option('matrix_mlm_login_logo_url', '');
+        $login_logo_id  = get_option('matrix_mlm_login_logo_id', '');
+        ?>
         <table class="form-table">
+            <tr><th><?php _e('Login Page Logo', 'matrix-mlm'); ?></th>
+                <td>
+                    <div class="matrix-media-uploader" data-target="matrix_mlm_login_logo">
+                        <div class="matrix-media-preview" style="margin-bottom:10px;<?php echo $login_logo_url ? '' : 'display:none;'; ?>">
+                            <img src="<?php echo esc_url($login_logo_url); ?>" alt="" style="max-height:80px;max-width:240px;border:1px solid #ddd;padding:6px;background:#fff;border-radius:4px;">
+                        </div>
+                        <input type="hidden" name="matrix_mlm_login_logo_url" class="matrix-media-url" value="<?php echo esc_attr($login_logo_url); ?>">
+                        <input type="hidden" name="matrix_mlm_login_logo_id"  class="matrix-media-id"  value="<?php echo esc_attr($login_logo_id); ?>">
+                        <button type="button" class="button matrix-media-upload"><?php _e('Upload / Select Logo', 'matrix-mlm'); ?></button>
+                        <button type="button" class="button matrix-media-remove" style="<?php echo $login_logo_url ? '' : 'display:none;'; ?>"><?php _e('Remove', 'matrix-mlm'); ?></button>
+                    </div>
+                    <p class="description"><?php _e('Logo shown above the login form. Recommended height: 80px.', 'matrix-mlm'); ?></p>
+                </td></tr>
             <tr><th><?php _e('Primary Color', 'matrix-mlm'); ?></th>
                 <td><input type="text" name="matrix_mlm_primary_color" class="matrix-color-picker" value="<?php echo esc_attr(get_option('matrix_mlm_primary_color', '#4f46e5')); ?>"></td></tr>
             <tr><th><?php _e('Secondary Color', 'matrix-mlm'); ?></th>
@@ -609,7 +625,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
                 break;
             case 'appearance':
-                $settings = ['matrix_mlm_primary_color', 'matrix_mlm_secondary_color', 'matrix_mlm_custom_css'];
+                $settings = ['matrix_mlm_primary_color', 'matrix_mlm_secondary_color', 'matrix_mlm_custom_css', 'matrix_mlm_login_logo_url', 'matrix_mlm_login_logo_id'];
                 break;
             case 'sms':
                 $settings = ['matrix_mlm_sms_provider', 'matrix_mlm_sms_api_key', 'matrix_mlm_sms_api_secret', 'matrix_mlm_sms_sender_id'];
@@ -644,6 +660,8 @@ class Matrix_MLM_Admin_Settings {
             $value = isset($_POST[$setting]) ? $_POST[$setting] : '';
             if (in_array($setting, ['matrix_mlm_custom_css', 'matrix_mlm_livechat_code'])) {
                 $value = wp_unslash($value);
+            } elseif (in_array($setting, ['matrix_mlm_login_logo_url'])) {
+                $value = esc_url_raw(wp_unslash($value));
             } else {
                 $value = sanitize_text_field($value);
             }
