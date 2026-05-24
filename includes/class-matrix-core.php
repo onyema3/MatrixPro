@@ -777,8 +777,21 @@ class Matrix_MLM_Core {
     }
 
     /**
-     * Process a "Matrix Transfers" (manual admin-approved withdrawal)
-     * request from the consolidated Wallet page.
+     * Process a "Matrix Transfers" (instant Matrix wallet → external
+     * bank withdrawal) request from the consolidated Wallet page.
+     *
+     * History note: this flow used to insert rows with status='pending'
+     * and rely on an admin clicking Approve in the Withdrawals admin
+     * page before the user got a final confirmation. The admin click,
+     * in practice, only flipped a status column and emailed the user —
+     * it never actually moved money on a payment rail (the operator
+     * settled the bank credit out-of-band through their own banking
+     * channel regardless of when the click happened). The pending
+     * gate was therefore pure UI friction from the user's POV. We
+     * now write status='approved' at submit time and surface an
+     * "instant" confirmation. The operator's off-platform reconciliation
+     * workflow is unchanged — they read approved-status rows now
+     * instead of pending ones.
      *
      * Distinct from process_transfer (user-to-user, internal) and
      * Matrix_MLM_Fintava::ajax_initiate_transfer (Fintava virtual
@@ -940,7 +953,13 @@ class Matrix_MLM_Core {
             'currency'        => $currency_code,
             'account_details' => $account_label,
             'admin_note'      => '',
-            'status'          => 'pending',
+            // Auto-approved at submit. Matrix transfers are instant and
+            // don't require an admin gate — see the docblock for the
+            // rationale. The legacy 'pending' status is preserved on the
+            // schema for any historical rows that pre-date this change,
+            // and the admin Approve / Reject UI is untouched so those
+            // legacy rows can still be actioned manually.
+            'status'          => 'approved',
         ]);
         if ($insert_result === false) {
             $wpdb->query('ROLLBACK');
@@ -955,17 +974,16 @@ class Matrix_MLM_Core {
 
         $wpdb->query('COMMIT');
 
-        // Email the user a "request received" confirmation. The
-        // 'pending' status is what the existing
-        // send_withdrawal_notification helper expects (it's also
-        // called on approve/reject from the admin side with the
-        // matching status). Send AFTER COMMIT so a transient SMTP
-        // failure can't roll back the money movement; the request
-        // is already real and queued.
-        Matrix_MLM_Notifications::send_withdrawal_notification($user_id, $amount, 'pending');
+        // Email the user an "approved" confirmation. The notification
+        // helper is the same one the legacy admin Approve flow called,
+        // so the email body wording (template: emails/withdrawal.php)
+        // applies cleanly. Send AFTER COMMIT so a transient SMTP
+        // failure can't roll back the money movement; the request is
+        // already real and approved.
+        Matrix_MLM_Notifications::send_withdrawal_notification($user_id, $amount, 'approved');
 
         wp_send_json_success([
-            'message' => __('Bank transfer request submitted. Your Matrix wallet has been debited; the bank account will be paid out after admin approval.', 'matrix-mlm'),
+            'message' => __('Matrix transfer processed instantly. Your Matrix wallet has been debited and the bank account is on its way to being credited.', 'matrix-mlm'),
         ]);
     }
 
