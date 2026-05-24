@@ -135,26 +135,43 @@ class Matrix_MLM_Flutterwave {
 
     /**
      * Handle Flutterwave webhook
+     *
+     * Security:
+     * - Signature verification is MANDATORY. If no webhook_hash is
+     *   configured, all webhook calls are rejected with 401.
+     * - Uses hash_equals() to avoid timing-attack leaks.
+     * - complete_deposit() validates that the verified gateway amount and
+     *   currency match the server-stored deposit row before crediting.
      */
     public function handle_webhook($request) {
         $payload = $request->get_body();
         $signature = $request->get_header('verif-hash');
 
-        // Verify webhook hash
         $gateway_params = $this->get_gateway_params();
         $webhook_hash = $gateway_params['webhook_hash'] ?? '';
 
-        if ($webhook_hash && $signature !== $webhook_hash) {
-            return new WP_REST_Response(['status' => 'error'], 401);
+        // Mandatory signature: refuse to process unsigned/unconfigured webhooks.
+        if (empty($webhook_hash) || !is_string($signature) || $signature === '') {
+            error_log('[Matrix Flutterwave Webhook] Rejected: missing webhook_hash or verif-hash header');
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Webhook signature required'], 401);
+        }
+
+        // Flutterwave's verif-hash is a shared secret echoed back as-is, not an
+        // HMAC of the payload. Use a constant-time compare to avoid byte-by-byte
+        // timing leaks.
+        if (!hash_equals((string) $webhook_hash, $signature)) {
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid signature'], 401);
         }
 
         $event = json_decode($payload, true);
+        if (!is_array($event)) {
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid payload'], 400);
+        }
 
         if (isset($event['event']) && $event['event'] === 'charge.completed') {
-            $data = $event['data'];
-            if ($data['status'] === 'successful') {
-                $tx_ref = $data['tx_ref'];
-                $this->complete_deposit($tx_ref, $data);
+            $data = $event['data'] ?? [];
+            if (isset($data['status']) && $data['status'] === 'successful' && !empty($data['tx_ref'])) {
+                $this->complete_deposit($data['tx_ref'], $data);
             }
         }
 
@@ -162,7 +179,11 @@ class Matrix_MLM_Flutterwave {
     }
 
     /**
-     * Complete deposit after successful payment
+     * Complete deposit after successful payment.
+     *
+     * Server-side amount and currency validation: the gateway-verified
+     * payment is compared against the deposit row stored at initialization
+     * time. Mismatches are recorded (status='disputed') and never credited.
      */
     private function complete_deposit($reference, $payment_data) {
         global $wpdb;
@@ -176,17 +197,55 @@ class Matrix_MLM_Flutterwave {
             return;
         }
 
-        // Update deposit status
-        $wpdb->update(
+        $paid_amount = isset($payment_data['amount']) ? floatval($payment_data['amount']) : 0.0;
+        $expected_amount = floatval($deposit->amount);
+        $paid_currency = isset($payment_data['currency']) ? strtoupper((string) $payment_data['currency']) : '';
+        $expected_currency = strtoupper((string) ($deposit->currency ?? get_option('matrix_mlm_currency', 'NGN')));
+
+        // Allow a 1-kobo tolerance for floating-point fuzz only.
+        if ($paid_amount + 0.01 < $expected_amount
+            || ($paid_currency !== '' && $paid_currency !== $expected_currency)) {
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_deposits',
+                [
+                    'status' => 'disputed',
+                    'gateway_response' => json_encode([
+                        'reason' => 'amount_or_currency_mismatch',
+                        'expected_amount' => $expected_amount,
+                        'paid_amount' => $paid_amount,
+                        'expected_currency' => $expected_currency,
+                        'paid_currency' => $paid_currency,
+                        'payment_data' => $payment_data,
+                    ]),
+                ],
+                ['id' => $deposit->id]
+            );
+            error_log(sprintf(
+                '[Matrix Flutterwave Webhook] Disputed deposit #%d ref=%s: expected %.2f %s got %.2f %s',
+                $deposit->id, $reference, $expected_amount, $expected_currency, $paid_amount, $paid_currency
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'flutterwave_deposit_disputed',
+                sprintf(__('Flutterwave deposit disputed (Ref: %s) - amount/currency mismatch', 'matrix-mlm'), $reference)
+            );
+            return;
+        }
+
+        // Conditional update: only the first webhook delivery wins.
+        $updated = $wpdb->update(
             $wpdb->prefix . 'matrix_deposits',
             [
                 'status' => 'completed',
-                'gateway_response' => json_encode($payment_data)
+                'gateway_response' => json_encode($payment_data),
             ],
-            ['id' => $deposit->id]
+            ['id' => $deposit->id, 'status' => 'pending']
         );
 
-        // Credit user wallet
+        if ($updated !== 1) {
+            // A concurrent delivery already completed this deposit.
+            return;
+        }
+
         $wallet = new Matrix_MLM_Wallet();
         $wallet->credit(
             $deposit->user_id,
@@ -196,7 +255,6 @@ class Matrix_MLM_Flutterwave {
             $reference
         );
 
-        // Send notification
         Matrix_MLM_Notifications::send_deposit_notification($deposit->user_id, $deposit->amount, 'completed');
     }
 

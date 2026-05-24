@@ -2462,12 +2462,18 @@ class Matrix_MLM_Fintava {
         $payload = $request->get_body();
         $signature = $request->get_header('x-fintava-signature');
 
+        // Mandatory signature: refuse to process unsigned/unconfigured webhooks.
+        // Without this gate, anyone on the internet can forge deposit / wallet-
+        // funding events and credit arbitrary amounts to any user's wallet.
         $webhook_secret = get_option('matrix_mlm_fintava_webhook_secret', '');
-        if (!empty($webhook_secret)) {
-            $computed_signature = hash_hmac('sha512', $payload, $webhook_secret);
-            if (!hash_equals($computed_signature, $signature ?? '')) {
-                return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid signature'], 401);
-            }
+        if (empty($webhook_secret) || !is_string($signature) || $signature === '') {
+            error_log('[Matrix Fintava Webhook] Rejected: missing webhook secret or signature header');
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Webhook signature required'], 401);
+        }
+
+        $computed_signature = hash_hmac('sha512', $payload, $webhook_secret);
+        if (!hash_equals($computed_signature, $signature)) {
+            return new WP_REST_Response(['status' => 'error', 'message' => 'Invalid signature'], 401);
         }
 
         $event = json_decode($payload, true);
@@ -2602,10 +2608,37 @@ class Matrix_MLM_Fintava {
         }
         $sender_name = $data['sender_name'] ?? $data['sender'] ?? __('External Wallet', 'matrix-mlm');
         $narration = $data['narration'] ?? $data['description'] ?? '';
-        $currency = $data['currency'] ?? 'NGN';
+        $currency = strtoupper((string) ($data['currency'] ?? 'NGN'));
 
         if (empty($reference) || $amount <= 0 || empty($recipient_account)) {
             error_log('[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2: Missing required data');
+            return;
+        }
+
+        // Currency must match site configuration. Mismatched currency suggests
+        // a forged payload (or a misconfigured upstream).
+        $expected_currency = strtoupper((string) get_option('matrix_mlm_currency', 'NGN'));
+        if ($currency !== $expected_currency) {
+            error_log(sprintf(
+                '[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2 rejected: currency=%s expected=%s ref=%s',
+                $currency, $expected_currency, $reference
+            ));
+            return;
+        }
+
+        // Sanity cap: refuse a single inbound credit over the configured ceiling.
+        // Default ceiling is intentionally generous; site owners can lower it.
+        $max_inbound = floatval(get_option('matrix_mlm_fintava_max_inbound_amount', 10000000));
+        if ($max_inbound > 0 && $amount > $max_inbound) {
+            error_log(sprintf(
+                '[Matrix Fintava Webhook] wallet_to_wallet_transfer_v2 rejected: amount %.2f exceeds cap %.2f ref=%s',
+                $amount, $max_inbound, $reference
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_inbound_over_cap',
+                sprintf(__('Fintava inbound transfer exceeds cap and was held: %.2f (Ref: %s, Account: %s)', 'matrix-mlm'),
+                    $amount, $reference, $recipient_account)
+            );
             return;
         }
 
@@ -2690,10 +2723,35 @@ class Matrix_MLM_Fintava {
         $sender_name = $data['sender_name'] ?? $data['payer_name'] ?? $data['originator_name'] ?? __('Bank Transfer', 'matrix-mlm');
         $sender_bank = $data['sender_bank'] ?? $data['payer_bank'] ?? $data['originator_bank'] ?? '';
         $narration = $data['narration'] ?? $data['description'] ?? $data['remark'] ?? '';
-        $currency = $data['currency'] ?? 'NGN';
+        $currency = strtoupper((string) ($data['currency'] ?? 'NGN'));
 
         if (empty($reference) || $amount <= 0 || empty($account_number)) {
             error_log('[Matrix Fintava Webhook] account_funded: Missing required data');
+            return;
+        }
+
+        // Currency must match site configuration.
+        $expected_currency = strtoupper((string) get_option('matrix_mlm_currency', 'NGN'));
+        if ($currency !== $expected_currency) {
+            error_log(sprintf(
+                '[Matrix Fintava Webhook] account_funded rejected: currency=%s expected=%s ref=%s',
+                $currency, $expected_currency, $reference
+            ));
+            return;
+        }
+
+        // Sanity cap on a single inbound funding event.
+        $max_inbound = floatval(get_option('matrix_mlm_fintava_max_inbound_amount', 10000000));
+        if ($max_inbound > 0 && $amount > $max_inbound) {
+            error_log(sprintf(
+                '[Matrix Fintava Webhook] account_funded rejected: amount %.2f exceeds cap %.2f ref=%s',
+                $amount, $max_inbound, $reference
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_inbound_over_cap',
+                sprintf(__('Fintava inbound funding exceeds cap and was held: %.2f (Ref: %s, Account: %s)', 'matrix-mlm'),
+                    $amount, $reference, $account_number)
+            );
             return;
         }
 
