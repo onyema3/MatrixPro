@@ -1,6 +1,20 @@
 <?php
 /**
- * Two-Factor Authentication
+ * Two-Factor Authentication.
+ *
+ * Security note: TOTP shared secrets are stored at-rest encrypted
+ * via Matrix_MLM_Crypto::encrypt() under the domain-separating
+ * context 'matrix_mlm:two_factor'. Legacy plaintext secrets that
+ * pre-date the encryption rollout are accepted on read (audit H10
+ * lazy-migration) — the next time a user verifies a code or
+ * re-runs enrolment, the stored secret is upgraded to the v1
+ * envelope.
+ *
+ * QR codes are generated locally via Matrix_MLM_QR_SVG and returned
+ * as inline `data:image/svg+xml;base64,…` URLs, eliminating the
+ * previous request to api.qrserver.com which logged every user's
+ * otpauth URL (and therefore every user's TOTP secret) on a
+ * third-party server (audit H11).
  */
 
 if (!defined('ABSPATH')) {
@@ -9,30 +23,31 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Two_Factor {
 
+    const CRYPTO_CONTEXT = 'matrix_mlm:two_factor';
+
     /**
      * Enable 2FA for user
      */
     public function enable($user_id) {
         $secret = $this->generate_secret();
-
-        global $wpdb;
-        $wpdb->update(
-            $wpdb->prefix . 'matrix_user_meta',
-            [
-                'two_factor_enabled' => 1,
-                'two_factor_secret' => $secret
-            ],
-            ['user_id' => $user_id]
-        );
+        $this->store_secret($user_id, $secret, true);
 
         $user = get_userdata($user_id);
         $site_name = get_bloginfo('name');
-        $otpauth_url = "otpauth://totp/{$site_name}:{$user->user_email}?secret={$secret}&issuer={$site_name}";
+        // The label and issuer are URL-encoded individually so that
+        // sites with names containing colons or spaces still produce
+        // a valid otpauth:// URI.
+        $label   = rawurlencode($site_name . ':' . $user->user_email);
+        $issuer  = rawurlencode($site_name);
+        $secret_q = rawurlencode($secret);
+        $otpauth_url = "otpauth://totp/{$label}?secret={$secret_q}&issuer={$issuer}";
 
         return [
-            'secret' => $secret,
-            'qr_url' => 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' . urlencode($otpauth_url),
-            'message' => __('2FA enabled successfully. Scan the QR code with your authenticator app.', 'matrix-mlm')
+            'secret'      => $secret,
+            'otpauth_url' => $otpauth_url,
+            // Inline data-URL — same-origin, no third-party request.
+            'qr_url'      => Matrix_MLM_QR_SVG::render_data_url($otpauth_url),
+            'message'     => __('2FA enabled successfully. Scan the QR code with your authenticator app, or enter the secret manually.', 'matrix-mlm'),
         ];
     }
 
@@ -53,20 +68,43 @@ class Matrix_MLM_Two_Factor {
     }
 
     /**
-     * Verify 2FA code
+     * Verify 2FA code.
+     *
+     * Reads the encrypted secret, decrypts it, and runs the standard
+     * TOTP window check. If the decrypted value indicates the row
+     * was still in legacy plaintext form, the value is opportunistically
+     * re-encrypted on success — that's the lazy-migration path
+     * referenced in the class docblock.
      */
     public function verify($user_id, $code) {
         global $wpdb;
-        $secret = $wpdb->get_var($wpdb->prepare(
+        $stored = $wpdb->get_var($wpdb->prepare(
             "SELECT two_factor_secret FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
             $user_id
         ));
 
-        if (!$secret) {
+        if (!$stored) {
             return false;
         }
 
-        return $this->verify_totp($secret, $code);
+        $secret = Matrix_MLM_Crypto::decrypt($stored, self::CRYPTO_CONTEXT);
+        if ($secret === null || $secret === '') {
+            // Decryption failure — surface as an invalid-code result so
+            // the front-end can show "invalid" rather than blowing up.
+            // Operator log so it's not silent.
+            error_log(sprintf('[Matrix MLM 2FA] Decrypt failure for user_id=%d (corrupt or salt-rotated)', $user_id));
+            return false;
+        }
+
+        $ok = $this->verify_totp($secret, $code);
+
+        // Lazy migration: if the stored value was still plaintext (no
+        // envelope prefix) AND the code verified, upgrade it to an
+        // encrypted envelope so the row stops sitting in plaintext.
+        if ($ok && strpos((string) $stored, Matrix_MLM_Crypto::ENVELOPE_PREFIX) !== 0) {
+            $this->store_secret($user_id, $secret, false);
+        }
+        return $ok;
     }
 
     /**
@@ -78,6 +116,33 @@ class Matrix_MLM_Two_Factor {
             "SELECT two_factor_enabled FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
             $user_id
         ));
+    }
+
+    /**
+     * Persist the secret encrypted at rest.
+     *
+     * @param int    $user_id
+     * @param string $secret_plain Base32 secret as displayed to the user.
+     * @param bool   $also_enable  Set the two_factor_enabled flag at the
+     *                             same time (used during initial enrol;
+     *                             not used by the lazy-migration path
+     *                             which only touches the secret column).
+     */
+    private function store_secret($user_id, $secret_plain, $also_enable) {
+        global $wpdb;
+
+        $envelope = Matrix_MLM_Crypto::encrypt($secret_plain, self::CRYPTO_CONTEXT);
+
+        $update = ['two_factor_secret' => $envelope];
+        if ($also_enable) {
+            $update['two_factor_enabled'] = 1;
+        }
+
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_user_meta',
+            $update,
+            ['user_id' => $user_id]
+        );
     }
 
     /**
