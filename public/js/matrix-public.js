@@ -76,18 +76,75 @@
     }
 
     // Login form
+    //
+    // Two-step flow when 2FA is enabled on the account:
+    //   1. Submit username + password.
+    //   2. If the server responds with `requires_2fa: true`, swap the
+    //      form's UI for the OTP prompt and re-post with the
+    //      challenge_token + 6-digit code.
+    //   3. The server replies with a redirect URL only after the OTP
+    //      verifies, so the auth cookie is never issued on password
+    //      alone for 2FA-protected accounts.
     $(document).on('submit', '#matrix-login-form', function(e) {
         e.preventDefault();
         const form = $(this);
         const btn = form.find('button[type="submit"]');
-        btn.prop('disabled', true).text('Logging in...');
 
+        // Submitting with the OTP step active? Re-post with the challenge token.
+        const challengeToken = form.data('matrixChallengeToken');
+        if (challengeToken) {
+            const code = form.find('[name="code"]').val();
+            btn.prop('disabled', true).text('Verifying...');
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'login',
+                challenge_token: challengeToken,
+                code: code
+            }, function(data) {
+                showNotification('Login successful! Redirecting...', 'success');
+                window.location.href = data.redirect;
+            }, function(err) {
+                // If the server says "restart", drop back to step 1.
+                if (err && err.restart) {
+                    form.removeData('matrixChallengeToken');
+                    form.find('.matrix-login-2fa-step').remove();
+                    form.find('.matrix-login-creds-step').show();
+                    btn.prop('disabled', false).text('Login');
+                } else {
+                    btn.prop('disabled', false).text('Verify');
+                }
+            });
+            return;
+        }
+
+        // Step 1: credentials.
+        btn.prop('disabled', true).text('Logging in...');
         matrixAjax({
             action: 'matrix_mlm_action',
             matrix_action: 'login',
             username: form.find('[name="username"]').val(),
             password: form.find('[name="password"]').val()
         }, function(data) {
+            if (data.requires_2fa && data.challenge_token) {
+                form.data('matrixChallengeToken', data.challenge_token);
+                form.find('.matrix-login-creds-step').hide();
+
+                // Render the OTP prompt. We append rather than replace
+                // so the form's nonce-bearing inputs (and any tracking
+                // hidden fields rendered by themes) remain intact.
+                const otpHtml =
+                    '<div class="matrix-login-2fa-step">' +
+                        '<p>' + (data.message || 'Enter the 6-digit code from your authenticator app.') + '</p>' +
+                        '<input type="text" name="code" inputmode="numeric" pattern="[0-9]*" ' +
+                        'maxlength="6" autocomplete="one-time-code" required ' +
+                        'placeholder="123456" class="matrix-input" />' +
+                    '</div>';
+                form.find('button[type="submit"]').before(otpHtml);
+                btn.prop('disabled', false).text('Verify');
+                form.find('input[name="code"]').focus();
+                return;
+            }
+
             showNotification('Login successful! Redirecting...', 'success');
             window.location.href = data.redirect;
         }, function() {
