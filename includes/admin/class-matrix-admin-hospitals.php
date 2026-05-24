@@ -469,7 +469,12 @@ class Matrix_MLM_Admin_Hospitals {
         if ($id > 0) {
             $result = $wpdb->update($table, $payload, ['id' => $id]);
             if ($result === false) {
-                self::admin_notice('error', __('Could not update hospital.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+                $ref = Matrix_MLM_DB_Error::log_and_token('hospitals.update', $wpdb->last_error);
+                self::admin_notice('error', sprintf(
+                    /* translators: %s: opaque support reference */
+                    __('Could not update hospital. Reference: %s.', 'matrix-mlm'),
+                    esc_html($ref)
+                ));
                 return;
             }
             self::admin_notice('success', __('Hospital updated.', 'matrix-mlm'));
@@ -479,7 +484,12 @@ class Matrix_MLM_Admin_Hospitals {
         $payload['created_at'] = current_time('mysql');
         $result = $wpdb->insert($table, $payload);
         if ($result === false) {
-            self::admin_notice('error', __('Could not add hospital.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+            $ref = Matrix_MLM_DB_Error::log_and_token('hospitals.insert', $wpdb->last_error);
+            self::admin_notice('error', sprintf(
+                /* translators: %s: opaque support reference */
+                __('Could not add hospital. Reference: %s.', 'matrix-mlm'),
+                esc_html($ref)
+            ));
             return;
         }
         self::admin_notice('success', __('Hospital added.', 'matrix-mlm'));
@@ -512,7 +522,12 @@ class Matrix_MLM_Admin_Hospitals {
 
         $result = $wpdb->delete($table, ['id' => $id], ['%d']);
         if ($result === false) {
-            self::admin_notice('error', __('Could not delete hospital.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+            $ref = Matrix_MLM_DB_Error::log_and_token('hospitals.delete', $wpdb->last_error);
+            self::admin_notice('error', sprintf(
+                /* translators: %s: opaque support reference */
+                __('Could not delete hospital. Reference: %s.', 'matrix-mlm'),
+                esc_html($ref)
+            ));
             return;
         }
         self::admin_notice('success', __('Hospital deleted.', 'matrix-mlm'));

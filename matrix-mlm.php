@@ -41,6 +41,7 @@ spl_autoload_register(function ($class) {
 
 // Core includes
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-database.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-db-error.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-activator.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-deactivator.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-core.php';

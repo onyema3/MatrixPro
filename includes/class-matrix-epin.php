@@ -110,7 +110,7 @@ class Matrix_MLM_Epin {
 
         $pins = [];
         $failed = 0;
-        $last_error = '';
+        $error_ref = '';
         for ($i = 0; $i < $quantity; $i++) {
             $pin_code = self::generate_pin_code();
 
@@ -132,7 +132,14 @@ class Matrix_MLM_Epin {
             if (!$inserted) {
                 $failed++;
                 if ($wpdb->last_error) {
-                    $last_error = $wpdb->last_error;
+                    // Redact the raw driver error from the response. The
+                    // full error text is written to the PHP error log
+                    // under the returned token; UI-side messages only
+                    // quote the token. See Matrix_MLM_DB_Error.
+                    $error_ref = Matrix_MLM_DB_Error::log_and_token(
+                        'epin.generate.insert',
+                        $wpdb->last_error
+                    );
                 }
                 // If the very first insert fails, there is no point continuing —
                 // it's almost certainly a schema/permissions issue that will
@@ -153,20 +160,22 @@ class Matrix_MLM_Epin {
             return [
                 'success' => false,
                 'message' => sprintf(
-                    /* translators: %s: database error */
+                    /* translators: %s: opaque support reference for the failed DB write */
                     __('Failed to save E-Pins to database. %s', 'matrix-mlm'),
-                    $last_error ? '(' . $last_error . ')' : ''
+                    $error_ref
+                        ? sprintf(__('(Reference: %s)', 'matrix-mlm'), $error_ref)
+                        : ''
                 ),
             ];
         }
 
         return [
-            'success' => true,
-            'pins'    => $pins,
-            'count'   => count($pins),
-            'amount'  => $amount,
-            'failed'  => $failed,
-            'error'   => $failed ? $last_error : '',
+            'success'   => true,
+            'pins'      => $pins,
+            'count'     => count($pins),
+            'amount'    => $amount,
+            'failed'    => $failed,
+            'error_ref' => $failed ? $error_ref : '',
         ];
     }
 

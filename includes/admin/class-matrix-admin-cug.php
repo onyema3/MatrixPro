@@ -479,7 +479,12 @@ class Matrix_MLM_Admin_CUG {
         );
 
         if ($result === false) {
-            self::admin_notice('error', __('Could not update CUG request.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+            $ref = Matrix_MLM_DB_Error::log_and_token('cug.update', $wpdb->last_error);
+            self::admin_notice('error', sprintf(
+                /* translators: %s: opaque support reference */
+                __('Could not update CUG request. Reference: %s.', 'matrix-mlm'),
+                esc_html($ref)
+            ));
             return;
         }
 

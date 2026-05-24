@@ -397,7 +397,12 @@ class Matrix_MLM_Admin_Benefits {
 
             $result = $wpdb->update($table, $data, ['id' => $id], $formats, ['%d']);
             if ($result === false) {
-                self::admin_notice('error', __('Could not update benefit.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+                $ref = Matrix_MLM_DB_Error::log_and_token('benefits.update', $wpdb->last_error);
+                self::admin_notice('error', sprintf(
+                    /* translators: %s: opaque support reference */
+                    __('Could not update benefit. Reference: %s.', 'matrix-mlm'),
+                    esc_html($ref)
+                ));
                 return;
             }
             self::admin_notice('success', __('Benefit updated.', 'matrix-mlm'));
@@ -418,7 +423,12 @@ class Matrix_MLM_Admin_Benefits {
             $formats[] = '%s';
             $result = $wpdb->insert($table, $data, $formats);
             if ($result === false) {
-                self::admin_notice('error', __('Could not create benefit.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+                $ref = Matrix_MLM_DB_Error::log_and_token('benefits.insert', $wpdb->last_error);
+                self::admin_notice('error', sprintf(
+                    /* translators: %s: opaque support reference */
+                    __('Could not create benefit. Reference: %s.', 'matrix-mlm'),
+                    esc_html($ref)
+                ));
                 return;
             }
             self::admin_notice('success', __('Benefit created.', 'matrix-mlm'));

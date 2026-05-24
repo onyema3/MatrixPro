@@ -440,7 +440,15 @@ class Matrix_MLM_Fintava {
                 $wpdb->show_errors();
             }
             if ($wpdb->last_error) {
-                $errors[] = sprintf('%s: %s', $name, $wpdb->last_error);
+                // Redact the raw driver error from the returned errors
+                // array (consumed by admin diagnostic UI). The full text
+                // is logged under an opaque reference token. See
+                // Matrix_MLM_DB_Error.
+                $ref = Matrix_MLM_DB_Error::log_and_token(
+                    'fintava.ensure_tables.' . $name,
+                    $wpdb->last_error
+                );
+                $errors[] = sprintf('%s: reference %s', $name, $ref);
             }
         }
 
