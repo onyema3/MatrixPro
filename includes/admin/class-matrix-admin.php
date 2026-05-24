@@ -253,14 +253,44 @@ class Matrix_MLM_Admin {
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $generated_pins = null;
 
+        // Defense-in-depth (H8). The submenu is registered with the
+        // 'manage_matrix_mlm' capability, so WordPress's menu router
+        // already gates entry. Re-checking here protects against the
+        // narrow class of bypasses where this method is invoked outside
+        // the menu pipeline (custom admin_init handlers, tests, future
+        // refactors that wire the page to a different surface).
+        if (!current_user_can('manage_matrix_mlm')) {
+            wp_die(__('Sorry, you are not allowed to access this page.', 'matrix-mlm'), 403);
+        }
+
         // Handle export
         if (isset($_GET['export_epins']) && wp_verify_nonce($_GET['_wpnonce'], 'matrix_export_epins')) {
+            // E-Pins are bearer tokens for wallet credit (H8). The
+            // export carries unredeemed pin codes in cleartext, so it
+            // is treated as a privileged financial action — same cap
+            // tier as Backup/Settings/balance adjustments per PR #226.
+            // The menu cap (manage_matrix_mlm, broad reviewer) is the
+            // wrong gate here on its own; reviewer-tier admins should
+            // be able to view/triage but not exfiltrate. The nonce
+            // catches the CSRF case; this catches the
+            // authenticated-but-undertier case.
+            if (!current_user_can('manage_matrix_settings')) {
+                wp_die(__('You do not have permission to export E-Pins.', 'matrix-mlm'), 403);
+            }
             $this->export_epins(sanitize_text_field($_GET['export_epins']));
             return;
         }
 
         // Handle generation
         if (isset($_POST['generate_epins']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_generate_epins')) {
+            // Generation mints new bearer tokens (H8). Same cap tier as
+            // export for the same reason — every generated pin is
+            // wallet credit waiting to happen, so a reviewer-tier admin
+            // who can see deposits/withdrawals should not also be able
+            // to issue free wallet credit.
+            if (!current_user_can('manage_matrix_settings')) {
+                wp_die(__('You do not have permission to generate E-Pins.', 'matrix-mlm'), 403);
+            }
             $plan_id = intval($_POST['plan_id']);
             $quantity = intval($_POST['quantity']);
             $custom_amount = floatval($_POST['custom_amount'] ?? 0);
@@ -433,6 +463,17 @@ class Matrix_MLM_Admin {
      * Export E-Pins
      */
     private function export_epins($format) {
+        // Belt-and-braces (H8). The caller in render_epins() already
+        // gates on manage_matrix_settings, but anchoring the check
+        // here too means any future caller (REST endpoint, CLI hook,
+        // direct invocation from an admin_init handler) cannot reach
+        // the SELECT without proving authorisation. E-Pins are bearer
+        // tokens for wallet credit and the export emits unredeemed
+        // codes in cleartext.
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_die(__('You do not have permission to export E-Pins.', 'matrix-mlm'), 403);
+        }
+
         global $wpdb;
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $status_filter = sanitize_text_field($_GET['pin_status'] ?? '');
