@@ -12,6 +12,42 @@ class Matrix_MLM_Core {
     protected $admin;
     protected $user_dashboard;
 
+    /**
+     * Resolve the originating client IP for rate-limit keying.
+     *
+     * Trust order:
+     *   1. CF-Connecting-IP — set by Cloudflare and validated upstream
+     *      against their edge. This is the de-facto standard for
+     *      sites behind Cloudflare's reverse proxy and is the common
+     *      production setup we ship to.
+     *   2. REMOTE_ADDR — the TCP-level peer. Correct for direct
+     *      connections; for installs behind a non-CF reverse proxy
+     *      (Nginx, AWS ALB, etc.) this collapses to the proxy's IP,
+     *      so per-IP rate limiting becomes a global rate limit.
+     *
+     * Operators behind a different proxy chain (e.g. Sucuri, AWS
+     * CloudFront, custom Nginx) can hook the
+     * 'matrix_mlm_login_client_ip' filter to plug in their own
+     * resolver — pulling from HTTP_X_FORWARDED_FOR after validating
+     * REMOTE_ADDR is in their proxy allow-list, etc.
+     *
+     * Note we deliberately do NOT trust X-Forwarded-For by default.
+     * That header is trivially spoofed when no proxy chain is
+     * actually in front of the site, which would let an attacker
+     * bypass rate limiting by rotating the spoofed value on every
+     * request.
+     */
+    private static function client_ip_for_rate_limit() {
+        $ip = '';
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+            $ip = (string) $_SERVER['HTTP_CF_CONNECTING_IP'];
+        } elseif (!empty($_SERVER['REMOTE_ADDR'])) {
+            $ip = (string) $_SERVER['REMOTE_ADDR'];
+        }
+        $ip = apply_filters('matrix_mlm_login_client_ip', $ip);
+        return is_string($ip) ? $ip : '';
+    }
+
     public function __construct() {
         $this->define_hooks();
     }
@@ -463,10 +499,76 @@ class Matrix_MLM_Core {
         $username = sanitize_text_field($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
 
+        // H12: per-username + per-IP rate limit, checked BEFORE
+        // wp_authenticate so the DB round-trip itself becomes
+        // budget-gated. Two independent counters because they defend
+        // against different patterns:
+        //
+        //   - Per-username counter is cleared on successful login, so
+        //     a real user who mistypes their password a few times
+        //     before getting it right is not penalised on the next
+        //     legitimate session. An attacker pounding ONE account
+        //     burns through this budget and is locked out of that
+        //     account for the window.
+        //
+        //   - Per-IP counter is NOT cleared on success. An IP that's
+        //     been guessing across multiple usernames stays throttled
+        //     even if it eventually lands on a valid pair — that
+        //     valid login is itself suspicious (we just observed many
+        //     failures from this IP). The counter melts away naturally
+        //     when the transient TTL elapses.
+        //
+        // Whichever counter exceeds first triggers the lockout. The
+        // user-facing message is identical to the generic auth-failed
+        // case below so an attacker can't tell whether their next
+        // attempt would have succeeded.
+        $client_ip      = self::client_ip_for_rate_limit();
+        $max_attempts   = (int) apply_filters('matrix_mlm_login_max_attempts', 10);
+        $window_seconds = (int) apply_filters('matrix_mlm_login_window_seconds', 15 * MINUTE_IN_SECONDS);
+        $user_key = 'matrix_login_attempts_user_' . md5(strtolower($username));
+        $ip_key   = 'matrix_login_attempts_ip_'   . md5($client_ip);
+
+        $user_attempts = (int) get_transient($user_key);
+        $ip_attempts   = (int) get_transient($ip_key);
+
+        if ($user_attempts >= $max_attempts || $ip_attempts >= $max_attempts) {
+            error_log(sprintf(
+                '[Matrix MLM] login throttled: ip=%s, user_attempts=%d/%d, ip_attempts=%d/%d',
+                $client_ip, $user_attempts, $max_attempts, $ip_attempts, $max_attempts
+            ));
+            wp_send_json_error([
+                'message' => __('Too many login attempts. Please wait a few minutes and try again.', 'matrix-mlm'),
+            ]);
+        }
+
         $user = wp_authenticate($username, $password);
         if (is_wp_error($user)) {
-            wp_send_json_error(['message' => $user->get_error_message()]);
+            // H12: generic message instead of WordPress's distinct
+            // 'invalid_username' / 'incorrect_password' errors. Both
+            // failure modes look identical from the outside, so an
+            // attacker cannot use the response to enumerate which
+            // usernames exist.
+            set_transient($user_key, $user_attempts + 1, $window_seconds);
+            set_transient($ip_key,   $ip_attempts   + 1, $window_seconds);
+
+            error_log(sprintf(
+                '[Matrix MLM] login rejected: ip=%s, code=%s, user_attempts=%d/%d, ip_attempts=%d/%d',
+                $client_ip,
+                $user->get_error_code(),
+                $user_attempts + 1, $max_attempts,
+                $ip_attempts + 1,   $max_attempts
+            ));
+
+            wp_send_json_error([
+                'message' => __('Invalid username or password.', 'matrix-mlm'),
+            ]);
         }
+
+        // Successful credential check. Clear the per-username counter
+        // so a legitimate user who mistyped earlier in the window is
+        // not punished going forward. The per-IP counter stays — see
+        // rationale above.
+        delete_transient($user_key);
 
         $two_factor = new Matrix_MLM_Two_Factor();
         if ($two_factor->is_enabled($user->ID)) {
