@@ -840,3 +840,364 @@
         max-width: 100%;
     }
 }
+
+
+/* ---------------------------------------------------------------------
+ * Genealogy Branch Heat-Map
+ * ---------------------------------------------------------------------
+ *
+ * The heat-map feature adds a top-of-tree Structure ↔ Activity toggle
+ * with three sub-metrics (total downline, recent commissions, active
+ * member ratio). Every visible node is pre-baked with three
+ * data-heat-* buckets and three data-pill-* labels at server-render
+ * time, and the toggle is a pure DOM-state flip:
+ *
+ *   - .heatmap-active on #genealogy-tree turns tints on
+ *   - data-active-metric on #genealogy-tree picks WHICH metric's
+ *     buckets paint the cards
+ *   - .tree-node-heat-pill text is rewritten in JS from the matching
+ *     data-pill-{metric} attribute
+ *
+ * The CSS below is written to coexist with the existing
+ * direct/spillover/you styling: heat tints only apply when
+ * .heatmap-active is on, and the selectors include both #genealogy-tree
+ * and a metric attribute, giving them strictly higher specificity than
+ * any single-class .matrix-tree-node-{direct,spillover,you} selector.
+ * That lets a member flip back to Structure mode and instantly see the
+ * familiar direct/spillover palette again — no specificity wars, no
+ * !important hacks.
+ *
+ * Empty-slot cards intentionally never get heat data attrs (see
+ * compute_heat_data() — the empty slot has no member to score) so the
+ * dashed-border placeholder look survives both modes unchanged.
+ */
+
+/*
+ * Mode toggle bar.
+ *
+ * Sits between the level-badges panel and the tree wrapper. Two halves
+ * share the bar: the segmented Structure/Activity pair on the left and
+ * the metric picker on the right (which appears only when Activity is
+ * on, via the [hidden] attribute). flex-wrap lets the picker drop to a
+ * second row on narrow viewports without crushing the segmented buttons.
+ */
+.matrix-genealogy-mode-toggle {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 10px 14px;
+    background: #f8fafc;
+    border: 1px solid var(--matrix-border);
+    border-radius: 8px;
+    font-size: 13px;
+}
+
+.genealogy-mode-segmented {
+    display: inline-flex;
+    border: 1px solid var(--matrix-border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #fff;
+}
+
+.genealogy-mode-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 14px;
+    background: transparent;
+    border: 0;
+    border-right: 1px solid var(--matrix-border);
+    color: #4b5563;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.genealogy-mode-btn:last-child {
+    border-right: 0;
+}
+
+.genealogy-mode-btn:hover:not(.is-active) {
+    background: #eef2ff;
+    color: var(--matrix-primary);
+}
+
+.genealogy-mode-btn:focus-visible {
+    outline: 2px solid var(--matrix-primary);
+    outline-offset: -2px;
+}
+
+.genealogy-mode-btn.is-active {
+    background: var(--matrix-primary);
+    color: #fff;
+    cursor: default;
+}
+
+.genealogy-mode-btn .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+}
+
+.genealogy-mode-metric-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #4b5563;
+}
+
+.genealogy-mode-metric-picker[hidden] {
+    display: none;
+}
+
+.genealogy-mode-metric-picker label {
+    font-weight: 600;
+    color: var(--matrix-dark);
+}
+
+.genealogy-heat-metric-select {
+    padding: 6px 10px;
+    border: 1px solid var(--matrix-border);
+    border-radius: 6px;
+    background: #fff;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.genealogy-heat-metric-select:focus {
+    outline: 2px solid var(--matrix-primary);
+    outline-offset: 1px;
+}
+
+/*
+ * Heat-tint overrides.
+ *
+ * Each metric × bucket pairing gets a single rule. Specificity:
+ *   #id.class[attr] descendant .class[attr]  →  (1, 4, 0)
+ * which beats the existing single-class .matrix-tree-node-direct (0,1,0).
+ * No !important needed.
+ *
+ * Border colour is deliberately stronger than the tinted background so
+ * the direct/spillover identity clue isn't lost — members can still
+ * tell whether a hot branch is a direct referral or spillover by the
+ * border's saturation, even though the fill is now driven by the heat
+ * metric.
+ *
+ * 'cold' is rendered as a neutral grey so a metric with no signal
+ * (e.g. a member with no commissions in the last 30 days) reads as
+ * "no data" rather than as a problem branch.
+ */
+.matrix-genealogy-tree.heatmap-active .matrix-tree-node {
+    transition: background 0.25s ease, border-color 0.25s ease;
+}
+
+/* Downline metric tints */
+.matrix-genealogy-tree.heatmap-active[data-active-metric="downline"] .matrix-tree-node[data-heat-downline="green"] {
+    background: #dcfce7;
+    border-color: #16a34a;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="downline"] .matrix-tree-node[data-heat-downline="yellow"] {
+    background: #fef9c3;
+    border-color: #eab308;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="downline"] .matrix-tree-node[data-heat-downline="red"] {
+    background: #fee2e2;
+    border-color: #dc2626;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="downline"] .matrix-tree-node[data-heat-downline="cold"] {
+    background: #f3f4f6;
+    border-color: #d1d5db;
+}
+
+/* Commission metric tints */
+.matrix-genealogy-tree.heatmap-active[data-active-metric="commission"] .matrix-tree-node[data-heat-commission="green"] {
+    background: #dcfce7;
+    border-color: #16a34a;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="commission"] .matrix-tree-node[data-heat-commission="yellow"] {
+    background: #fef9c3;
+    border-color: #eab308;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="commission"] .matrix-tree-node[data-heat-commission="red"] {
+    background: #fee2e2;
+    border-color: #dc2626;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="commission"] .matrix-tree-node[data-heat-commission="cold"] {
+    background: #f3f4f6;
+    border-color: #d1d5db;
+}
+
+/* Active-ratio metric tints */
+.matrix-genealogy-tree.heatmap-active[data-active-metric="active"] .matrix-tree-node[data-heat-active="green"] {
+    background: #dcfce7;
+    border-color: #16a34a;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="active"] .matrix-tree-node[data-heat-active="yellow"] {
+    background: #fef9c3;
+    border-color: #eab308;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="active"] .matrix-tree-node[data-heat-active="red"] {
+    background: #fee2e2;
+    border-color: #dc2626;
+}
+.matrix-genealogy-tree.heatmap-active[data-active-metric="active"] .matrix-tree-node[data-heat-active="cold"] {
+    background: #f3f4f6;
+    border-color: #d1d5db;
+}
+
+/*
+ * The display root ("you" / "viewing" card) is intentionally NOT
+ * heat-tinted — compute_heat_data() skips it and the renderer doesn't
+ * emit data-heat-* on it. But the existing .matrix-tree-node-you
+ * gradient already coexists with these heat selectors because
+ * data-heat-* matches always fail on the root. Documented here as the
+ * intended invariant in case a future change ever considers tinting
+ * the root.
+ */
+
+/* Empty slots: explicit no-op so a future contributor can't be tempted
+ * to add data-heat-* attrs to empty slots and inadvertently start
+ * tinting them. */
+.matrix-genealogy-tree.heatmap-active .matrix-tree-node-empty {
+    background: #f9fafb;
+    border-color: #e5e7eb;
+}
+
+/*
+ * Heat pill — small label inline in the node info, showing the metric's
+ * value (e.g. "12", "₦1,200", "85%"). Hidden by default; shown only
+ * when the wrapper is in heatmap-active mode AND the pill itself isn't
+ * marked [hidden] by JS (which it does when the active metric's label
+ * is empty for that node).
+ */
+.tree-node-heat-pill {
+    display: none;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    padding: 1px 6px;
+    margin-top: 2px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.85);
+    color: var(--matrix-dark);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    width: max-content;
+    max-width: 100%;
+    line-height: 1.4;
+}
+
+.matrix-genealogy-tree.heatmap-active .tree-node-heat-pill:not([hidden]) {
+    display: inline-block;
+}
+
+/*
+ * Legend variants.
+ *
+ * Two .matrix-genealogy-legend blocks live inside the
+ * .matrix-genealogy-legends parent. The parent's data-mode flips
+ * between "structure" and "activity"; the matching legend stays
+ * visible, the other hides. Inside the heat legend, three
+ * .legend-heat-title-{metric} spans sit on top of each other and the
+ * parent's data-metric attribute decides which one is shown — that
+ * way the legend headline stays in sync with the metric picker
+ * (e.g. "Heat by total downline:" vs "Heat by commissions earned…")
+ * without needing additional JS rewriting.
+ */
+.matrix-genealogy-legends[data-mode="structure"] .matrix-genealogy-legend-heat,
+.matrix-genealogy-legends[data-mode="activity"] .matrix-genealogy-legend-structure {
+    display: none;
+}
+
+.matrix-genealogy-legend-heat {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: #f8fafc;
+    border-radius: 8px;
+    border: 1px solid var(--matrix-border);
+}
+
+.legend-heat-title {
+    font-weight: 600;
+    color: var(--matrix-dark);
+    margin-right: 4px;
+}
+
+.legend-heat-title > span {
+    display: none;
+}
+
+.matrix-genealogy-legends[data-metric="downline"]   .legend-heat-title-downline,
+.matrix-genealogy-legends[data-metric="commission"] .legend-heat-title-commission,
+.matrix-genealogy-legends[data-metric="active"]     .legend-heat-title-active {
+    display: inline;
+}
+
+.legend-heat-green {
+    background: #dcfce7;
+    border: 1px solid #16a34a;
+}
+
+.legend-heat-yellow {
+    background: #fef9c3;
+    border: 1px solid #eab308;
+}
+
+.legend-heat-red {
+    background: #fee2e2;
+    border: 1px solid #dc2626;
+}
+
+.legend-heat-cold {
+    background: #f3f4f6;
+    border: 1px solid #d1d5db;
+}
+
+/*
+ * Reduced-motion: skip the background/border transition when a member
+ * has opted out of motion at the OS level. Matches the existing
+ * @media (prefers-reduced-motion) block higher up in this file that
+ * already pauses the tree spinner.
+ */
+@media (prefers-reduced-motion: reduce) {
+    .matrix-genealogy-tree.heatmap-active .matrix-tree-node {
+        transition: none;
+    }
+}
+
+/*
+ * Mobile responsive: stack the toggle's two halves vertically on
+ * narrow viewports so the picker doesn't squeeze the segmented
+ * buttons off-screen on a 360px phone. Same flex-direction switch
+ * the pivot bar uses elsewhere in this file.
+ */
+@media (max-width: 640px) {
+    .matrix-genealogy-mode-toggle {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .genealogy-mode-segmented {
+        width: 100%;
+    }
+
+    .genealogy-mode-btn {
+        flex: 1 1 50%;
+        justify-content: center;
+    }
+
+    .genealogy-mode-metric-picker {
+        flex-wrap: wrap;
+    }
+
+    .genealogy-heat-metric-select {
+        flex: 1 1 auto;
+    }
+}

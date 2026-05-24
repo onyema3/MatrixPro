@@ -276,6 +276,45 @@ class Matrix_MLM_User_Genealogy {
             'level_commissions' => $level_commissions_decoded,
             'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
         ];
+
+        // Parse the heat-map view-mode URL params and compute per-
+        // node heat scores ahead of the tree render.
+        //
+        // Two URL params drive the feature:
+        //   ?mode=structure|activity   — top-level toggle.
+        //                                Default 'structure'.
+        //   ?heat_metric=downline|commission|active
+        //                              — sub-metric used when
+        //                                mode=activity. Default
+        //                                'downline'. Pre-baked into
+        //                                every node regardless of
+        //                                mode so the JS toggle can
+        //                                flip metrics without a
+        //                                page reload.
+        //
+        // Both are sanitised against allow-lists in self::HEAT_METRICS
+        // and ['structure','activity'] before being trusted — these
+        // values flow into HTML attributes and class names, so a
+        // permissive read would invite an XSS surface even though
+        // the outputs are esc_attr'd downstream.
+        //
+        // compute_heat_data() runs ALWAYS (even on structure mode)
+        // because emitting the data attrs at render-time is what
+        // makes the toggle instant on the client. The cost is two
+        // batch SQLs whose result sets are bounded by the visible
+        // tree's size — see compute_heat_data() for the reasoning.
+        $mode_raw    = isset($_GET['mode']) ? sanitize_text_field((string) $_GET['mode']) : 'structure';
+        $heat_metric = isset($_GET['heat_metric']) ? sanitize_text_field((string) $_GET['heat_metric']) : 'downline';
+        if ($mode_raw !== 'activity') {
+            $mode_raw = 'structure';
+        }
+        if (!in_array($heat_metric, self::HEAT_METRICS, true)) {
+            $heat_metric = 'downline';
+        }
+        $heat_data = $this->compute_heat_data($tree, (int) $user_id, (int) $selected_plan_id);
+        $this->pivot_state['heat_data']   = $heat_data;
+        $this->pivot_state['heat_metric'] = $heat_metric;
+        $this->pivot_state['mode']        = $mode_raw;
         ?>
 
         <?php if ($is_pivoted): ?>
@@ -315,8 +354,10 @@ class Matrix_MLM_User_Genealogy {
 
         <?php $this->render_level_badges($level_status, $levels_completed, $all_levels_complete, $display_position, $next_goal); ?>
 
+        <?php $this->render_mode_toggle($mode_raw, $heat_metric); ?>
+
         <div class="matrix-genealogy-wrapper">
-            <div class="matrix-genealogy-tree" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $display_position->depth; ?>" data-plan-width="<?php echo (int) $display_position->width; ?>" data-root-user-id="<?php echo $display_user_id; ?>">
+            <div class="matrix-genealogy-tree<?php echo $mode_raw === 'activity' ? ' heatmap-active' : ''; ?>" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $display_position->depth; ?>" data-plan-width="<?php echo (int) $display_position->width; ?>" data-root-user-id="<?php echo $display_user_id; ?>" data-active-metric="<?php echo esc_attr($heat_metric); ?>">
                 <?php if ($tree): ?>
                     <?php $this->render_tree_node($tree, $display_position->width, true, $display_user_id, $initial_render_depth); ?>
                 <?php else: ?>
@@ -325,14 +366,34 @@ class Matrix_MLM_User_Genealogy {
             </div>
         </div>
 
-        <div class="matrix-genealogy-legend">
-            <span class="legend-item"><span class="legend-dot legend-you"></span> <?php _e('You', 'matrix-mlm'); ?></span>
-            <span class="legend-item"><span class="legend-dot legend-direct"></span> <?php _e('Direct Referral', 'matrix-mlm'); ?></span>
-            <span class="legend-item"><span class="legend-dot legend-spillover"></span> <?php _e('Spillover', 'matrix-mlm'); ?></span>
-            <span class="legend-item"><span class="legend-dot legend-empty"></span> <?php _e('Empty Slot', 'matrix-mlm'); ?></span>
+        <div class="matrix-genealogy-legends" data-mode="<?php echo esc_attr($mode_raw); ?>" data-metric="<?php echo esc_attr($heat_metric); ?>">
+            <div class="matrix-genealogy-legend matrix-genealogy-legend-structure">
+                <span class="legend-item"><span class="legend-dot legend-you"></span> <?php _e('You', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-direct"></span> <?php _e('Direct Referral', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-spillover"></span> <?php _e('Spillover', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-empty"></span> <?php _e('Empty Slot', 'matrix-mlm'); ?></span>
+            </div>
+            <div class="matrix-genealogy-legend matrix-genealogy-legend-heat" aria-live="polite">
+                <span class="legend-heat-title">
+                    <span class="legend-heat-title-downline"><?php esc_html_e('Heat by total downline:', 'matrix-mlm'); ?></span>
+                    <span class="legend-heat-title-commission"><?php
+                        printf(
+                            /* translators: %d: window in days */
+                            esc_html__('Heat by commissions earned (last %d days):', 'matrix-mlm'),
+                            (int) self::HEAT_COMMISSION_WINDOW_DAYS
+                        );
+                    ?></span>
+                    <span class="legend-heat-title-active"><?php esc_html_e('Heat by active member ratio:', 'matrix-mlm'); ?></span>
+                </span>
+                <span class="legend-item"><span class="legend-dot legend-heat-green"></span>   <?php esc_html_e('Top performer', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-heat-yellow"></span>  <?php esc_html_e('Mid performer', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-heat-red"></span>     <?php esc_html_e('Needs attention', 'matrix-mlm'); ?></span>
+                <span class="legend-item"><span class="legend-dot legend-heat-cold"></span>    <?php esc_html_e('No data yet', 'matrix-mlm'); ?></span>
+            </div>
         </div>
 
         <?php $this->render_lazy_load_script(); ?>
+        <?php $this->render_mode_toggle_script(); ?>
         <?php $this->render_search_script($selected_plan_id); ?>
         <?php $this->render_hovercard($selected_plan_id); ?>
         <?php $this->render_hovercard_script($selected_plan_id); ?>
@@ -435,6 +496,616 @@ class Matrix_MLM_User_Genealogy {
     }
 
     /**
+     * Allowed values for the ?heat_metric= URL param and the metric
+     * picker dropdown. Centralised here so render(),
+     * compute_heat_data() and the AJAX subtree handler all sanitise
+     * against the same allow-list — adding a fourth metric means
+     * adding it once to this constant + once to the metric switch in
+     * compute_heat_data().
+     */
+    const HEAT_METRICS = ['downline', 'commission', 'active'];
+
+    /**
+     * Window for the "recent commissions" heat metric, in days.
+     *
+     * 30 days matches the dashboard's other "recent" copy (the
+     * level-badges panel quotes a 30-day cumulative figure) so
+     * members don't have to context-switch between two timeframes
+     * when comparing the heat map against the rest of their
+     * dashboard at a glance.
+     */
+    const HEAT_COMMISSION_WINDOW_DAYS = 30;
+
+    /**
+     * Pre-compute heat scores + green/yellow/red buckets for every
+     * non-root, non-empty node in the visible tree, for ALL three
+     * metrics in one pass.
+     *
+     * Why all three even when the user only toggled one on:
+     *
+     *   - Toggling between metrics is the most-common interaction
+     *     for this feature (the whole point of the toggle is fast
+     *     comparison). Recomputing server-side on every flip would
+     *     mean a full page reload per click; instead we bake all
+     *     three metrics into data-heat-* attributes once and the
+     *     toggle JS is purely a class swap on the wrapper, which
+     *     feels instant.
+     *   - Cost is bounded: the visible tree caps at 4 levels deep
+     *     (~width^4 nodes — 81 for a 3-wide plan, 256 for 4-wide).
+     *     The two batch SQLs we do here scale linearly in that node
+     *     count and run as `IN (...)` lookups — well within budget
+     *     for a dashboard tab that already runs ~6 queries.
+     *
+     * Score semantics per metric (subtree-aggregated over visible
+     * descendants only — see "boundary caveat" below):
+     *
+     *   - downline:   node->total_downline, read directly off the
+     *                 matrix_positions row. This is the only metric
+     *                 that's already a true full-tree aggregate
+     *                 because total_downline is maintained by the
+     *                 plan engine on every insert.
+     *   - commission: SUM of paid commission rows where
+     *                 user_id=$viewer AND from_user_id IN (subtree's
+     *                 visible user_ids) AND created_at within the
+     *                 last HEAT_COMMISSION_WINDOW_DAYS days.
+     *   - active:     count of subtree members whose
+     *                 matrix_user_meta.status='active' divided by
+     *                 the subtree size. 1.0 means every visible
+     *                 descendant (and the node itself) is active;
+     *                 lower values reveal banned/inactive accounts
+     *                 inside that branch.
+     *
+     * Bucketing rules:
+     *
+     *   - downline / commission: relative thresholds — score / max
+     *     ratio across the visible non-root nodes. >= 0.66 green,
+     *     >= 0.33 yellow, > 0 red, 0 cold. Relative because the
+     *     useful question is "where is this branch hot relative to
+     *     the others on screen?", not "is 12 downline objectively a
+     *     lot?".
+     *   - active: absolute thresholds on the ratio. >= 0.85 green,
+     *     >= 0.6 yellow, >= 0 red. Absolute because the operator
+     *     wants to know "is this branch unhealthy?" — having every
+     *     branch coloured against the worst-banned branch as a
+     *     reference would mute the signal.
+     *
+     * Boundary caveat (commission + active): we aggregate over the
+     * VISIBLE rendered subtree, not the full database descendant
+     * set. A branch with thousands of descendants below the 4th-
+     * level cutoff still scores using only the ~16 nodes the user
+     * can see. The total_downline metric is unaffected because it's
+     * pre-aggregated on each row. We accept this trade because:
+     *
+     *   - Calling sum_branch_commissions_for_viewer() per node would
+     *     run an O(N) BFS per node, multiplying queries.
+     *   - Lazy-loaded subtrees (Show more) get their own self-
+     *     contained heat scoring on the AJAX side, so as members
+     *     drill in, the deeper branches re-bucket against the new
+     *     visible set — which is what they care about at that
+     *     moment of inspection.
+     *
+     * @param array|null $tree           Tree node from
+     *                                   Matrix_MLM_Plan_Engine::get_matrix_tree().
+     *                                   Null/empty returns an empty
+     *                                   map gracefully — caller can
+     *                                   still render a no-tree state.
+     * @param int        $viewer_user_id WP user id whose commissions
+     *                                   we attribute to the tree
+     *                                   when scoring the commission
+     *                                   metric. Equals the actual
+     *                                   logged-in member regardless
+     *                                   of whether the tree is
+     *                                   pivoted, because the pivot
+     *                                   only changes the view, not
+     *                                   the earnings owner.
+     * @param int        $plan_id        Plan whose subtree we're
+     *                                   scoping all three metrics
+     *                                   to.
+     * @return array<int, array{
+     *     downline:    array{score:float, bucket:string, label:string},
+     *     commission:  array{score:float, bucket:string, label:string},
+     *     active:      array{score:float, bucket:string, label:string}
+     * }>  Map keyed by matrix_positions.id. Root position is omitted
+     *     (the root card is always the indigo "you" card; tinting it
+     *     would be a category error). Empty slots also have no entry.
+     */
+    public function compute_heat_data($tree, $viewer_user_id, $plan_id) {
+        if (empty($tree) || empty($tree['children'])) {
+            return [];
+        }
+
+        global $wpdb;
+
+        // Pass 1: gather all (position_id, user_id, level) triples in
+        // the visible tree, EXCLUDING the root. We need user_ids for
+        // the two batch SQLs and position_ids as the eventual map key
+        // — render_tree_node() looks heat data up by position id.
+        //
+        // We also memoise per-node children references so the
+        // post-order aggregation pass can walk without re-recursing
+        // the original (potentially deep) tree shape.
+        $position_user      = []; // position_id => user_id
+        $position_children  = []; // position_id => [child_position_id, ...]
+        $position_level     = []; // position_id => absolute level
+        $all_user_ids       = [];
+
+        $stack = [[$tree, true]]; // [node, is_root]
+        while (!empty($stack)) {
+            list($node, $is_root) = array_pop($stack);
+            $pid = (int) ($node['id'] ?? 0);
+            $uid = (int) ($node['user_id'] ?? 0);
+            if ($pid <= 0) {
+                continue;
+            }
+
+            $position_children[$pid] = [];
+            $position_level[$pid]    = (int) ($node['level'] ?? 0);
+
+            if (!$is_root) {
+                $position_user[$pid] = $uid;
+                if ($uid > 0) {
+                    $all_user_ids[$uid] = true;
+                }
+            } else {
+                // Root's user_id is needed for the active-ratio
+                // metric only at descendants — we don't score the
+                // root itself, so don't add it to $position_user.
+                // But we do still want it in $all_user_ids for the
+                // SQL because some descendants' parents resolve
+                // there and consistency is cheap.
+            }
+
+            $children = !empty($node['children']) ? $node['children'] : [];
+            foreach ($children as $child) {
+                $cpid = (int) ($child['id'] ?? 0);
+                if ($cpid > 0) {
+                    $position_children[$pid][] = $cpid;
+                    $stack[] = [$child, false];
+                }
+            }
+        }
+
+        // No descendants visible → no heat to compute. The toggle
+        // will still render but every node scores 'cold' — the
+        // legend's "no data" hint covers this state.
+        if (empty($position_user)) {
+            return [];
+        }
+
+        $user_ids = array_keys($all_user_ids);
+
+        // Pass 2: batch SQL — recent commissions to this viewer,
+        // grouped by from_user_id. One round-trip for the whole
+        // tree. We deliberately DON'T include cancelled/pending rows
+        // (status='paid' filter) because the heat map is meant to
+        // reflect realised earnings the member can spend, not
+        // pipeline that might never settle.
+        $commission_self = []; // user_id => recent paid amount FROM that user
+        if (!empty($user_ids) && (int) $viewer_user_id > 0) {
+            $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+            $params       = array_map('intval', $user_ids);
+            array_unshift($params, (int) $viewer_user_id);
+            $params[]     = (int) self::HEAT_COMMISSION_WINDOW_DAYS;
+
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT from_user_id, COALESCE(SUM(amount), 0) AS total
+                   FROM {$wpdb->prefix}matrix_commissions
+                  WHERE user_id = %d
+                    AND status = 'paid'
+                    AND from_user_id IN ($placeholders)
+                    AND created_at >= DATE_SUB(NOW(), INTERVAL %d DAY)
+                  GROUP BY from_user_id",
+                $params
+            ));
+            foreach ($rows as $r) {
+                $commission_self[(int) $r->from_user_id] = (float) $r->total;
+            }
+        }
+
+        // Pass 3: batch SQL — matrix_user_meta.status for every
+        // visible user. Missing rows (legacy imports without a
+        // matrix_user_meta record) default to 'active' so we don't
+        // punish a branch for a data-quality issue the member can't
+        // fix from the dashboard.
+        $user_status = [];
+        if (!empty($user_ids)) {
+            $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+            $params       = array_map('intval', $user_ids);
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT user_id, status
+                   FROM {$wpdb->prefix}matrix_user_meta
+                  WHERE user_id IN ($placeholders)",
+                $params
+            ));
+            foreach ($rows as $r) {
+                $user_status[(int) $r->user_id] = (string) $r->status;
+            }
+        }
+
+        // Pass 4: post-order aggregation. We walk the tree once,
+        // bottom-up, accumulating per-position commission and
+        // active counters. Iterative to keep deep matrices off the
+        // PHP recursion limit — a 9-deep plan would otherwise nest
+        // up to 9 frames per branch, which the recursive
+        // build_tree_recursive already pushes against.
+        $sub_commission = []; // pid => sum of recent commission via subtree
+        $sub_active     = []; // pid => count of active members in subtree
+        $sub_total      = []; // pid => total members in subtree (incl. self)
+
+        // Reverse-DFS to get post-order: visit children before
+        // parents. We stamp each node twice on the stack — once on
+        // first encounter (push children) and once for processing
+        // after children are done. The 'visited' flag distinguishes.
+        $work = [[(int) $tree['id'], false]];
+        while (!empty($work)) {
+            list($pid, $visited) = array_pop($work);
+            if (!$visited) {
+                $work[] = [$pid, true];
+                foreach ($position_children[$pid] ?? [] as $cpid) {
+                    $work[] = [$cpid, false];
+                }
+                continue;
+            }
+
+            // Self contribution: only descendants (non-root) count
+            // toward their own "self" stats; the root contributes
+            // nothing because we don't tint it.
+            $is_root_pid = ($pid === (int) $tree['id']);
+            $own_commission = 0.0;
+            $own_total      = 0;
+            $own_active     = 0;
+
+            if (!$is_root_pid) {
+                $uid = (int) ($position_user[$pid] ?? 0);
+                if ($uid > 0) {
+                    $own_commission = (float) ($commission_self[$uid] ?? 0.0);
+                    $own_total      = 1;
+                    // Default to active when matrix_user_meta is
+                    // missing (see pass 3 docblock for the
+                    // rationale).
+                    $status = $user_status[$uid] ?? 'active';
+                    if ($status === 'active') {
+                        $own_active = 1;
+                    }
+                }
+            }
+
+            $agg_commission = $own_commission;
+            $agg_total      = $own_total;
+            $agg_active     = $own_active;
+            foreach ($position_children[$pid] ?? [] as $cpid) {
+                $agg_commission += (float) ($sub_commission[$cpid] ?? 0.0);
+                $agg_total      += (int)   ($sub_total[$cpid]      ?? 0);
+                $agg_active     += (int)   ($sub_active[$cpid]     ?? 0);
+            }
+            $sub_commission[$pid] = $agg_commission;
+            $sub_total[$pid]      = $agg_total;
+            $sub_active[$pid]     = $agg_active;
+        }
+
+        // Pass 5: bucket assignment. For downline / commission we
+        // need the global max across all non-root nodes to compute
+        // a relative score; for active we go straight from ratio to
+        // bucket without any tree-level normalisation.
+        //
+        // total_downline lives on the matrix_positions row but we
+        // don't have it indexed by position id at this point —
+        // re-scan the original tree once to build the map. One
+        // bounded pass is cheaper than threading
+        // $position_total_downline through every recursion site
+        // back in the gathering pass above.
+        $max_downline   = 0;
+        $max_commission = 0.0;
+        $position_downline = []; // pid => total_downline (DB column)
+        $stack = [$tree];
+        while (!empty($stack)) {
+            $node = array_pop($stack);
+            $pid  = (int) ($node['id'] ?? 0);
+            if ($pid > 0 && $pid !== (int) $tree['id']) {
+                $position_downline[$pid] = (int) ($node['total_downline'] ?? 0);
+                $max_downline = max($max_downline, $position_downline[$pid]);
+            }
+            foreach (($node['children'] ?? []) as $child) {
+                $stack[] = $child;
+            }
+        }
+        foreach ($sub_commission as $pid => $amount) {
+            if ($pid !== (int) $tree['id']) {
+                $max_commission = max($max_commission, $amount);
+            }
+        }
+
+        $heat = [];
+        $currency = isset($this->pivot_state['currency_symbol'])
+            ? (string) $this->pivot_state['currency_symbol']
+            : (string) get_option('matrix_mlm_currency_symbol', '₦');
+
+        foreach ($position_user as $pid => $uid) {
+            // Downline bucket (relative)
+            $d_score = (int) ($position_downline[$pid] ?? 0);
+            $d_bucket = self::bucket_relative($d_score, $max_downline);
+            $d_label  = number_format_i18n($d_score);
+
+            // Commission bucket (relative)
+            $c_score  = (float) ($sub_commission[$pid] ?? 0.0);
+            $c_bucket = self::bucket_relative($c_score, $max_commission);
+            // Compact money label so it fits the small node card.
+            // No decimals on small amounts; comma thousands separator.
+            $c_label  = $currency . number_format_i18n($c_score, $c_score >= 1000 ? 0 : 2);
+
+            // Active-ratio bucket (absolute thresholds)
+            $a_total  = (int) ($sub_total[$pid] ?? 0);
+            $a_active = (int) ($sub_active[$pid] ?? 0);
+            $a_score  = $a_total > 0 ? ($a_active / $a_total) : 0.0;
+            if ($a_total === 0) {
+                $a_bucket = 'cold';
+            } elseif ($a_score >= 0.85) {
+                $a_bucket = 'green';
+            } elseif ($a_score >= 0.6) {
+                $a_bucket = 'yellow';
+            } else {
+                $a_bucket = 'red';
+            }
+            $a_label = round($a_score * 100) . '%';
+
+            $heat[$pid] = [
+                'downline'   => ['score' => (float) $d_score, 'bucket' => $d_bucket, 'label' => $d_label],
+                'commission' => ['score' => $c_score,         'bucket' => $c_bucket, 'label' => $c_label],
+                'active'     => ['score' => $a_score,         'bucket' => $a_bucket, 'label' => $a_label],
+            ];
+        }
+
+        return $heat;
+    }
+
+    /**
+     * Map a score to a green/yellow/red/cold bucket based on its
+     * fraction of the visible tree's max. Relative bucketing is
+     * what the user actually wants for downline + commission: "is
+     * this branch hot RELATIVE to the others I can see?" rather
+     * than against an arbitrary absolute threshold that would mean
+     * different things on a 1000-member matrix vs a 10-member one.
+     *
+     * Threshold choice (0.66 / 0.33 / >0): an even three-way split
+     * would put the boundary at 0.5 / 0.25, which empirically gives
+     * too many "green" branches on long-tailed matrices (one big
+     * branch + many small ones → most of the small ones still land
+     * in green because the max is huge). 0.66 / 0.33 produces a
+     * crisper visual: the top third are green, the middle third
+     * yellow, the bottom (still earning) are red. Members with a
+     * single dominant branch see exactly that — the dominant branch
+     * green, everyone else red — which is correct for the
+     * "where to focus attention" framing.
+     *
+     * @param float $score Per-node score.
+     * @param float $max   Max across visible non-root nodes.
+     * @return string One of green|yellow|red|cold.
+     */
+    private static function bucket_relative($score, $max) {
+        if ($max <= 0) {
+            // Whole tree has no signal on this metric (e.g. nobody
+            // earned any commissions in the last 30 days). Render
+            // every node neutral — a screen of all-green would lie
+            // about activity that isn't there.
+            return $score > 0 ? 'green' : 'cold';
+        }
+        if ($score <= 0) {
+            return 'cold';
+        }
+        $ratio = $score / $max;
+        if ($ratio >= 0.66) return 'green';
+        if ($ratio >= 0.33) return 'yellow';
+        return 'red';
+    }
+
+    /**
+     * Render the Structure ↔ Activity mode toggle plus the metric
+     * picker for Activity mode.
+     *
+     * Two-tier UI matching the user's mental model: top-level binary
+     * choice (current view vs analytic view) with a secondary
+     * picker exposed only when Activity is on. Implemented as a
+     * segmented control + a select rather than three flat buttons
+     * because the segmented control's "this is a dial, not three
+     * unrelated actions" framing reads correctly to first-time users
+     * — picking Activity then Commission feels like configuring one
+     * thing, not making two unrelated choices.
+     *
+     * Initial state is hydrated from the URL params parsed in
+     * render() so a refreshed page (or a shared link) lands in the
+     * same view the member configured. The toggle JS keeps the URL
+     * in sync via history.replaceState on every click — no real
+     * navigation, so back/forward doesn't trap the user in a long
+     * history of toggle clicks.
+     *
+     * @param string $mode        'structure' or 'activity'.
+     * @param string $heat_metric One of HEAT_METRICS.
+     */
+    private function render_mode_toggle($mode, $heat_metric) {
+        $is_activity = ($mode === 'activity');
+        ?>
+        <div class="matrix-genealogy-mode-toggle" role="group" aria-label="<?php esc_attr_e('Genealogy view mode', 'matrix-mlm'); ?>">
+            <div class="genealogy-mode-segmented" role="tablist">
+                <button type="button"
+                        class="genealogy-mode-btn<?php echo !$is_activity ? ' is-active' : ''; ?>"
+                        data-mode="structure"
+                        role="tab"
+                        aria-selected="<?php echo !$is_activity ? 'true' : 'false'; ?>">
+                    <span class="dashicons dashicons-screenoptions" aria-hidden="true"></span>
+                    <?php esc_html_e('Structure', 'matrix-mlm'); ?>
+                </button>
+                <button type="button"
+                        class="genealogy-mode-btn<?php echo $is_activity ? ' is-active' : ''; ?>"
+                        data-mode="activity"
+                        role="tab"
+                        aria-selected="<?php echo $is_activity ? 'true' : 'false'; ?>"
+                        title="<?php esc_attr_e('Tint each subtree by activity to see where to focus.', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-chart-bar" aria-hidden="true"></span>
+                    <?php esc_html_e('Activity', 'matrix-mlm'); ?>
+                </button>
+            </div>
+            <div class="genealogy-mode-metric-picker"<?php echo $is_activity ? '' : ' hidden'; ?>>
+                <label for="genealogy-heat-metric"><?php esc_html_e('Heat by:', 'matrix-mlm'); ?></label>
+                <select id="genealogy-heat-metric" class="genealogy-heat-metric-select">
+                    <option value="downline" <?php selected($heat_metric, 'downline'); ?>>
+                        <?php esc_html_e('Total downline size', 'matrix-mlm'); ?>
+                    </option>
+                    <option value="commission" <?php selected($heat_metric, 'commission'); ?>>
+                        <?php
+                        printf(
+                            /* translators: %d: window in days */
+                            esc_html__('Commissions earned (last %d days)', 'matrix-mlm'),
+                            (int) self::HEAT_COMMISSION_WINDOW_DAYS
+                        );
+                        ?>
+                    </option>
+                    <option value="active" <?php selected($heat_metric, 'active'); ?>>
+                        <?php esc_html_e('Active member ratio', 'matrix-mlm'); ?>
+                    </option>
+                </select>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Inline JS that wires the mode toggle and metric picker.
+     *
+     * Behavioural contract:
+     *
+     *   1. Clicking a Structure/Activity button updates the
+     *      .is-active class on the segmented buttons, toggles the
+     *      visibility of the metric picker, applies/removes the
+     *      .heatmap-active class on #genealogy-tree (the CSS hook
+     *      that turns tints on), updates the legends container's
+     *      data-mode attr (which CSS uses to show the right legend
+     *      variant), and replaces the URL's ?mode= param via
+     *      history.replaceState so a refresh preserves the choice
+     *      without polluting browser history.
+     *   2. Picking a different metric updates the wrapper's
+     *      data-active-metric attr (the other half of the CSS heat
+     *      selector), rewrites every visible heat pill's text from
+     *      its data-pill-{metric} attribute, updates the URL's
+     *      ?heat_metric= param, and updates the legend's data-metric
+     *      attr so the metric-specific legend label flips with it.
+     *   3. After the lazy-load script injects new nodes (which carry
+     *      their own data-pill-* / data-heat-* attributes), the
+     *      toggle's class state and active-metric attr already
+     *      apply to them via CSS — no extra rebinding needed.
+     *      Refreshing pill text on the new nodes is handled by the
+     *      lazy-load handler firing a 'matrix:subtree-loaded' event
+     *      that this script listens for.
+     *
+     * No AJAX here — the metric picker is purely client-side,
+     * because compute_heat_data() ran once at page render and
+     * stamped all three buckets into the DOM. Toggling between them
+     * is therefore a CSS-state flip plus a textContent rewrite per
+     * pill, both O(visible nodes) and instant on any device.
+     */
+    private function render_mode_toggle_script() {
+        ?>
+        <script>
+        (function() {
+            var tree     = document.getElementById('genealogy-tree');
+            var toggle   = document.querySelector('.matrix-genealogy-mode-toggle');
+            var legends  = document.querySelector('.matrix-genealogy-legends');
+            var picker   = toggle ? toggle.querySelector('.genealogy-mode-metric-picker') : null;
+            var select   = toggle ? toggle.querySelector('.genealogy-heat-metric-select') : null;
+            if (!tree || !toggle) return;
+
+            function refreshPills(metric) {
+                // Each pill carries data-pill-downline, data-pill-commission,
+                // and data-pill-active. Flipping the metric picker means
+                // rewriting textContent on every pill from its matching
+                // data-attr. Empty strings just blank the pill, which is
+                // what we want for nodes with no data on that metric.
+                var pills = tree.querySelectorAll('.tree-node-heat-pill');
+                for (var i = 0; i < pills.length; i++) {
+                    var pill = pills[i];
+                    var label = pill.getAttribute('data-pill-' + metric) || '';
+                    pill.textContent = label;
+                    if (label === '') {
+                        pill.setAttribute('hidden', 'hidden');
+                    } else {
+                        pill.removeAttribute('hidden');
+                    }
+                }
+            }
+
+            function updateUrl(mode, metric) {
+                if (typeof window.history.replaceState !== 'function') return;
+                try {
+                    var url = new URL(window.location.href);
+                    if (mode === 'structure') {
+                        url.searchParams.delete('mode');
+                        url.searchParams.delete('heat_metric');
+                    } else {
+                        url.searchParams.set('mode', 'activity');
+                        url.searchParams.set('heat_metric', metric);
+                    }
+                    window.history.replaceState({}, '', url.toString());
+                } catch (e) {
+                    // Older browsers without URL constructor — silently
+                    // skip URL persistence; in-page toggle still works.
+                }
+            }
+
+            function applyMode(mode, metric) {
+                var buttons = toggle.querySelectorAll('.genealogy-mode-btn');
+                for (var i = 0; i < buttons.length; i++) {
+                    var b = buttons[i];
+                    var isActive = (b.getAttribute('data-mode') === mode);
+                    b.classList.toggle('is-active', isActive);
+                    b.setAttribute('aria-selected', isActive ? 'true' : 'false');
+                }
+                if (picker) {
+                    if (mode === 'activity') picker.removeAttribute('hidden');
+                    else                     picker.setAttribute('hidden', 'hidden');
+                }
+                tree.setAttribute('data-active-metric', metric);
+                if (mode === 'activity') {
+                    tree.classList.add('heatmap-active');
+                } else {
+                    tree.classList.remove('heatmap-active');
+                }
+                if (legends) {
+                    legends.setAttribute('data-mode', mode);
+                    legends.setAttribute('data-metric', metric);
+                }
+                refreshPills(metric);
+                updateUrl(mode, metric);
+            }
+
+            // Wire the segmented buttons.
+            toggle.addEventListener('click', function(e) {
+                var btn = e.target.closest('.genealogy-mode-btn');
+                if (!btn) return;
+                var mode   = btn.getAttribute('data-mode') || 'structure';
+                var metric = (select && select.value) ? select.value : 'downline';
+                applyMode(mode, metric);
+            });
+
+            // Wire the metric picker.
+            if (select) {
+                select.addEventListener('change', function() {
+                    applyMode('activity', select.value);
+                });
+            }
+
+            // Refresh pill text on lazy-loaded subtrees so the new
+            // nodes show the right label for the currently-active
+            // metric. The lazy-load script dispatches this event
+            // after injecting the new .matrix-tree-children block.
+            tree.addEventListener('matrix:subtree-loaded', function() {
+                var metric = tree.getAttribute('data-active-metric') || 'downline';
+                refreshPills(metric);
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
      * Emit the inline JS that powers the "Show more" expand buttons.
      *
      * Runs once per genealogy view render, attached as a delegated
@@ -532,6 +1203,22 @@ class Matrix_MLM_User_Genealogy {
                     var newChildren = holder.firstElementChild;
                     if (newChildren) {
                         wrapper.replaceWith(newChildren);
+                        // Tell the mode-toggle script that fresh
+                        // nodes just landed in the DOM. Its handler
+                        // re-runs refreshPills() against the
+                        // currently-active metric so the new heat
+                        // pills show the right label without the
+                        // user having to flip the toggle.
+                        try {
+                            tree.dispatchEvent(new CustomEvent('matrix:subtree-loaded'));
+                        } catch (ev) {
+                            // Older browsers without CustomEvent
+                            // constructor — IE11 / very old Edge.
+                            // Skipping the event just leaves the
+                            // pills showing whatever the server
+                            // pre-filled them with, which is still
+                            // correct for the URL-selected metric.
+                        }
                     } else {
                         // Defensive: server returned empty markup.
                         // Don't leave the user staring at a stuck
@@ -901,9 +1588,48 @@ class Matrix_MLM_User_Genealogy {
         if (!$is_display_root && $node_user_id > 0) {
             $pivot_link_href = $this->pivot_url_for_user($node_user_id);
         }
+
+        // Heat-map data for this node (all three metrics pre-baked
+        // by compute_heat_data() so the JS toggle is a pure DOM
+        // attribute flip — no AJAX, no recompute).
+        //
+        // The display root is excluded from heat scoring on purpose:
+        // it's always rendered as the indigo "you" / "viewing" card,
+        // and tinting it would conflict with that fixed identity.
+        // For descendants, we emit data-heat-{metric} buckets on
+        // the outer node card (CSS uses these to apply tints when
+        // the wrapper is in heatmap-active mode) plus a hidden
+        // <span class="tree-node-heat-pill"> carrying all three
+        // labels — JS shows the right label on toggle, but we also
+        // pre-fill the visible textContent with whichever metric
+        // matches the currently-active mode so SSR works without
+        // JS for the metric that came in via the URL.
+        $heat_attrs   = '';
+        $pill_attrs   = '';
+        $pill_text    = '';
+        $pill_hidden  = true;
+        $node_heat    = null;
+        if (!$is_display_root && isset($this->pivot_state['heat_data'][(int) $node['id']])) {
+            $node_heat = $this->pivot_state['heat_data'][(int) $node['id']];
+        }
+        if ($node_heat) {
+            $heat_attrs .= ' data-heat-downline="'   . esc_attr($node_heat['downline']['bucket'])   . '"';
+            $heat_attrs .= ' data-heat-commission="' . esc_attr($node_heat['commission']['bucket']) . '"';
+            $heat_attrs .= ' data-heat-active="'     . esc_attr($node_heat['active']['bucket'])     . '"';
+            $pill_attrs .= ' data-pill-downline="'   . esc_attr($node_heat['downline']['label'])   . '"';
+            $pill_attrs .= ' data-pill-commission="' . esc_attr($node_heat['commission']['label']) . '"';
+            $pill_attrs .= ' data-pill-active="'     . esc_attr($node_heat['active']['label'])     . '"';
+
+            $current_mode   = isset($this->pivot_state['mode'])        ? (string) $this->pivot_state['mode']        : 'structure';
+            $current_metric = isset($this->pivot_state['heat_metric']) ? (string) $this->pivot_state['heat_metric'] : 'downline';
+            if (isset($node_heat[$current_metric])) {
+                $pill_text   = (string) $node_heat[$current_metric]['label'];
+                $pill_hidden = ($current_mode !== 'activity' || $pill_text === '');
+            }
+        }
         ?>
         <div class="matrix-tree-item">
-            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>" data-position-id="<?php echo (int) $node['id']; ?>" data-user-id="<?php echo (int) $node_user_id; ?>">
+            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>" data-position-id="<?php echo (int) $node['id']; ?>" data-user-id="<?php echo (int) $node_user_id; ?>"<?php echo $heat_attrs; // safe: each value is esc_attr'd above ?>>
                 <div class="tree-node-avatar tree-node-info-trigger" role="button" tabindex="0" aria-label="<?php echo esc_attr(sprintf(
                     /* translators: %s: username whose details we'd reveal */
                     __('Show details for %s', 'matrix-mlm'),
@@ -935,6 +1661,9 @@ class Matrix_MLM_User_Genealogy {
                         <?php endif; ?>
                     </div>
                     <small><?php printf(__('Level %d', 'matrix-mlm'), $node_level); ?> &bull; <?php printf(__('%d downline', 'matrix-mlm'), $downline); ?></small>
+                    <?php if ($node_heat): ?>
+                    <span class="tree-node-heat-pill"<?php echo $pill_attrs; // safe: esc_attr'd above ?><?php echo $pill_hidden ? ' hidden' : ''; ?>><?php echo esc_html($pill_text); ?></span>
+                    <?php endif; ?>
                 </div>
             </div>
             <?php if ($render_children_block): ?>
