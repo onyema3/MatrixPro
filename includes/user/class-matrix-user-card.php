@@ -86,6 +86,38 @@ class Matrix_MLM_User_Card {
             font-family: 'Courier New', monospace; font-size: 18px; letter-spacing: 2px;
             text-align: center;
         }
+        /* "View Card Details" panel — sensitive-data-aware layout. The
+           raw Fintava response is mapped to friendly labels here, with
+           PAN/CVV starting masked and revealed only on click. See the
+           inline comments on matrixViewCardDetails for the threat model
+           the auto-hide and visibilitychange listener address. */
+        .matrix-cd-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin: 16px 0; }
+        .matrix-cd-warn { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 13px; color: #92400e; line-height: 1.4; }
+        .matrix-cd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .matrix-cd-grid > .matrix-cd-row.is-full { grid-column: 1 / -1; }
+        .matrix-cd-row { background: #f9fafb; border: 1px solid #f3f4f6; border-radius: 8px; padding: 12px 14px; }
+        .matrix-cd-row.is-flex { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+        .matrix-cd-row .matrix-cd-body { flex: 1; min-width: 0; }
+        .matrix-cd-label { display: block; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+        .matrix-cd-value { font-family: 'Courier New', monospace; font-size: 16px; color: #1f2937; word-break: break-all; line-height: 1.3; }
+        .matrix-cd-value.is-pan { letter-spacing: 1.5px; font-size: 17px; }
+        .matrix-cd-toggle { background: #eef2ff; color: #4f46e5; border: 1px solid #c7d2fe; cursor: pointer; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px; white-space: nowrap; }
+        .matrix-cd-toggle:hover { background: #e0e7ff; }
+        .matrix-cd-toggle.is-revealed { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+        .matrix-cd-toggle.is-revealed:hover { background: #fee2e2; }
+        .matrix-cd-extras { margin-top: 16px; }
+        .matrix-cd-extras summary { cursor: pointer; color: #6b7280; font-size: 13px; padding: 6px 0; }
+        .matrix-cd-extras summary:hover { color: #4f46e5; }
+        .matrix-cd-extras-table { width: 100%; margin-top: 8px; border-collapse: collapse; }
+        .matrix-cd-extras-table td { padding: 6px 10px; font-size: 12px; border-bottom: 1px solid #f3f4f6; word-break: break-all; }
+        .matrix-cd-extras-table td:first-child { font-weight: 600; color: #374151; width: 40%; }
+        .matrix-cd-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; padding-top: 16px; border-top: 1px solid #f3f4f6; }
+        /* Print suppression: never include the details panel on a
+           printed page or PDF export, even if the user accidentally
+           hits CTRL+P while it is visible. The card visual at the top
+           of the page is still allowed; only the unmasked-on-screen
+           PAN/CVV panel is removed. */
+        @media print { .matrix-cd-card { display: none !important; } }
         </style>
         <?php
     }
@@ -346,25 +378,356 @@ class Matrix_MLM_User_Card {
                 });
             };
 
+            // ============================================================
+            // "View Card Details" panel
+            // ============================================================
+            //
+            // Fintava's GET /cards/fetch/{cardMapId} returns a flat object
+            // whose keys vary across tiers (cardNumber vs cardPan vs pan;
+            // cvv vs cvv2 vs securityCode; expiryMonth+expiryYear vs
+            // expiry; embossName vs cardName, etc.). The previous
+            // implementation dumped that object verbatim into a <table>
+            // with raw key labels, which was both ugly to look at AND
+            // — more importantly — left the full PAN and CVV plaintext
+            // on screen until the user reloaded the page. That made
+            // shoulder-surfing trivial: anyone walking past their
+            // monitor could read both card-not-present credentials.
+            //
+            // This rewrite addresses both:
+            //
+            //   - Field mapping. FIELD_MAP below maps canonical roles
+            //     ("pan", "cvv", "expiry", ...) to ordered lists of
+            //     Fintava key variants. cdPick() returns the first
+            //     non-empty match, so the layout below stays stable
+            //     regardless of which spelling Fintava sends today.
+            //   - Friendly layout. PAN/expiry/CVV/holder/brand/type
+            //     are rendered as labelled rows in a card-shaped grid,
+            //     not a flat key/value table.
+            //   - Sensitive-data masking. PAN, CVV, and PIN start
+            //     MASKED with a per-field "Show" toggle. Revealing
+            //     starts a 20s auto-mask timer (cdAutoHideMs); the
+            //     field reverts on timeout, on click of "Hide", on
+            //     dismissal of the panel, OR on visibilitychange
+            //     (tab/window blur). Unmasked values live only in a
+            //     closure-scoped object (cdSecrets), never in DOM
+            //     attributes — so DevTools / View-Source can't trivially
+            //     leak them either.
+            //   - Print suppression. The whole panel is display:none
+            //     in @media print so the user can't accidentally
+            //     CTRL+P a plaintext PAN to a network printer or PDF.
+            //   - Forward-compat. Any Fintava keys we don't have a
+            //     mapping for appear in a collapsed "More fields"
+            //     expander, so a Fintava-side schema change doesn't
+            //     silently drop diagnostic data.
+
+            // 20s is long enough for the user to copy / transcribe a
+            // value once, short enough that a momentary distraction
+            // doesn't leave the credentials sitting on screen. Tunable
+            // here in one place.
+            var cdAutoHideMs = 20000;
+
+            // Closure-scoped registry of unmasked values. Populated by
+            // cdRender(), cleared by matrixHideCardDetails().
+            var cdSecrets = {};
+
+            // Per-field auto-mask timer handles, keyed by element id so
+            // re-revealing one field doesn't cancel another's countdown.
+            var cdTimers = {};
+
+            // First non-empty key wins on each role. Keep canonical
+            // names (Fintava-current camelCase) first so the common
+            // case is the fastest match.
+            var FIELD_MAP = {
+                pan:         ['cardNumber', 'cardPan', 'pan', 'card_number', 'card_pan', 'maskedPan'],
+                cvv:         ['cvv', 'cvv2', 'securityCode', 'cvc', 'cardCvv'],
+                pin:         ['cardPin', 'pin'],
+                expiryMonth: ['expiryMonth', 'expiry_month', 'expMonth'],
+                expiryYear:  ['expiryYear', 'expiry_year', 'expYear'],
+                expiry:      ['expiry', 'expiryDate', 'expDate', 'expiry_date'],
+                holder:      ['embossName', 'cardName', 'cardholder', 'holderName', 'cardHolder', 'card_holder'],
+                brand:       ['cardBrand', 'brand'],
+                type:        ['cardType', 'type'],
+                status:      ['status', 'cardStatus']
+            };
+
+            function cdPick(raw, keys) {
+                for (var i = 0; i < keys.length; i++) {
+                    if (Object.prototype.hasOwnProperty.call(raw, keys[i])) {
+                        var v = raw[keys[i]];
+                        if (v !== null && v !== '' && typeof v !== 'undefined') {
+                            return { key: keys[i], val: String(v) };
+                        }
+                    }
+                }
+                return null;
+            }
+
+            // Render the PAN with one space every four digits — the
+            // standard ISO/IEC 7812 grouping that matches what's
+            // embossed on the physical card. Falls back to the raw
+            // string if it isn't digit-only, so an already-formatted
+            // Fintava response is still readable.
+            function cdFormatPan(s) {
+                var digits = String(s || '').replace(/\D+/g, '');
+                if (digits.length === 0) return String(s || '');
+                return digits.replace(/(.{4})/g, '$1 ').trim();
+            }
+
+            function cdMaskPan(s) {
+                var digits = String(s || '').replace(/\D+/g, '');
+                if (digits.length < 4) return '\u2022\u2022\u2022\u2022 \u2022\u2022\u2022\u2022 \u2022\u2022\u2022\u2022 \u2022\u2022\u2022\u2022';
+                return '\u2022\u2022\u2022\u2022 \u2022\u2022\u2022\u2022 \u2022\u2022\u2022\u2022 ' + digits.slice(-4);
+            }
+
+            function cdMaskShort(s) {
+                return String(s || '').replace(/./g, '\u2022');
+            }
+
+            // Detect a value Fintava has already masked on the wire
+            // (some tiers return "**** **** **** 1234" verbatim on
+            // PAN). When that's the case there's nothing to reveal,
+            // so we skip the toggle and the warning banner.
+            function cdLooksMasked(s) {
+                return /[*\u2022]/.test(String(s));
+            }
+
+            function cdEsc(s) {
+                return String(s).replace(/[&<>"']/g, function(c) {
+                    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+                });
+            }
+
+            // Mask handler — used by both the manual "Hide" toggle
+            // and the auto-mask timer. kind is 'pan' or 'simple'
+            // (CVV/PIN).
+            function cdMaskField(fieldId, kind) {
+                var $val = $('#' + fieldId);
+                var raw  = cdSecrets[fieldId] || '';
+                $val.text(kind === 'pan' ? cdMaskPan(raw) : cdMaskShort(raw))
+                    .attr('data-state', 'masked');
+                $('#' + fieldId + '-toggle')
+                    .text('<?php echo esc_js(__('Show', 'matrix-mlm')); ?>')
+                    .removeClass('is-revealed');
+                if (cdTimers[fieldId]) {
+                    clearTimeout(cdTimers[fieldId]);
+                    delete cdTimers[fieldId];
+                }
+            }
+
+            window.matrixCdToggleSensitive = function(btnEl, fieldId, kind) {
+                var $val = $('#' + fieldId);
+                var revealed = $val.attr('data-state') === 'shown';
+                if (revealed) {
+                    cdMaskField(fieldId, kind);
+                    return;
+                }
+                var raw = cdSecrets[fieldId] || '';
+                $val.text(kind === 'pan' ? cdFormatPan(raw) : raw)
+                    .attr('data-state', 'shown');
+                $(btnEl)
+                    .text('<?php echo esc_js(__('Hide', 'matrix-mlm')); ?>')
+                    .addClass('is-revealed');
+                if (cdTimers[fieldId]) clearTimeout(cdTimers[fieldId]);
+                cdTimers[fieldId] = setTimeout(function() {
+                    cdMaskField(fieldId, kind);
+                }, cdAutoHideMs);
+            };
+
+            window.matrixHideCardDetails = function() {
+                Object.keys(cdTimers).forEach(function(k) { clearTimeout(cdTimers[k]); });
+                cdTimers   = {};
+                cdSecrets  = {};
+                $('#matrix-card-details-display').hide();
+                $('#matrix-card-details-content').empty();
+            };
+
+            // visibilitychange listener: re-mask any revealed sensitive
+            // field as soon as the tab/window loses focus. This catches
+            // the alt-tab and screen-share scenarios — the user looks
+            // away briefly, returns, and finds the credentials masked
+            // again rather than still on screen for whoever was
+            // standing behind them. Namespaced (.matrixCd) so we don't
+            // collide with other dashboard handlers on the same event.
+            $(document).off('visibilitychange.matrixCd').on('visibilitychange.matrixCd', function() {
+                if (!document.hidden) return;
+                Object.keys(cdTimers).forEach(function(fieldId) {
+                    var $el  = $('#' + fieldId);
+                    var kind = $el.hasClass('is-pan') ? 'pan' : 'simple';
+                    cdMaskField(fieldId, kind);
+                });
+            });
+
+            // Build a structured row. opts.sensitive=true wires the
+            // masking toggle; sensitive=false renders the value plainly.
+            // Returns '' when value is empty so the caller can pass any
+            // optional field through and have it skipped.
+            function cdRow(label, value, opts) {
+                opts = opts || {};
+                if (value === null || typeof value === 'undefined' || value === '') return '';
+                if (opts.sensitive) {
+                    var fieldId = opts.fieldId;
+                    var kind    = opts.kind || 'simple';
+                    cdSecrets[fieldId] = value;
+                    var initialMasked = (kind === 'pan') ? cdMaskPan(value) : cdMaskShort(value);
+                    var valueClass    = 'matrix-cd-value' + (kind === 'pan' ? ' is-pan' : '');
+                    var rowClass      = 'matrix-cd-row is-flex' + (opts.fullWidth ? ' is-full' : '');
+                    return '' +
+                        '<div class="' + rowClass + '">' +
+                          '<div class="matrix-cd-body">' +
+                            '<span class="matrix-cd-label">' + cdEsc(label) + '</span>' +
+                            '<span class="' + valueClass + '" id="' + cdEsc(fieldId) + '" data-state="masked">' + cdEsc(initialMasked) + '</span>' +
+                          '</div>' +
+                          '<button type="button" class="matrix-cd-toggle" id="' + cdEsc(fieldId) + '-toggle" ' +
+                            'onclick="matrixCdToggleSensitive(this, \'' + cdEsc(fieldId) + '\', \'' + cdEsc(kind) + '\')">' +
+                            '<?php echo esc_js(__('Show', 'matrix-mlm')); ?>' +
+                          '</button>' +
+                        '</div>';
+                }
+                var rowClass2 = 'matrix-cd-row' + (opts.fullWidth ? ' is-full' : '');
+                return '' +
+                    '<div class="' + rowClass2 + '">' +
+                      '<span class="matrix-cd-label">' + cdEsc(label) + '</span>' +
+                      '<span class="matrix-cd-value">' + cdEsc(value) + '</span>' +
+                    '</div>';
+            }
+
+            function cdRender(raw) {
+                cdSecrets = {};
+                Object.keys(cdTimers).forEach(function(k) { clearTimeout(cdTimers[k]); });
+                cdTimers = {};
+
+                var pan        = cdPick(raw, FIELD_MAP.pan);
+                var cvv        = cdPick(raw, FIELD_MAP.cvv);
+                var pin        = cdPick(raw, FIELD_MAP.pin);
+                var holder     = cdPick(raw, FIELD_MAP.holder);
+                var brand      = cdPick(raw, FIELD_MAP.brand);
+                var type       = cdPick(raw, FIELD_MAP.type);
+                var status     = cdPick(raw, FIELD_MAP.status);
+                var expMM      = cdPick(raw, FIELD_MAP.expiryMonth);
+                var expYY      = cdPick(raw, FIELD_MAP.expiryYear);
+                var expFull    = cdPick(raw, FIELD_MAP.expiry);
+
+                // Compose MM/YY when Fintava sends month + year split
+                // (the common shape on /cards/fetch). Falls through to
+                // a single 'expiry' string when the response is
+                // pre-composed.
+                var expiryStr = '';
+                if (expMM && expYY) {
+                    var mm = ('0' + String(expMM.val).replace(/\D+/g, '')).slice(-2);
+                    var yy = String(expYY.val).replace(/\D+/g, '');
+                    if (yy.length === 4) yy = yy.slice(-2);
+                    expiryStr = mm + '/' + yy;
+                } else if (expFull) {
+                    expiryStr = String(expFull.val);
+                }
+
+                // Track which raw keys we've consumed so they don't
+                // also appear in the "More fields" tail.
+                var consumed = {};
+                [pan, cvv, pin, holder, brand, type, status, expMM, expYY, expFull].forEach(function(p) {
+                    if (p) consumed[p.key] = true;
+                });
+
+                var html = '';
+
+                // Show the warning banner only when there's actually
+                // something sensitive to reveal. Suppresses the panel
+                // looking alarming on tiers where Fintava already
+                // masked the PAN server-side.
+                var hasSecrets =
+                       (pan && !cdLooksMasked(pan.val))
+                    || (cvv && !cdLooksMasked(cvv.val))
+                    || (pin && !cdLooksMasked(pin.val));
+                if (hasSecrets) {
+                    html += '<div class="matrix-cd-warn">' +
+                              cdEsc('<?php echo esc_js(__('These details are sensitive. Tap Show to reveal each one, then Hide when you are done. Anything you reveal auto-hides after 20 seconds, and any time you switch tabs.', 'matrix-mlm')); ?>') +
+                            '</div>';
+                }
+
+                html += '<div class="matrix-cd-card">';
+
+                // PAN — full-width, sensitive (unless Fintava already
+                // masked it in the response).
+                if (pan) {
+                    if (cdLooksMasked(pan.val)) {
+                        html += cdRow('<?php echo esc_js(__('Card Number', 'matrix-mlm')); ?>', pan.val, { fullWidth: true });
+                    } else {
+                        html += cdRow('<?php echo esc_js(__('Card Number', 'matrix-mlm')); ?>', pan.val, { sensitive: true, fieldId: 'cd-pan', kind: 'pan', fullWidth: true });
+                    }
+                }
+
+                html += '<div class="matrix-cd-grid">';
+
+                html += cdRow('<?php echo esc_js(__('Expiry', 'matrix-mlm')); ?>', expiryStr);
+
+                if (cvv) {
+                    if (cdLooksMasked(cvv.val)) {
+                        html += cdRow('<?php echo esc_js(__('CVV', 'matrix-mlm')); ?>', cvv.val);
+                    } else {
+                        html += cdRow('<?php echo esc_js(__('CVV', 'matrix-mlm')); ?>', cvv.val, { sensitive: true, fieldId: 'cd-cvv', kind: 'simple' });
+                    }
+                }
+
+                if (pin) {
+                    if (cdLooksMasked(pin.val)) {
+                        html += cdRow('<?php echo esc_js(__('PIN', 'matrix-mlm')); ?>', pin.val);
+                    } else {
+                        html += cdRow('<?php echo esc_js(__('PIN', 'matrix-mlm')); ?>', pin.val, { sensitive: true, fieldId: 'cd-pin', kind: 'simple' });
+                    }
+                }
+
+                html += cdRow('<?php echo esc_js(__('Cardholder', 'matrix-mlm')); ?>', holder ? holder.val : '');
+                html += cdRow('<?php echo esc_js(__('Brand', 'matrix-mlm')); ?>',      brand  ? brand.val  : '');
+                html += cdRow('<?php echo esc_js(__('Type', 'matrix-mlm')); ?>',       type   ? type.val   : '');
+                html += cdRow('<?php echo esc_js(__('Status', 'matrix-mlm')); ?>',     status ? status.val : '');
+
+                html += '</div>'; // .matrix-cd-grid
+
+                // Forward-compat tail: anything we didn't recognise
+                // goes into a collapsed expander so support has the
+                // raw payload available without it cluttering the
+                // primary view.
+                var extras = [];
+                Object.keys(raw).forEach(function(key) {
+                    if (consumed[key]) return;
+                    var val = raw[key];
+                    if (val === null || typeof val === 'undefined' || val === '') return;
+                    if (typeof val === 'object') val = JSON.stringify(val);
+                    extras.push({ key: key, val: String(val) });
+                });
+                if (extras.length) {
+                    html += '<details class="matrix-cd-extras">' +
+                              '<summary>' + cdEsc('<?php echo esc_js(__('More fields from Fintava', 'matrix-mlm')); ?>') + '</summary>' +
+                              '<table class="matrix-cd-extras-table"><tbody>';
+                    extras.forEach(function(e) {
+                        html += '<tr><td>' + cdEsc(e.key) + '</td><td>' + cdEsc(e.val) + '</td></tr>';
+                    });
+                    html += '</tbody></table></details>';
+                }
+
+                html += '<div class="matrix-cd-actions">' +
+                          '<button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixHideCardDetails()">' +
+                            cdEsc('<?php echo esc_js(__('Done', 'matrix-mlm')); ?>') +
+                          '</button>' +
+                        '</div>';
+
+                html += '</div>'; // .matrix-cd-card
+
+                $('#matrix-card-details-content').html(html);
+                $('#matrix-card-details-display').show();
+            }
+
             window.matrixViewCardDetails = function() {
                 $.ajax({
                     url: matrixMLM.ajaxUrl,
                     type: 'POST',
                     data: { action: 'matrix_fintava_fetch_card', nonce: matrixMLM.nonce },
                     success: function(r) {
-                        if (r.success) {
-                            var card = r.data.card;
-                            var html = '<table class="matrix-table"><tbody>';
-                            for (var key in card) {
-                                if (!Object.prototype.hasOwnProperty.call(card, key)) continue;
-                                var val = card[key];
-                                if (val !== null && typeof val === 'object') val = JSON.stringify(val);
-                                html += '<tr><td><strong>' + key + '</strong></td><td>' + val + '</td></tr>';
-                            }
-                            html += '</tbody></table>';
-                            $('#matrix-card-details-content').html(html);
-                            $('#matrix-card-details-display').show();
-                        } else { alert(r.data.message); }
+                        if (r.success) { cdRender(r.data.card || {}); }
+                        else           { alert(r.data.message); }
+                    },
+                    error: function() {
+                        alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?>');
                     }
                 });
             };
