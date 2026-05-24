@@ -20,7 +20,7 @@ class Matrix_MLM_User_Card {
         $is_active = $fintava->is_active();
         ?>
         <h2><?php _e('Verve Card', 'matrix-mlm'); ?></h2>
-        <p class="matrix-subtitle"><?php _e('Your physical Verve debit card linked to your Fintava wallet. Use it for POS, ATM, and online payments.', 'matrix-mlm'); ?></p>
+        <p class="matrix-subtitle"><?php _e('Your physical Verve debit card linked to your Fintava wallet. The cards are already produced — create yours, link it to your wallet, then activate it for ATM, POS, and online payments.', 'matrix-mlm'); ?></p>
 
         <?php if (!$is_active): ?>
         <div class="matrix-alert matrix-alert-warning"><?php _e('Card service is currently unavailable. Please contact support.', 'matrix-mlm'); ?></div>
@@ -74,8 +74,15 @@ class Matrix_MLM_User_Card {
 
     private function render_card_details($card, $user_id) {
         $last_four = $card->last_four ?: '****';
-        $statuses_order = ['pending', 'processing', 'shipped', 'delivered', 'linked', 'active'];
-        $current_index = array_search($card->status, $statuses_order);
+        // Pre-produced flow: created (pending) -> linked -> active. The
+        // legacy intermediate states (processing/shipped/delivered) are
+        // still tolerated by the schema, but the UI treats anything that
+        // isn't 'linked' or 'active' as "created and ready to link".
+        $statuses_order = ['pending', 'linked', 'active'];
+        $effective_status = in_array($card->status, $statuses_order, true)
+            ? $card->status
+            : 'pending';
+        $current_index = array_search($effective_status, $statuses_order);
         ?>
 
         <!-- Card Visual -->
@@ -103,12 +110,9 @@ class Matrix_MLM_User_Card {
         <div class="matrix-card-timeline">
             <?php
             $steps = [
-                'pending' => __('Card Requested', 'matrix-mlm'),
-                'processing' => __('Processing', 'matrix-mlm'),
-                'shipped' => __('Shipped', 'matrix-mlm'),
-                'delivered' => __('Delivered', 'matrix-mlm'),
-                'linked' => __('Linked to Wallet', 'matrix-mlm'),
-                'active' => __('Active', 'matrix-mlm'),
+                'pending' => __('Card Created', 'matrix-mlm'),
+                'linked'  => __('Linked to Wallet', 'matrix-mlm'),
+                'active'  => __('Active', 'matrix-mlm'),
             ];
             foreach ($steps as $key => $label):
                 $step_index = array_search($key, $statuses_order);
@@ -124,20 +128,17 @@ class Matrix_MLM_User_Card {
 
         <!-- Actions based on status -->
         <div class="matrix-card-actions">
-            <?php if (in_array($card->status, ['pending', 'processing', 'shipped'])): ?>
-            <button class="matrix-btn matrix-btn-primary" onclick="matrixCheckCardStatus()"><?php _e('Refresh Status', 'matrix-mlm'); ?></button>
+            <?php if ($effective_status === 'pending'): ?>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixLinkCard()"><?php _e('Link to Wallet', 'matrix-mlm'); ?></button>
             <?php endif; ?>
 
-            <?php if ($card->status === 'delivered'): ?>
-            <button class="matrix-btn matrix-btn-primary" onclick="matrixLinkCard()"><?php _e('Link to Wallet', 'matrix-mlm'); ?></button>
+            <?php if ($effective_status === 'linked'): ?>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixActivateCard()"><?php _e('Activate Card', 'matrix-mlm'); ?></button>
+                <button class="matrix-btn matrix-btn-secondary" onclick="matrixViewCardDetails()"><?php _e('View Card Details', 'matrix-mlm'); ?></button>
             <?php endif; ?>
 
-            <?php if ($card->status === 'linked'): ?>
-            <button class="matrix-btn matrix-btn-primary" onclick="matrixActivateCard()"><?php _e('Activate Card', 'matrix-mlm'); ?></button>
-            <?php endif; ?>
-
-            <?php if ($card->status === 'active'): ?>
-            <button class="matrix-btn matrix-btn-primary" onclick="matrixViewCardDetails()"><?php _e('View Card Details', 'matrix-mlm'); ?></button>
+            <?php if ($effective_status === 'active'): ?>
+                <button class="matrix-btn matrix-btn-primary" onclick="matrixViewCardDetails()"><?php _e('View Card Details', 'matrix-mlm'); ?></button>
             <?php endif; ?>
         </div>
 
@@ -173,12 +174,12 @@ class Matrix_MLM_User_Card {
                     <tr><td><strong><?php _e('Card Type', 'matrix-mlm'); ?></strong></td><td>Physical Verve Card (STATIC_NO_ACCOUNT)</td></tr>
                     <tr><td><strong><?php _e('Brand', 'matrix-mlm'); ?></strong></td><td>Verve</td></tr>
                     <tr><td><strong><?php _e('Status', 'matrix-mlm'); ?></strong></td><td><?php echo ucfirst($card->status); ?></td></tr>
-                    <tr><td><strong><?php _e('Requested', 'matrix-mlm'); ?></strong></td><td><?php echo date('F d, Y', strtotime($card->created_at)); ?></td></tr>
+                    <tr><td><strong><?php _e('Created', 'matrix-mlm'); ?></strong></td><td><?php echo date('F d, Y', strtotime($card->created_at)); ?></td></tr>
                     <?php if ($card->activated_at): ?>
                     <tr><td><strong><?php _e('Activated', 'matrix-mlm'); ?></strong></td><td><?php echo date('F d, Y', strtotime($card->activated_at)); ?></td></tr>
                     <?php endif; ?>
                     <?php if ($card->delivery_address): ?>
-                    <tr><td><strong><?php _e('Delivery Address', 'matrix-mlm'); ?></strong></td><td><?php echo esc_html($card->delivery_address); ?></td></tr>
+                    <tr><td><strong><?php _e('Address on File', 'matrix-mlm'); ?></strong></td><td><?php echo esc_html($card->delivery_address); ?></td></tr>
                     <?php endif; ?>
                 </tbody>
             </table>
@@ -187,14 +188,6 @@ class Matrix_MLM_User_Card {
         <script>
         (function($) {
             'use strict';
-
-            window.matrixCheckCardStatus = function() {
-                $.ajax({
-                    url: matrixMLM.ajaxUrl, type: 'POST',
-                    data: { action: 'matrix_fintava_card_status', nonce: matrixMLM.nonce },
-                    success: function(r) { if (r.success) { alert('Status: ' + r.data.card.status); location.reload(); } else { alert(r.data.message); } }
-                });
-            };
 
             window.matrixLinkCard = function() {
                 if (!confirm('<?php _e("Link this card to your Fintava wallet?", "matrix-mlm"); ?>')) return;
@@ -245,18 +238,19 @@ class Matrix_MLM_User_Card {
         $meta = Matrix_MLM_User::get_meta($user_id);
         ?>
         <div class="matrix-create-wallet-intro" style="background: #f5f3ff; border-color: #c4b5fd;">
-            <h3 style="color: #5b21b6;"><?php _e('Request Your Physical Verve Card', 'matrix-mlm'); ?></h3>
-            <p style="color: #6d28d9;"><?php _e('Get a physical Verve debit card linked to your Fintava wallet. Use it at ATMs, POS terminals, and for online payments anywhere Verve is accepted.', 'matrix-mlm'); ?></p>
+            <h3 style="color: #5b21b6;"><?php _e('Create Your Verve Card', 'matrix-mlm'); ?></h3>
+            <p style="color: #6d28d9;"><?php _e('Your physical Verve debit card has already been produced for you. Create the card record now, then link it to your Fintava wallet and activate it to start using it at ATMs, POS terminals, and online.', 'matrix-mlm'); ?></p>
             <ul style="margin: 8px 0; padding-left: 20px; font-size: 13px; color: #6d28d9;">
                 <li><?php _e('Card Type: STATIC_NO_ACCOUNT (Verve)', 'matrix-mlm'); ?></li>
                 <li><?php _e('Linked directly to your Fintava wallet balance', 'matrix-mlm'); ?></li>
-                <li><?php _e('Physical card delivered to your address', 'matrix-mlm'); ?></li>
+                <li><?php _e('Three quick steps after creation: link → view → activate', 'matrix-mlm'); ?></li>
                 <li><?php _e('Works at all ATMs and POS terminals in Nigeria', 'matrix-mlm'); ?></li>
             </ul>
         </div>
 
         <div class="matrix-form-card">
-            <h3><?php _e('Delivery Details', 'matrix-mlm'); ?></h3>
+            <h3><?php _e('Cardholder Details', 'matrix-mlm'); ?></h3>
+            <p style="color: #6b7280; font-size: 13px; margin-top: -6px;"><?php _e('Used for KYC on Fintava\'s side. Address fields are optional — there is no shipping, since the cards are already produced.', 'matrix-mlm'); ?></p>
             <form id="matrix-request-card-form" class="matrix-form">
                 <div class="matrix-form-row">
                     <div class="matrix-form-group">
@@ -269,8 +263,8 @@ class Matrix_MLM_User_Card {
                     </div>
                 </div>
                 <div class="matrix-form-group">
-                    <label><?php _e('Delivery Address', 'matrix-mlm'); ?> *</label>
-                    <textarea name="address" rows="2" required placeholder="<?php _e('Full street address for card delivery', 'matrix-mlm'); ?>"><?php echo esc_textarea($meta->address ?? ''); ?></textarea>
+                    <label><?php _e('Address', 'matrix-mlm'); ?></label>
+                    <textarea name="address" rows="2" placeholder="<?php _e('Optional — your address on file for KYC', 'matrix-mlm'); ?>"><?php echo esc_textarea($meta->address ?? ''); ?></textarea>
                 </div>
                 <div class="matrix-form-row">
                     <div class="matrix-form-group">
@@ -283,7 +277,7 @@ class Matrix_MLM_User_Card {
                     </div>
                 </div>
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="request-card-btn">
-                    <?php _e('Request Verve Card', 'matrix-mlm'); ?>
+                    <?php _e('Create Verve Card', 'matrix-mlm'); ?>
                 </button>
             </form>
         </div>
@@ -294,8 +288,8 @@ class Matrix_MLM_User_Card {
             $('#matrix-request-card-form').on('submit', function(e) {
                 e.preventDefault();
                 var form = $(this), btn = $('#request-card-btn');
-                if (!confirm('<?php _e("Request a physical Verve card? It will be delivered to the address provided.", "matrix-mlm"); ?>')) return;
-                btn.prop('disabled', true).text('<?php _e("Requesting...", "matrix-mlm"); ?>');
+                if (!confirm('<?php _e("Create your Verve card record now? You'll link it to your wallet in the next step.", "matrix-mlm"); ?>')) return;
+                btn.prop('disabled', true).text('<?php _e("Creating...", "matrix-mlm"); ?>');
                 $.ajax({
                     url: matrixMLM.ajaxUrl, type: 'POST',
                     data: {
@@ -308,9 +302,9 @@ class Matrix_MLM_User_Card {
                     },
                     success: function(r) {
                         if (r.success) { alert(r.data.message); location.reload(); }
-                        else { alert(r.data.message); btn.prop('disabled', false).text('<?php _e("Request Verve Card", "matrix-mlm"); ?>'); }
+                        else { alert(r.data.message); btn.prop('disabled', false).text('<?php _e("Create Verve Card", "matrix-mlm"); ?>'); }
                     },
-                    error: function() { alert('<?php _e("Network error", "matrix-mlm"); ?>'); btn.prop('disabled', false).text('<?php _e("Request Verve Card", "matrix-mlm"); ?>'); }
+                    error: function() { alert('<?php _e("Network error", "matrix-mlm"); ?>'); btn.prop('disabled', false).text('<?php _e("Create Verve Card", "matrix-mlm"); ?>'); }
                 });
             });
         })(jQuery);
