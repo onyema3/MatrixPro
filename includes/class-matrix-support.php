@@ -10,10 +10,28 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Support {
 
     /**
+     * Allowed priority values. Whitelisted at the model layer as a
+     * defense-in-depth gate so a future caller that forgets to validate
+     * (CLI tool, REST hook, importer) cannot land an attacker-controlled
+     * string into the priority column. The ticket views render priority
+     * inside class="matrix-badge matrix-badge-..." and as visible text,
+     * so any byte landing here would be reflected on every reviewer's
+     * page (audit H15).
+     */
+    const ALLOWED_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+
+    /**
      * Create a ticket
      */
     public function create_ticket($user_id, $subject, $message, $priority = 'medium', $department = null) {
         global $wpdb;
+
+        // Coerce priority to the allow-list. The AJAX handler already does
+        // this (Matrix_MLM_Core::process_ticket); duplicating the gate here
+        // covers any non-AJAX caller without relying on out-of-band trust.
+        if (!in_array($priority, self::ALLOWED_PRIORITIES, true)) {
+            $priority = 'medium';
+        }
 
         $wpdb->insert($wpdb->prefix . 'matrix_tickets', [
             'user_id' => $user_id,

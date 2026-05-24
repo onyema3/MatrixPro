@@ -1734,7 +1734,16 @@ class Matrix_MLM_Core {
         $user_id = get_current_user_id();
         $subject = sanitize_text_field($_POST['subject'] ?? '');
         $message = sanitize_textarea_field($_POST['message'] ?? '');
-        $priority = sanitize_text_field($_POST['priority'] ?? 'medium');
+
+        // Whitelist priority. sanitize_text_field strips tags but lets attribute-
+        // breaking bytes (", >, =) through, and the ticket views render priority
+        // both inside class="matrix-badge matrix-badge-..." and as visible text
+        // (audit H15). Coerce to a fixed enum so neither sink can ever receive
+        // attacker-controlled bytes, regardless of whether the output sites
+        // remember to escape.
+        $priority_raw = sanitize_text_field($_POST['priority'] ?? 'medium');
+        $allowed_priorities = ['low', 'medium', 'high', 'urgent'];
+        $priority = in_array($priority_raw, $allowed_priorities, true) ? $priority_raw : 'medium';
 
         if (empty($subject) || empty($message)) {
             wp_send_json_error(['message' => __('Subject and message are required', 'matrix-mlm')]);

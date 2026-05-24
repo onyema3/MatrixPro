@@ -54,11 +54,11 @@ class Matrix_MLM_Admin_Tickets {
                 <tbody>
                     <?php foreach ($tickets as $ticket): ?>
                     <tr>
-                        <td><?php echo $ticket->id; ?></td>
+                        <td><?php echo (int) $ticket->id; ?></td>
                         <td><strong><?php echo esc_html($ticket->subject); ?></strong></td>
                         <td><?php echo esc_html($ticket->user_login); ?></td>
-                        <td><span class="matrix-badge matrix-badge-<?php echo $ticket->priority; ?>"><?php echo ucfirst($ticket->priority); ?></span></td>
-                        <td><span class="matrix-badge matrix-badge-<?php echo $ticket->status; ?>"><?php echo ucfirst(str_replace('_', ' ', $ticket->status)); ?></span></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->priority); ?>"><?php echo esc_html(ucfirst($ticket->priority)); ?></span></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->status); ?>"><?php echo esc_html(ucfirst(str_replace('_', ' ', $ticket->status))); ?></span></td>
                         <td><?php echo date('M d, Y H:i', strtotime($ticket->updated_at)); ?></td>
                         <td><a href="<?php echo admin_url('admin.php?page=matrix-mlm-tickets&action=view&id=' . $ticket->id); ?>" class="button button-small"><?php _e('View', 'matrix-mlm'); ?></a></td>
                     </tr>
@@ -103,8 +103,8 @@ class Matrix_MLM_Admin_Tickets {
             <div class="matrix-admin-card">
                 <div class="matrix-ticket-meta">
                     <span><strong><?php _e('User:', 'matrix-mlm'); ?></strong> <?php echo esc_html($ticket->user_login); ?></span>
-                    <span><strong><?php _e('Priority:', 'matrix-mlm'); ?></strong> <span class="matrix-badge matrix-badge-<?php echo $ticket->priority; ?>"><?php echo ucfirst($ticket->priority); ?></span></span>
-                    <span><strong><?php _e('Status:', 'matrix-mlm'); ?></strong> <span class="matrix-badge matrix-badge-<?php echo $ticket->status; ?>"><?php echo ucfirst(str_replace('_', ' ', $ticket->status)); ?></span></span>
+                    <span><strong><?php _e('Priority:', 'matrix-mlm'); ?></strong> <span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->priority); ?>"><?php echo esc_html(ucfirst($ticket->priority)); ?></span></span>
+                    <span><strong><?php _e('Status:', 'matrix-mlm'); ?></strong> <span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->status); ?>"><?php echo esc_html(ucfirst(str_replace('_', ' ', $ticket->status))); ?></span></span>
                     <span><strong><?php _e('Created:', 'matrix-mlm'); ?></strong> <?php echo date('M d, Y H:i', strtotime($ticket->created_at)); ?></span>
                 </div>
             </div>
