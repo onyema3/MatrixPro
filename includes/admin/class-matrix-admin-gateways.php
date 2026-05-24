@@ -807,18 +807,66 @@ class Matrix_MLM_Admin_Gateways {
 
     /**
      * Save gateway settings (database-stored gateways)
+     *
+     * Hardened in audit fix C10: previously this method JSON-encoded
+     * `$_POST['params']` verbatim, allowing whoever could submit the
+     * Gateways form to inject arbitrary keys into the gateway_parameters
+     * row — including rotating secret_key/webhook_secret/webhook_hash.
+     *
+     * The fix: only persist parameter keys that ALREADY EXIST in the
+     * gateway's stored gateway_parameters JSON. The set of editable
+     * keys is therefore seeded by activation/migration and cannot be
+     * extended through the UI. Adding a new gateway parameter requires
+     * a schema/migration update — which is the right operational
+     * surface for that change. Any extra keys submitted in the POST
+     * are silently dropped.
      */
     private function save_gateway() {
         global $wpdb;
 
         $id = intval($_POST['gateway_id']);
+        if ($id <= 0) {
+            echo '<div class="notice notice-error"><p>' . esc_html__('Invalid gateway id.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        // Read the existing gateway row to derive the allow-list of
+        // editable parameter keys. If the row has no params at all
+        // we leave it empty — no keys can be set through this form.
+        $existing = $wpdb->get_row($wpdb->prepare(
+            "SELECT gateway_parameters FROM {$wpdb->prefix}matrix_gateways WHERE id = %d",
+            $id
+        ));
+        if (!$existing) {
+            echo '<div class="notice notice-error"><p>' . esc_html__('Gateway not found.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        $existing_params = json_decode($existing->gateway_parameters ?? '', true);
+        if (!is_array($existing_params)) {
+            $existing_params = [];
+        }
+        $allowed_keys = array_keys($existing_params);
+
+        $submitted = isset($_POST['params']) && is_array($_POST['params']) ? wp_unslash($_POST['params']) : [];
+
+        // Filter the submitted params through the allow-list. Each
+        // value is forced through sanitize_text_field — gateway
+        // credentials are short opaque strings (API keys / webhook
+        // secrets) and should never contain HTML or newlines.
+        $sanitized = $existing_params;
+        foreach ($allowed_keys as $key) {
+            if (array_key_exists($key, $submitted)) {
+                $sanitized[$key] = sanitize_text_field((string) $submitted[$key]);
+            }
+        }
 
         $currencies_raw = sanitize_text_field($_POST['supported_currencies'] ?? '');
         $currencies = array_filter(array_map('trim', explode(',', $currencies_raw)));
         $currencies = array_map('strtoupper', $currencies);
 
         $data = [
-            'gateway_parameters' => json_encode($_POST['params'] ?? []),
+            'gateway_parameters' => json_encode($sanitized),
             'supported_currencies' => json_encode(array_values($currencies)),
             'min_amount' => floatval($_POST['min_amount']),
             'max_amount' => floatval($_POST['max_amount']),
