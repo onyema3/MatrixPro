@@ -1,7 +1,7 @@
 <?php
 /**
  * Fintava Pay - Billing Services (Airtime, Data, Cable TV, Electricity)
- * 
+ *
  * Endpoints:
  * - POST /billing/airtime                  - Buy airtime
  * - GET  /cable-service-name               - List cable providers
@@ -12,6 +12,20 @@
  * - GET  /billing/discos                   - List electricity disco providers
  * - POST /billing/discos                   - Preview meter details (verify meter)
  * - POST /billing/electricity              - Buy electricity (pay bill)
+ *
+ * Funds flow:
+ *   The Fintava billing API debits the merchant's master Fintava
+ *   account when these endpoints are called. To make the user pay
+ *   for what they actually consume, every bill-purchase handler in
+ *   this class debits the user's MatrixPro internal wallet
+ *   (matrix_user_meta.balance) BEFORE calling the upstream API.
+ *   On API failure the wallet is refunded; on API success the
+ *   debit stands and the merchant has been reimbursed by the user.
+ *
+ *   Previously these handlers ran the API call without ever
+ *   debiting the user, so any logged-in member could buy unlimited
+ *   airtime / data / cable / electricity at the merchant's expense.
+ *   See security audit C1.
  */
 
 if (!defined('ABSPATH')) {
@@ -19,6 +33,22 @@ if (!defined('ABSPATH')) {
 }
 
 class Matrix_MLM_Fintava_Billing {
+
+    /**
+     * Per-transaction caps for each bill type. Operators can override
+     * via the matrix_mlm_fintava_billing_caps option (assoc array
+     * keyed by type) but these defaults bound the worst-case loss on
+     * a single fraudulent purchase.
+     */
+    const DEFAULT_CAPS = [
+        'airtime'     => 50000,    // 50,000
+        'data'        => 50000,
+        'cable'       => 100000,
+        'electricity' => 500000,
+    ];
+
+    /** Lower bound — refuse zero/negative or absurdly small purchases. */
+    const MIN_AMOUNT = 50;
 
     public function __construct() {
         $this->register_hooks();
@@ -198,22 +228,26 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('Phone, amount and network are required', 'matrix-mlm')]);
         }
 
-        // Require Fintava virtual wallet — bills are debited from Fintava wallet
-        $fintava = new Matrix_MLM_Fintava();
-        if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
+        $cap_check = self::validate_amount('airtime', $amount);
+        if (is_wp_error($cap_check)) {
+            wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        $user_wallet = $fintava->get_user_wallet($user_id);
+        $debit = self::debit_for_purchase($user_id, $amount, 'airtime', sprintf(__('Airtime purchase to %s', 'matrix-mlm'), $phone));
+        if (is_wp_error($debit)) {
+            wp_send_json_error(['message' => $debit->get_error_message()]);
+        }
+        $debit_reference = $debit;
 
         $result = $this->buy_airtime($phone, $amount, $network);
         if (is_wp_error($result)) {
+            self::refund_failed_purchase($user_id, $amount, 'airtime', $debit_reference, $result->get_error_message());
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'airtime', $amount, ['phone' => $phone, 'network' => $network, 'wallet_id' => $user_wallet->wallet_id], $result);
-        wp_send_json_success(['message' => sprintf(__('%s%s airtime sent to %s (debited from your Fintava wallet)', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount), $phone)]);
+        $this->log_transaction($user_id, 'airtime', $amount, ['phone' => $phone, 'network' => $network, 'debit_ref' => $debit_reference], $result);
+        wp_send_json_success(['message' => sprintf(__('%s%s airtime sent to %s (debited from your wallet)', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount), $phone)]);
     }
 
     public function ajax_list_data_bundles() {
@@ -242,22 +276,26 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        // Require Fintava virtual wallet — bills are debited from Fintava wallet
-        $fintava = new Matrix_MLM_Fintava();
-        if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
+        $cap_check = self::validate_amount('data', $amount);
+        if (is_wp_error($cap_check)) {
+            wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        $user_wallet = $fintava->get_user_wallet($user_id);
+        $debit = self::debit_for_purchase($user_id, $amount, 'data', sprintf(__('Data bundle to %s', 'matrix-mlm'), $phone));
+        if (is_wp_error($debit)) {
+            wp_send_json_error(['message' => $debit->get_error_message()]);
+        }
+        $debit_reference = $debit;
 
         $result = $this->buy_data($phone, $plan_id, $network);
         if (is_wp_error($result)) {
+            self::refund_failed_purchase($user_id, $amount, 'data', $debit_reference, $result->get_error_message());
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'data', $amount, ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id, 'wallet_id' => $user_wallet->wallet_id], $result);
-        wp_send_json_success(['message' => __('Data bundle purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm')]);
+        $this->log_transaction($user_id, 'data', $amount, ['phone' => $phone, 'network' => $network, 'plan_id' => $plan_id, 'debit_ref' => $debit_reference], $result);
+        wp_send_json_success(['message' => __('Data bundle purchased successfully! (debited from your wallet)', 'matrix-mlm')]);
     }
 
     public function ajax_list_cable_providers() {
@@ -295,22 +333,26 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        // Require Fintava virtual wallet — bills are debited from Fintava wallet
-        $fintava = new Matrix_MLM_Fintava();
-        if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
+        $cap_check = self::validate_amount('cable', $amount);
+        if (is_wp_error($cap_check)) {
+            wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        $user_wallet = $fintava->get_user_wallet($user_id);
+        $debit = self::debit_for_purchase($user_id, $amount, 'cable', sprintf(__('Cable subscription %s', 'matrix-mlm'), $provider));
+        if (is_wp_error($debit)) {
+            wp_send_json_error(['message' => $debit->get_error_message()]);
+        }
+        $debit_reference = $debit;
 
         $result = $this->buy_cable($smartcard, $plan_id, $provider);
         if (is_wp_error($result)) {
+            self::refund_failed_purchase($user_id, $amount, 'cable', $debit_reference, $result->get_error_message());
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        $this->log_transaction($user_id, 'cable', $amount, ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id, 'wallet_id' => $user_wallet->wallet_id], $result);
-        wp_send_json_success(['message' => __('Cable subscription purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm')]);
+        $this->log_transaction($user_id, 'cable', $amount, ['smartcard' => $smartcard, 'provider' => $provider, 'plan_id' => $plan_id, 'debit_ref' => $debit_reference], $result);
+        wp_send_json_success(['message' => __('Cable subscription purchased successfully! (debited from your wallet)', 'matrix-mlm')]);
     }
 
     public function ajax_list_discos() {
@@ -354,26 +396,130 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('All fields are required', 'matrix-mlm')]);
         }
 
-        // Require Fintava virtual wallet — bills are debited from Fintava wallet
-        $fintava = new Matrix_MLM_Fintava();
-        if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to pay bills. Please create one from the Virtual Wallet tab.', 'matrix-mlm')]);
+        $cap_check = self::validate_amount('electricity', $amount);
+        if (is_wp_error($cap_check)) {
+            wp_send_json_error(['message' => $cap_check->get_error_message()]);
         }
 
-        $user_wallet = $fintava->get_user_wallet($user_id);
+        $debit = self::debit_for_purchase($user_id, $amount, 'electricity', sprintf(__('Electricity purchase for meter %s', 'matrix-mlm'), $meter_number));
+        if (is_wp_error($debit)) {
+            wp_send_json_error(['message' => $debit->get_error_message()]);
+        }
+        $debit_reference = $debit;
 
         $result = $this->buy_electricity($meter_number, $amount, $disco, $meter_type);
         if (is_wp_error($result)) {
+            self::refund_failed_purchase($user_id, $amount, 'electricity', $debit_reference, $result->get_error_message());
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
         $token = $result['data']['token'] ?? $result['token'] ?? '';
-        $this->log_transaction($user_id, 'electricity', $amount, ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type, 'token' => $token, 'wallet_id' => $user_wallet->wallet_id], $result);
+        $this->log_transaction($user_id, 'electricity', $amount, ['meter' => $meter_number, 'disco' => $disco, 'type' => $meter_type, 'token' => $token, 'debit_ref' => $debit_reference], $result);
 
-        $msg = __('Electricity purchased successfully! (debited from your Fintava wallet)', 'matrix-mlm');
+        $msg = __('Electricity purchased successfully! (debited from your wallet)', 'matrix-mlm');
         if ($token) { $msg .= ' Token: ' . $token; }
         wp_send_json_success(['message' => $msg, 'token' => $token]);
+    }
+
+    // =========================================================================
+    // INTERNAL: USER WALLET DEBIT / REFUND
+    // =========================================================================
+
+    /**
+     * Validate that the requested amount is within the per-bill cap and
+     * is not below the floor. Operators can override caps via the
+     * matrix_mlm_fintava_billing_caps option.
+     *
+     * @return true|WP_Error
+     */
+    private static function validate_amount($type, $amount) {
+        if ($amount < self::MIN_AMOUNT) {
+            return new WP_Error('amount_too_low', sprintf(
+                /* translators: %1$s: currency symbol, %2$s: minimum amount */
+                __('Minimum bill amount is %1$s%2$s.', 'matrix-mlm'),
+                get_option('matrix_mlm_currency_symbol', '₦'),
+                number_format(self::MIN_AMOUNT, 2)
+            ));
+        }
+
+        $caps = get_option('matrix_mlm_fintava_billing_caps', []);
+        if (!is_array($caps)) { $caps = []; }
+        $caps = array_merge(self::DEFAULT_CAPS, $caps);
+        $cap = isset($caps[$type]) ? floatval($caps[$type]) : 0;
+
+        if ($cap > 0 && $amount > $cap) {
+            return new WP_Error('amount_over_cap', sprintf(
+                /* translators: %1$s: bill type, %2$s: currency symbol, %3$s: cap */
+                __('%1$s purchases are capped at %2$s%3$s per transaction.', 'matrix-mlm'),
+                ucfirst($type),
+                get_option('matrix_mlm_currency_symbol', '₦'),
+                number_format($cap, 2)
+            ));
+        }
+        return true;
+    }
+
+    /**
+     * Debit the user's MatrixPro wallet for a bill purchase.
+     *
+     * Returns a unique reference string on success, or WP_Error on
+     * failure (insufficient funds is the most common case — surfaced
+     * to the user with a helpful message).
+     *
+     * @return string|WP_Error reference identifier
+     */
+    private static function debit_for_purchase($user_id, $amount, $type, $description) {
+        $wallet = new Matrix_MLM_Wallet();
+        if ($wallet->get_balance($user_id) < $amount) {
+            return new WP_Error('insufficient_balance', __('Insufficient wallet balance. Please fund your wallet first.', 'matrix-mlm'));
+        }
+
+        $reference = 'BILL-' . $type . '-' . $user_id . '-' . wp_generate_uuid4();
+        $result = $wallet->debit(
+            $user_id,
+            $amount,
+            'bill_payment',
+            $description,
+            $reference
+        );
+        if ($result === false) {
+            // debit() already logged; surface the same insufficient/locked message.
+            return new WP_Error('debit_failed', __('Could not debit wallet. Please try again or contact support.', 'matrix-mlm'));
+        }
+        return $reference;
+    }
+
+    /**
+     * Refund a failed bill purchase by crediting the user's wallet
+     * back. Records the refund as a wallet transaction tied to the
+     * original debit reference so reconciliation is straightforward.
+     */
+    private static function refund_failed_purchase($user_id, $amount, $type, $debit_reference, $reason) {
+        $wallet = new Matrix_MLM_Wallet();
+        $refund_ref = 'REFUND-' . $debit_reference;
+        $description = sprintf(
+            /* translators: %1$s: bill type, %2$s: failure reason */
+            __('Refund: %1$s purchase failed (%2$s)', 'matrix-mlm'),
+            $type,
+            $reason
+        );
+        $credited = $wallet->credit($user_id, $amount, 'bill_refund', $description, $refund_ref);
+
+        if ($credited === false) {
+            // Catastrophic: we debited but couldn't refund. Alert ops loudly.
+            error_log(sprintf(
+                '[Matrix Fintava Billing] CRITICAL: refund failed user_id=%d amount=%.2f debit_ref=%s reason=%s',
+                $user_id, $amount, $debit_reference, $reason
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_bill_refund_failed',
+                sprintf(
+                    __('Bill purchase refund FAILED for user #%1$d, amount %2$.2f, debit ref %3$s. Manual intervention required.', 'matrix-mlm'),
+                    $user_id, $amount, $debit_reference
+                )
+            );
+        }
     }
 
     // =========================================================================
