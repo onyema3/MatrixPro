@@ -50,19 +50,30 @@ class Matrix_MLM_User_Loan {
     const MAX_FILE_BYTES = 5242880;
 
 
-    /** Document uploads (NIN, utility bill, ID cards, marketing,
-     *  project info, guarantor ID) accept PDF + common image
-     *  formats. Photo-only uploads (passport photos) are stricter. */
+    /**
+     * Document uploads (NIN, utility bill, ID cards, marketing,
+     * project info, guarantor ID) accept PDF + common image
+     * formats. Photo-only uploads (passport photos) are stricter.
+     *
+     * Shape note: WordPress's `wp_check_filetype` / `wp_handle_upload`
+     * mime allow-list expects keys to be regex extension patterns
+     * and values to be MIME types — i.e. `'pdf' => 'application/pdf'`,
+     * NOT the other way round. The previous revision had this
+     * inverted (keys were MIME strings, values were extension
+     * patterns), which made WP's regex never match a real filename
+     * and pushed the security decision back onto the client-supplied
+     * Content-Type header. See audit finding H7.
+     */
     const DOC_MIMES = [
-        'application/pdf' => 'pdf',
-        'image/jpeg'      => 'jpg|jpeg',
-        'image/png'       => 'png',
-        'image/webp'      => 'webp',
+        'pdf'          => 'application/pdf',
+        'jpg|jpeg|jpe' => 'image/jpeg',
+        'png'          => 'image/png',
+        'webp'         => 'image/webp',
     ];
     const PHOTO_MIMES = [
-        'image/jpeg' => 'jpg|jpeg',
-        'image/png'  => 'png',
-        'image/webp' => 'webp',
+        'jpg|jpeg|jpe' => 'image/jpeg',
+        'png'          => 'image/png',
+        'webp'         => 'image/webp',
     ];
 
     public function __construct() {
@@ -456,6 +467,18 @@ class Matrix_MLM_User_Loan {
      *   - the resulting URL on success
      *   - never returns false; size/mime/upload errors raise via
      *     self::error() so the JS can highlight the field.
+     *
+     * Security:
+     *   - File type is validated by wp_check_filetype_and_ext(), which
+     *     inspects file content with fileinfo where available rather
+     *     than trusting the client-supplied Content-Type header. The
+     *     previous revision's array_key_exists($file['type'], ...)
+     *     check trusted the form-data Content-Type, which a curl
+     *     attacker can spoof to anything.
+     *   - Files land in a per-user subdirectory of /uploads/matrix-loan-files/
+     *     where a deny-PHP-execution .htaccess + web.config sit, so
+     *     even if a polyglot file slipped through the type check it
+     *     would still not execute on Apache or IIS.
      */
     private static function upload_one($field, $spec, $user_id) {
         if (empty($_FILES[$field]) || !isset($_FILES[$field]['tmp_name'])) {
@@ -481,13 +504,37 @@ class Matrix_MLM_User_Loan {
                 (int) (self::MAX_FILE_BYTES / 1048576)
             ), $field);
         }
-        if (!array_key_exists($file['type'], $spec['mimes'])) {
+
+        // Magic-byte + extension check independent of any client-supplied
+        // header. fileinfo (where available) is what backs the actual MIME
+        // detection inside wp_check_filetype_and_ext; the function returns
+        // ['ext'=>..., 'type'=>..., 'proper_filename'=>...] when the file
+        // matches the allow-list, and ['ext'=>false,'type'=>false] otherwise.
+        $check = wp_check_filetype_and_ext(
+            $file['tmp_name'],
+            $file['name'],
+            $spec['mimes']
+        );
+        if (empty($check['type']) || empty($check['ext']) || !in_array($check['type'], $spec['mimes'], true)) {
             self::error(sprintf(
                 /* translators: %s: document label */
                 __('%s must be a PDF, JPG, PNG, or WebP file.', 'matrix-mlm'),
                 $spec['label']
             ), $field);
         }
+
+        // Direct loan uploads to a sibling-of-uploads/ subdir we own
+        // and where we can drop a deny-PHP-execution .htaccess and
+        // web.config. The filter is scoped to this single
+        // wp_handle_upload call via add/remove of an anonymous fn.
+        $reroute = function ($dirs) use ($user_id) {
+            $sub = '/matrix-loan-files/' . (int) $user_id;
+            $dirs['path']   = $dirs['basedir'] . $sub;
+            $dirs['url']    = $dirs['baseurl'] . $sub;
+            $dirs['subdir'] = $sub;
+            return $dirs;
+        };
+        add_filter('upload_dir', $reroute);
 
         $upload = wp_handle_upload($file, [
             'test_form'                => false,
@@ -501,10 +548,78 @@ class Matrix_MLM_User_Loan {
                 return sprintf('matrix-loan-%d-%s-%s%s', $user_id, $field, substr(md5($base . microtime(true)), 0, 8), $ext);
             },
         ]);
+
+        remove_filter('upload_dir', $reroute);
+
         if (isset($upload['error'])) {
             self::error($upload['error'], $field);
         }
+
+        // First successful upload of this run — make sure the deny-
+        // execution guards are in place. Idempotent: write only if
+        // missing. The dirname of the uploaded file is the canonical
+        // location to plant them since wp_handle_upload created it.
+        self::ensure_upload_guards(dirname($upload['file']));
+
         return $upload['url'];
+    }
+
+    /**
+     * Drop deny-execution config files into the loan-uploads subdir
+     * the first time it's used. Both files are idempotent — re-creating
+     * them on every upload is harmless but unnecessary, so we skip if
+     * they already exist.
+     *
+     *   .htaccess  — Apache (and any front-end that respects it)
+     *   web.config — IIS
+     *
+     * The Apache rules deny direct execution of any PHP script
+     * (.php, .phtml, .php3-7, .phar) and remove any handler/
+     * AddType mapping that might otherwise route the file through
+     * the PHP engine. On Nginx, these files are ignored and the
+     * server admin must add an equivalent location block in their
+     * vhost — that's documented in the README, but the file in
+     * disk also serves as an obvious flag for someone auditing the
+     * directory.
+     */
+    private static function ensure_upload_guards($dir) {
+        if (!is_dir($dir)) { return; }
+
+        $htaccess = trailingslashit($dir) . '.htaccess';
+        if (!file_exists($htaccess)) {
+            $rules = "# MatrixPro: deny script execution in this directory.\n"
+                   . "# Loan applicants upload PDFs and images here; nothing in\n"
+                   . "# this folder should ever be executed by the PHP engine.\n"
+                   . "<FilesMatch \"\\.(php|phtml|php3|php4|php5|php6|php7|phar|pht)$\">\n"
+                   . "    Require all denied\n"
+                   . "</FilesMatch>\n"
+                   . "<IfModule mod_php.c>\n"
+                   . "    php_flag engine off\n"
+                   . "</IfModule>\n"
+                   . "RemoveHandler .php .phtml .phar\n"
+                   . "RemoveType .php .phtml .phar\n";
+            @file_put_contents($htaccess, $rules);
+        }
+
+        $webconfig = trailingslashit($dir) . 'web.config';
+        if (!file_exists($webconfig)) {
+            $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                 . "<configuration>\n"
+                 . "  <system.webServer>\n"
+                 . "    <handlers accessPolicy=\"Read\" />\n"
+                 . "    <security>\n"
+                 . "      <requestFiltering>\n"
+                 . "        <fileExtensions allowUnlisted=\"true\">\n"
+                 . "          <add fileExtension=\".php\" allowed=\"false\" />\n"
+                 . "          <add fileExtension=\".phtml\" allowed=\"false\" />\n"
+                 . "          <add fileExtension=\".phar\" allowed=\"false\" />\n"
+                 . "        </fileExtensions>\n"
+                 . "      </requestFiltering>\n"
+                 . "    </security>\n"
+                 . "  </system.webServer>\n"
+                 . "</configuration>\n";
+            @file_put_contents($webconfig, $xml);
+        }
     }
 
     /**
