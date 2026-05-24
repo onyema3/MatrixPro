@@ -568,6 +568,9 @@ class Matrix_MLM_Admin {
             case 'repair_database_schema':
                 $this->repair_database_schema();
                 break;
+            case 'reset_card':
+                $this->reset_card();
+                break;
             default:
                 wp_send_json_error(['message' => __('Invalid action', 'matrix-mlm')]);
         }
@@ -1401,7 +1404,11 @@ class Matrix_MLM_Admin {
         $bank_name = sanitize_text_field($_POST['bank_name'] ?? 'Fintava');
         $card_id = sanitize_text_field($_POST['card_id'] ?? '');
         $last_four = sanitize_text_field($_POST['last_four'] ?? '');
-        $card_status = sanitize_text_field($_POST['card_status'] ?? 'active');
+        // Default to 'pending' so a manually-linked card whose true Fintava
+        // state is unknown doesn't get marked active locally without an
+        // actual link+activate round-trip. Admins who genuinely know the
+        // card is active can pick that explicitly in the migration dropdown.
+        $card_status = sanitize_text_field($_POST['card_status'] ?? 'pending');
 
         $linked = [];
 
@@ -1458,5 +1465,72 @@ class Matrix_MLM_Admin {
         }
 
         wp_send_json_success(['message' => sprintf(__('Successfully linked %s to %s', 'matrix-mlm'), implode(' & ', $linked), $username)]);
+    }
+
+    /**
+     * Reset a user's card row to a pending state so they can self-serve
+     * the link+activate flow again.
+     *
+     * Used when the local DB row says the card is in some advanced state
+     * (linked/active) but Fintava either never had it linked or has lost
+     * the association. Most common cause is the pre-API-rewrite import
+     * path which defaulted status to 'active' on rows whose card was
+     * never round-tripped through Fintava.
+     *
+     * What stays:
+     *   - The row itself, including card_id (= Fintava cardMapId), so the
+     *     fresh link call uses the right cardMapId Fintava is expecting.
+     *   - wallet_id (the row's cross-reference to the wallet).
+     *   - metadata (historical Fintava response, useful for debugging).
+     *
+     * What gets cleared:
+     *   - status     → 'pending'
+     *   - last_four  → NULL (no PAN entered yet on this attempt)
+     *   - activated_at → NULL (no real activation)
+     *
+     * After this, the user reloads their card page, sees the
+     * 'Activate Card' button on the pending state, types in their PAN,
+     * and goes through the proper link+activate flow.
+     */
+    private function reset_card() {
+        global $wpdb;
+
+        $user_id = intval($_POST['user_id'] ?? 0);
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('User ID required', 'matrix-mlm')]);
+        }
+
+        $card = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, status FROM {$wpdb->prefix}matrix_fintava_cards WHERE user_id = %d ORDER BY id DESC LIMIT 1",
+            $user_id
+        ));
+        if (!$card) {
+            wp_send_json_error(['message' => __('No card found for this user', 'matrix-mlm')]);
+        }
+
+        $previous_status = $card->status;
+
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_cards',
+            [
+                'status'       => 'pending',
+                'last_four'    => null,
+                'activated_at' => null,
+                'updated_at'   => current_time('mysql'),
+            ],
+            ['id' => $card->id]
+        );
+
+        if ($updated === false) {
+            wp_send_json_error(['message' => __('Failed to reset card', 'matrix-mlm')]);
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: 1: previous card status the row was in before reset */
+                __('Card reset to pending (was %s). The user can now reload their card page and re-enter their PAN to link and activate it. The cardMapId on Fintava is preserved.', 'matrix-mlm'),
+                $previous_status
+            ),
+        ]);
     }
 }
