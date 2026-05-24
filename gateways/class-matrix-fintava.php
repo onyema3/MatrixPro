@@ -4504,14 +4504,39 @@ class Matrix_MLM_Fintava {
                 // half-parsed result.
             } else {
                 $msg = strtolower(is_array($direct->get_error_message()) ? implode(' ', $direct->get_error_message()) : (string) $direct->get_error_message());
-                if (strpos($msg, 'cannot get') !== false
+                // HTTP 404 / "cannot get" / "not found" — the tier doesn't
+                // expose this endpoint at all. Already handled.
+                //
+                // HTTP 400 with a generic upstream body ("Http Exception",
+                // "Bad Request", validation rejections of the wallet id
+                // shape) — Fintava is rejecting the request itself, not
+                // an auth/rate-limit failure. Symptom that drove this:
+                // a freshly card-reset user calling the balance page got
+                //   API Error (HTTP 400) calling
+                //   /customer/wallet/balance/<uuid>: Http Exception
+                // even though the same wallet still resolves correctly
+                // through the details-chain fallback (which uses
+                // /wallet/details?accountNumber=… → /customers/{id}).
+                // The 400 is recoverable in the same way a 404 is: stop
+                // probing the fast-path endpoint for the rest of the
+                // request and let the slower-but-known-good fallback
+                // answer the balance question. Keep the error around
+                // so the final diagnostic still mentions the 400 if
+                // everything else also fails.
+                $is_endpoint_unusable =
+                       strpos($msg, 'cannot get') !== false
                     || strpos($msg, 'not found') !== false
                     || strpos($msg, 'http 404') !== false
-                    || strpos($msg, '(http 404)') !== false) {
-                    // Tier doesn't expose this endpoint — stop probing it
+                    || strpos($msg, '(http 404)') !== false
+                    || strpos($msg, 'http 400') !== false
+                    || strpos($msg, '(http 400)') !== false
+                    || strpos($msg, 'http exception') !== false
+                    || strpos($msg, 'bad request') !== false;
+                if ($is_endpoint_unusable) {
+                    // Tier doesn't expose this endpoint (or doesn't
+                    // accept this wallet id shape) — stop probing it
                     // for the rest of the request and let the details
-                    // fallback take over. Keep the error around so we can
-                    // include it in the final diagnostic if everything fails.
+                    // fallback take over.
                     $balance_endpoint_dead = true;
                     $balance_endpoint_error = $direct;
                 } else {
