@@ -121,7 +121,10 @@ if (is_admin()) {
 // User Dashboard
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-dashboard.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-deposits.php';
-require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-withdrawals.php';
+// class-matrix-user-withdrawals.php removed — Path 4 (legacy /withdraw)
+// retired in feat/admin-controlled-withdrawals. The Wallet tab's
+// "Transfer to Own Wallet" + "Transfer to Bank" panes are the live
+// withdrawal surfaces.
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-referrals.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-genealogy.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-profile.php';

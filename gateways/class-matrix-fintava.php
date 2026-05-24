@@ -1701,8 +1701,15 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        if (!Matrix_MLM_User::is_active($user_id)) {
-            wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
+        // Withdrawal-policy gate. Replaces the bare is_active() check
+        // with the admin-configurable Matrix_MLM_User::can_withdraw()
+        // chain so the master kill switch, active-user requirement,
+        // and restricted-plan tier all evaluate at one source of
+        // truth. The returned reason string is already localised and
+        // user-facing, so we round-trip it straight to wp_send_json_error.
+        $eligibility = Matrix_MLM_User::can_withdraw($user_id);
+        if (!$eligibility['allowed']) {
+            wp_send_json_error(['message' => $eligibility['reason']]);
         }
 
         if (!$this->is_active()) {
@@ -2053,8 +2060,14 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        if (!Matrix_MLM_User::is_active($user_id)) {
-            wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
+        // Withdrawal-policy gate. See ajax_initiate_transfer for the
+        // rationale — same Matrix_MLM_User::can_withdraw() replacement
+        // applied here so the Matrix→Virtual flow honours the master
+        // kill switch and the active-user / restricted-plan toggles
+        // consistently with the bank-payout path.
+        $eligibility = Matrix_MLM_User::can_withdraw($user_id);
+        if (!$eligibility['allowed']) {
+            wp_send_json_error(['message' => $eligibility['reason']]);
         }
 
         if (!$this->is_active()) {

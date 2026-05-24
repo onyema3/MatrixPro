@@ -149,26 +149,13 @@
         });
     });
 
-    // Withdraw form
-    $(document).on('submit', '#matrix-withdraw-form', function(e) {
-        e.preventDefault();
-        const form = $(this);
-        const btn = form.find('button[type="submit"]');
-        btn.prop('disabled', true).text('Submitting...');
-
-        matrixAjax({
-            action: 'matrix_mlm_action',
-            matrix_action: 'withdraw',
-            amount: form.find('[name="amount"]').val(),
-            method: form.find('[name="method"]').val(),
-            account_details: form.find('[name="account_details"]').val()
-        }, function(data) {
-            showNotification(data.message, 'success');
-            setTimeout(function() { matrixMLMReload(); }, 2000);
-        }, function() {
-            btn.prop('disabled', false).text('Submit Withdrawal');
-        });
-    });
+    // Withdraw form handler removed — see feat/admin-controlled-withdrawals.
+    // The Withdraw tab and #matrix-withdraw-form selector haven't been
+    // rendered for a while; the matrix_action=withdraw endpoint they
+    // posted to has now been removed too. Bank payouts go through
+    // matrix_fintava_initiate_transfer (the bank-payout pane), and
+    // Matrix→Virtual moves go through matrix_transfer_matrix_to_virtual.
+    // Both honour the new admin withdrawal controls.
 
     // Transfer form
     $(document).on('submit', '#matrix-transfer-form', function(e) {

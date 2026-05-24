@@ -322,9 +322,6 @@ class Matrix_MLM_Core {
             case 'deposit':
                 $this->process_deposit();
                 break;
-            case 'withdraw':
-                $this->process_withdrawal();
-                break;
             case 'transfer':
                 $this->process_transfer();
                 break;
@@ -533,57 +530,6 @@ class Matrix_MLM_Core {
         }
     }
 
-    private function process_withdrawal() {
-        $user_id = get_current_user_id();
-        $amount = floatval($_POST['amount'] ?? 0);
-        $method = sanitize_text_field($_POST['method'] ?? '');
-        $account_details = sanitize_textarea_field($_POST['account_details'] ?? '');
-
-        $min = get_option('matrix_mlm_min_withdraw', 1000);
-        $max = get_option('matrix_mlm_max_withdraw', 1000000);
-
-        if ($amount < $min || $amount > $max) {
-            wp_send_json_error(['message' => sprintf(__('Amount must be between %s and %s', 'matrix-mlm'), $min, $max)]);
-        }
-
-        // User must have a Fintava wallet — funds move from Matrix wallet to Fintava wallet on approval
-        $fintava = new Matrix_MLM_Fintava();
-        if (!$fintava->user_has_wallet($user_id)) {
-            wp_send_json_error(['message' => __('You need a Fintava virtual wallet to withdraw. Please create one from the Virtual Wallet tab first.', 'matrix-mlm')]);
-        }
-
-        // Calculate charge
-        $charge_type = get_option('matrix_mlm_withdraw_charge_type', 'percent');
-        $charge_value = get_option('matrix_mlm_withdraw_charge', 5);
-        $charge = $charge_type === 'percent' ? ($amount * $charge_value / 100) : $charge_value;
-        $total = $amount + $charge;
-
-        // Check Matrix wallet has enough for full amount + charge
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
-
-        if ($balance < $total) {
-            wp_send_json_error(['message' => __('Insufficient Matrix wallet balance', 'matrix-mlm')]);
-        }
-
-        global $wpdb;
-        $wpdb->insert($wpdb->prefix . 'matrix_withdrawals', [
-            'user_id' => $user_id,
-            'method' => $method,
-            'amount' => $amount,
-            'charge' => $charge,
-            'net_amount' => $amount - $charge,
-            'currency' => get_option('matrix_mlm_currency', 'NGN'),
-            'account_details' => $account_details,
-            'status' => 'pending'
-        ]);
-
-        // Debit full amount + charge from Matrix wallet (funds move to Fintava wallet on approval)
-        $wallet->debit($user_id, $total, 'withdrawal', sprintf(__('Withdrawal request: %s%s to Fintava wallet', 'matrix-mlm'), get_option('matrix_mlm_currency_symbol', '₦'), number_format($amount, 2)));
-
-        wp_send_json_success(['message' => __('Withdrawal request submitted successfully. Funds have been held from your Matrix wallet and will be credited to your Fintava wallet upon admin approval.', 'matrix-mlm')]);
-    }
-
     /**
      * Process a user-to-user (Matrix wallet → Matrix wallet) transfer.
      *
@@ -621,6 +567,26 @@ class Matrix_MLM_Core {
      */
     private function process_transfer() {
         $user_id = get_current_user_id();
+
+        // Banned-user gap close. handle_ajax already gates this on
+        // login (wp_ajax_ requires it) but never checked the matrix-
+        // user status flag, so a banned user could still move funds
+        // out of their own Matrix wallet to an accomplice account
+        // and have that account cash them out. Closing it here at the
+        // same place the bank-payout and matrix-to-virtual paths
+        // already do.
+        //
+        // Intentionally NOT calling Matrix_MLM_User::can_withdraw()
+        // here — that helper is for actual cash-out paths (Matrix →
+        // Fintava and Fintava → bank). User-to-user transfers stay
+        // available even when admins disable withdrawals globally,
+        // because they don't move money off the platform; only the
+        // recipient's later withdrawal would, and that's already
+        // gated by can_withdraw().
+        if (!Matrix_MLM_User::is_active($user_id)) {
+            wp_send_json_error(['message' => __('Your account is not active. Please contact support.', 'matrix-mlm')]);
+        }
+
         $amount = floatval($_POST['amount'] ?? 0);
         $recipient_username = sanitize_text_field($_POST['recipient'] ?? '');
 
