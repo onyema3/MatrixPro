@@ -10,6 +10,16 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Admin_Settings {
 
     public function render() {
+        // Defense-in-depth at page entry. The submenu router enforces
+        // manage_matrix_settings; this re-check covers any future
+        // caller that invokes render() outside the menu pipeline
+        // (REST hook, CLI, custom admin_init handler), matching the
+        // pattern PR #226 introduced for balance/gateway saves and
+        // PR #235 for E-Pin generate/export. (audit H17)
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_die(__('You do not have permission to access this page.', 'matrix-mlm'), 403);
+        }
+
         if (isset($_POST['save_settings']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_save_settings')) {
             $this->save_settings();
         }
@@ -701,6 +711,22 @@ class Matrix_MLM_Admin_Settings {
     <?php }
 
     private function save_settings() {
+        // Belt-and-braces re-check at the function boundary. The submenu
+        // router gates the page on manage_matrix_settings; this re-check
+        // covers any future caller that invokes save_settings() outside
+        // the menu pipeline (REST hook, CLI, custom admin_init handler) —
+        // matching PR #226's pattern for balance/gateway saves and PR
+        // #235's for E-Pin generate/export. (audit H17)
+        //
+        // The appearance tab persists matrix_mlm_custom_css and the
+        // sms/livechat tabs persist matrix_mlm_livechat_code; those
+        // fields are designed to be emitted verbatim into the page,
+        // so the cap check here is what makes their wp_unslash
+        // pass-through safe regardless of who reaches save_settings().
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_die(__('You do not have permission to save these settings.', 'matrix-mlm'), 403);
+        }
+
         $tab = sanitize_text_field($_POST['settings_tab']);
 
         $settings = [];

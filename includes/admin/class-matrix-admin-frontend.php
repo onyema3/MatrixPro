@@ -9,10 +9,90 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Admin_Frontend {
 
+    /**
+     * Per-field sanitiser map for save_settings().
+     *
+     * Anything not in this map (matrix_mlm_custom_head_code) is
+     * stored RAW after wp_unslash() because that field's whole
+     * point is to inject HTML/script into <head> for analytics or
+     * tracking pixels. Letting it through is intentional, but
+     * because the byte string is then echoed verbatim into every
+     * public page (Matrix_MLM_SEO::output_head_code), the SAVE
+     * action is gated behind manage_matrix_settings rather than
+     * the menu's broader manage_matrix_mlm cap (audit H17).
+     *
+     * Sanitiser keys correspond to a small dispatch in save_settings()
+     * so we can apply per-field shape without one-off branches.
+     */
+    const FIELD_SANITIZERS = [
+        // SEO
+        'matrix_mlm_seo_title'         => 'text',
+        'matrix_mlm_meta_description'  => 'textarea',
+        'matrix_mlm_meta_keywords'     => 'text',
+        'matrix_mlm_og_image'          => 'url',
+        // matrix_mlm_custom_head_code intentionally NOT mapped — see docblock.
+
+        // Blog
+        'matrix_mlm_blog_enabled'      => 'bool',
+        'matrix_mlm_blog_title'        => 'text',
+        'matrix_mlm_blog_per_page'     => 'int',
+
+        // FAQ
+        'matrix_mlm_faq_enabled'       => 'bool',
+        'matrix_mlm_faq_title'         => 'text',
+        'matrix_mlm_faq_items'         => 'textarea', // JSON content; preserved as-is, no HTML allowed.
+
+        // Contact
+        'matrix_mlm_contact_email'     => 'email',
+        'matrix_mlm_contact_phone'     => 'text',
+        'matrix_mlm_contact_address'   => 'textarea',
+
+        // Footer
+        'matrix_mlm_footer_text'       => 'textarea',
+        'matrix_mlm_footer_about'      => 'textarea',
+
+        // Social
+        'matrix_mlm_social_facebook'   => 'url',
+        'matrix_mlm_social_twitter'    => 'url',
+        'matrix_mlm_social_instagram'  => 'url',
+        'matrix_mlm_social_linkedin'   => 'url',
+        'matrix_mlm_social_youtube'    => 'url',
+        'matrix_mlm_social_telegram'   => 'url',
+        'matrix_mlm_social_whatsapp'   => 'url',
+
+        // Policy pages — these render as user-visible HTML pages so
+        // formatting tags are allowed, but script and event handlers
+        // are stripped by wp_kses_post.
+        'matrix_mlm_privacy_policy'    => 'kses',
+        'matrix_mlm_terms_of_service'  => 'kses',
+        'matrix_mlm_refund_policy'     => 'kses',
+    ];
+
     public function render() {
+        // Defense-in-depth at page entry. The submenu router enforces
+        // manage_matrix_mlm; this re-check covers any future caller
+        // that invokes render() outside the menu pipeline (REST hook,
+        // CLI, custom admin_init handler) — same belt-and-braces
+        // pattern PR #235 used for E-Pin render. Cheap insurance.
+        if (!current_user_can('manage_matrix_mlm')) {
+            wp_die(__('You do not have permission to access this page.', 'matrix-mlm'), 403);
+        }
+
         $tab = isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'seo';
 
         if (isset($_POST['save_frontend']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_save_frontend')) {
+            // Privilege gate on the SAVE action. Reviewer-tier admins
+            // (manage_matrix_mlm) can land on this page to read SEO
+            // and policy copy, but writing here is dangerous because
+            // matrix_mlm_custom_head_code is echoed verbatim into the
+            // <head> of every public page — a low-tier admin who can
+            // write here gets a site-wide stored-XSS lever (audit
+            // H17). Saving therefore requires manage_matrix_settings,
+            // matching how PR #226 raised gateway/balance saves and
+            // PR #235 raised E-Pin export/generate.
+            if (!current_user_can('manage_matrix_settings')) {
+                wp_die(__('You do not have permission to save these settings.', 'matrix-mlm'), 403);
+            }
             $this->save_settings($tab);
         }
         ?>
@@ -166,6 +246,17 @@ class Matrix_MLM_Admin_Frontend {
     <?php }
 
     private function save_settings($tab) {
+        // Belt-and-braces re-check at the function boundary. render()
+        // already gates this with the same cap, but a future caller
+        // (REST hook, CLI, admin_init handler) could invoke save_settings()
+        // directly. The byte string written through here is echoed
+        // verbatim into <head> on every public page (matrix_mlm_custom_head_code
+        // path), so this is the line that has to hold under any
+        // call-site pattern. (audit H17)
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_die(__('You do not have permission to save these settings.', 'matrix-mlm'), 403);
+        }
+
         $fields = [];
         switch ($tab) {
             case 'seo': $fields = ['matrix_mlm_seo_title', 'matrix_mlm_meta_description', 'matrix_mlm_meta_keywords', 'matrix_mlm_og_image', 'matrix_mlm_custom_head_code']; break;
@@ -178,10 +269,43 @@ class Matrix_MLM_Admin_Frontend {
         }
 
         foreach ($fields as $field) {
-            $value = isset($_POST[$field]) ? wp_unslash($_POST[$field]) : '';
+            $raw = isset($_POST[$field]) ? wp_unslash($_POST[$field]) : '';
+            $value = $this->sanitize_field($field, $raw);
             update_option($field, $value);
         }
 
-        echo '<div class="notice notice-success"><p>' . __('Settings saved!', 'matrix-mlm') . '</p></div>';
+        echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved!', 'matrix-mlm') . '</p></div>';
+    }
+
+    /**
+     * Apply per-field shape sanitisation.
+     *
+     * Fields in self::FIELD_SANITIZERS get their declared shape;
+     * anything else (today: only matrix_mlm_custom_head_code) is
+     * stored raw because the field's purpose is verbatim emission
+     * into <head>. The cap gate at the save boundary is what makes
+     * that safe.
+     */
+    private function sanitize_field($field, $raw) {
+        $sanitizer = self::FIELD_SANITIZERS[$field] ?? null;
+        switch ($sanitizer) {
+            case 'text':
+                return sanitize_text_field($raw);
+            case 'textarea':
+                return sanitize_textarea_field($raw);
+            case 'email':
+                return sanitize_email($raw);
+            case 'url':
+                return esc_url_raw($raw);
+            case 'int':
+                return intval($raw);
+            case 'bool':
+                return empty($raw) ? 0 : 1;
+            case 'kses':
+                return wp_kses_post($raw);
+            default:
+                // Intentionally raw — see FIELD_SANITIZERS docblock.
+                return $raw;
+        }
     }
 }
