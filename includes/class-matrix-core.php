@@ -868,9 +868,56 @@ class Matrix_MLM_Core {
         // already on the page — this AJAX call replaces the expand
         // button under it with a freshly-rendered .matrix-tree-children
         // sibling).
+        //
+        // Hydrate the renderer's per-render pivot_state with just
+        // enough context for empty-slot CTAs to render their
+        // "Refer 1 more here →" affordance: viewer, plan id,
+        // referral URL, plan-level commission map, and currency
+        // symbol. We deliberately omit goal_level — the goal-level
+        // pulse is anchored to the levels visible in the
+        // page-rendered banner, and re-deriving it on each AJAX
+        // expansion would just compete for attention with the
+        // banner itself.
+        $referral_url = '';
+        if (class_exists('Matrix_MLM_User')) {
+            $maybe = (string) Matrix_MLM_User::get_referral_link($current_user_id);
+            if ($maybe !== '' && substr($maybe, -4) !== 'ref=') {
+                $referral_url = $maybe;
+            }
+        }
+        $level_commissions = [];
+        if (!empty($row->plan_id)) {
+            $plan_row = $wpdb->get_row($wpdb->prepare(
+                "SELECT level_commission FROM {$wpdb->prefix}matrix_plans WHERE id = %d",
+                (int) $row->plan_id
+            ));
+            if ($plan_row && !empty($plan_row->level_commission)) {
+                $decoded = json_decode((string) $plan_row->level_commission, true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $k => $v) {
+                        $level_commissions[(int) $k] = (float) $v;
+                    }
+                }
+            }
+        }
+
         ob_start();
         echo '<div class="matrix-tree-children">';
         $renderer = new Matrix_MLM_User_Genealogy();
+        // Public setter so the AJAX path can match the page-render
+        // contract that empty-slot rendering depends on. Without
+        // this, lazy-loaded subtrees would silently lose the
+        // "Refer 1 more here" affordance the rest of the tree shows.
+        $renderer->set_render_state([
+            'viewer_user_id'    => $current_user_id,
+            'display_user_id'   => $effective_root_user_id,
+            'plan_id'           => (int) $row->plan_id,
+            'is_pivoted'        => ($effective_root_user_id !== $current_user_id),
+            'referral_url'      => $referral_url,
+            'goal_level'        => 0,
+            'level_commissions' => $level_commissions,
+            'currency_symbol'   => get_option('matrix_mlm_currency_symbol', '₦'),
+        ]);
         $renderer->render_children_inner(
             $tree,
             (int) $row->plan_width,
