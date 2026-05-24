@@ -6755,7 +6755,7 @@ class Matrix_MLM_Fintava {
             'create_card' => [
                 'label'    => 'Create Card (Physical, STATIC_NO_ACCOUNT)',
                 'method'   => 'POST',
-                'path'     => '/cards/physical/',
+                'path'     => '/cards/physical',
                 'params'   => [],
                 'category' => 'Cards',
             ],
