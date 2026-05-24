@@ -1308,7 +1308,8 @@ class Matrix_MLM_Fintava_Billing {
         $fee     = round((float) ($amounts['fee']     ?? 0), 2);
         $total   = round((float) ($amounts['total']   ?? ($nominal + $fee)), 2);
 
-        $inserted = $wpdb->insert($wpdb->prefix . 'matrix_billing_transactions', [
+        $table   = $wpdb->prefix . 'matrix_billing_transactions';
+        $payload = [
             'user_id'          => (int) $user_id,
             'type'             => (string) $type,
             // Legacy `amount` column kept in sync with nominal so a
@@ -1323,7 +1324,57 @@ class Matrix_MLM_Fintava_Billing {
             'status'           => 'pending',
             'client_reference' => (string) $client_reference,
             'created_at'       => current_time('mysql'),
-        ]);
+        ];
+
+        $inserted = $wpdb->insert($table, $payload);
+
+        // Schema-drift self-heal: if the INSERT failed AND the
+        // $wpdb error matches one of the canonical schema-drift
+        // signatures (column missing, status enum value missing,
+        // table missing entirely), force-run create_table() and
+        // retry the INSERT once. Items C/D/E each added new
+        // columns and enum values; a copy-deploy that hadn't
+        // triggered Matrix_MLM_Database::create_tables() (e.g.
+        // FTP-replaced plugin files but never opened a Matrix
+        // admin page) lands here today with the user-visible
+        // "Internal error" message and no usable diagnostic.
+        //
+        // Heuristic intentionally narrow:
+        //   - "Unknown column 'X' in 'field list'" — C/D/E added
+        //     a column the table doesn't have yet.
+        //   - "Data truncated for column 'status' at row 1" — E
+        //     widened the status enum to include 'pending'; the
+        //     pre-E table still has the narrow enum.
+        //   - "Table '<db>.<prefix>matrix_billing_transactions'
+        //     doesn't exist" — fresh install where activation
+        //     didn't run (e.g. plugin deployed via mu-plugins
+        //     drop-in that bypasses register_activation_hook).
+        //
+        // Anything else (deadlock, charset issue, FK violation,
+        // disk full, UNIQUE collision on client_reference) takes
+        // the legacy fail-and-refund path: re-running dbDelta
+        // wouldn't help and could mask a real bug.
+        //
+        // Single retry only — no recursion. If create_table()
+        // can't fix the underlying cause (e.g. the DB user lacks
+        // ALTER permission), the second insert fails the same
+        // way and we surface the error normally.
+        if ($inserted === false && self::looks_like_schema_drift((string) $wpdb->last_error)) {
+            $drift_error = (string) $wpdb->last_error;
+            error_log(sprintf(
+                '[Matrix Fintava Billing] begin_transaction schema-drift detected user_id=%d type=%s last_error=%s; running create_table() and retrying once',
+                (int) $user_id, $type, $drift_error
+            ));
+            self::create_table();
+            $inserted = $wpdb->insert($table, $payload);
+            if ($inserted !== false) {
+                error_log(sprintf(
+                    '[Matrix Fintava Billing] begin_transaction self-heal succeeded user_id=%d type=%s ref=%s tx_id=%d',
+                    (int) $user_id, $type, $client_reference, (int) $wpdb->insert_id
+                ));
+            }
+        }
+
         if ($inserted === false) {
             $last_error = (string) $wpdb->last_error;
             // Existing structured-context line — preserves any ops
@@ -1348,6 +1399,45 @@ class Matrix_MLM_Fintava_Billing {
         }
         $this->last_begin_support_ref = null;
         return (int) $wpdb->insert_id;
+    }
+
+    /**
+     * Heuristic: does this $wpdb->last_error string look like a
+     * schema-drift / missing-table issue that re-running
+     * create_table() (the idempotent dbDelta migration) would fix?
+     *
+     * Returns TRUE for the canonical MySQL/MariaDB error texts
+     * emitted when the live schema is missing a column / enum
+     * value / the entire table that the current code expects:
+     *   - "Unknown column 'X' in 'field list'"
+     *   - "Table '<db>.<table>' doesn't exist"
+     *   - "Data truncated for column 'status' at row 1"
+     *
+     * Any other error returns FALSE so the caller takes the
+     * legacy fail-and-refund path. Re-running dbDelta on a
+     * deadlock / charset / FK / disk-full failure wouldn't help
+     * and could mask a real bug — the regex is deliberately
+     * narrow.
+     *
+     * Case-insensitive match because some MariaDB locales return
+     * the message with different capitalisation than upstream
+     * MySQL ("doesn't exist" vs "Doesn't exist"). The English
+     * driver text is the same across locales — the texts are not
+     * localised by the server, only formatted — so a literal-text
+     * match is portable enough for this use.
+     *
+     * @param string $wpdb_error Raw $wpdb->last_error value.
+     * @return bool TRUE iff the caller should retry after
+     *              create_table(); FALSE for any other failure.
+     */
+    private static function looks_like_schema_drift($wpdb_error) {
+        if ($wpdb_error === '') {
+            return false;
+        }
+        return (bool) preg_match(
+            '/(unknown column|doesn\'t exist|data truncated for column)/i',
+            $wpdb_error
+        );
     }
 
     /**
