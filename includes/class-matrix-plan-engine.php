@@ -75,112 +75,164 @@ class Matrix_MLM_Plan_Engine {
 
     /**
      * Join a matrix plan
+     *
+     * Concurrency note: this method is serialized per (user_id, plan_id)
+     * via a MySQL advisory lock (GET_LOCK). Without that lock, two
+     * parallel "Join" requests from the same user for the same plan
+     * could both pass the existing-position check, both debit the
+     * wallet, both insert a duplicate active position, and both pay
+     * referral + level commissions to the entire upline — fabricating
+     * money. The lock holds for at most LOCK_TIMEOUT seconds and is
+     * released in a finally block so a fatal error mid-flow never
+     * leaves it dangling.
      */
     public function join_plan($user_id, $plan_id, $use_wallet = true) {
         global $wpdb;
 
-        $plan = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d AND status = 'active'",
-            $plan_id
-        ));
-
-        if (!$plan) {
-            return ['success' => false, 'message' => __('Plan not found or inactive', 'matrix-mlm')];
+        $user_id = (int) $user_id;
+        $plan_id = (int) $plan_id;
+        if ($user_id <= 0 || $plan_id <= 0) {
+            return ['success' => false, 'message' => __('Invalid user or plan', 'matrix-mlm')];
         }
 
-        // Check if user already has active position in this plan
-        $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM {$wpdb->prefix}matrix_positions WHERE user_id = %d AND plan_id = %d AND status = 'active'",
-            $user_id, $plan_id
-        ));
-
-        if ($existing) {
-            return ['success' => false, 'message' => __('You already have an active position in this plan', 'matrix-mlm')];
+        $lock_name = 'mlm_join_' . md5($user_id . ':' . $plan_id);
+        $got_lock = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 5)", $lock_name));
+        if ($got_lock !== 1) {
+            return ['success' => false, 'message' => __('Another request is in progress, please try again.', 'matrix-mlm')];
         }
 
-        // Check balance
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
-        $total_cost = $plan->price + $plan->joining_fee;
+        try {
+            $plan = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d AND status = 'active'",
+                $plan_id
+            ));
 
-        if ($use_wallet && $balance < $total_cost) {
-            return ['success' => false, 'message' => __('Insufficient balance. Please deposit funds first.', 'matrix-mlm')];
+            if (!$plan) {
+                return ['success' => false, 'message' => __('Plan not found or inactive', 'matrix-mlm')];
+            }
+
+            // Check if user already has active position in this plan.
+            // The advisory lock ensures the SELECT-then-INSERT below is
+            // serialized for this (user, plan) pair.
+            $existing = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$wpdb->prefix}matrix_positions WHERE user_id = %d AND plan_id = %d AND status = 'active'",
+                $user_id, $plan_id
+            ));
+
+            if ($existing) {
+                return ['success' => false, 'message' => __('You already have an active position in this plan', 'matrix-mlm')];
+            }
+
+            $wallet = new Matrix_MLM_Wallet();
+            $total_cost = $plan->price + $plan->joining_fee;
+
+            // Debit wallet. The wallet's atomic debit (UPDATE ...
+            // WHERE balance >= N) prevents a concurrent debit from
+            // overspending; we still need the existence check above
+            // because a free plan (cost 0) has no wallet gate.
+            if ($use_wallet) {
+                $debited = $wallet->debit(
+                    $user_id,
+                    $total_cost,
+                    'plan_purchase',
+                    sprintf(__('Joined plan: %s', 'matrix-mlm'), $plan->name),
+                    'PLAN-' . $plan_id . '-' . $user_id . '-' . time()
+                );
+                if ($debited === false) {
+                    return ['success' => false, 'message' => __('Insufficient balance. Please deposit funds first.', 'matrix-mlm')];
+                }
+            }
+
+            // Find placement position
+            $user_meta = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
+                $user_id
+            ));
+
+            $sponsor_id = $user_meta ? $user_meta->referred_by : null;
+            $placement = $this->find_placement($plan_id, $plan->width, $sponsor_id);
+
+            // Create position
+            $inserted = $wpdb->insert($wpdb->prefix . 'matrix_positions', [
+                'user_id' => $user_id,
+                'plan_id' => $plan_id,
+                'sponsor_id' => $sponsor_id,
+                'parent_id' => $placement['parent_id'],
+                'position' => $placement['position'],
+                'level' => $placement['level'],
+                'status' => 'active'
+            ]);
+
+            if ($inserted === false) {
+                // Roll back the wallet debit to keep the user whole.
+                if ($use_wallet) {
+                    $wallet->credit(
+                        $user_id,
+                        $total_cost,
+                        'plan_purchase_refund',
+                        sprintf(__('Refund: failed to join plan %s', 'matrix-mlm'), $plan->name),
+                        'PLAN-REFUND-' . $plan_id . '-' . $user_id . '-' . time()
+                    );
+                }
+                return ['success' => false, 'message' => __('Could not create position. Please try again.', 'matrix-mlm')];
+            }
+
+            $position_id = $wpdb->insert_id;
+
+            // Snapshot the freshly-created position into the audit
+            // log. Powers the genealogy "time machine" view —
+            // without a 'created' event captured at insert time,
+            // the time-machine reconstruction wouldn't know whether
+            // a member was in the tree at any given snapshot date
+            // earlier than this join. Defensive class_exists() guard
+            // covers the (vanishingly rare) case where the autoloader
+            // hasn't picked up the helper yet — capture skips
+            // silently rather than blocking the join.
+            if (class_exists('Matrix_MLM_Position_History')) {
+                Matrix_MLM_Position_History::record_event(
+                    $position_id,
+                    'created',
+                    $user_id,
+                    ''
+                );
+            }
+
+            // Update parent counts
+            $this->update_upline_counts($placement['parent_id'], $plan_id);
+
+            // Pay referral commission
+            if ($sponsor_id) {
+                $this->pay_referral_commission($sponsor_id, $user_id, $plan);
+            }
+
+            // Pay level commissions to upline
+            $this->pay_level_commissions($user_id, $plan);
+
+            // Record any level-completion milestones unlocked by this
+            // placement and fire the email-side notification for each new
+            // milestone. Runs *before* check_matrix_completion() because
+            // the deepest level becoming complete should record both a
+            // level-D milestone (this method) and the whole-matrix
+            // completion bonus (the next call) — they're independent
+            // events with independent persistence and independent
+            // notification surfaces.
+            $this->record_level_completions($placement, $plan);
+
+            // Check for matrix completion
+            $this->check_matrix_completion($plan_id, $plan->width, $plan->depth);
+
+            return [
+                'success' => true,
+                'message' => sprintf(__('Successfully joined %s plan!', 'matrix-mlm'), $plan->name),
+                'position_id' => $position_id
+            ];
+        } finally {
+            // Always release the advisory lock, even if any of the
+            // above threw. RELEASE_LOCK is a no-op if we never
+            // actually held the lock (got_lock check above already
+            // guards the early-return path).
+            $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
         }
-
-        // Debit wallet
-        if ($use_wallet) {
-            $wallet->debit($user_id, $total_cost, 'plan_purchase', sprintf(__('Joined plan: %s', 'matrix-mlm'), $plan->name));
-        }
-
-        // Find placement position
-        $user_meta = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
-            $user_id
-        ));
-
-        $sponsor_id = $user_meta ? $user_meta->referred_by : null;
-        $placement = $this->find_placement($plan_id, $plan->width, $sponsor_id);
-
-        // Create position
-        $wpdb->insert($wpdb->prefix . 'matrix_positions', [
-            'user_id' => $user_id,
-            'plan_id' => $plan_id,
-            'sponsor_id' => $sponsor_id,
-            'parent_id' => $placement['parent_id'],
-            'position' => $placement['position'],
-            'level' => $placement['level'],
-            'status' => 'active'
-        ]);
-
-        $position_id = $wpdb->insert_id;
-
-        // Snapshot the freshly-created position into the audit
-        // log. Powers the genealogy "time machine" view —
-        // without a 'created' event captured at insert time,
-        // the time-machine reconstruction wouldn't know whether
-        // a member was in the tree at any given snapshot date
-        // earlier than this join. Defensive class_exists() guard
-        // covers the (vanishingly rare) case where the autoloader
-        // hasn't picked up the helper yet — capture skips
-        // silently rather than blocking the join.
-        if (class_exists('Matrix_MLM_Position_History')) {
-            Matrix_MLM_Position_History::record_event(
-                $position_id,
-                'created',
-                $user_id,
-                ''
-            );
-        }
-
-        // Update parent counts
-        $this->update_upline_counts($placement['parent_id'], $plan_id);
-
-        // Pay referral commission
-        if ($sponsor_id) {
-            $this->pay_referral_commission($sponsor_id, $user_id, $plan);
-        }
-
-        // Pay level commissions to upline
-        $this->pay_level_commissions($user_id, $plan);
-
-        // Record any level-completion milestones unlocked by this
-        // placement and fire the email-side notification for each new
-        // milestone. Runs *before* check_matrix_completion() because
-        // the deepest level becoming complete should record both a
-        // level-D milestone (this method) and the whole-matrix
-        // completion bonus (the next call) — they're independent
-        // events with independent persistence and independent
-        // notification surfaces.
-        $this->record_level_completions($placement, $plan);
-
-        // Check for matrix completion
-        $this->check_matrix_completion($plan_id, $plan->width, $plan->depth);
-
-        return [
-            'success' => true,
-            'message' => sprintf(__('Successfully joined %s plan!', 'matrix-mlm'), $plan->name),
-            'position_id' => $position_id
-        ];
     }
 
     /**

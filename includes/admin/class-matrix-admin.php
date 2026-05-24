@@ -579,8 +579,25 @@ class Matrix_MLM_Admin {
     private function approve_withdrawal() {
         global $wpdb;
         $id = intval($_POST['id']);
-        $wpdb->update($wpdb->prefix . 'matrix_withdrawals', ['status' => 'approved'], ['id' => $id]);
-        
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid withdrawal id', 'matrix-mlm')]);
+        }
+
+        // Conditional UPDATE: only the first request that flips
+        // pending -> approved wins. A second click (same admin or two
+        // admins on the page) sees affected_rows == 0 and bails out.
+        // This replaces the previous pattern of unconditional UPDATE +
+        // SELECT, which could double-credit when raced.
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_withdrawals',
+            ['status' => 'approved'],
+            ['id' => $id, 'status' => 'pending']
+        );
+        if ($rows !== 1) {
+            wp_send_json_error(['message' => __('This withdrawal has already been processed.', 'matrix-mlm')]);
+        }
+
+        // Now we own the transition. Read the row for the side-effects.
         $withdrawal = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d", $id));
         if ($withdrawal) {
             // Credit the withdrawal amount to user's Fintava wallet
@@ -589,7 +606,7 @@ class Matrix_MLM_Admin {
 
             Matrix_MLM_Notifications::send_withdrawal_notification($withdrawal->user_id, $withdrawal->amount, 'approved');
         }
-        
+
         wp_send_json_success(['message' => __('Withdrawal approved and credited to Fintava wallet', 'matrix-mlm')]);
     }
 
@@ -597,17 +614,39 @@ class Matrix_MLM_Admin {
         global $wpdb;
         $id = intval($_POST['id']);
         $note = sanitize_textarea_field($_POST['note'] ?? '');
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid withdrawal id', 'matrix-mlm')]);
+        }
 
+        // Read first to capture the user_id / amount / charge for the
+        // refund; the conditional UPDATE below confirms we won the race
+        // before the wallet credit lands.
         $withdrawal = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d", $id));
         if (!$withdrawal) {
             wp_send_json_error(['message' => __('Not found', 'matrix-mlm')]);
         }
 
-        $wpdb->update($wpdb->prefix . 'matrix_withdrawals', ['status' => 'rejected', 'admin_note' => $note], ['id' => $id]);
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_withdrawals',
+            ['status' => 'rejected', 'admin_note' => $note],
+            ['id' => $id, 'status' => 'pending']
+        );
+        if ($rows !== 1) {
+            wp_send_json_error(['message' => __('This withdrawal has already been processed.', 'matrix-mlm')]);
+        }
 
-        // Refund full amount + charge back to Matrix wallet
+        // We own the transition. Refund full amount + charge back to
+        // Matrix wallet. A reference tied to the withdrawal id makes
+        // the credit row unique so a hypothetical retry can't credit
+        // twice.
         $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit($withdrawal->user_id, $withdrawal->amount + $withdrawal->charge, 'withdrawal_refund', __('Withdrawal rejected - refund', 'matrix-mlm'));
+        $wallet->credit(
+            $withdrawal->user_id,
+            $withdrawal->amount + $withdrawal->charge,
+            'withdrawal_refund',
+            __('Withdrawal rejected - refund', 'matrix-mlm'),
+            'WD-REFUND-' . $withdrawal->id
+        );
 
         Matrix_MLM_Notifications::send_withdrawal_notification($withdrawal->user_id, $withdrawal->amount, 'rejected');
         wp_send_json_success(['message' => __('Withdrawal rejected and refunded to Matrix wallet', 'matrix-mlm')]);
@@ -616,16 +655,36 @@ class Matrix_MLM_Admin {
     private function approve_deposit() {
         global $wpdb;
         $id = intval($_POST['id']);
-        
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid deposit id', 'matrix-mlm')]);
+        }
+
         $deposit = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE id = %d", $id));
         if (!$deposit) {
             wp_send_json_error(['message' => __('Not found', 'matrix-mlm')]);
         }
 
-        $wpdb->update($wpdb->prefix . 'matrix_deposits', ['status' => 'completed'], ['id' => $id]);
+        // Conditional UPDATE: pending -> completed only once. A second
+        // click (or a webhook completing the same row concurrently)
+        // gets affected_rows == 0 and is rejected before the credit
+        // lands.
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_deposits',
+            ['status' => 'completed'],
+            ['id' => $id, 'status' => 'pending']
+        );
+        if ($rows !== 1) {
+            wp_send_json_error(['message' => __('This deposit has already been processed.', 'matrix-mlm')]);
+        }
 
         $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit($deposit->user_id, $deposit->net_amount, 'deposit', __('Manual deposit approval', 'matrix-mlm'));
+        $wallet->credit(
+            $deposit->user_id,
+            $deposit->net_amount,
+            'deposit',
+            __('Manual deposit approval', 'matrix-mlm'),
+            'DEP-MANUAL-' . $deposit->id
+        );
 
         Matrix_MLM_Notifications::send_deposit_notification($deposit->user_id, $deposit->amount, 'completed');
         wp_send_json_success(['message' => __('Deposit approved', 'matrix-mlm')]);
