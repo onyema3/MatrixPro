@@ -10,7 +10,18 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Admin_Settings {
 
     public function render() {
-        if (isset($_POST['save_settings']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_save_settings')) {
+        if (isset($_POST['matrix_repair_billing_schema']) && wp_verify_nonce($_POST['_wpnonce'] ?? '', 'matrix_save_settings')) {
+            // Click on the Repair Bill Payments Schema button at the
+            // bottom of the Bill Payments tab. Routed BEFORE the
+            // save_settings() branch because (a) browsers only
+            // submit the clicked submit button's name+value, so
+            // when the operator clicks Repair the save_settings
+            // input is absent from POST and save_settings() would
+            // never run anyway, but (b) keeping repair as a
+            // sibling elseif makes the dispatch contract explicit
+            // for any future button added to the same form.
+            $this->repair_billing_schema();
+        } elseif (isset($_POST['save_settings']) && wp_verify_nonce($_POST['_wpnonce'], 'matrix_save_settings')) {
             $this->save_settings();
         }
 
@@ -972,6 +983,22 @@ class Matrix_MLM_Admin_Settings {
         <p class="description" style="margin-top:8px;">
             <?php _e('Fee = flat + (amount &times; percent &divide; 100), rounded to 2 decimal places. Negative values are coerced to 0 and percentages above 100 are capped at 100.', 'matrix-mlm'); ?>
         </p>
+
+        <h2 style="margin-top:32px;"><?php _e('Bill Payments &mdash; Schema Repair', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('If users see <em>"Internal error. Please try again."</em> when buying airtime / data / cable / electricity, the <code>matrix_billing_transactions</code> table may be out of sync with the current plugin code &mdash; typically a column or status enum value missing after an upgrade that copied plugin files without ever loading a Matrix admin page (so the dbDelta migration never ran). Click below to re-run the schema migration. The migration is idempotent, so this is safe to run repeatedly.', 'matrix-mlm'); ?>
+        </p>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('After a successful repair, the next bill purchase that hits the previously-broken code path will succeed. Existing wallet refunds for previously-failed purchases stay in place &mdash; this button does not retry past failures, only unblocks future ones.', 'matrix-mlm'); ?>
+        </p>
+        <p>
+            <button type="submit"
+                    name="matrix_repair_billing_schema"
+                    value="1"
+                    class="button">
+                <?php _e('Repair Bill Payments Schema', 'matrix-mlm'); ?>
+            </button>
+        </p>
     <?php }
 
     private function save_settings() {
@@ -1184,5 +1211,129 @@ class Matrix_MLM_Admin_Settings {
         }
 
         echo '<div class="notice notice-success"><p>' . __('Settings saved successfully!', 'matrix-mlm') . '</p></div>';
+    }
+
+    /**
+     * Re-run the matrix_billing_transactions schema migration on
+     * demand (admin -> Settings -> Bill Payments -> Repair Bill
+     * Payments Schema).
+     *
+     * The migration itself lives on the gateway class as
+     * Matrix_MLM_Fintava_Billing::create_table() and is already
+     * called on every Matrix admin pageload via
+     * Matrix_MLM_Database::create_tables(). This handler exists
+     * for the cases where that idempotent pageload migration
+     * doesn't fire or doesn't pick up a change:
+     *
+     *   - Plugin files FTP-replaced without ever loading wp-admin
+     *     to trigger the pageload migration.
+     *   - dbDelta silently failing (charset/collation conflict,
+     *     ALTER permission missing on the DB user, table locked).
+     *   - An operator who wants to force a known-good schema
+     *     before opening a support ticket about the user-visible
+     *     "Internal error. Please try again." message.
+     *
+     * Output flow:
+     *   1. Capability check (manage_options) — settings page is
+     *      already admin-gated, but defence-in-depth costs us
+     *      nothing and matches the rest of the plugin's pattern.
+     *   2. Run create_table().
+     *   3. Probe INFORMATION_SCHEMA for the post-E columns
+     *      (nominal_amount, service_fee, total_charged,
+     *      refunded_amount, client_reference, completed_at). If
+     *      any are still missing, the migration didn't take —
+     *      surface the missing list as an error notice so the
+     *      operator can pursue the underlying cause (DB perms,
+     *      etc.) rather than seeing a misleading green tick.
+     *   4. Echo a success or error notice. Notices echo BEFORE
+     *      the .wrap div opens (matches save_settings()'s
+     *      pattern); WordPress admin auto-positions them.
+     *
+     * Does NOT redirect / set transients — the operator just
+     * clicked a button on this exact page, so the inline notice
+     * is the most direct feedback.
+     */
+    private function repair_billing_schema() {
+        if (!current_user_can('manage_options')) {
+            wp_die(esc_html__('Insufficient permission to repair the bill payments schema.', 'matrix-mlm'));
+        }
+
+        global $wpdb;
+
+        // Suppress wpdb's "show_errors" output during the
+        // migration. dbDelta is loud and the schema-probe
+        // ALTER cycle inside create_table() legitimately emits
+        // intermediate errors that the migration logic catches
+        // and recovers from (e.g. probing for a column that
+        // doesn't exist yet). We want a clean success notice
+        // when the table ends up healthy, not the dbDelta
+        // commentary scrolling past it.
+        $previous_show = $wpdb->hide_errors();
+
+        $threw = null;
+        try {
+            Matrix_MLM_Fintava_Billing::create_table();
+        } catch (\Throwable $e) {
+            // create_table() doesn't throw under any documented
+            // path, but a future refactor or a fatal during
+            // dbDelta on an exotic MySQL fork would land here.
+            // Capture the message for the error notice rather
+            // than letting it bubble up and white-screen the
+            // whole settings page.
+            $threw = $e->getMessage();
+        }
+
+        if ($previous_show) {
+            $wpdb->show_errors();
+        }
+
+        if ($threw !== null) {
+            echo '<div class="notice notice-error"><p>' . sprintf(
+                /* translators: %s: exception message from create_table() */
+                esc_html__('Bill Payments schema repair failed: %s', 'matrix-mlm'),
+                esc_html($threw)
+            ) . '</p></div>';
+            return;
+        }
+
+        // Verify the post-E critical columns are actually present
+        // after the migration. This is the only way to tell the
+        // difference between "create_table() ran clean and the
+        // schema is up to date" and "create_table() ran but
+        // dbDelta silently dropped an ALTER" (the latter happens
+        // when, say, the DB user has SELECT/INSERT/UPDATE/DELETE
+        // but lacks ALTER, which dbDelta swallows without
+        // returning an error).
+        $table = $wpdb->prefix . 'matrix_billing_transactions';
+        $required_cols = [
+            'nominal_amount',
+            'service_fee',
+            'total_charged',
+            'refunded_amount',
+            'client_reference',
+            'completed_at',
+        ];
+        $missing = [];
+        foreach ($required_cols as $col) {
+            $exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                DB_NAME, $table, $col
+            ));
+            if ($exists === 0) {
+                $missing[] = $col;
+            }
+        }
+
+        if (!empty($missing)) {
+            echo '<div class="notice notice-error"><p>' . sprintf(
+                /* translators: %s: comma-separated list of column names that are still missing after the migration */
+                esc_html__('Bill Payments schema repair ran, but these columns are still missing: %s. The most likely cause is that the database user lacks ALTER permission on the matrix_billing_transactions table. Check the PHP error log for dbDelta output and grant the missing permission, then click Repair again.', 'matrix-mlm'),
+                '<code>' . esc_html(implode(', ', $missing)) . '</code>'
+            ) . '</p></div>';
+            return;
+        }
+
+        echo '<div class="notice notice-success"><p>' . esc_html__('Bill Payments schema is up to date. New bill purchases will use the current schema; previously-failed purchases were already wallet-refunded.', 'matrix-mlm') . '</p></div>';
     }
 }
