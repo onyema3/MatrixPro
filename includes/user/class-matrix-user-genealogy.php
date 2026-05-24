@@ -4877,24 +4877,84 @@ class Matrix_MLM_User_Genealogy {
      *   - Revoke an existing token via
      *     matrix_revoke_share_token, with optimistic styling
      *     on the row + a rollback on error.
-     *   - PNG export. Lazy-load html2canvas from a CDN on first
-     *     click so the dashboard's initial page weight is
+     *   - PNG export. Lazy-load html2canvas (bundled in the
+     *     plugin's vendor directory, NOT a third-party CDN) on
+     *     first click so the dashboard's initial page weight is
      *     unaffected by a feature most members will never use.
-     *     Falls back to a "use PDF instead" toast if the CDN
-     *     fetch fails (ad-blocker, offline, etc.).
+     *     Falls back to a "use PDF instead" toast if the load
+     *     fails for any reason (corrupted asset, capture error,
+     *     CSP block on inline-injected scripts, etc.).
+     *
+     * Important load-order detail: this <script> block is parsed
+     * inline in the body when the dashboard renders, but
+     * `window.matrixMLM` (which holds ajaxUrl + nonce) is defined
+     * by `wp_localize_script` against the footer-loaded
+     * matrix-mlm-public handle. So matrixMLM is NOT yet on
+     * window when this script first executes — it only becomes
+     * available once the footer parses, around the time
+     * DOMContentLoaded fires.
+     *
+     * Two consequences flow from that:
+     *
+     *   1. Initialisation (querying panel children, binding
+     *      handlers) is deferred to DOMContentLoaded — by then
+     *      the footer has run and matrixMLM is on window.
+     *   2. The AJAX handlers themselves still re-read
+     *      matrixMLM.{ajaxUrl,nonce} at click time rather than
+     *      capturing them into closure-local vars. Belt-and-
+     *      suspenders, in case a future refactor moves
+     *      matrix-mlm-public out of the footer or another
+     *      script regenerates the nonce mid-session.
+     *
+     * The earlier version of this script captured ajaxUrl/nonce
+     * into local vars at IIFE time, which silently broke the
+     * "Create link" button (POST went to empty URL with empty
+     * nonce) — fixing that is the reason for the deferral
+     * above.
      *
      * jQuery is used only for the AJAX call (matches the rest of
      * the dashboard's AJAX pattern); the dnd handlers and
      * clipboard interactions are vanilla JS so the panel works
      * even on minimal jQuery deferments.
+     *
+     * @param string $html2canvas_url  Full URL to the bundled
+     *   html2canvas.min.js. Injected from PHP so the JS doesn't
+     *   need to know the plugin's install path. Bundled locally
+     *   (not pulled from a third-party CDN) so PNG export works
+     *   in environments that block cdnjs/jsdelivr/etc — corp
+     *   firewalls, strict CSP, regional ISP filtering, ad-
+     *   blockers configured to block third-party JS, etc.
      */
     private function render_share_export_script() {
+        $html2canvas_url = MATRIX_MLM_PLUGIN_URL . 'public/vendor/html2canvas/html2canvas.min.js';
         ?>
         <script>
         (function() {
-            var ajaxUrl = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
-            var nonce   = (window.matrixMLM && window.matrixMLM.nonce)   || '';
+            // Initialisation must wait until matrixMLM has been
+            // localized — see the docblock for the why. The
+            // panel's child elements are already in the DOM (the
+            // <script> tag is rendered AFTER the panel markup),
+            // but matrixMLM lives in a footer-loaded script.
+            function init() {
+                runPanel();
+            }
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', init);
+            } else {
+                // Already past DOMContentLoaded — covers the case
+                // where this script is somehow injected after the
+                // event has fired (e.g., a future tab-AJAX flow).
+                init();
+            }
 
+            function getAjaxUrl() {
+                return (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
+            }
+            function getNonce() {
+                return (window.matrixMLM && window.matrixMLM.nonce) || '';
+            }
+
+        function runPanel() {
             var panel = document.getElementById('matrix-share-export-panel');
             if (!panel) return;
             var form     = panel.querySelector('#msep-share-form');
@@ -4945,9 +5005,9 @@ class Matrix_MLM_User_Genealogy {
                     btn.disabled = true;
                     btn.textContent = '<?php echo esc_js(__('Creating…', 'matrix-mlm')); ?>';
 
-                    jQuery.post(ajaxUrl, {
+                    jQuery.post(getAjaxUrl(), {
                         action: 'matrix_create_share_token',
-                        nonce: nonce,
+                        nonce: getNonce(),
                         plan_id:       panel.querySelector('#msep-plan-id').value,
                         pivot_user_id: panel.querySelector('#msep-pivot-user-id').value,
                         expiry_days:   panel.querySelector('#msep-expiry').value,
@@ -5011,9 +5071,9 @@ class Matrix_MLM_User_Genealogy {
                         }
                         var tokenId = parseInt(li.getAttribute('data-token-id'), 10) || 0;
                         revokeBtn.disabled = true;
-                        jQuery.post(ajaxUrl, {
+                        jQuery.post(getAjaxUrl(), {
                             action: 'matrix_revoke_share_token',
-                            nonce: nonce,
+                            nonce: getNonce(),
                             token_id: tokenId
                         }, function(res) {
                             if (res && res.success) {
@@ -5044,23 +5104,31 @@ class Matrix_MLM_User_Genealogy {
             }
 
             // ---------- PNG export (lazy html2canvas) ----------
-            // We don't bundle html2canvas in the plugin because it
-            // adds ~200KB to the initial dashboard payload for a
-            // feature most members will use rarely. Lazy-loading
-            // from a well-known CDN at click time keeps the
-            // baseline page weight unchanged.
+            // We don't enqueue html2canvas globally because it
+            // adds ~200KB to the dashboard payload for a feature
+            // most members will use rarely. Lazy-load on first
+            // click — the script lives in the plugin's vendor
+            // directory rather than a third-party CDN, so it
+            // works in environments that block cdnjs/jsdelivr
+            // (corp firewalls, strict CSP, regional ISP
+            // filtering, ad-blockers, etc.). The CDN-based
+            // version of this loader was brittle in exactly
+            // those environments — failing silently with the
+            // "use PDF instead" toast even though the rest of
+            // the dashboard worked fine.
             //
-            // Failure modes covered: CDN blocked (ad-blocker / no
-            // network) and html2canvas itself throwing during
-            // capture (font/CORS issues). Both surface a "use PDF
-            // instead" toast rather than an opaque console error.
+            // Failure modes still covered: a corrupted or
+            // missing vendor file, html2canvas itself throwing
+            // during capture (CORS-tainted images, fonts,
+            // unsupported CSS). All surface a "use PDF instead"
+            // toast rather than an opaque console error.
             var html2canvasPromise = null;
             function loadHtml2Canvas() {
                 if (html2canvasPromise) return html2canvasPromise;
                 html2canvasPromise = new Promise(function(resolve, reject) {
                     if (window.html2canvas) { resolve(window.html2canvas); return; }
                     var s = document.createElement('script');
-                    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+                    s.src = '<?php echo esc_js($html2canvas_url); ?>';
                     s.async = true;
                     s.onload = function() {
                         if (window.html2canvas) resolve(window.html2canvas);
@@ -5074,7 +5142,23 @@ class Matrix_MLM_User_Genealogy {
 
             if (btnPng) {
                 btnPng.addEventListener('click', function() {
-                    var tree = document.querySelector('.matrix-genealogy-wrapper');
+                    // Capture target depends on which tree view
+                    // is currently active. The classic and D3
+                    // wrappers swap visibility via display:none
+                    // tied to data-active-view, so we ask the DOM
+                    // for the one that's actually visible. If the
+                    // user is on the D3 view we capture the
+                    // matrix-genealogy-d3-canvas (which contains
+                    // the SVG render); if classic, we capture the
+                    // matrix-genealogy-wrapper.
+                    //
+                    // Earlier versions of this handler always
+                    // captured `.matrix-genealogy-wrapper` —
+                    // which produced a blank PNG on the D3 tab
+                    // because that wrapper has display:none
+                    // there. Selecting by visibility makes both
+                    // tabs export usable output.
+                    var tree = pickVisibleTreeNode();
                     if (!tree) {
                         showToast('<?php echo esc_js(__('No tree to export.', 'matrix-mlm')); ?>', true);
                         return;
@@ -5101,6 +5185,35 @@ class Matrix_MLM_User_Genealogy {
                     });
                 });
             }
+
+            // Pick whichever of the two genealogy view roots is
+            // currently visible (i.e., not hidden via display:
+            // none). Returns null if neither is on screen, which
+            // can happen during a tab switch animation or before
+            // the D3 module has finished mounting.
+            function pickVisibleTreeNode() {
+                var candidates = [
+                    document.querySelector('.matrix-genealogy-d3-canvas[data-active-view="d3"]'),
+                    document.querySelector('.matrix-genealogy-wrapper[data-active-view="classic"]'),
+                    // Last-resort fallback for older markup that
+                    // didn't carry data-active-view attributes.
+                    document.querySelector('.matrix-genealogy-wrapper')
+                ];
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = candidates[i];
+                    if (!el) continue;
+                    // offsetParent === null when display:none is
+                    // applied anywhere up the chain. A zero-size
+                    // bounding box catches visibility:hidden +
+                    // collapsed elements too.
+                    if (el.offsetParent === null) continue;
+                    var rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    return el;
+                }
+                return null;
+            }
+        }
         })();
         </script>
         <?php
