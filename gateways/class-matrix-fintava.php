@@ -218,11 +218,50 @@ class Matrix_MLM_Fintava {
     }
 
     public function register_webhook_routes() {
+        // permission_callback is defense-in-depth on the route shape.
+        // The handler (Matrix_MLM_Fintava::handle_webhook) is the
+        // authority on the signature — it does the constant-time
+        // hash_equals check against the configured webhook_secret and
+        // gates inbound credits on a successful match. This pre-check
+        // refuses the request at the framework boundary when the
+        // x-fintava-signature header is structurally missing, so a
+        // future refactor that weakens the handler check still has a
+        // second line of defense at the route layer. (Audit H18:
+        // webhook routes used permission_callback => '__return_true'
+        // so the per-gateway handler was the SOLE gate.)
         register_rest_route('matrix-mlm/v1', '/fintava/webhook', [
             'methods' => 'POST',
             'callback' => [$this, 'handle_webhook'],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [$this, 'check_webhook_permission'],
         ]);
+    }
+
+    /**
+     * Pre-handler signature presence check.
+     *
+     * Returns WP_Error (rendered by REST as 401) if the
+     * x-fintava-signature header is missing or empty, or true to let
+     * handle_webhook() proceed. handle_webhook() then performs the
+     * full hash_hmac + hash_equals comparison and the inbound-credit
+     * defense-in-depth caps from PR #222.
+     *
+     * We don't try to verify the signature here because that would
+     * require reading the body twice (once for the permission check,
+     * once for the handler) — leaving the cryptographic step in the
+     * handler keeps the body read single-pass and ensures any future
+     * change to the signature-verification logic only has to be made
+     * in one place.
+     */
+    public function check_webhook_permission($request) {
+        $signature = $request->get_header('x-fintava-signature');
+        if (!is_string($signature) || $signature === '') {
+            return new WP_Error(
+                'rest_forbidden',
+                __('Webhook signature header is missing.', 'matrix-mlm'),
+                ['status' => 401]
+            );
+        }
+        return true;
     }
 
     /**
