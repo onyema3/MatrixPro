@@ -4451,6 +4451,18 @@ class Matrix_MLM_User_Genealogy {
      * Hides on print so a member exporting their tree doesn't
      * get the panel's chrome printed alongside it.
      *
+     * Styling lives in public/css/matrix-dashboard.css under the
+     * "Share & Export panel — colourful" section. Originally was
+     * inline next to this markup (same single-tab co-location
+     * pattern the rest of this class uses), but moved out in v1.0.8
+     * for the same reason the hover-card CSS moved out in v1.0.6 —
+     * production caching plugins, strict CSP, and shortcode
+     * sanitisers were stripping the body-level <style> block before
+     * it reached the browser, leaving members with an unstyled
+     * panel. Serving from the registered matrix-mlm-dashboard
+     * stylesheet (cache-busted by MATRIX_MLM_VERSION) sidesteps all
+     * three failure modes.
+     *
      * @param int $current_plan_id  The plan currently being viewed —
      *                               pre-selects on the share form so a
      *                               member who's already on Plan 3
@@ -4539,159 +4551,6 @@ class Matrix_MLM_User_Genealogy {
             <div id="msep-toast" class="msep-toast" role="status" aria-live="polite"></div>
         </div>
 
-        <style>
-        .matrix-share-export-panel {
-            background: #fff;
-            border: 1px solid #e2e8f0;
-            border-radius: 10px;
-            padding: 16px 20px;
-            margin: 0 0 18px;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-            position: relative;
-        }
-        .matrix-share-export-panel h3 {
-            margin: 0 0 6px;
-            font-size: 14px;
-            color: #111827;
-        }
-        .matrix-share-export-panel .msep-help {
-            margin: 0 0 10px;
-            font-size: 12px;
-            color: #6b7280;
-            line-height: 1.45;
-        }
-        .matrix-share-export-panel .msep-row {
-            display: grid;
-            grid-template-columns: 1fr 1.4fr;
-            gap: 28px;
-        }
-        @media (max-width: 768px) {
-            .matrix-share-export-panel .msep-row { grid-template-columns: 1fr; }
-        }
-        .matrix-share-export-panel .msep-actions {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-        .matrix-share-export-panel .msep-form {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            align-items: flex-end;
-            margin-bottom: 12px;
-        }
-        .matrix-share-export-panel .msep-field {
-            display: flex;
-            flex-direction: column;
-            gap: 3px;
-            font-size: 11px;
-            color: #4b5563;
-            flex: 1 1 140px;
-        }
-        .matrix-share-export-panel .msep-field input[type="text"],
-        .matrix-share-export-panel .msep-field select {
-            border: 1px solid #d1d5db;
-            border-radius: 6px;
-            padding: 5px 8px;
-            font-size: 13px;
-            min-width: 0;
-        }
-        .matrix-share-export-panel .msep-tokens {
-            border-top: 1px dashed #e5e7eb;
-            padding-top: 10px;
-        }
-        .matrix-share-export-panel .msep-empty {
-            margin: 0;
-            font-size: 12px;
-            color: #9ca3af;
-            font-style: italic;
-        }
-        .matrix-share-export-panel .msep-token-list {
-            list-style: none;
-            margin: 0;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-        .matrix-share-export-panel .msep-token {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 10px;
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 6px;
-            font-size: 12px;
-            flex-wrap: wrap;
-        }
-        .matrix-share-export-panel .msep-token.is-revoked,
-        .matrix-share-export-panel .msep-token.is-expired {
-            opacity: 0.55;
-        }
-        .matrix-share-export-panel .msep-token-label {
-            font-weight: 600;
-            color: #111827;
-            flex: 1 1 140px;
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        .matrix-share-export-panel .msep-token-meta {
-            color: #6b7280;
-            font-size: 11px;
-        }
-        .matrix-share-export-panel .msep-token-status {
-            display: inline-block;
-            padding: 1px 8px;
-            border-radius: 999px;
-            font-size: 10px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-        }
-        .matrix-share-export-panel .msep-status-active   { background: #d1fae5; color: #065f46; }
-        .matrix-share-export-panel .msep-status-revoked  { background: #fee2e2; color: #991b1b; }
-        .matrix-share-export-panel .msep-status-expired  { background: #f3f4f6; color: #4b5563; }
-        .matrix-share-export-panel .msep-token-url {
-            flex-basis: 100%;
-            margin-top: 2px;
-            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            font-size: 11px;
-            background: #fff;
-            border: 1px solid #e5e7eb;
-            border-radius: 4px;
-            padding: 4px 8px;
-            color: #1f2937;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-        .matrix-share-export-panel .msep-toast {
-            position: absolute;
-            top: 8px;
-            right: 16px;
-            background: #111827;
-            color: #fff;
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-size: 12px;
-            opacity: 0;
-            transform: translateY(-4px);
-            transition: opacity 0.15s, transform 0.15s;
-            pointer-events: none;
-        }
-        .matrix-share-export-panel .msep-toast.is-shown {
-            opacity: 1;
-            transform: translateY(0);
-        }
-        .matrix-share-export-panel .msep-toast.is-error { background: #b91c1c; }
-
-        @media print {
-            .matrix-share-export-panel { display: none !important; }
-        }
-        </style>
 
         <?php $this->render_share_export_script(); ?>
         <?php

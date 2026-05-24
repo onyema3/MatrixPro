@@ -2913,3 +2913,471 @@
 .matrix-genealogy-d3-details .mtx-details-loading {
     color: #6d28d9 !important;
 }
+
+
+
+/* =====================================================================
+ * Genealogy Share & Export panel — colourful
+ * =====================================================================
+ *
+ * Originally lived inline in render_share_export_panel() (in
+ * includes/user/class-matrix-user-genealogy.php). Moved here in
+ * v1.0.8 for the same reasons we moved the hover-card CSS in
+ * v1.0.6 — body-level <style> blocks are silently stripped on
+ * production WordPress installs by:
+ *
+ *   - HTML minifiers in caching plugins (LiteSpeed, W3 Total Cache,
+ *     WP Rocket, Autoptimize) when "Optimize CSS Delivery" or
+ *     "Combine CSS" is enabled.
+ *   - Strict Content-Security-Policy headers (style-src 'self'
+ *     without 'unsafe-inline').
+ *   - Themes / page builders that route shortcode output through
+ *     wp_kses_post()-style sanitisers.
+ *
+ * Serving the rules from the registered matrix-mlm-dashboard
+ * stylesheet (cache-busted by MATRIX_MLM_VERSION, delivered as a
+ * <link> in <head>) sidesteps all three.
+ *
+ * On top of the move, the rules are now styled to match the rest
+ * of the genealogy view's palette: indigo / violet / pink / amber
+ * gradient stripe across the top of the panel, gradient-pill
+ * primary button for "Create link", soft-indigo outlined pills for
+ * the export buttons, accent-coloured section dots, and tinted
+ * lavender card surface on each share-token row. The plain
+ * white-and-grey panel stood out against an otherwise colourful
+ * genealogy view, so this brings it in line.
+ *
+ * Markup contract is owned by render_share_export_panel() in PHP
+ * — keep selectors in sync with the DOM emitted there
+ * (.matrix-share-export-panel and the .msep-* inner classes).
+ * --------------------------------------------------------------------- */
+
+/* Outer panel — same gradient wash + tinted shadow as the
+   hover-card so the two surfaces feel like one product. */
+.matrix-share-export-panel {
+    background: linear-gradient(180deg, #ffffff 0%, #ffffff 70%, #faf5ff 100%);
+    border: 1px solid #e9d5ff;
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin: 0 0 18px;
+    box-shadow: 0 2px 6px -2px rgba(99, 102, 241, 0.10),
+                0 0 0 1px rgba(139, 92, 246, 0.04);
+    position: relative;
+    overflow: hidden;
+}
+
+/* Top stripe (indigo → violet → pink → amber). Pure ::before
+   pseudo so we don't have to touch the markup. !important on
+   background defends against themes that aggressively reset
+   pseudo-elements (Astra, GeneratePress popup-hardening). */
+.matrix-share-export-panel::before {
+    content: "" !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    height: 5px !important;
+    background: linear-gradient(90deg,
+        #6366f1 0%, #8b5cf6 35%, #ec4899 70%, #f59e0b 100%) !important;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* Section headings carry accent dots so the two columns read
+   as related-but-distinct (Export = indigo, Share = pink). */
+.matrix-share-export-panel h3 {
+    margin: 0 0 6px;
+    font-size: 14px;
+    color: #4f46e5;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.matrix-share-export-panel h3::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4f46e5;
+    flex: 0 0 auto;
+}
+.matrix-share-export-panel .msep-col-share h3 {
+    color: #db2777;
+}
+.matrix-share-export-panel .msep-col-share h3::before {
+    background: #db2777;
+}
+
+.matrix-share-export-panel .msep-help {
+    margin: 0 0 12px;
+    font-size: 12px;
+    color: #6b7280;
+    line-height: 1.45;
+}
+
+.matrix-share-export-panel .msep-row {
+    display: grid;
+    grid-template-columns: 1fr 1.4fr;
+    gap: 28px;
+}
+@media (max-width: 768px) {
+    .matrix-share-export-panel .msep-row { grid-template-columns: 1fr; }
+}
+
+.matrix-share-export-panel .msep-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.matrix-share-export-panel .msep-form {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    margin-bottom: 14px;
+}
+
+.matrix-share-export-panel .msep-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: #6d28d9;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    flex: 1 1 140px;
+}
+
+.matrix-share-export-panel .msep-field input[type="text"],
+.matrix-share-export-panel .msep-field select {
+    border: 1px solid #ddd6fe;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 13px;
+    min-width: 0;
+    background: #ffffff;
+    color: #111827;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+    transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+.matrix-share-export-panel .msep-field input[type="text"]:focus,
+.matrix-share-export-panel .msep-field select:focus {
+    outline: none;
+    border-color: #8b5cf6;
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+}
+
+/* ---------- Buttons ----------
+ *
+ * Override the host theme's `.button` styling with our gradient
+ * palette. `!important` on colour / background / border /
+ * text-decoration is the same belt-and-braces treatment the
+ * hover-card uses against themes (Astra, GeneratePress, Elementor
+ * child themes) that aggressively reset anchor and button styling.
+ *
+ * Three button tiers, each visually distinct:
+ *   - Primary: "Create link" — full gradient pill (indigo → violet
+ *     → pink). The most-prominent CTA on the panel.
+ *   - Secondary: "Export PDF" / "Export PNG" — soft lavender pill
+ *     with indigo text. Less visual weight than the primary so
+ *     the eye lands on Create first when the panel is empty.
+ *   - Tertiary: "Copy link" / "Revoke" inside each token row —
+ *     small accent-coloured pills (blue/red) so they read as
+ *     row-scoped controls, not panel-level CTAs.
+ */
+.matrix-share-export-panel .button.button-primary,
+.matrix-share-export-panel #msep-create-btn {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 8px 18px !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    color: #ffffff !important;
+    text-decoration: none !important;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%) !important;
+    border: 0 !important;
+    border-radius: 999px !important;
+    box-shadow: 0 2px 8px -2px rgba(139, 92, 246, 0.5) !important;
+    text-shadow: none !important;
+    cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+
+.matrix-share-export-panel .button.button-primary:hover,
+.matrix-share-export-panel .button.button-primary:focus,
+.matrix-share-export-panel #msep-create-btn:hover,
+.matrix-share-export-panel #msep-create-btn:focus,
+.matrix-share-export-panel #msep-create-btn:focus-visible {
+    color: #ffffff !important;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px -2px rgba(139, 92, 246, 0.6) !important;
+}
+
+.matrix-share-export-panel .button.button-primary:disabled,
+.matrix-share-export-panel #msep-create-btn:disabled {
+    opacity: 0.6;
+    transform: none;
+    cursor: wait;
+}
+
+/* Secondary buttons (Export PDF / Export PNG). Soft lavender
+   surface with indigo text — visually quieter than the primary
+   but still on-palette. */
+.matrix-share-export-panel #msep-export-pdf,
+.matrix-share-export-panel #msep-export-png {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 7px 16px !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    color: #4f46e5 !important;
+    text-decoration: none !important;
+    background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%) !important;
+    border: 1px solid #c7d2fe !important;
+    border-radius: 999px !important;
+    text-shadow: none !important;
+    cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
+}
+
+.matrix-share-export-panel #msep-export-pdf:hover,
+.matrix-share-export-panel #msep-export-pdf:focus,
+.matrix-share-export-panel #msep-export-pdf:focus-visible,
+.matrix-share-export-panel #msep-export-png:hover,
+.matrix-share-export-panel #msep-export-png:focus,
+.matrix-share-export-panel #msep-export-png:focus-visible {
+    color: #4338ca !important;
+    background: linear-gradient(135deg, #ddd6fe 0%, #c7d2fe 100%) !important;
+    border-color: #a5b4fc !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px -3px rgba(99, 102, 241, 0.4);
+}
+
+.matrix-share-export-panel #msep-export-png:disabled {
+    opacity: 0.6;
+    transform: none;
+    cursor: wait;
+}
+
+/* Tokens divider with a subtle gradient instead of a flat dash. */
+.matrix-share-export-panel .msep-tokens {
+    border-top: 1px solid transparent;
+    border-image: linear-gradient(90deg,
+        rgba(99, 102, 241, 0.25),
+        rgba(236, 72, 153, 0.25),
+        rgba(245, 158, 11, 0.25)) 1;
+    padding-top: 12px;
+}
+
+.matrix-share-export-panel .msep-empty {
+    margin: 0;
+    font-size: 12px;
+    color: #9ca3af;
+    font-style: italic;
+}
+
+.matrix-share-export-panel .msep-token-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Token rows — soft lavender wash so the panel reads as one
+   continuous palette. Non-active rows fade out so members'
+   eyes find live tokens first. */
+.matrix-share-export-panel .msep-token {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: linear-gradient(135deg, #faf5ff 0%, #ffffff 100%);
+    border: 1px solid #e9d5ff;
+    border-radius: 8px;
+    font-size: 12px;
+    flex-wrap: wrap;
+    transition: box-shadow .15s ease, border-color .15s ease;
+}
+
+.matrix-share-export-panel .msep-token:hover {
+    border-color: #c4b5fd;
+    box-shadow: 0 4px 14px -4px rgba(139, 92, 246, 0.18);
+}
+
+.matrix-share-export-panel .msep-token.is-revoked,
+.matrix-share-export-panel .msep-token.is-expired {
+    opacity: 0.55;
+    background: linear-gradient(135deg, #f9fafb 0%, #ffffff 100%);
+    border-color: #e5e7eb;
+}
+
+.matrix-share-export-panel .msep-token-label {
+    font-weight: 600;
+    color: #4c1d95;
+    flex: 1 1 140px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.matrix-share-export-panel .msep-token-meta {
+    color: #6b7280;
+    font-size: 11px;
+}
+
+/* Status pills — brighter palette than the prior flat fills,
+   with darker text for contrast. */
+.matrix-share-export-panel .msep-token-status {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border: 1px solid transparent;
+}
+
+.matrix-share-export-panel .msep-status-active {
+    background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+    color: #065f46;
+    border-color: #6ee7b7;
+}
+
+.matrix-share-export-panel .msep-status-revoked {
+    background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+    color: #991b1b;
+    border-color: #fca5a5;
+}
+
+.matrix-share-export-panel .msep-status-expired {
+    background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
+    color: #4b5563;
+    border-color: #d1d5db;
+}
+
+/* Token URL — soft purple-tinted readout with a monospaced font
+   so the link reads as content rather than chrome. */
+.matrix-share-export-panel .msep-token-url {
+    flex-basis: 100%;
+    margin-top: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    background: #f5f3ff;
+    border: 1px solid #e9d5ff;
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #4f46e5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Small action buttons inside token rows. WP's .button-small
+   would otherwise win on specificity, so override directly with
+   the same colour-bearing !important pattern the panel-level
+   buttons use. */
+.matrix-share-export-panel .msep-copy-btn,
+.matrix-share-export-panel .msep-revoke-btn {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 3px 12px !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    border-radius: 999px !important;
+    border: 1px solid transparent !important;
+    text-shadow: none !important;
+    cursor: pointer;
+    transition: transform .15s ease, background .15s ease, border-color .15s ease;
+    min-height: 0 !important;
+    line-height: 1.4 !important;
+}
+
+.matrix-share-export-panel .msep-copy-btn {
+    color: #1d4ed8 !important;
+    background: #dbeafe !important;
+    border-color: #bfdbfe !important;
+}
+
+.matrix-share-export-panel .msep-copy-btn:hover,
+.matrix-share-export-panel .msep-copy-btn:focus,
+.matrix-share-export-panel .msep-copy-btn:focus-visible {
+    color: #1e40af !important;
+    background: #bfdbfe !important;
+    border-color: #93c5fd !important;
+    transform: translateY(-1px);
+}
+
+.matrix-share-export-panel .msep-revoke-btn {
+    color: #b91c1c !important;
+    background: #fee2e2 !important;
+    border-color: #fecaca !important;
+}
+
+.matrix-share-export-panel .msep-revoke-btn:hover,
+.matrix-share-export-panel .msep-revoke-btn:focus,
+.matrix-share-export-panel .msep-revoke-btn:focus-visible {
+    color: #991b1b !important;
+    background: #fecaca !important;
+    border-color: #fca5a5 !important;
+    transform: translateY(-1px);
+}
+
+.matrix-share-export-panel .msep-revoke-btn:disabled {
+    opacity: 0.6;
+    transform: none;
+    cursor: wait;
+}
+
+/* Toast — gradient pill so success/info feels celebratory and
+   matches the rest of the panel's palette. The error variant
+   keeps a strong red so the failure state still reads as
+   "something went wrong" at a glance. */
+.matrix-share-export-panel .msep-toast {
+    position: absolute;
+    top: 12px;
+    right: 18px;
+    background: linear-gradient(135deg, #4f46e5 0%, #8b5cf6 50%, #ec4899 100%);
+    color: #fff;
+    padding: 7px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: 0 4px 14px -2px rgba(139, 92, 246, 0.5);
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: opacity 0.15s, transform 0.15s;
+    pointer-events: none;
+    z-index: 2;
+}
+
+.matrix-share-export-panel .msep-toast.is-shown {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.matrix-share-export-panel .msep-toast.is-error {
+    background: linear-gradient(135deg, #b91c1c 0%, #dc2626 100%);
+    box-shadow: 0 4px 14px -2px rgba(220, 38, 38, 0.45);
+}
+
+@media print {
+    .matrix-share-export-panel { display: none !important; }
+}
