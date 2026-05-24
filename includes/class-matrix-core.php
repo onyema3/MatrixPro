@@ -341,6 +341,9 @@ class Matrix_MLM_Core {
             case 'node_details':
                 $this->process_node_details();
                 break;
+            case 'fetch_new_descendants':
+                $this->process_fetch_new_descendants();
+                break;
             case 'submit_ticket':
                 $this->process_ticket();
                 break;
@@ -1595,6 +1598,299 @@ class Matrix_MLM_Core {
 
         update_user_meta($user_id, 'matrix_avatar_url', $upload['url']);
         wp_send_json_success(['message' => __('Avatar updated', 'matrix-mlm'), 'url' => $upload['url']]);
+    }
+
+    /**
+     * AJAX: poll for new descendants that joined under the
+     * currently-viewed root since a given timestamp.
+     *
+     * Powers the genealogy tree's real-time updates: the D3 view
+     * fires this every ~45 seconds and grafts the response into
+     * its live data, animating new arrivals with a subtle pulse.
+     * The whole point is to remove the "refresh to see your new
+     * referral" friction that previously sat between members and
+     * the dopamine hit of seeing their tree grow.
+     *
+     * Request shape:
+     *   matrix_action = fetch_new_descendants
+     *   plan_id       (int, required)  Plan whose tree is being viewed.
+     *   position_id   (int, optional)  matrix_positions.id of the
+     *                                  currently-displayed root —
+     *                                  defaults to the viewer's own
+     *                                  active position in the plan.
+     *                                  Set when the genealogy view is
+     *                                  pivoted onto a downline member
+     *                                  (?pivot_user_id=X) so polling
+     *                                  scopes to that pivot's subtree.
+     *   since         (int, required)  Unix timestamp; only positions
+     *                                  with joined_at strictly greater
+     *                                  than this are returned. Capped
+     *                                  server-side to a 24-hour
+     *                                  window so a stale or
+     *                                  clock-skewed client can't
+     *                                  request a full-history scan.
+     *
+     * Authorization model:
+     *   - Standard nonce check (already done by handle_ajax dispatcher).
+     *   - Must be logged in (get_current_user_id > 0).
+     *   - The supplied position_id must pass user_can_view_position()
+     *     against the viewer — same gate the lazy-expand and node-
+     *     details endpoints use, so polling can never grant
+     *     visibility the page render itself wouldn't.
+     *   - Each candidate row gets an individual user_can_view_position()
+     *     check before being emitted, defending against a malicious
+     *     since value combined with a guessed plan id.
+     *
+     * Response shape:
+     *     {
+     *       success: true,
+     *       data: {
+     *         server_time:    1716489600,   // unix ts the client should send
+     *                                       // back as the next `since`
+     *         plan_id:        3,
+     *         root_user_id:   42,
+     *         new_nodes:      [
+     *           {
+     *             id:             123,      // matrix_positions.id
+     *             user_id:        77,
+     *             parent_id:      45,
+     *             sponsor_id:     42,
+     *             username:       "alice",
+     *             level:          5,
+     *             total_downline: 0,
+     *             status:         "active",
+     *             relationship:   "direct" | "spillover" | "you",
+     *             joined_ts:      1716489580
+     *           },
+     *           ...
+     *         ],
+     *         updated_parents: [             // every visible ancestor of
+     *                                        // any new node — the client
+     *                                        // refreshes their meta line
+     *                                        // ("N downline") in place.
+     *           { id: 45, total_downline: 1 },
+     *           { id: 12, total_downline: 8 },
+     *           ...
+     *         ]
+     *       }
+     *     }
+     *
+     * Performance budget:
+     *   - At most 50 candidate rows are scanned per call. The 24-hour
+     *     `since` floor is the second guardrail: even an attacker
+     *     replaying the request can't exceed 50 auth walks against
+     *     the rolling 24-hour set of joins in this plan.
+     *   - Each auth walk is the same O(plan_depth) parent_id climb
+     *     used by the existing tree endpoints. For a 3x9 matrix that's
+     *     <= 9 single-row queries.
+     *   - Ancestor refresh: at most ~plan_depth distinct parent ids
+     *     across all returned new nodes (because their chains converge
+     *     at the root). Returned in a single IN(...) query.
+     */
+    private function process_fetch_new_descendants() {
+        $current_user_id = get_current_user_id();
+        if ($current_user_id <= 0) {
+            wp_send_json_error(['message' => __('You must be logged in.', 'matrix-mlm')]);
+        }
+
+        $plan_id     = isset($_POST['plan_id'])     ? (int) $_POST['plan_id']     : 0;
+        $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        $since       = isset($_POST['since'])       ? (int) $_POST['since']       : 0;
+
+        if ($plan_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
+        }
+
+        // Cap the polling window. A well-behaved client always sends
+        // back the previous response's server_time, which keeps `since`
+        // within a poll-interval of "now". A misbehaving or
+        // long-paused client (tab buried for hours, then visibility
+        // restores) could otherwise drag in months of history; the
+        // 24-hour floor bounds that scenario without breaking the
+        // common case.
+        $now          = time();
+        $window_floor = $now - DAY_IN_SECONDS;
+        if ($since <= 0 || $since < $window_floor) {
+            $since = $window_floor;
+        }
+
+        global $wpdb;
+        $plan_engine = new Matrix_MLM_Plan_Engine();
+
+        // Resolve / authorize the root the viewer is currently looking
+        // at. Two paths:
+        //   - Client supplied position_id (pivoted view OR
+        //     belt-and-braces request from D3 with bootstrap.tree.id):
+        //     check it belongs to the same plan and that the viewer
+        //     can see it.
+        //   - Client omitted it: fall back to the viewer's own active
+        //     position in the plan. This is the unpivoted, common
+        //     case.
+        if ($position_id > 0) {
+            $root_row = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, user_id, plan_id
+                   FROM {$wpdb->prefix}matrix_positions
+                  WHERE id = %d",
+                $position_id
+            ));
+            if (!$root_row || (int) $root_row->plan_id !== $plan_id) {
+                wp_send_json_error(['message' => __('Position not in this plan.', 'matrix-mlm')]);
+            }
+            if (!$plan_engine->user_can_view_position($current_user_id, (int) $root_row->id)) {
+                wp_send_json_error(['message' => __('You do not have access to this position.', 'matrix-mlm')]);
+            }
+            $root_position_id = (int) $root_row->id;
+            $root_user_id     = (int) $root_row->user_id;
+        } else {
+            $root_position_id = $plan_engine->get_position_id_for_user_in_plan(
+                $current_user_id,
+                $plan_id
+            );
+            if ($root_position_id <= 0) {
+                wp_send_json_error(['message' => __('No active position in this plan.', 'matrix-mlm')]);
+            }
+            $root_user_id = $current_user_id;
+        }
+
+        // Pull recent joins in the plan, ordered oldest-first so the
+        // animated insertion sequence on the client mirrors the order
+        // they actually arrived — small detail, but it keeps the
+        // pulse cascade narratively coherent ("then this one, then
+        // that one") instead of randomly jumbled.
+        //
+        // The status='active' filter mirrors every other tree
+        // surface — inactive/completed positions are not on the
+        // visible tree so they shouldn't be polled either.
+        //
+        // We exclude the root position itself defensively: a clock
+        // skew that placed `since` before the root's own join_at
+        // would otherwise spam the response with the viewer's own
+        // node, which they obviously already see.
+        $candidates = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.id, p.user_id, p.parent_id, p.sponsor_id, p.level,
+                    p.total_downline, p.status, p.joined_at,
+                    u.user_login
+               FROM {$wpdb->prefix}matrix_positions p
+          LEFT JOIN {$wpdb->users} u ON u.ID = p.user_id
+              WHERE p.plan_id    = %d
+                AND p.joined_at  > FROM_UNIXTIME(%d)
+                AND p.status     = 'active'
+                AND p.id        <> %d
+           ORDER BY p.joined_at ASC
+              LIMIT 50",
+            $plan_id,
+            (int) $since,
+            $root_position_id
+        ));
+
+        $new_nodes        = [];
+        $ancestor_id_set  = [];
+
+        foreach ($candidates as $row) {
+            // Per-row downline auth gate. user_can_view_position()
+            // walks parent_id upward from $row->id and returns true
+            // iff the viewer's user id appears on the chain. This is
+            // the structural truth — denormalised counters can lag
+            // but the parent_id chain can't, so this is the right
+            // place to make the access decision.
+            if (!$plan_engine->user_can_view_position($current_user_id, (int) $row->id)) {
+                continue;
+            }
+
+            $sponsor_id = ($row->sponsor_id !== null) ? (int) $row->sponsor_id : 0;
+            // Mirror prepare_tree_for_d3()'s classification exactly so
+            // the polling-grafted nodes colour-match the rest of the
+            // tree. See Matrix_MLM_User_Genealogy::prepare_tree_for_d3
+            // for the rationale on why this rule lives in PHP.
+            if ((int) $row->user_id === $root_user_id) {
+                $relationship = 'you';
+            } elseif ($sponsor_id > 0 && $sponsor_id === $root_user_id) {
+                $relationship = 'direct';
+            } else {
+                $relationship = 'spillover';
+            }
+
+            $joined_ts = $row->joined_at ? strtotime((string) $row->joined_at) : 0;
+
+            $new_nodes[] = [
+                'id'             => (int) $row->id,
+                'user_id'        => (int) $row->user_id,
+                'parent_id'      => $row->parent_id !== null ? (int) $row->parent_id : null,
+                'sponsor_id'     => $sponsor_id > 0 ? $sponsor_id : null,
+                'username'       => (string) ($row->user_login ?: ('User #' . (int) $row->user_id)),
+                'level'          => (int) $row->level,
+                'total_downline' => (int) $row->total_downline,
+                'status'         => (string) $row->status,
+                'relationship'   => $relationship,
+                'joined_ts'      => $joined_ts ?: 0,
+            ];
+
+            // Walk the parent_id chain up to the root and collect
+            // every ancestor's id. The client refreshes the
+            // total_downline meta on each in place so the user sees
+            // the count tick up on every visible ancestor card —
+            // the parent's "1 downline" becoming "2 downline" is
+            // half the satisfaction of the live update.
+            //
+            // Bounded by the same 30-hop ceiling user_can_view_position
+            // uses; in practice we stop at $root_position_id.
+            $cur = $row->parent_id !== null ? (int) $row->parent_id : 0;
+            for ($hops = 0; $hops < 30 && $cur > 0; $hops++) {
+                if (isset($ancestor_id_set[$cur])) {
+                    // Already seen this ancestor on a previous
+                    // candidate's walk — its own ancestors are
+                    // already collected too, so we can short-circuit.
+                    break;
+                }
+                $ancestor_id_set[$cur] = true;
+                if ($cur === $root_position_id) {
+                    break;
+                }
+                $next_parent = $wpdb->get_var($wpdb->prepare(
+                    "SELECT parent_id FROM {$wpdb->prefix}matrix_positions WHERE id = %d",
+                    $cur
+                ));
+                if ($next_parent === null) {
+                    break;
+                }
+                $cur = (int) $next_parent;
+            }
+        }
+
+        // Resolve the ancestor id set into fresh total_downline values.
+        // Single IN(...) lookup so this stays one round-trip even when
+        // 50 new nodes land at once on a deep matrix.
+        //
+        // We don't re-run user_can_view_position() on each ancestor —
+        // membership in the chain of a candidate that already passed
+        // the auth gate is itself proof of visibility (transitivity:
+        // if viewer can see X, viewer can see every ancestor of X up
+        // to and including the root).
+        $updated_parents = [];
+        if (!empty($ancestor_id_set)) {
+            $ids          = array_map('intval', array_keys($ancestor_id_set));
+            $placeholders = implode(',', array_fill(0, count($ids), '%d'));
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT id, total_downline
+                   FROM {$wpdb->prefix}matrix_positions
+                  WHERE id IN ($placeholders)",
+                $ids
+            ));
+            foreach ($rows as $r) {
+                $updated_parents[] = [
+                    'id'             => (int) $r->id,
+                    'total_downline' => (int) $r->total_downline,
+                ];
+            }
+        }
+
+        wp_send_json_success([
+            'server_time'     => $now,
+            'plan_id'         => $plan_id,
+            'root_user_id'    => $root_user_id,
+            'new_nodes'       => $new_nodes,
+            'updated_parents' => $updated_parents,
+        ]);
     }
 
     private function process_enable_2fa() {

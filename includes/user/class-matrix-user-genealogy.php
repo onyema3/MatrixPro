@@ -1397,6 +1397,15 @@ class Matrix_MLM_User_Genealogy {
                 'reset_view'    => __('Reset view', 'matrix-mlm'),
                 'switch_classic' => __('Switch to classic view', 'matrix-mlm'),
                 'switch_d3'     => __('Switch to interactive view', 'matrix-mlm'),
+                // Real-time polling toast — surfaced when the
+                // genealogy view's poll loop discovers new
+                // descendants since the last tick. Two variants
+                // because singular vs plural reads differently
+                // (the singular case includes the username for a
+                // personal touch; the plural case just announces
+                // the count to avoid a 30-name run-on toast).
+                'new_referral_one'  => __('%s just joined your tree!', 'matrix-mlm'),
+                'new_referral_many' => __('%d new referrals just joined your tree!', 'matrix-mlm'),
             ],
         ];
 
