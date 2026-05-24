@@ -1300,6 +1300,159 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Sum the commissions paid to $viewer_user_id that originated from
+     * any active member sitting inside the subtree rooted at
+     * $branch_root_position_id in $plan_id's tree (the root user
+     * themselves included). Powers the genealogy hover-card's
+     * "branch commission" line so a member can see, at a glance, how
+     * much money a particular sub-leader's tree has produced for them.
+     *
+     * Why this is correct from the viewer's perspective:
+     *   - matrix_commissions.user_id is the *recipient* — i.e. the
+     *     person who got paid.
+     *   - matrix_commissions.from_user_id is the *trigger* — typically
+     *     the new joiner whose plan purchase paid the commission to
+     *     someone in their upline.
+     *   So "commission earned by the viewer because of this branch"
+     *   becomes a single SUM over rows where user_id = viewer AND
+     *   from_user_id ∈ {everyone in this branch}. status = 'paid'
+     *   filters out anything pending or refunded.
+     *
+     * Implementation:
+     *   1. Seed with the branch root's own user_id (commissions paid
+     *      to viewer when this very member joined a plan still count
+     *      toward "what this branch earned me").
+     *   2. BFS down parent_id collecting active descendant user_ids.
+     *      Same level-by-level pattern get_level_completion_status()
+     *      and count_descendants_at_level() use, so query cost scales
+     *      with frontier size and rides the parent_id index.
+     *   3. Hard-cap descendant collection at $hard_cap (default 2000)
+     *      so a hover on a member with a 30k-position downline can't
+     *      stall the AJAX call. When the cap trips we set 'capped' =
+     *      true on the return value so the hover-card can render a
+     *      "(branch too large to summarize)" hint instead of a number
+     *      that silently undercounts.
+     *   4. One final SUM(amount) against matrix_commissions with the
+     *      collected user_ids in an IN clause.
+     *
+     * Authorization is the caller's job — every public surface that
+     * exposes this information already runs through
+     * user_can_view_position() before getting here, and threading auth
+     * into this helper would conflate "compute a number" with
+     * "decide if you're allowed to see it". Same separation
+     * search_downline_users() and build_pivot_breadcrumbs() use.
+     *
+     * @param int $viewer_user_id           WP user id whose earnings we're counting.
+     * @param int $branch_root_position_id  matrix_positions.id at the top of the branch.
+     * @param int $plan_id                  Plan id (sanity filter; descend only inside this plan's tree).
+     * @param int $hard_cap                 Max descendants (incl. root) to collect.
+     * @return array{amount:float, capped:bool, descendants:int}
+     */
+    public function sum_branch_commissions_for_viewer($viewer_user_id, $branch_root_position_id, $plan_id, $hard_cap = 2000) {
+        global $wpdb;
+
+        $viewer_user_id          = (int) $viewer_user_id;
+        $branch_root_position_id = (int) $branch_root_position_id;
+        $plan_id                 = (int) $plan_id;
+        $hard_cap                = max(1, (int) $hard_cap);
+
+        $empty_result = ['amount' => 0.0, 'capped' => false, 'descendants' => 0];
+        if ($viewer_user_id <= 0 || $branch_root_position_id <= 0 || $plan_id <= 0) {
+            return $empty_result;
+        }
+
+        // Seed with the branch root's user_id. We include the root
+        // because if this branch's "head" member triggered a
+        // commission to the viewer (e.g. their plan-join referral
+        // bonus), that money is part of what the branch earned the
+        // viewer.
+        $root_user_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT user_id FROM {$wpdb->prefix}matrix_positions
+              WHERE id = %d AND plan_id = %d",
+            $branch_root_position_id, $plan_id
+        ));
+        if ($root_user_id <= 0) {
+            return $empty_result;
+        }
+
+        $user_ids = [$root_user_id];
+        $frontier = [$branch_root_position_id];
+        $capped   = false;
+
+        while (!empty($frontier)) {
+            if (count($user_ids) >= $hard_cap) {
+                $capped = true;
+                break;
+            }
+
+            // %d-only IN clause: every value in $frontier comes from
+            // matrix_positions.id which we cast to int below — safe
+            // to interpolate after intval-ing each element.
+            $placeholders = implode(',', array_fill(0, count($frontier), '%d'));
+            $params       = array_map('intval', $frontier);
+            $params[]     = $plan_id;
+
+            $children = $wpdb->get_results($wpdb->prepare(
+                "SELECT id, user_id
+                   FROM {$wpdb->prefix}matrix_positions
+                  WHERE parent_id IN ($placeholders)
+                    AND plan_id = %d
+                    AND status = 'active'",
+                $params
+            ));
+
+            if (empty($children)) {
+                break;
+            }
+
+            $next_frontier = [];
+            foreach ($children as $child) {
+                $user_ids[]      = (int) $child->user_id;
+                $next_frontier[] = (int) $child->id;
+                if (count($user_ids) >= $hard_cap) {
+                    $capped = true;
+                    break 2;
+                }
+            }
+            $frontier = $next_frontier;
+        }
+
+        // De-dupe — a member could in theory appear twice if they had
+        // multiple positions in the same plan (shouldn't happen given
+        // join_plan() enforces uniqueness, but cheap defensive step).
+        $user_ids = array_values(array_unique($user_ids));
+        if ($capped) {
+            // Truncate to the cap so the IN clause stays bounded; the
+            // returned 'capped' flag tells the caller this is a
+            // floor not a true total.
+            $user_ids = array_slice($user_ids, 0, $hard_cap);
+        }
+
+        if (empty($user_ids)) {
+            return ['amount' => 0.0, 'capped' => $capped, 'descendants' => 0];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
+        $params       = array_map('intval', $user_ids);
+        array_unshift($params, $viewer_user_id);
+
+        $sum = (float) $wpdb->get_var($wpdb->prepare(
+            "SELECT COALESCE(SUM(amount), 0)
+               FROM {$wpdb->prefix}matrix_commissions
+              WHERE user_id = %d
+                AND status = 'paid'
+                AND from_user_id IN ($placeholders)",
+            $params
+        ));
+
+        return [
+            'amount'      => $sum,
+            'capped'      => $capped,
+            'descendants' => count($user_ids),
+        ];
+    }
+
+    /**
      * Build tree recursively
      */
     private function build_tree_recursive($position_id, $plan_id, $current_depth, $max_depth) {

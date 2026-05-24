@@ -286,6 +286,9 @@ class Matrix_MLM_Core {
             case 'search_genealogy':
                 $this->process_genealogy_search();
                 break;
+            case 'node_details':
+                $this->process_node_details();
+                break;
             case 'submit_ticket':
                 $this->process_ticket();
                 break;
@@ -1029,6 +1032,185 @@ class Matrix_MLM_Core {
         }
         $first = mb_substr($local, 0, 1);
         return $first . '***@' . $domain;
+    }
+
+    /**
+     * AJAX: return enriched detail for a single genealogy node so the
+     * hover-card above the tree can show full name, joined date,
+     * sponsor, plans and total branch commission without bloating
+     * every server-rendered tree node up front.
+     *
+     * Why this is its own endpoint rather than baking the data into
+     * the initial tree payload:
+     *   - The branch-commission sum is the expensive bit (BFS over
+     *     the subtree + one SUM query). Doing it for every visible
+     *     node on every dashboard pageload would multiply the cost
+     *     by the visible-node count for data the member only
+     *     actually wants when they hover.
+     *   - The "view profile" admin link needs runtime
+     *     current_user_can() context that's cleanest to compute on
+     *     the request that needs it; baking it into a JSON blob
+     *     served alongside the static HTML would mix concerns.
+     *
+     * Authorization: same user_can_view_position() walk every other
+     * genealogy surface uses, so a member can't poke around someone
+     * else's downline by guessing position ids — the search box,
+     * the page-level pivot, the lazy-load endpoint and now the
+     * hover-card all share one auth gate.
+     *
+     * Returns (on success):
+     *   {
+     *     position_id, user_id, username, full_name, joined,
+     *     level, sponsor (string label or ''), plans (array of
+     *     "Name (WxD)"), commission { amount, amount_display,
+     *     capped }, profile_url (admins only, '' otherwise),
+     *     is_self (bool — viewer hovering their own card)
+     *   }
+     */
+    private function process_node_details() {
+        $current_user_id = get_current_user_id();
+        if ($current_user_id <= 0) {
+            wp_send_json_error(['message' => __('You must be logged in.', 'matrix-mlm')]);
+        }
+
+        $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        if ($position_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+
+        // Single round-trip pull of position + plan + user fields the
+        // hover-card needs. matrix_positions and wp_users on user_id,
+        // matrix_user_meta only as a left-join in case the row is
+        // missing on legacy imports.
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT p.id, p.user_id, p.plan_id, p.sponsor_id,
+                    p.joined_at, p.level
+               FROM {$wpdb->prefix}matrix_positions p
+              WHERE p.id = %d",
+            $position_id
+        ));
+        if (!$row || !$row->plan_id) {
+            wp_send_json_error(['message' => __('Position not found.', 'matrix-mlm')]);
+        }
+
+        $plan_engine = new Matrix_MLM_Plan_Engine();
+        if (!$plan_engine->user_can_view_position($current_user_id, $position_id)) {
+            wp_send_json_error([
+                'message' => __('You do not have access to this member.', 'matrix-mlm')
+            ]);
+        }
+
+        $node_user_id = (int) $row->user_id;
+        $user         = get_userdata($node_user_id);
+        if (!$user) {
+            // The position points at a user_id with no matching
+            // wp_users row. Shouldn't happen — but if it does the
+            // hover-card has nothing useful to render, so error
+            // gracefully rather than ship half a payload.
+            wp_send_json_error(['message' => __('Member record not found.', 'matrix-mlm')]);
+        }
+
+        // Full name: prefer first + last; fall back to display_name;
+        // last fall back to user_login. Members commonly leave their
+        // first/last empty so the fall-through chain matters.
+        $first_name = trim((string) $user->first_name);
+        $last_name  = trim((string) $user->last_name);
+        $full_name  = trim($first_name . ' ' . $last_name);
+        if ($full_name === '') {
+            $full_name = $user->display_name ?: $user->user_login;
+        }
+
+        // Joined date: prefer the matrix_positions.joined_at because
+        // the WP user could have registered long before they joined a
+        // plan (or via an importer that backfilled wp_users with the
+        // old registration date). Falls back to user_registered when
+        // the position row's joined_at is empty (legacy rows).
+        $joined_raw    = !empty($row->joined_at) ? (string) $row->joined_at : (string) $user->user_registered;
+        $joined_ts     = $joined_raw ? strtotime($joined_raw) : 0;
+        $joined_label  = $joined_ts ? date_i18n(get_option('date_format'), $joined_ts) : '';
+
+        // Sponsor: matrix_positions.sponsor_id is the explicit
+        // structural sponsor (who actually referred this member),
+        // distinct from parent_id which is just placement. NULL on
+        // the root and on legacy-imported rows where the backfill
+        // couldn't resolve a sponsor.
+        $sponsor_label = '';
+        $sponsor_id    = (int) $row->sponsor_id;
+        if ($sponsor_id > 0) {
+            $sponsor_user = get_userdata($sponsor_id);
+            $sponsor_label = $sponsor_user
+                ? (string) $sponsor_user->user_login
+                : sprintf(__('User #%d', 'matrix-mlm'), $sponsor_id);
+        }
+
+        // All active positions this member holds, across every plan
+        // (not just the currently-viewed plan). Members commonly
+        // join several plans — surfacing them all in the hover-card
+        // gives the upline context they can't get from a tree
+        // rooted at one plan.
+        $plan_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT pl.name, pl.width, pl.depth
+               FROM {$wpdb->prefix}matrix_positions p
+               JOIN {$wpdb->prefix}matrix_plans pl ON pl.id = p.plan_id
+              WHERE p.user_id = %d
+                AND p.status = 'active'
+              ORDER BY pl.price ASC",
+            $node_user_id
+        ));
+        $plans_display = [];
+        foreach ($plan_rows as $pl) {
+            $plans_display[] = sprintf(
+                '%s (%dx%d)',
+                $pl->name,
+                (int) $pl->width,
+                (int) $pl->depth
+            );
+        }
+
+        // Branch commission (in this plan's tree): how much money has
+        // the *viewer* earned because of this branch. See
+        // sum_branch_commissions_for_viewer() docblock for the
+        // recipient/trigger semantics. Hard-capped descendant set so
+        // the hover stays snappy on huge downlines.
+        $commission = $plan_engine->sum_branch_commissions_for_viewer(
+            $current_user_id,
+            (int) $row->id,
+            (int) $row->plan_id,
+            2000
+        );
+
+        $currency_symbol  = get_option('matrix_mlm_currency_symbol', '₦');
+        $commission_display = $currency_symbol . number_format((float) $commission['amount'], 2);
+
+        // Admin profile link: only handed back to the front end when
+        // the viewer can actually edit users in wp-admin. Anyone
+        // without that cap gets an empty string and the hover-card
+        // hides the link entirely.
+        $profile_url = '';
+        if (current_user_can('edit_users') || current_user_can('manage_options')) {
+            $profile_url = admin_url('user-edit.php?user_id=' . $node_user_id);
+        }
+
+        wp_send_json_success([
+            'position_id' => (int) $row->id,
+            'user_id'     => $node_user_id,
+            'username'    => (string) $user->user_login,
+            'full_name'   => $full_name,
+            'joined'      => $joined_label,
+            'level'       => (int) $row->level,
+            'sponsor'     => $sponsor_label,
+            'plans'       => $plans_display,
+            'commission'  => [
+                'amount'         => (float) $commission['amount'],
+                'amount_display' => $commission_display,
+                'capped'         => (bool) $commission['capped'],
+                'descendants'    => (int) $commission['descendants'],
+            ],
+            'profile_url' => $profile_url,
+            'is_self'     => ($node_user_id === $current_user_id),
+        ]);
     }
 
     private function process_ticket() {

@@ -255,6 +255,8 @@ class Matrix_MLM_User_Genealogy {
 
         <?php $this->render_lazy_load_script(); ?>
         <?php $this->render_search_script($selected_plan_id); ?>
+        <?php $this->render_hovercard($selected_plan_id); ?>
+        <?php $this->render_hovercard_script($selected_plan_id); ?>
 
         <?php endif; ?>
         <?php
@@ -767,8 +769,12 @@ class Matrix_MLM_User_Genealogy {
         }
         ?>
         <div class="matrix-tree-item">
-            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>" data-position-id="<?php echo (int) $node['id']; ?>">
-                <div class="tree-node-avatar">
+            <div class="matrix-tree-node <?php echo esc_attr($node_class); ?>" data-relationship="<?php echo esc_attr($relationship); ?>" data-position-id="<?php echo (int) $node['id']; ?>" data-user-id="<?php echo (int) $node_user_id; ?>">
+                <div class="tree-node-avatar tree-node-info-trigger" role="button" tabindex="0" aria-label="<?php echo esc_attr(sprintf(
+                    /* translators: %s: username whose details we'd reveal */
+                    __('Show details for %s', 'matrix-mlm'),
+                    $username
+                )); ?>" aria-haspopup="dialog" aria-expanded="false">
                     <?php echo get_avatar($node_user_id, 36); ?>
                 </div>
                 <div class="tree-node-info">
@@ -1419,6 +1425,783 @@ class Matrix_MLM_User_Genealogy {
                     setListOpen(false);
                 }
             });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Render the shared hover-card DOM node and its inline CSS.
+     *
+     * One card per genealogy view, repositioned (and refilled) by JS
+     * for whichever node is currently active. Living once at the end
+     * of the tree wrapper means we don't ship a card stub per node —
+     * a 3x9 plan with hundreds of visible positions would otherwise
+     * pay for that markup hundreds of times even though only one card
+     * is ever visible at a time.
+     *
+     * Markup contract (the JS in render_hovercard_script() depends on
+     * these hooks staying stable):
+     *   .matrix-tree-hovercard               outer pop-up
+     *     .matrix-tree-hovercard-arrow       little pointer triangle
+     *     .matrix-tree-hovercard-close       dismiss button
+     *     .matrix-tree-hovercard-loading     spinner state
+     *     .matrix-tree-hovercard-error       error state
+     *     .matrix-tree-hovercard-body        success state
+     *       .matrix-tree-hovercard-name      full name
+     *       .matrix-tree-hovercard-username  @login (small)
+     *       .matrix-tree-hovercard-fields    dl with the four metadata rows
+     *       .matrix-tree-hovercard-profile   admin-only "View profile" link
+     *
+     * Position is `fixed` so the card lives in viewport coordinates;
+     * the JS computes top/left from the trigger node's getBoundingClientRect()
+     * and flips above/below to stay on-screen. Below 768px the JS
+     * switches to a centered "mini modal" placement because the
+     * mobile layout is an indented vertical tree where there isn't a
+     * sensible horizontal anchor.
+     *
+     * Inline CSS lives next to the markup for the same reason
+     * render_level_badges() and render_search_box() do — single-tab
+     * dashboard styling that's faster to find when you're editing
+     * the panel it decorates than buried in matrix-dashboard.css.
+     */
+    private function render_hovercard($plan_id) {
+        $plan_id = (int) $plan_id;
+        ?>
+        <div
+            id="matrix-tree-hovercard"
+            class="matrix-tree-hovercard"
+            data-plan-id="<?php echo esc_attr($plan_id); ?>"
+            role="dialog"
+            aria-modal="false"
+            aria-label="<?php esc_attr_e('Member details', 'matrix-mlm'); ?>"
+            aria-live="polite"
+            hidden
+        >
+            <span class="matrix-tree-hovercard-arrow" aria-hidden="true"></span>
+            <button
+                type="button"
+                class="matrix-tree-hovercard-close"
+                aria-label="<?php esc_attr_e('Close member details', 'matrix-mlm'); ?>"
+            >
+                <span class="dashicons dashicons-no-alt" aria-hidden="true"></span>
+            </button>
+
+            <div class="matrix-tree-hovercard-loading" hidden>
+                <span class="dashicons dashicons-update matrix-tree-spin" aria-hidden="true"></span>
+                <span><?php esc_html_e('Loading…', 'matrix-mlm'); ?></span>
+            </div>
+
+            <div class="matrix-tree-hovercard-error" hidden></div>
+
+            <div class="matrix-tree-hovercard-body" hidden>
+                <div class="matrix-tree-hovercard-header">
+                    <strong class="matrix-tree-hovercard-name"></strong>
+                    <span class="matrix-tree-hovercard-username"></span>
+                </div>
+
+                <dl class="matrix-tree-hovercard-fields">
+                    <dt><?php esc_html_e('Joined', 'matrix-mlm'); ?></dt>
+                    <dd class="matrix-tree-hovercard-joined">—</dd>
+
+                    <dt><?php esc_html_e('Sponsor', 'matrix-mlm'); ?></dt>
+                    <dd class="matrix-tree-hovercard-sponsor">—</dd>
+
+                    <dt><?php esc_html_e('Plans', 'matrix-mlm'); ?></dt>
+                    <dd class="matrix-tree-hovercard-plans">—</dd>
+
+                    <dt><?php esc_html_e('Branch commission', 'matrix-mlm'); ?></dt>
+                    <dd class="matrix-tree-hovercard-commission">—</dd>
+                </dl>
+
+                <a
+                    class="matrix-tree-hovercard-profile"
+                    href="#"
+                    target="_blank"
+                    rel="noopener"
+                    hidden
+                ><?php esc_html_e('View profile in admin', 'matrix-mlm'); ?> &rarr;</a>
+            </div>
+        </div>
+
+        <style>
+        /* Avatar becomes the touch trigger on mobile (where hover
+           doesn't fire reliably). cursor:pointer + a subtle focus
+           ring announces the affordance without bolting on a
+           dedicated info icon next to the username — keeps the node
+           card visually quiet. */
+        .tree-node-info-trigger {
+            cursor: pointer;
+            outline: 0;
+            border-radius: 50%;
+            transition: box-shadow .15s ease, transform .15s ease;
+        }
+        .tree-node-info-trigger:hover,
+        .tree-node-info-trigger:focus-visible {
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.25);
+            transform: translateY(-1px);
+        }
+        .matrix-tree-node-empty .tree-node-info-trigger { /* defensive: empty slots don't get this class but just in case */
+            cursor: default;
+            box-shadow: none;
+            transform: none;
+        }
+
+        .matrix-tree-hovercard {
+            position: fixed;
+            z-index: 9999;
+            width: 320px;
+            max-width: calc(100vw - 24px);
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            box-shadow: 0 18px 36px -10px rgba(0, 0, 0, 0.18);
+            padding: 14px 16px 12px;
+            font-size: 13px;
+            color: #111827;
+            line-height: 1.4;
+        }
+        .matrix-tree-hovercard[hidden] { display: none; }
+
+        .matrix-tree-hovercard-arrow {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background: #fff;
+            border-left: 1px solid #e5e7eb;
+            border-top: 1px solid #e5e7eb;
+            transform: rotate(45deg);
+            display: none; /* JS toggles per placement */
+        }
+        .matrix-tree-hovercard.is-below .matrix-tree-hovercard-arrow {
+            display: block;
+            top: -7px;
+            left: 28px;
+            transform: rotate(45deg);
+        }
+        .matrix-tree-hovercard.is-above .matrix-tree-hovercard-arrow {
+            display: block;
+            bottom: -7px;
+            left: 28px;
+            transform: rotate(225deg);
+        }
+
+        .matrix-tree-hovercard-close {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            background: transparent;
+            border: 0;
+            padding: 4px;
+            border-radius: 4px;
+            cursor: pointer;
+            color: #6b7280;
+        }
+        .matrix-tree-hovercard-close:hover { color: #111827; background: #f3f4f6; }
+        .matrix-tree-hovercard-close .dashicons { font-size: 16px; width: 16px; height: 16px; }
+
+        .matrix-tree-hovercard-loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0 0;
+            color: #6b7280;
+        }
+        .matrix-tree-hovercard-loading[hidden] { display: none; }
+        .matrix-tree-hovercard-loading .dashicons {
+            font-size: 18px;
+            width: 18px;
+            height: 18px;
+            color: #8b5cf6;
+        }
+
+        .matrix-tree-hovercard-error {
+            color: #b91c1c;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            padding: 8px 10px;
+            border-radius: 6px;
+            margin-top: 4px;
+        }
+        .matrix-tree-hovercard-error[hidden] { display: none; }
+
+        .matrix-tree-hovercard-body[hidden] { display: none; }
+
+        .matrix-tree-hovercard-header {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            margin-bottom: 10px;
+            padding-right: 22px; /* leave space for the close X */
+        }
+        .matrix-tree-hovercard-name {
+            font-size: 15px;
+            font-weight: 700;
+        }
+        .matrix-tree-hovercard-username {
+            font-size: 12px;
+            color: #6b7280;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+
+        .matrix-tree-hovercard-fields {
+            display: grid;
+            grid-template-columns: 110px 1fr;
+            gap: 6px 10px;
+            margin: 0 0 10px;
+        }
+        .matrix-tree-hovercard-fields dt {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
+            color: #6b7280;
+            margin: 0;
+            padding-top: 1px;
+        }
+        .matrix-tree-hovercard-fields dd {
+            margin: 0;
+            font-size: 13px;
+            color: #111827;
+            word-break: break-word;
+        }
+        .matrix-tree-hovercard-fields dd em {
+            color: #6b7280;
+            font-style: normal;
+            font-size: 12px;
+        }
+        .matrix-tree-hovercard-commission {
+            font-weight: 600;
+            color: #047857; /* same emerald the level-badge "complete" pill uses */
+        }
+        .matrix-tree-hovercard-commission.is-zero { color: #6b7280; font-weight: 500; }
+        .matrix-tree-hovercard-commission.is-capped { color: #b45309; }
+
+        .matrix-tree-hovercard-profile {
+            display: inline-block;
+            margin-top: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #6d28d9;
+            text-decoration: none;
+        }
+        .matrix-tree-hovercard-profile[hidden] { display: none; }
+        .matrix-tree-hovercard-profile:hover { text-decoration: underline; }
+
+        /* Mobile: the indented vertical tree leaves no good horizontal
+           anchor, so we promote the card to a centered "mini modal"
+           with a translucent backdrop click target. */
+        @media (max-width: 767px) {
+            .matrix-tree-hovercard.is-mobile {
+                left: 50% !important;
+                top: 50% !important;
+                transform: translate(-50%, -50%);
+                width: calc(100vw - 32px);
+            }
+            .matrix-tree-hovercard.is-mobile .matrix-tree-hovercard-arrow {
+                display: none !important;
+            }
+        }
+
+        /* Backdrop overlay used in mobile modal mode. Created by the
+           JS on demand so non-mobile renders never pay the cost. */
+        .matrix-tree-hovercard-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(17, 24, 39, 0.35);
+            z-index: 9998;
+        }
+        .matrix-tree-hovercard-backdrop[hidden] { display: none; }
+        </style>
+        <?php
+    }
+
+    /**
+     * Inline JS that drives the genealogy hover-card.
+     *
+     * Single delegated listener on the tree wrapper handles every
+     * trigger surface — hovering a node, focus-into a node, clicking
+     * (or pressing Enter / Space on) the avatar info-trigger. The
+     * card is a single shared DOM node we move and refill rather than
+     * one card per visible member, so cost stays O(1) regardless of
+     * how many positions are on the page.
+     *
+     * Behaviour highlights:
+     *   - Hover-trigger has a 220ms open delay and a 180ms close
+     *     delay so brief mouseovers (e.g. the cursor passing over a
+     *     node on the way to clicking the username pivot link) don't
+     *     fire AJAX requests or flash a card. The same delays apply
+     *     when moving between adjacent nodes — moving from card A's
+     *     trigger to card B's trigger swaps the content without a
+     *     visible flash if we already have B cached.
+     *   - Touch devices (no hover) get a click-to-open path on the
+     *     avatar trigger, with a body-level click-away listener for
+     *     dismiss. The mobile modal uses a backdrop overlay so a
+     *     tap outside reliably closes — without it, taps on the
+     *     parts of the page covered by the indented tree would
+     *     have to compete with sibling click handlers.
+     *   - In-memory cache keyed by position id; backspacing /
+     *     re-hovering doesn't re-hit the server. Cache is per page
+     *     load — short-lived enough that admin commission updates
+     *     during a session won't get stuck on a stale value across
+     *     navigations, since the next pageload starts fresh.
+     *   - Sequence-token-guarded fetch so a slow earlier request
+     *     can't render its result on top of a fresher hover.
+     *   - ESC always closes; Tab away from the card body also
+     *     closes (so keyboard users don't get stuck inside an
+     *     invisible focus trap).
+     *
+     * Why inline rather than enqueued: same trade-off as
+     * render_lazy_load_script() and render_search_script() — the
+     * dashboard page is authenticated and uncached, the script is
+     * tied 1:1 to the markup it decorates, and a separate .js file
+     * would scatter responsibility for one tab's behaviour.
+     */
+    private function render_hovercard_script($plan_id) {
+        $plan_id = (int) $plan_id;
+        ?>
+        <script>
+        (function() {
+            var tree = document.getElementById('genealogy-tree');
+            var card = document.getElementById('matrix-tree-hovercard');
+            if (!tree || !card) return;
+
+            var planId       = parseInt(card.getAttribute('data-plan-id'), 10) || 0;
+            var bodyEl       = card.querySelector('.matrix-tree-hovercard-body');
+            var loadingEl    = card.querySelector('.matrix-tree-hovercard-loading');
+            var errorEl      = card.querySelector('.matrix-tree-hovercard-error');
+            var nameEl       = card.querySelector('.matrix-tree-hovercard-name');
+            var usernameEl   = card.querySelector('.matrix-tree-hovercard-username');
+            var joinedEl     = card.querySelector('.matrix-tree-hovercard-joined');
+            var sponsorEl    = card.querySelector('.matrix-tree-hovercard-sponsor');
+            var plansEl      = card.querySelector('.matrix-tree-hovercard-plans');
+            var commissionEl = card.querySelector('.matrix-tree-hovercard-commission');
+            var profileEl    = card.querySelector('.matrix-tree-hovercard-profile');
+            var closeBtn     = card.querySelector('.matrix-tree-hovercard-close');
+
+            // Localised label fragments — built once via PHP so we
+            // don't repeat translation calls per hover.
+            var STR_LOADING_ERR    = '<?php echo esc_js(__('Could not load member details. Please try again.', 'matrix-mlm')); ?>';
+            var STR_NETWORK_ERR    = '<?php echo esc_js(__('Network error.', 'matrix-mlm')); ?>';
+            var STR_NO_SPONSOR     = '<?php echo esc_js(__('— (root)', 'matrix-mlm')); ?>';
+            var STR_NO_PLANS       = '<?php echo esc_js(__('No active plans', 'matrix-mlm')); ?>';
+            var STR_NO_DATE        = '<?php echo esc_js(__('Unknown', 'matrix-mlm')); ?>';
+            var STR_BRANCH_CAPPED  = '<?php echo esc_js(__('(branch too large to summarize fully)', 'matrix-mlm')); ?>';
+            var STR_YOU_TAG        = '<?php echo esc_js(__('(you)', 'matrix-mlm')); ?>';
+
+            var OPEN_DELAY  = 220;
+            var CLOSE_DELAY = 180;
+
+            // Capability flag — falls back to "no pointer = touch"
+            // for environments where matchMedia(hover) is missing.
+            // Mobile uses click only (hover is unreliable there).
+            var supportsHover = (window.matchMedia && window.matchMedia('(hover: hover)').matches);
+
+            var openTimer  = null;
+            var closeTimer = null;
+            var requestSeq = 0;
+            var lastRenderedSeq = 0;
+            // Cache keyed by position id. Map<positionId, payload|'pending'>
+            // We never expire entries on this side — page navigation
+            // resets the cache anyway, and the dataset rarely
+            // changes within the lifetime of one tab.
+            var cache = Object.create(null);
+            // Currently displayed position id, used to short-circuit
+            // re-renders when the user moves between two halves of
+            // the same node card.
+            var currentPositionId = 0;
+            var currentTrigger    = null;
+            var backdropEl        = null;
+
+            function isMobileLayout() {
+                return window.innerWidth < 768;
+            }
+
+            function clearTimers() {
+                if (openTimer)  { clearTimeout(openTimer);  openTimer  = null; }
+                if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
+            }
+
+            function showBackdrop(show) {
+                if (!show) {
+                    if (backdropEl) {
+                        backdropEl.hidden = true;
+                    }
+                    return;
+                }
+                if (!backdropEl) {
+                    backdropEl = document.createElement('div');
+                    backdropEl.className = 'matrix-tree-hovercard-backdrop';
+                    backdropEl.addEventListener('click', closeCard);
+                    document.body.appendChild(backdropEl);
+                }
+                backdropEl.hidden = false;
+            }
+
+            function setTriggerExpanded(triggerEl, expanded) {
+                if (!triggerEl) return;
+                // The trigger is the .tree-node-info-trigger div on
+                // the avatar. Reflecting open state on the node
+                // makes screen readers announce the relationship.
+                try {
+                    triggerEl.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+                } catch (_e) { /* Old IE — ignore. */ }
+            }
+
+            function positionCard(triggerEl) {
+                // Mobile: centered modal-style placement. The CSS
+                // already pins centered; we just toggle the class
+                // so the !important rules apply, and bring up the
+                // backdrop so taps outside the card dismiss.
+                if (isMobileLayout()) {
+                    card.classList.add('is-mobile');
+                    card.classList.remove('is-below', 'is-above');
+                    card.style.left = '';
+                    card.style.top  = '';
+                    showBackdrop(true);
+                    return;
+                }
+
+                card.classList.remove('is-mobile');
+                showBackdrop(false);
+
+                var rect = triggerEl.getBoundingClientRect();
+
+                // First show off-screen to measure intrinsic size.
+                card.style.left = '-9999px';
+                card.style.top  = '0px';
+                card.classList.add('is-below'); // pre-bias for measurement
+                var cw = card.offsetWidth || 320;
+                var ch = card.offsetHeight || 220;
+
+                var margin = 8;
+                // Default placement: just below the trigger, left
+                // edge aligned to the trigger's left.
+                var top  = rect.bottom + margin;
+                var left = rect.left;
+                var placement = 'below';
+
+                // Flip above if no room below.
+                if (top + ch > window.innerHeight - margin) {
+                    var flippedTop = rect.top - ch - margin;
+                    if (flippedTop >= margin) {
+                        top = flippedTop;
+                        placement = 'above';
+                    } else {
+                        top = Math.max(margin, window.innerHeight - ch - margin);
+                    }
+                }
+
+                // Constrain horizontally so the card stays in the
+                // viewport with a small gutter.
+                if (left + cw > window.innerWidth - margin) {
+                    left = Math.max(margin, window.innerWidth - cw - margin);
+                }
+                if (left < margin) left = margin;
+
+                card.classList.toggle('is-below', placement === 'below');
+                card.classList.toggle('is-above', placement === 'above');
+                card.style.left = left + 'px';
+                card.style.top  = top  + 'px';
+            }
+
+            function applyPayload(p) {
+                errorEl.hidden   = true;
+                loadingEl.hidden = true;
+                bodyEl.hidden    = false;
+
+                // Header. Append a "(you)" tag when the hovered node
+                // is the viewer themselves so the card can't be
+                // misread as someone else's data.
+                var displayName = p.full_name || p.username || ('User #' + p.user_id);
+                if (p.is_self) displayName = displayName + ' ' + STR_YOU_TAG;
+                nameEl.textContent     = displayName;
+                usernameEl.textContent = p.username ? '@' + p.username : '';
+
+                // Joined / sponsor / plans / commission.
+                joinedEl.textContent  = p.joined  || STR_NO_DATE;
+                sponsorEl.textContent = p.sponsor ? p.sponsor : STR_NO_SPONSOR;
+                if (p.plans && p.plans.length) {
+                    plansEl.textContent = p.plans.join(', ');
+                } else {
+                    plansEl.textContent = STR_NO_PLANS;
+                }
+
+                var amt = (p.commission && p.commission.amount_display) || '';
+                var capped = !!(p.commission && p.commission.capped);
+                commissionEl.classList.remove('is-zero', 'is-capped');
+                if (capped) {
+                    // Pre-pend the cap hint as an italic note so
+                    // the displayed number reads as a floor, not a
+                    // total.
+                    commissionEl.innerHTML = '';
+                    var amtSpan = document.createElement('span');
+                    amtSpan.textContent = amt + ' ';
+                    var hint = document.createElement('em');
+                    hint.textContent = STR_BRANCH_CAPPED;
+                    commissionEl.appendChild(amtSpan);
+                    commissionEl.appendChild(hint);
+                    commissionEl.classList.add('is-capped');
+                } else {
+                    commissionEl.textContent = amt;
+                    if (p.commission && parseFloat(p.commission.amount) === 0) {
+                        commissionEl.classList.add('is-zero');
+                    }
+                }
+
+                // Admin profile link.
+                if (p.profile_url) {
+                    profileEl.setAttribute('href', p.profile_url);
+                    profileEl.hidden = false;
+                } else {
+                    profileEl.hidden = true;
+                    profileEl.removeAttribute('href');
+                }
+            }
+
+            function applyError(message) {
+                bodyEl.hidden    = true;
+                loadingEl.hidden = true;
+                errorEl.hidden   = false;
+                errorEl.textContent = message || STR_LOADING_ERR;
+            }
+
+            function applyLoading() {
+                bodyEl.hidden    = true;
+                errorEl.hidden   = true;
+                loadingEl.hidden = false;
+            }
+
+            function fetchAndShow(positionId, triggerEl) {
+                currentPositionId = positionId;
+                currentTrigger    = triggerEl;
+
+                // Open the card now (so positioning can measure).
+                card.hidden = false;
+                setTriggerExpanded(triggerEl, true);
+
+                if (cache[positionId] && cache[positionId] !== 'pending') {
+                    applyPayload(cache[positionId]);
+                    positionCard(triggerEl);
+                    return;
+                }
+
+                applyLoading();
+                positionCard(triggerEl);
+
+                // Bail-out for in-flight duplicate requests against
+                // the same id — could happen if the hover delay
+                // races with a focus event.
+                if (cache[positionId] === 'pending') return;
+                cache[positionId] = 'pending';
+
+                var seq = ++requestSeq;
+
+                var data = new FormData();
+                data.append('action',        'matrix_mlm_action');
+                data.append('matrix_action', 'node_details');
+                data.append('nonce',         matrixMLM.nonce);
+                data.append('position_id',   String(positionId));
+
+                fetch(matrixMLM.ajaxUrl, {
+                    method:      'POST',
+                    body:        data,
+                    credentials: 'same-origin'
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(j) {
+                    // If the user has hovered onto a different node
+                    // since this request fired, drop the response
+                    // so we don't paint stale data.
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
+
+                    if (!j || !j.success) {
+                        delete cache[positionId];
+                        applyError((j && j.data && j.data.message) || STR_LOADING_ERR);
+                        return;
+                    }
+                    var payload = j.data || {};
+                    cache[positionId] = payload;
+                    // Only render if the user is still hovering this
+                    // same node. If they've moved elsewhere we keep
+                    // the cached payload around for next time but
+                    // don't override the current display.
+                    if (currentPositionId === positionId) {
+                        applyPayload(payload);
+                        positionCard(triggerEl);
+                    }
+                })
+                .catch(function() {
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
+                    delete cache[positionId];
+                    applyError(STR_NETWORK_ERR);
+                });
+            }
+
+            function closeCard() {
+                clearTimers();
+                card.hidden = true;
+                card.classList.remove('is-mobile', 'is-above', 'is-below');
+                showBackdrop(false);
+                if (currentTrigger) setTriggerExpanded(currentTrigger, false);
+                currentPositionId = 0;
+                currentTrigger    = null;
+            }
+
+            function openFor(triggerEl) {
+                var nodeEl = triggerEl.closest('.matrix-tree-node');
+                if (!nodeEl) return;
+                // Empty slots have neither a position id worth
+                // showing nor any commission to summarise — bail.
+                if (nodeEl.classList.contains('matrix-tree-node-empty')) return;
+                var posId = parseInt(nodeEl.getAttribute('data-position-id'), 10) || 0;
+                if (posId <= 0) return;
+
+                // If we're already showing this same position, just
+                // reposition (in case of resize / scroll).
+                if (currentPositionId === posId && !card.hidden) {
+                    positionCard(triggerEl);
+                    return;
+                }
+
+                fetchAndShow(posId, triggerEl);
+            }
+
+            function scheduleOpen(triggerEl) {
+                clearTimers();
+                openTimer = setTimeout(function() {
+                    openTimer = null;
+                    openFor(triggerEl);
+                }, OPEN_DELAY);
+            }
+
+            function scheduleClose() {
+                clearTimers();
+                closeTimer = setTimeout(function() {
+                    closeTimer = null;
+                    closeCard();
+                }, CLOSE_DELAY);
+            }
+
+            // Hover (desktop): bind to mouseenter/mouseleave on each
+            // .matrix-tree-node via delegation. We use mouseover /
+            // mouseout (which bubble) and check the related target
+            // so moves *within* the same node card don't churn the
+            // open/close state.
+            tree.addEventListener('mouseover', function(e) {
+                if (!supportsHover) return;
+                var nodeEl = e.target.closest('.matrix-tree-node');
+                if (!nodeEl || nodeEl.classList.contains('matrix-tree-node-empty')) return;
+                // Treat the avatar as the trigger so the card
+                // anchors below the avatar — the visual focal point
+                // of the node card.
+                var triggerEl = nodeEl.querySelector('.tree-node-info-trigger') || nodeEl;
+                scheduleOpen(triggerEl);
+            });
+
+            tree.addEventListener('mouseout', function(e) {
+                if (!supportsHover) return;
+                var nodeEl = e.target.closest('.matrix-tree-node');
+                if (!nodeEl) return;
+                // Ignore moves that stay inside the same node card.
+                if (nodeEl.contains(e.relatedTarget)) return;
+                // Don't close if the mouse moved into the card
+                // itself — let the user reach buttons / link.
+                if (card.contains(e.relatedTarget)) return;
+                scheduleClose();
+            });
+
+            // Keep the card alive while the user is mousing over
+            // the card body itself.
+            card.addEventListener('mouseenter', clearTimers);
+            card.addEventListener('mouseleave', function(e) {
+                if (!supportsHover) return;
+                if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('.matrix-tree-node')) {
+                    return;
+                }
+                scheduleClose();
+            });
+
+            // Touch / click path. Tapping the avatar trigger toggles
+            // the card. We listen for click rather than touchstart
+            // so the affordance also serves keyboard users
+            // activating via Enter/Space.
+            tree.addEventListener('click', function(e) {
+                var triggerEl = e.target.closest('.tree-node-info-trigger');
+                if (!triggerEl) return;
+                e.preventDefault();
+                e.stopPropagation();
+
+                var nodeEl = triggerEl.closest('.matrix-tree-node');
+                if (!nodeEl) return;
+                var posId = parseInt(nodeEl.getAttribute('data-position-id'), 10) || 0;
+
+                // Toggle: clicking the trigger of the currently-open
+                // card closes it; clicking another opens that one.
+                if (!card.hidden && currentPositionId === posId) {
+                    closeCard();
+                    return;
+                }
+                openFor(triggerEl);
+            });
+
+            // Keyboard activation on the avatar trigger (Space /
+            // Enter). The role="button" already announces it as
+            // activatable; this binds the handler.
+            tree.addEventListener('keydown', function(e) {
+                var triggerEl = e.target.closest('.tree-node-info-trigger');
+                if (!triggerEl) return;
+                if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+                    e.preventDefault();
+                    openFor(triggerEl);
+                }
+            });
+
+            // Close button on the card.
+            closeBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                closeCard();
+            });
+
+            // Esc closes from anywhere — most-expected keyboard
+            // affordance for transient UI.
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape' && !card.hidden) {
+                    closeCard();
+                    if (currentTrigger && typeof currentTrigger.focus === 'function') {
+                        currentTrigger.focus();
+                    }
+                }
+            });
+
+            // Click anywhere outside both the card and any node
+            // trigger closes the card. The mobile backdrop already
+            // handles this in modal mode; this is the desktop
+            // fallback for mouse users who clicked into the page.
+            document.addEventListener('click', function(e) {
+                if (card.hidden) return;
+                if (card.contains(e.target)) return;
+                if (e.target.closest && e.target.closest('.tree-node-info-trigger')) return;
+                closeCard();
+            });
+
+            // Keep position fresh when the page is scrolled or
+            // resized while the card is open. Skipped on mobile
+            // modal mode (CSS pins it centered).
+            var rafId = 0;
+            function scheduleReposition() {
+                if (rafId) return;
+                rafId = window.requestAnimationFrame(function() {
+                    rafId = 0;
+                    if (card.hidden || !currentTrigger || isMobileLayout()) return;
+                    positionCard(currentTrigger);
+                });
+            }
+            window.addEventListener('scroll',  scheduleReposition, true);
+            window.addEventListener('resize',  scheduleReposition);
         })();
         </script>
         <?php
