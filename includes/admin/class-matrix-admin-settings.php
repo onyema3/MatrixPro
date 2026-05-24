@@ -300,7 +300,7 @@ class Matrix_MLM_Admin_Settings {
         // because the option-save loop runs sanitize_text_field on
         // every value, which would mangle an array. CSV survives that
         // and matches the parsing contract in
-        // Matrix_MLM_User::can_withdraw().
+        // Matrix_MLM_User::can_move_funds().
         global $wpdb;
         $active_plans = $wpdb->get_results(
             "SELECT id, name FROM {$wpdb->prefix}matrix_plans WHERE status = 'active' ORDER BY price ASC"
@@ -337,18 +337,24 @@ class Matrix_MLM_Admin_Settings {
             <tr><td colspan="2" style="padding-top:24px;border-bottom:1px solid #e5e7eb;padding-bottom:8px;">
                 <h3 style="margin:0;color:#1f2937;"><?php _e('Withdrawal Controls', 'matrix-mlm'); ?></h3>
                 <p class="description" style="margin-top:4px;">
-                    <?php _e('These three toggles gate every user-facing money-out flow on the platform — the Wallet tab\'s "Transfer to Own Wallet" pane (Matrix → Fintava virtual) and "Transfer to Bank" pane (Fintava virtual → external bank). All three are evaluated by Matrix_MLM_User::can_withdraw(); changes here take effect immediately on the next request, no cache to bust.', 'matrix-mlm'); ?>
+                    <?php _e('Five separated toggles that gate every fund-movement surface on the platform. All are evaluated by <code>Matrix_MLM_User::can_move_funds($user_id, $path)</code>; changes here take effect immediately on the next request, no cache to bust.', 'matrix-mlm'); ?>
                 </p>
+                <ul class="description" style="margin:8px 0 0 18px;list-style:disc;color:#4b5563;">
+                    <li><?php _e('<strong>Master kill switch</strong> &mdash; blocks every path below.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('<strong>Active-account</strong> and <strong>Plan-tier</strong> &mdash; user-eligibility gates that apply uniformly to every path so they cannot be circumvented through a peer transfer.', 'matrix-mlm'); ?></li>
+                    <li><?php _e('<strong>Matrix Transfers</strong> &mdash; gates Matrix-wallet-sourced flows (Wallet to Wallet + Transfer to Own Wallet).', 'matrix-mlm'); ?></li>
+                    <li><?php _e('<strong>Bank Transfers</strong> &mdash; gates the Fintava virtual &rarr; external bank flow (Transfer to Bank).', 'matrix-mlm'); ?></li>
+                </ul>
             </td></tr>
 
-            <tr><th><?php _e('Withdrawals Enabled', 'matrix-mlm'); ?></th>
+            <tr><th><?php _e('Master Kill Switch', 'matrix-mlm'); ?></th>
                 <td>
                     <label>
                         <input type="checkbox" name="matrix_mlm_withdrawals_enabled" value="1" <?php checked(get_option('matrix_mlm_withdrawals_enabled', 1)); ?>>
-                        <?php _e('Allow users to withdraw funds', 'matrix-mlm'); ?>
+                        <?php _e('Allow users to move funds', 'matrix-mlm'); ?>
                     </label>
                     <p class="description">
-                        <?php _e('Master kill switch. Uncheck to pause every withdrawal flow site-wide — useful during reconciliation, an incident with the payment gateway, or a freeze window before a re-import. Users see a friendly "Withdrawals are temporarily disabled" message; deposits, transfers between users, and admin actions are unaffected.', 'matrix-mlm'); ?>
+                        <?php _e('Master kill switch. Uncheck to pause every fund-movement flow site-wide &mdash; useful during reconciliation, an incident with the payment gateway, or a freeze window before a re-import. Users see a friendly "Withdrawals are temporarily disabled" message; deposits and admin actions are unaffected.', 'matrix-mlm'); ?>
                     </p>
                 </td></tr>
 
@@ -356,10 +362,10 @@ class Matrix_MLM_Admin_Settings {
                 <td>
                     <label>
                         <input type="checkbox" name="matrix_mlm_withdraw_require_active_user" value="1" <?php checked(get_option('matrix_mlm_withdraw_require_active_user', 1)); ?>>
-                        <?php _e('Block withdrawals from banned or inactive accounts', 'matrix-mlm'); ?>
+                        <?php _e('Block fund movement from banned or inactive accounts', 'matrix-mlm'); ?>
                     </label>
                     <p class="description">
-                        <?php _e('When on, only users whose status is "active" in matrix_user_meta can withdraw. Defaults on. Uncheck only if you need to let a banned user drain their balance as part of a controlled close-out.', 'matrix-mlm'); ?>
+                        <?php _e('When on, only users whose status is "active" in matrix_user_meta can move funds &mdash; on every path including peer wallet-to-wallet, so a banned user cannot relay through an accomplice. Defaults on. Uncheck only if you need to let a banned user drain their balance as part of a controlled close-out.', 'matrix-mlm'); ?>
                     </p>
                 </td></tr>
 
@@ -381,9 +387,40 @@ class Matrix_MLM_Admin_Settings {
                             <?php endforeach; ?>
                         </div>
                         <p class="description" style="margin-top:10px;">
-                            <?php _e('When any plans are checked above, only users who have at least one ACTIVE position on one of the selected plans can withdraw. Leave everything unchecked to allow withdrawals from users on any plan (the default). Use this to gate withdrawals on a tier — e.g., check only "Premium" to make withdrawals a Premium-only feature.', 'matrix-mlm'); ?>
+                            <?php _e('When any plans are checked above, only users who have at least one ACTIVE position on one of the selected plans can move funds &mdash; on every path including peer wallet-to-wallet, to close the relay loophole where a non-qualifying user transfers their balance to a qualifying accomplice. Leave everything unchecked to allow fund movement from users on any plan (the default).', 'matrix-mlm'); ?>
                         </p>
                     <?php endif; ?>
+                </td></tr>
+
+            <tr><th><?php _e('Matrix Transfers', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_matrix_transfers_enabled" value="1" <?php checked(get_option('matrix_mlm_matrix_transfers_enabled', 1)); ?>>
+                        <?php _e('Allow Matrix wallet transfers', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Path-specific toggle. Gates the two Matrix-wallet-sourced flows in the Internal Transfers group on the Wallet page: <strong>Wallet to Wallet</strong> (peer Matrix &rarr; Matrix) and <strong>Transfer to Own Wallet</strong> (Matrix &rarr; user\'s Fintava virtual). Defaults on. Uncheck to disable Matrix-side movement without affecting the Fintava &rarr; external bank flow below.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Bank Transfers', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_bank_transfers_enabled" value="1" <?php
+                            // Read with the legacy fallback so an admin who hasn't re-saved
+                            // Financial since this toggle moved here from Gateways → Fintava
+                            // sees their previous setting reflected in the checkbox state.
+                            $bank_raw = get_option('matrix_mlm_bank_transfers_enabled', null);
+                            if ($bank_raw === null || $bank_raw === false || $bank_raw === '') {
+                                $bank_raw = get_option('matrix_mlm_fintava_payouts_enabled', 1);
+                            }
+                            checked((int) $bank_raw, 1);
+                        ?>>
+                        <?php _e('Allow Fintava virtual &rarr; external bank transfers', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Path-specific toggle. Gates the <strong>Transfer to Bank</strong> button + pane in the External Transfers group on the Wallet page (Fintava virtual wallet &rarr; external Nigerian bank, instant via Fintava\'s /bank/credit endpoint). Defaults on. Uncheck to keep the Fintava integration available (virtual wallet, Matrix &rarr; Virtual transfer, bills) while blocking only the external cash-out pane &mdash; useful when you want to freeze the highest-risk surface without breaking the rest of the platform. This option moved here from Gateways &rarr; Fintava in refactor/withdrawal-controls-five-toggles; the legacy <code>matrix_mlm_fintava_payouts_enabled</code> key is still read as a fallback so existing installs don\'t lose their setting until they re-save here.', 'matrix-mlm'); ?>
+                    </p>
                 </td></tr>
         </table>
     <?php }
@@ -680,14 +717,14 @@ class Matrix_MLM_Admin_Settings {
                 }
                 break;
             case 'financial':
-                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user'];
+                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
                 // Required-plans multi-checkbox is the one field on
                 // this tab whose POST shape is an array, not a scalar.
                 // The generic save loop further down runs every value
                 // through sanitize_text_field, which would coerce the
                 // array to the string "Array". Handle it explicitly
                 // here, store as CSV (matching the parsing contract
-                // in Matrix_MLM_User::can_withdraw()).
+                // in Matrix_MLM_User::can_move_funds()).
                 $required_plans_raw = isset($_POST['matrix_mlm_withdraw_required_plans']) && is_array($_POST['matrix_mlm_withdraw_required_plans'])
                     ? $_POST['matrix_mlm_withdraw_required_plans']
                     : [];
@@ -745,7 +782,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

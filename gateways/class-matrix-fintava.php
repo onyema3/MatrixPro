@@ -1701,31 +1701,18 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        // Withdrawal-policy gate. Replaces the bare is_active() check
-        // with the admin-configurable Matrix_MLM_User::can_withdraw()
-        // chain so the master kill switch, active-user requirement,
-        // and restricted-plan tier all evaluate at one source of
-        // truth. The returned reason string is already localised and
-        // user-facing, so we round-trip it straight to wp_send_json_error.
-        $eligibility = Matrix_MLM_User::can_withdraw($user_id);
+        // Withdrawal-policy gate. Single call into the centralised
+        // five-toggle policy helper. For path='bank_transfer' it
+        // evaluates: master kill switch, active-account requirement,
+        // plan-tier restriction, and the Bank Transfers toggle on
+        // Settings → Financial (with the legacy
+        // matrix_mlm_fintava_payouts_enabled key as a fallback for
+        // installs that haven't re-saved Financial since the toggle
+        // moved over from Gateways → Fintava). The reason string is
+        // pre-localised, round-trip it straight to JSON.
+        $eligibility = Matrix_MLM_User::can_move_funds($user_id, 'bank_transfer');
         if (!$eligibility['allowed']) {
             wp_send_json_error(['message' => $eligibility['reason']]);
-        }
-
-        // Dedicated "Transfer to Bank" toggle (matrix_mlm_fintava_payouts_enabled,
-        // default ON). Independent from is_active() and can_withdraw() so an
-        // admin can disable just the external bank-payout flow without taking
-        // down the entire Fintava integration or freezing every "money out"
-        // path. See Matrix_MLM_Admin_Gateways::save_fintava_settings() and the
-        // toggle's description on Gateways → Fintava for the rationale and
-        // operator semantics. This is the defence-in-depth gate paired with
-        // the UI-level hide in Matrix_MLM_User_Wallet::render_action_buttons —
-        // a tampered POST that bypasses the hidden button still hits this
-        // server-side check and gets a clean rejection.
-        if (!(int) get_option('matrix_mlm_fintava_payouts_enabled', 1)) {
-            wp_send_json_error([
-                'message' => __('Bank transfers via Fintava are currently disabled by the administrator. Please use the Matrix Transfers form instead, or try again later.', 'matrix-mlm'),
-            ]);
         }
 
         if (!$this->is_active()) {
@@ -2076,12 +2063,12 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        // Withdrawal-policy gate. See ajax_initiate_transfer for the
-        // rationale — same Matrix_MLM_User::can_withdraw() replacement
-        // applied here so the Matrix→Virtual flow honours the master
-        // kill switch and the active-user / restricted-plan toggles
-        // consistently with the bank-payout path.
-        $eligibility = Matrix_MLM_User::can_withdraw($user_id);
+        // Withdrawal-policy gate. path='matrix_transfer' evaluates
+        // the master kill switch, active-account requirement, plan-tier
+        // restriction, and the Matrix Transfers toggle on
+        // Settings → Financial. Centralised in Matrix_MLM_User::can_move_funds
+        // so the bank-transfer path and the peer-to-peer path stay aligned.
+        $eligibility = Matrix_MLM_User::can_move_funds($user_id, 'matrix_transfer');
         if (!$eligibility['allowed']) {
             wp_send_json_error(['message' => $eligibility['reason']]);
         }

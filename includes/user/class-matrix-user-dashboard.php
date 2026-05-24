@@ -33,7 +33,7 @@ class Matrix_MLM_User_Dashboard {
         // withdrawal surfaces are now the Wallet tab's "Transfer to
         // Own Wallet" pane (Matrix → Fintava virtual) and "Transfer
         // to Bank" pane (Fintava virtual → external bank), both of
-        // which evaluate Matrix_MLM_User::can_withdraw() so admin
+        // which evaluate Matrix_MLM_User::can_move_funds() so admin
         // toggles for stopping withdrawals apply uniformly.
         //
         // 'transactions' was retired for the same reason: the wallet
