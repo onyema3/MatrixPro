@@ -2728,3 +2728,188 @@
     z-index: 9998;
 }
 .matrix-tree-hovercard-backdrop[hidden] { display: none; }
+
+
+
+/* =====================================================================
+ * D3 details panel — colourful overrides
+ * =====================================================================
+ *
+ * The interactive (D3) genealogy view's hover/click details panel
+ * (.matrix-genealogy-d3-details, populated by the JS in
+ * matrix-genealogy-d3.js → spawnDetailsPanel/fillDetailsPanel) was
+ * still rendering in the original plain white-and-grey palette
+ * after PRs #186 / #187 / #188 made the *classic*-view hover-card
+ * (.matrix-tree-hovercard) colourful. The two surfaces serve the
+ * same purpose ("show this member's details on hover") but live in
+ * different DOM trees with different class prefixes, so colouring
+ * one didn't touch the other — and the genealogy view defaults to
+ * the interactive (D3) view, meaning most members were still seeing
+ * the plain panel even after the hover-card fix landed.
+ *
+ * Mirror the hover-card palette here against the .mtx-details-*
+ * classes the D3 panel emits, so members on the default
+ * interactive view see the same coordinated indigo / violet / pink /
+ * amber treatment members on the classic view already see. Keeps
+ * the brand visual consistent across both views without changing
+ * any markup or JS contract — every selector below targets DOM
+ * the JS already builds in matrix-genealogy-d3.js → spawnDetailsPanel
+ * and fillDetailsPanel.
+ *
+ * Selectors are parent-prefixed with .matrix-genealogy-d3-details
+ * so they cleanly out-specify the original neutral rules earlier in
+ * this file (which use bare .mtx-details-* selectors). !important
+ * is layered on the colour, background, font-weight, and
+ * text-decoration properties for the same theme-override defence
+ * the hover-card uses (Astra, GeneratePress popup-hardening, etc.
+ * commonly !important-reset <strong>, <a>, <dt>, and <dl dd>).
+ *
+ * dt accents use :nth-of-type cycling because the JS conditionally
+ * skips fields whose data is empty — Joined / Level / Sponsor /
+ * Plans / Branch earnings can each be present or absent on any
+ * given hover. The cycle assigns five colours in rotation, so
+ * whichever fields are present each get a distinct accent. The
+ * "Branch earnings" row — usually rendered last — typically lands
+ * on the emerald 5th-position colour, which matches its semantic
+ * meaning, but we don't depend on that mapping.
+ * --------------------------------------------------------------------- */
+
+/* Card body — gradient wash + tinted shadow + decorative top stripe */
+.matrix-genealogy-d3-details {
+    background: linear-gradient(180deg, #ffffff 0%, #ffffff 70%, #faf5ff 100%) !important;
+    box-shadow: 0 18px 36px -10px rgba(99, 102, 241, 0.28),
+                0 0 0 1px rgba(139, 92, 246, 0.06) !important;
+    overflow: hidden;
+}
+
+.matrix-genealogy-d3-details::before {
+    content: "" !important;
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    height: 5px !important;
+    background: linear-gradient(90deg,
+        #6366f1 0%, #8b5cf6 35%, #ec4899 70%, #f59e0b 100%) !important;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    pointer-events: none;
+    z-index: 1;
+}
+
+/* Header — bump padding so name/username clear the top stripe and
+   close-X without the gradient line bleeding into the text. */
+.matrix-genealogy-d3-details .mtx-details-header {
+    padding-top: 4px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
+/* Member name — solid bold indigo so theme <strong> resets can't
+   wash it back to body-text colour. Same colour the hover-card
+   uses (#4f46e5) so the two surfaces feel like one product. */
+.matrix-genealogy-d3-details .mtx-details-name {
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    color: #4f46e5 !important;
+    background: transparent !important;
+    -webkit-text-fill-color: #4f46e5 !important;
+}
+
+/* Username pill — soft purple, rounded, monospace. */
+.matrix-genealogy-d3-details .mtx-details-username {
+    font-size: 12px !important;
+    color: #6d28d9 !important;
+    background: #ede9fe !important;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    align-self: flex-start;
+    margin-top: 0;
+}
+
+/* Per-row label dot + accent colour. Five-cycle through the same
+   palette the hover-card uses (blue / violet / pink / indigo /
+   emerald) so consecutive rows read as related-but-distinct rather
+   than four random hues. The dt itself becomes a flexbox so the
+   leading dot pseudo-element sits inline with the label. */
+.matrix-genealogy-d3-details .mtx-details-list dt {
+    font-size: 11px !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.5px;
+    font-weight: 600 !important;
+    color: #6b7280 !important;
+    margin: 0 !important;
+    padding-top: 1px;
+    display: flex !important;
+    align-items: center;
+    gap: 6px;
+}
+
+.matrix-genealogy-d3-details .mtx-details-list dt::before {
+    content: "" !important;
+    display: inline-block !important;
+    width: 8px !important;
+    height: 8px !important;
+    border-radius: 50%;
+    background: #9ca3af !important;
+    flex: 0 0 auto;
+}
+
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(1)         { color: #2563eb !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(1)::before { background: #2563eb !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(2)         { color: #7c3aed !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(2)::before { background: #7c3aed !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(3)         { color: #db2777 !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(3)::before { background: #db2777 !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(4)         { color: #4f46e5 !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(4)::before { background: #4f46e5 !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(5)         { color: #047857 !important; }
+.matrix-genealogy-d3-details .mtx-details-list dt:nth-of-type(5)::before { background: #047857 !important; }
+
+/* dd values stay dark for readability — bump font-weight a notch
+   so the value reads as the foreground content vs the muted label. */
+.matrix-genealogy-d3-details .mtx-details-list dd {
+    margin: 0 !important;
+    color: #111827 !important;
+    font-weight: 600 !important;
+    word-break: break-word;
+}
+
+/* "View their tree →" link — gradient pill button matching the
+   hover-card's profile button. Theme override-resistant: every
+   visual property carries !important so themes that style anchor
+   tags globally (text-decoration: underline, accent-coloured
+   colours, etc.) can't wash out the gradient. */
+.matrix-genealogy-d3-details .mtx-details-pivot {
+    display: block !important;
+    margin-top: 4px;
+    padding: 8px 12px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    color: #fff !important;
+    text-align: center !important;
+    text-decoration: none !important;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%) !important;
+    border: 0 !important;
+    border-radius: 999px !important;
+    box-shadow: 0 2px 8px -2px rgba(139, 92, 246, 0.5);
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+
+.matrix-genealogy-d3-details .mtx-details-pivot:hover,
+.matrix-genealogy-d3-details .mtx-details-pivot:focus,
+.matrix-genealogy-d3-details .mtx-details-pivot:focus-visible {
+    text-decoration: none !important;
+    color: #fff !important;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 14px -2px rgba(139, 92, 246, 0.6);
+}
+
+/* Loading spinner colour aligned with the brand palette. */
+.matrix-genealogy-d3-details .mtx-details-loading {
+    color: #6d28d9 !important;
+}
