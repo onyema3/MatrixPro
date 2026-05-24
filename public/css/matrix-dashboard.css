@@ -510,4 +510,102 @@
         flex-wrap: wrap;
         gap: 12px;
     }
+
+    /*
+     * Mobile layout switch: indented vertical tree.
+     *
+     * The desktop layout renders children horizontally (.matrix-tree-children
+     * is a flex row) with horizontal/vertical connector pseudo-elements
+     * fanning out from each parent. That works fine for 3-wide x 4-deep
+     * trees on a 1200px screen, but on a 360–414px phone every child
+     * past the first overflows horizontally — past two levels deep the
+     * rightmost branches scroll off-screen entirely and the connector
+     * lines stop matching up because the container can't absorb the
+     * width.
+     *
+     * The mobile fix below repaints the same DOM as a vertical indented
+     * tree: each .matrix-tree-children block stacks its children top-to-
+     * bottom, anchored to a single vertical guide on the left edge, and
+     * each child renders a short horizontal stub from the guide into the
+     * node card. Same look-and-feel as a file explorer or a code editor's
+     * outline panel.
+     *
+     * Approach: override the desktop connector pseudo-elements rather
+     * than fighting them. The desktop ::before (vertical drop from parent
+     * to child band) and ::after (horizontal band across all children) are
+     * suppressed; in their place .matrix-tree-children gets a left border
+     * acting as the trunk, and each .matrix-tree-item gets a single ::before
+     * stub that connects its node to the trunk.
+     *
+     * Nodes go full-width (no min-width override) so the username, badge
+     * and meta line don't truncate in the narrow column.
+     */
+    .matrix-tree-children {
+        flex-direction: column;
+        gap: 6px;
+        padding-top: 6px;
+        padding-left: 22px;
+        margin-left: 18px;
+        position: relative;
+
+        /* Vertical trunk down the left edge, replacing the desktop's
+         * horizontal connector band. Stops short of the bottom by a
+         * few pixels so the last child's stub doesn't continue past
+         * its own node — visually matches a tree's bottom branch. */
+        border-left: 2px solid var(--matrix-border);
+    }
+
+    /* Suppress the desktop tee-down ::before and the horizontal
+     * cross-bar ::after — they're position:absolute relative to a
+     * row layout that no longer exists in column mode. */
+    .matrix-tree-children::before,
+    .matrix-tree-children::after {
+        display: none;
+    }
+
+    .matrix-tree-children > .matrix-tree-item {
+        padding-top: 0;
+        position: relative;
+    }
+
+    /* Replace the desktop down-pointing connector with a left-pointing
+     * stub from the trunk into each child node. The 18px width matches
+     * the parent's 22px padding-left minus a 4px gap so the stub looks
+     * "attached" to the node card without touching it. */
+    .matrix-tree-children > .matrix-tree-item::before {
+        content: '';
+        position: absolute;
+        top: 22px;             /* aligns with the avatar's vertical centre */
+        left: -22px;
+        width: 18px;
+        height: 2px;
+        background: var(--matrix-border);
+        transform: none;       /* desktop centred via translateX, undo */
+    }
+
+    /*
+     * Make the node card stretch across the column. The desktop
+     * .matrix-tree-node is sized for inline-level nesting; in column
+     * mode the natural sizing still leaves an awkward right gutter.
+     * width:100% inside .matrix-tree-item gives a clean indent grid.
+     */
+    .matrix-tree-item {
+        width: 100%;
+    }
+
+    .matrix-tree-node {
+        width: 100%;
+        min-width: 0;
+    }
+
+    /* Top-level "You" node still centres on desktop via the wrapper —
+     * in column mode it should align flush-left with the rest of the
+     * tree so the indent ladder reads correctly. */
+    .matrix-genealogy-tree > .matrix-tree-item {
+        width: 100%;
+    }
+    .matrix-genealogy-tree > .matrix-tree-item > .matrix-tree-node {
+        width: auto;
+        max-width: 100%;
+    }
 }
