@@ -161,12 +161,12 @@ class Matrix_MLM_User_Card {
         <!-- Actions -->
         <div class="matrix-card-actions">
             <?php if ($effective_status === 'pending'): ?>
-                <button type="button" class="matrix-btn matrix-btn-primary" data-pan-form-target="setup">
+                <button type="button" class="matrix-btn matrix-btn-primary" onclick="matrixCardOpenPanForm('setup')">
                     <?php _e('Activate Card', 'matrix-mlm'); ?>
                 </button>
 
             <?php elseif ($effective_status === 'linked'): ?>
-                <button type="button" class="matrix-btn matrix-btn-primary" data-pan-form-target="activate">
+                <button type="button" class="matrix-btn matrix-btn-primary" onclick="matrixCardOpenPanForm('activate')">
                     <?php _e('Complete Activation', 'matrix-mlm'); ?>
                 </button>
                 <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixViewCardDetails()">
@@ -177,12 +177,12 @@ class Matrix_MLM_User_Card {
                 <button type="button" class="matrix-btn matrix-btn-primary" onclick="matrixViewCardDetails()">
                     <?php _e('View Card Details', 'matrix-mlm'); ?>
                 </button>
-                <button type="button" class="matrix-btn matrix-btn-secondary" data-pan-form-target="deactivate">
+                <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixCardOpenPanForm('deactivate')">
                     <?php _e('Freeze Card', 'matrix-mlm'); ?>
                 </button>
 
             <?php elseif ($effective_status === 'frozen'): ?>
-                <button type="button" class="matrix-btn matrix-btn-primary" data-pan-form-target="activate">
+                <button type="button" class="matrix-btn matrix-btn-primary" onclick="matrixCardOpenPanForm('activate')">
                     <?php _e('Reactivate Card', 'matrix-mlm'); ?>
                 </button>
                 <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixViewCardDetails()">
@@ -201,11 +201,11 @@ class Matrix_MLM_User_Card {
 
         <!--
             PAN-entry form. Re-used for setup (link+activate), activate-only,
-            and deactivate. The action is set by the button's
-            data-pan-form-target attribute and decides which AJAX endpoint
-            and confirm copy is used. The PAN itself is forwarded to Fintava
-            and never persisted locally — only the last four digits, which
-            the server derives from the entered PAN on success.
+            and deactivate. The action is set via matrixCardOpenPanForm()
+            and decides which AJAX endpoint and confirm copy is used. The
+            PAN itself is forwarded to Fintava and never persisted locally
+            — only the last four digits, which the server derives from the
+            entered PAN on success.
         -->
         <div id="matrix-card-pan-form" style="display:none;" class="matrix-form-card matrix-pan-form">
             <h3 id="matrix-card-pan-form-title"><?php _e('Enter Card PAN', 'matrix-mlm'); ?></h3>
@@ -247,7 +247,9 @@ class Matrix_MLM_User_Card {
         (function($) {
             'use strict';
 
-            // Map data-pan-form-target → { ajax action, button label, confirm copy }
+            // Map of action keys → {ajax action, dialog copy}. Lookup is by
+            // the same key the button's onclick passes in (`setup`,
+            // `activate`, `deactivate`).
             var ACTIONS = {
                 setup: {
                     action:  'matrix_fintava_setup_card',
@@ -269,9 +271,17 @@ class Matrix_MLM_User_Card {
                 }
             };
 
-            // Reveal the PAN form, retargeted to the chosen action.
-            $(document).on('click', '[data-pan-form-target]', function() {
-                var target = $(this).data('pan-form-target');
+            // Reveal the PAN form, retargeted to the chosen action. Exposed
+            // on `window` and called via inline onclick from the action
+            // buttons. The earlier event-delegated form
+            // (`$(document).on('click', '[data-pan-form-target]')`) was
+            // racey: if any earlier inline script on the dashboard threw,
+            // the IIFE never bound the handler and the buttons silently
+            // did nothing. Inline onclick → globally-named function is the
+            // pattern the rest of the dashboard uses (see
+            // matrixViewCardDetails) and it's robust to that class of
+            // failure.
+            window.matrixCardOpenPanForm = function(target) {
                 var cfg = ACTIONS[target];
                 if (!cfg) return;
                 $('#matrix-card-pan-form-title').text(cfg.title);
@@ -280,7 +290,7 @@ class Matrix_MLM_User_Card {
                 $('#matrix-card-pan-form [name="pan"]').val('');
                 $('#matrix-card-pan-form').show();
                 $('#matrix-card-pan-form [name="pan"]').focus();
-            });
+            };
 
             window.matrixHideCardPanForm = function() {
                 $('#matrix-card-pan-form').hide();
