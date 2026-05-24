@@ -166,8 +166,23 @@ class Matrix_MLM_User_Card {
                 </button>
 
             <?php elseif ($effective_status === 'linked'): ?>
-                <button type="button" class="matrix-btn matrix-btn-primary" data-pan-form-target="activate">
-                    <?php _e('Complete Activation', 'matrix-mlm'); ?>
+                <?php /*
+                    'linked' is reached two ways:
+                      1. setup_card linked successfully but activate failed
+                         (the genuine recovery case).
+                      2. The local DB row says linked but Fintava doesn't
+                         actually have it linked — happens to cards created
+                         via the pre-API-rewrite code path which wrote
+                         linked state without a real round-trip.
+
+                    We can't tell those cases apart from the local row, so
+                    the safe move is to run the full link+activate setup
+                    again. setup_card tolerates Fintava's "already linked"
+                    responses for case 1, and does the missing link
+                    properly for case 2.
+                */ ?>
+                <button type="button" class="matrix-btn matrix-btn-primary" data-pan-form-target="setup">
+                    <?php _e('Activate Card', 'matrix-mlm'); ?>
                 </button>
                 <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixViewCardDetails()">
                     <?php _e('View Card Details', 'matrix-mlm'); ?>
