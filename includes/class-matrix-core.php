@@ -164,54 +164,54 @@ class Matrix_MLM_Core {
             'userName' => is_user_logged_in() ? wp_get_current_user()->display_name : '',
         ]);
 
-        // Conditionally enqueue the D3.js genealogy view.
+        // Register (but don't enqueue) the D3.js genealogy view scripts.
         //
         // D3 is ~273 KB minified — significant enough that we don't
         // want to ship it on every page of the site. We only need
-        // it where the dashboard shortcode renders, so we gate the
-        // enqueue on a fast has_shortcode() check against the
-        // current post. Same gate the nocache_dashboard_pages()
-        // method uses, kept inline here rather than factored out
-        // because there's only two callers and copy-paste is more
-        // readable than a one-line helper.
+        // it where the genealogy tab actually renders. The previous
+        // approach gated the enqueue on has_shortcode() against
+        // $post->post_content, but that check is brittle: it returns
+        // false whenever the dashboard is hosted by anything other
+        // than a stock published Page whose body literally contains
+        // "[matrix_dashboard]" — page-builder blocks (Elementor,
+        // Bricks, etc.), FSE template parts, theme-template-injected
+        // shortcodes, and custom post type wrappers all bypass the
+        // detection and silently strand the scripts. The user-
+        // visible symptom was the genealogy "Interactive view"
+        // hanging on its loading shimmer because the JS module
+        // never loaded to either mount the SVG or fail-over to the
+        // classic tree.
         //
-        // Why we don't gate further (e.g. only on ?tab=genealogy):
-        //   - The dashboard tab is set after enqueue_scripts fires;
-        //     reading $_GET['tab'] here works for the initial pageload
-        //     but breaks if a future revision fetches tab content
-        //     via AJAX (the D3 module would never be enqueued in
-        //     that flow). Coupling the enqueue to tab detection
-        //     would also fight WordPress's caching layer, which
-        //     fingerprints by URL but not by POST/AJAX state.
-        //   - Members commonly land on /matrix-dashboard/ then click
-        //     the Genealogy tab. If the script weren't already
-        //     enqueued, that click would either need a fresh page
-        //     load or its own JS-side loader. Always-loaded-on-the-
-        //     dashboard is the simpler shape.
+        // The fix is to register the scripts here unconditionally
+        // (so the WP registry knows about them) and let
+        // Matrix_MLM_User_Genealogy::render_d3_view() call
+        // wp_enqueue_script() by handle when it actually emits the
+        // canvas. wp_enqueue_script can be invoked late from inside
+        // a shortcode because both scripts are footer-loaded
+        // (true as the 5th arg) — wp_print_footer_scripts fires
+        // after the_content, so anything enqueued during shortcode
+        // rendering still makes it into the output. This binds
+        // script lifetime to actual usage instead of guessing
+        // from page content, eliminating the failure mode
+        // entirely.
         //
         // Loading D3 BEFORE the genealogy module ensures `window.d3`
         // is defined by the time matrix-genealogy-d3.js executes.
-        // Both are footer-loaded so they don't block paint.
-        if (is_singular()) {
-            global $post;
-            if ($post && has_shortcode((string) $post->post_content, 'matrix_dashboard')) {
-                wp_enqueue_script(
-                    'matrix-mlm-d3-vendor',
-                    MATRIX_MLM_PLUGIN_URL . 'public/vendor/d3/d3.v7.min.js',
-                    [],
-                    '7.9.0',
-                    true
-                );
+        wp_register_script(
+            'matrix-mlm-d3-vendor',
+            MATRIX_MLM_PLUGIN_URL . 'public/vendor/d3/d3.v7.min.js',
+            [],
+            '7.9.0',
+            true
+        );
 
-                wp_enqueue_script(
-                    'matrix-mlm-genealogy-d3',
-                    MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-genealogy-d3.js',
-                    ['matrix-mlm-d3-vendor', 'matrix-mlm-public'],
-                    MATRIX_MLM_VERSION,
-                    true
-                );
-            }
-        }
+        wp_register_script(
+            'matrix-mlm-genealogy-d3',
+            MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-genealogy-d3.js',
+            ['matrix-mlm-d3-vendor', 'matrix-mlm-public'],
+            MATRIX_MLM_VERSION,
+            true
+        );
     }
 
     /**
