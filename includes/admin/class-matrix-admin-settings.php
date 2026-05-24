@@ -590,11 +590,10 @@ class Matrix_MLM_Admin_Settings {
                 <tr><td><?php _e('Bank Payout (User Fintava Wallet → Bank)', 'matrix-mlm'); ?></td><td><code>POST /bank/credit</code> @ configured env host</td></tr>
                 <tr><td><?php _e('Merchant Bank Credit (legacy / unused on bank-payout path)', 'matrix-mlm'); ?></td><td><code>POST /bank/credit/merchant</code></td></tr>
                 <tr><td><?php _e('Generate Virtual Wallet', 'matrix-mlm'); ?></td><td><code>POST /virtual-wallet/generate</code></td></tr>
-                <tr><td><?php _e('Request Physical Card', 'matrix-mlm'); ?></td><td><code>POST /cards/physical/request</code></td></tr>
-                <tr><td><?php _e('Card Status', 'matrix-mlm'); ?></td><td><code>GET /cards/status</code></td></tr>
-                <tr><td><?php _e('Link Card', 'matrix-mlm'); ?></td><td><code>POST /cards/link</code></td></tr>
-                <tr><td><?php _e('Activate Card', 'matrix-mlm'); ?></td><td><code>POST /cards/activate</code></td></tr>
+                <tr><td><?php _e('Create Physical Card (Verve, STATIC_NO_ACCOUNT)', 'matrix-mlm'); ?></td><td><code>POST /cards/physical/</code></td></tr>
+                <tr><td><?php _e('Link Card to Wallet', 'matrix-mlm'); ?></td><td><code>POST /cards/link</code></td></tr>
                 <tr><td><?php _e('View Card', 'matrix-mlm'); ?></td><td><code>GET /cards/fetch/{id}</code></td></tr>
+                <tr><td><?php _e('Activate Card', 'matrix-mlm'); ?></td><td><code>POST /cards/activate</code></td></tr>
             </tbody>
         </table>
     <?php }

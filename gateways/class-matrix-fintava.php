@@ -6753,9 +6753,9 @@ class Matrix_MLM_Fintava {
 
             // --- Cards ---
             'create_card' => [
-                'label'    => 'Create Card (Physical Request)',
+                'label'    => 'Create Card (Physical, STATIC_NO_ACCOUNT)',
                 'method'   => 'POST',
-                'path'     => '/cards/physical/request',
+                'path'     => '/cards/physical/',
                 'params'   => [],
                 'category' => 'Cards',
             ],
@@ -6776,7 +6776,7 @@ class Matrix_MLM_Fintava {
             'link_card' => [
                 'label'    => 'Link Card',
                 'method'   => 'POST',
-                'path'     => '/cards/activate',
+                'path'     => '/cards/link',
                 'params'   => [],
                 'category' => 'Cards',
             ],

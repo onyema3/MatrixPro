@@ -1,16 +1,25 @@
 <?php
 /**
  * Fintava Pay - Physical Card Management (Verve Card)
- * 
+ *
  * Integrates with Fintava Pay card endpoints for physical Verve card operations.
  * Card type: STATIC_NO_ACCOUNT (Verve Card)
- * 
+ *
+ * The physical Verve cards are pre-produced and held by the merchant — there
+ * is no shipping/delivery step. End users claim a card by walking through the
+ * four-step flow below: create a card record on the Fintava side, link it to
+ * their virtual wallet, optionally view full card details, and finally
+ * activate it for use at ATM/POS/online.
+ *
  * Endpoints:
- * - POST /cards/physical/request  - Request a new physical card
- * - GET  /cards/status            - Check card request status
- * - POST /cards/link              - Link card to user's wallet
- * - POST /cards/activate          - Activate a physical card
- * - GET  /cards/fetch/{id}        - View card details
+ * - POST /cards/physical/   - Create a new card record (STATIC_NO_ACCOUNT)
+ * - POST /cards/link        - Link card to user's wallet
+ * - GET  /cards/fetch/{id}  - View card details
+ * - POST /cards/activate    - Activate the card
+ *
+ * GET /cards/status is also wired up as an optional diagnostic but is not
+ * part of the four-step user flow (since cards are not shipped, there's
+ * no fulfillment status to poll for).
  */
 
 if (!defined('ABSPATH')) {
@@ -42,10 +51,17 @@ class Matrix_MLM_Fintava_Card {
     // =========================================================================
 
     /**
-     * Request a physical card
-     * POST /cards/physical/request
-     * 
-     * @param array $card_data Card request parameters
+     * Create a physical card record (Verve, pre-produced).
+     *
+     * POST /cards/physical/
+     *
+     * Card type is fixed to STATIC_NO_ACCOUNT — these are the pre-produced
+     * physical Verve cards Fintava has already issued for the merchant.
+     * Linking the card to the user's wallet is a separate explicit step
+     * (POST /cards/link), so we intentionally do NOT send wallet_id here.
+     *
+     * @param array $card_data Customer KYC fields (first_name, last_name,
+     *                         email, phone, optional address/city/state/country).
      * @return array|WP_Error
      */
     public function request_physical_card($card_data) {
@@ -78,11 +94,12 @@ class Matrix_MLM_Fintava_Card {
         if (!empty($card_data['country'])) {
             $payload['country'] = sanitize_text_field($card_data['country']);
         }
-        if (!empty($card_data['wallet_id'])) {
-            $payload['wallet_id'] = sanitize_text_field($card_data['wallet_id']);
-        }
 
-        $response = $this->make_request('POST', '/cards/physical/request', $payload);
+        // wallet_id is intentionally NOT included here — wallet linking is
+        // a separate step via POST /cards/link, performed after the card
+        // record exists.
+
+        $response = $this->make_request('POST', '/cards/physical/', $payload);
 
         if (is_wp_error($response)) {
             return $response;
@@ -93,14 +110,14 @@ class Matrix_MLM_Fintava_Card {
                 'success' => true,
                 'card_id' => $response['data']['id'] ?? $response['data']['card_id'] ?? null,
                 'status' => $response['data']['status'] ?? 'pending',
-                'message' => $response['message'] ?? __('Card request submitted successfully', 'matrix-mlm'),
+                'message' => $response['message'] ?? __('Card created successfully', 'matrix-mlm'),
                 'data' => $response['data'] ?? [],
             ];
         }
 
         return new WP_Error(
             'fintava_card_error',
-            $response['message'] ?? __('Failed to request card', 'matrix-mlm')
+            $response['message'] ?? __('Failed to create card', 'matrix-mlm')
         );
     }
 
@@ -225,7 +242,7 @@ class Matrix_MLM_Fintava_Card {
     // =========================================================================
 
     /**
-     * AJAX: Request a physical card
+     * AJAX: Create a physical card record (Verve, pre-produced).
      */
     public function ajax_request_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -242,14 +259,15 @@ class Matrix_MLM_Fintava_Card {
         // Check if user already has a card
         $existing = $this->get_user_card($user_id);
         if ($existing) {
-            wp_send_json_error(['message' => __('You already have a card request. Only one card per user is allowed.', 'matrix-mlm')]);
+            wp_send_json_error(['message' => __('You already have a card. Only one card per user is allowed.', 'matrix-mlm')]);
         }
 
-        // Check if user has a Fintava wallet (required for card)
+        // Check if user has a Fintava wallet (required so we can link the
+        // card to it in the next step).
         $fintava = new Matrix_MLM_Fintava();
         $wallet = $fintava->get_user_wallet($user_id);
         if (!$wallet) {
-            wp_send_json_error(['message' => __('You need a Fintava wallet before requesting a card. Please create one first.', 'matrix-mlm')]);
+            wp_send_json_error(['message' => __('You need a Fintava wallet before creating a card. Please create one first.', 'matrix-mlm')]);
         }
 
         $user = get_userdata($user_id);
@@ -265,11 +283,12 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('First name and last name are required', 'matrix-mlm')]);
         }
 
-        if (empty($address)) {
-            wp_send_json_error(['message' => __('Delivery address is required for physical card', 'matrix-mlm')]);
-        }
+        // Address fields are optional — the card is pre-produced and held
+        // by the merchant, so there's no shipping. We still pass them when
+        // available so Fintava has the customer's KYC details on file.
 
-        // Request card from Fintava
+        // Create the card record on Fintava's side. wallet_id is NOT sent
+        // here — linking happens in the next step (POST /cards/link).
         $result = $this->request_physical_card([
             'first_name' => $first_name,
             'last_name' => $last_name,
@@ -279,7 +298,6 @@ class Matrix_MLM_Fintava_Card {
             'city' => $city,
             'state' => $state,
             'country' => 'Nigeria',
-            'wallet_id' => $wallet->wallet_id,
         ]);
 
         if (is_wp_error($result)) {
@@ -287,7 +305,9 @@ class Matrix_MLM_Fintava_Card {
             return;
         }
 
-        // Store card in database
+        // Store card in database. wallet_id is recorded so the link step
+        // knows which wallet to link against, but the actual link is not
+        // performed yet.
         global $wpdb;
         $wpdb->insert($wpdb->prefix . 'matrix_fintava_cards', [
             'user_id' => $user_id,
@@ -296,12 +316,12 @@ class Matrix_MLM_Fintava_Card {
             'card_type' => 'STATIC_NO_ACCOUNT',
             'card_brand' => 'VERVE',
             'status' => $result['status'] ?? 'pending',
-            'delivery_address' => $address . ', ' . $city . ', ' . $state,
+            'delivery_address' => trim(implode(', ', array_filter([$address, $city, $state]))),
             'metadata' => json_encode($result['data']),
         ]);
 
         wp_send_json_success([
-            'message' => __('Physical Verve card requested successfully! You will be notified when it is ready for delivery.', 'matrix-mlm'),
+            'message' => __('Verve card created. Next, link it to your wallet to start using it.', 'matrix-mlm'),
             'card_id' => $result['card_id'],
             'status' => $result['status'] ?? 'pending',
         ]);
