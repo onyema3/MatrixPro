@@ -2,24 +2,52 @@
 /**
  * Fintava Pay - Physical Card Management (Verve Card)
  *
- * Integrates with Fintava Pay card endpoints for physical Verve card operations.
- * Card type: STATIC_NO_ACCOUNT (Verve Card)
+ * Integrates with Fintava Pay card endpoints for physical Verve card
+ * operations. Card type: STATIC_NO_ACCOUNT (Verve Card).
  *
- * The physical Verve cards are pre-produced and held by the merchant — there
- * is no shipping/delivery step. End users claim a card by walking through the
- * four-step flow below: create a card record on the Fintava side, link it to
- * their virtual wallet, optionally view full card details, and finally
- * activate it for use at ATM/POS/online.
+ * The physical Verve cards are pre-produced and held by the merchant —
+ * there is no shipping/delivery step. The end-user flow is:
  *
- * Endpoints:
- * - POST /cards/physical    - Create a new card record (STATIC_NO_ACCOUNT)
- * - POST /cards/link        - Link card to user's wallet
- * - GET  /cards/fetch/{id}  - View card details
- * - POST /cards/activate    - Activate the card
+ *   1. Create the card record on Fintava's side (POST /cards/physical/request)
+ *   2. Activate it by typing in the PAN printed on the physical card.
+ *      "Activate" is a server-side composite of:
+ *        - PATCH /cards/link      (link the PAN to the user's wallet)
+ *        - PATCH /cards/activate  (flip the card to ACTIVE)
+ *      The user only enters the PAN once.
+ *   3. Optionally view full card details (GET /cards/fetch/{cardMapId}).
  *
- * GET /cards/status is also wired up as an optional diagnostic but is not
- * part of the four-step user flow (since cards are not shipped, there's
- * no fulfillment status to poll for).
+ * Endpoints (all under the same base URL as Matrix_MLM_Fintava):
+ *   - POST  /cards/physical/request   - Create a card record
+ *   - GET   /cards/fetch/{cardMapId}  - Fetch card details (and status)
+ *   - PATCH /cards/link               - Link card PAN to wallet
+ *   - PATCH /cards/activate           - Activate card
+ *   - PATCH /cards/deactivate         - Freeze/deactivate card
+ *
+ * Notable correctness points worth pinning down here, since they were the
+ * source of the original 404 and several latent bugs:
+ *
+ *   - The create path is /cards/physical/REQUEST, not /cards/physical.
+ *     Earlier versions of this class hit /cards/physical and got a hard
+ *     404 from Fintava's router; PR #202 misdiagnosed it as a trailing
+ *     slash issue.
+ *
+ *   - Link / activate / deactivate are PATCH, not POST. Fintava returns
+ *     405 for the POST variants.
+ *
+ *   - The create payload is {cardBrand, cardName, accountNumber, cardType}
+ *     — camelCase, NUBAN-driven. Customer KYC (address, BVN, etc.) lives
+ *     on the Fintava customer record, which Matrix_MLM_Fintava already
+ *     creates at wallet-provisioning time via POST /create/customer. By
+ *     the time we get here, $wallet->account_number IS the customer's
+ *     virtualAcctNo, which is exactly what /cards/physical/request wants.
+ *
+ *   - Fintava returns card statuses in UPPERCASE (ACTIVE, FROZEN, ...).
+ *     We normalize to lowercase on read via self::normalize_status() so
+ *     the local DB stays case-consistent.
+ *
+ *   - The card PAN is never persisted. We send it through to Fintava on
+ *     link/activate/deactivate and only store its last four digits in
+ *     wp_matrix_fintava_cards.last_four for display.
  */
 
 if (!defined('ABSPATH')) {
@@ -30,20 +58,33 @@ class Matrix_MLM_Fintava_Card {
 
     private $fintava;
 
+    /**
+     * Local DB column wp_matrix_fintava_cards.card_id stores Fintava's
+     * cardMapId (the ID of the card *record*, not a PAN). The column was
+     * named before that distinction was clear; it's kept for backward
+     * compat with the import path. All API calls treat it as cardMapId.
+     */
+
     public function __construct() {
         $this->fintava = new Matrix_MLM_Fintava();
         $this->register_hooks();
     }
 
     /**
-     * Register AJAX hooks
+     * Register AJAX hooks.
+     *
+     * `setup_card` is the user-facing combined link+activate flow (single
+     * PAN entry, two server-side PATCH calls). `link_card` and
+     * `activate_card` remain individually callable for admin tooling and
+     * recovery from a partially-failed setup.
      */
     private function register_hooks() {
-        add_action('wp_ajax_matrix_fintava_request_card', [$this, 'ajax_request_card']);
-        add_action('wp_ajax_matrix_fintava_card_status', [$this, 'ajax_card_status']);
-        add_action('wp_ajax_matrix_fintava_link_card', [$this, 'ajax_link_card']);
-        add_action('wp_ajax_matrix_fintava_activate_card', [$this, 'ajax_activate_card']);
-        add_action('wp_ajax_matrix_fintava_fetch_card', [$this, 'ajax_fetch_card']);
+        add_action('wp_ajax_matrix_fintava_request_card',    [$this, 'ajax_request_card']);
+        add_action('wp_ajax_matrix_fintava_setup_card',      [$this, 'ajax_setup_card']);
+        add_action('wp_ajax_matrix_fintava_link_card',       [$this, 'ajax_link_card']);
+        add_action('wp_ajax_matrix_fintava_activate_card',   [$this, 'ajax_activate_card']);
+        add_action('wp_ajax_matrix_fintava_deactivate_card', [$this, 'ajax_deactivate_card']);
+        add_action('wp_ajax_matrix_fintava_fetch_card',      [$this, 'ajax_fetch_card']);
     }
 
     // =========================================================================
@@ -51,183 +92,265 @@ class Matrix_MLM_Fintava_Card {
     // =========================================================================
 
     /**
-     * Create a physical card record (Verve, pre-produced).
+     * Create a physical card record on Fintava's side.
      *
-     * POST /cards/physical
+     * POST /cards/physical/request
      *
-     * Note: NO trailing slash. Fintava's router treats `/cards/physical/`
-     * (trailing slash) as a different — non-existent — route and returns
-     * "Cannot POST /api/dev/cards/physical/" (Express's default 404).
-     * The endpoint is `/cards/physical` exactly.
+     * Payload (all camelCase, per Fintava's DTO):
+     *   - cardBrand:     'Verve' (only brand currently supported)
+     *   - cardName:      Embossed name on the card.
+     *   - accountNumber: The customer's virtual NUBAN
+     *                    (= $wallet->account_number).
+     *   - cardType:      'STATIC_NO_ACCOUNT'.
      *
-     * Card type is fixed to STATIC_NO_ACCOUNT — these are the pre-produced
-     * physical Verve cards Fintava has already issued for the merchant.
-     * Linking the card to the user's wallet is a separate explicit step
-     * (POST /cards/link), so we intentionally do NOT send wallet_id here.
+     * The customer record on Fintava's side already exists at this point
+     * because Matrix_MLM_Fintava::create_customer() ran during wallet
+     * provisioning. We do NOT need to send address/email/phone here — that
+     * KYC lives on the customer record, keyed off accountNumber.
      *
-     * @param array $card_data Customer KYC fields (first_name, last_name,
-     *                         email, phone, optional address/city/state/country).
-     * @return array|WP_Error
+     * @param int    $user_id    WP user ID (must already have a wallet).
+     * @param string $first_name Cardholder first name (embossed).
+     * @param string $last_name  Cardholder last name (embossed).
+     * @return array|WP_Error    On success: ['card_map_id', 'status', ...]
      */
-    public function request_physical_card($card_data) {
+    public function request_physical_card($user_id, $first_name, $last_name) {
+        $wallet = $this->fintava->get_user_wallet($user_id);
+        if (!$wallet || empty($wallet->account_number)) {
+            return new WP_Error(
+                'no_wallet',
+                __('A Fintava wallet is required before creating a card.', 'matrix-mlm')
+            );
+        }
+
+        $card_name = trim(
+            sanitize_text_field($first_name) . ' ' . sanitize_text_field($last_name)
+        );
+        if ($card_name === '') {
+            return new WP_Error(
+                'missing_card_name',
+                __('Cardholder name is required.', 'matrix-mlm')
+            );
+        }
+
         $payload = [
-            'card_type' => 'STATIC_NO_ACCOUNT',
+            'cardBrand'     => 'Verve',
+            'cardName'      => $card_name,
+            'accountNumber' => $wallet->account_number,
+            'cardType'      => 'STATIC_NO_ACCOUNT',
         ];
 
-        // Customer details
-        if (!empty($card_data['first_name'])) {
-            $payload['first_name'] = sanitize_text_field($card_data['first_name']);
-        }
-        if (!empty($card_data['last_name'])) {
-            $payload['last_name'] = sanitize_text_field($card_data['last_name']);
-        }
-        if (!empty($card_data['email'])) {
-            $payload['email'] = sanitize_email($card_data['email']);
-        }
-        if (!empty($card_data['phone'])) {
-            $payload['phone'] = sanitize_text_field($card_data['phone']);
-        }
-        if (!empty($card_data['address'])) {
-            $payload['address'] = sanitize_text_field($card_data['address']);
-        }
-        if (!empty($card_data['city'])) {
-            $payload['city'] = sanitize_text_field($card_data['city']);
-        }
-        if (!empty($card_data['state'])) {
-            $payload['state'] = sanitize_text_field($card_data['state']);
-        }
-        if (!empty($card_data['country'])) {
-            $payload['country'] = sanitize_text_field($card_data['country']);
-        }
-
-        // wallet_id is intentionally NOT included here — wallet linking is
-        // a separate step via POST /cards/link, performed after the card
-        // record exists.
-
-        $response = $this->make_request('POST', '/cards/physical', $payload);
-
+        $response = $this->make_request('POST', '/cards/physical/request', $payload);
         if (is_wp_error($response)) {
             return $response;
         }
 
-        if (Matrix_MLM_Fintava::is_api_success($response)) {
-            return [
-                'success' => true,
-                'card_id' => $response['data']['id'] ?? $response['data']['card_id'] ?? null,
-                'status' => $response['data']['status'] ?? 'pending',
-                'message' => $response['message'] ?? __('Card created successfully', 'matrix-mlm'),
-                'data' => $response['data'] ?? [],
-            ];
+        if (!Matrix_MLM_Fintava::is_api_success($response)) {
+            return new WP_Error(
+                'fintava_card_error',
+                $response['message'] ?? __('Failed to create card', 'matrix-mlm')
+            );
         }
 
-        return new WP_Error(
-            'fintava_card_error',
-            $response['message'] ?? __('Failed to create card', 'matrix-mlm')
-        );
+        $data = $response['data'] ?? [];
+        return [
+            'success'     => true,
+            // Fintava returns the cardMapId at data.cardMapId in current
+            // shape, but older tier responses surface it as data.id. Try
+            // both, in that order.
+            'card_map_id' => $data['cardMapId'] ?? $data['id'] ?? null,
+            'status'      => self::normalize_status($data['status'] ?? 'pending'),
+            'message'     => $response['message'] ?? __('Card created successfully', 'matrix-mlm'),
+            'data'        => $data,
+        ];
     }
 
     /**
-     * Check card request status
-     * GET /cards/status
-     * 
-     * @param string $card_id Card ID to check
+     * Link the physical card's PAN to the user's wallet.
+     *
+     * PATCH /cards/link
+     *
+     * Payload: {cardMapId, cardPan, customerAccountNo, userId}
+     *
+     * `userId` here is Fintava's customer-record id (userInfo.id), NOT
+     * the WordPress user_id. We persist that as wallets.customer_id at
+     * wallet-creation time. For older wallets where it was never written
+     * we fall back to Matrix_MLM_Fintava::resolve_customer_id() and
+     * back-fill the row.
+     *
+     * @param int    $user_id  WP user ID.
+     * @param string $card_pan 16-digit PAN typed by the user from their
+     *                         physical card. Sent to Fintava but never
+     *                         persisted locally.
      * @return array|WP_Error
      */
-    public function get_card_status($card_id = null) {
-        $endpoint = '/cards/status';
-        if ($card_id) {
-            $endpoint .= '?card_id=' . urlencode($card_id);
+    public function link_card($user_id, $card_pan) {
+        $card = $this->get_user_card($user_id);
+        if (!$card || empty($card->card_id)) {
+            return new WP_Error('no_card', __('No card to link', 'matrix-mlm'));
         }
 
-        $response = $this->make_request('GET', $endpoint);
+        $wallet = $this->fintava->get_user_wallet($user_id);
+        if (!$wallet || empty($wallet->account_number)) {
+            return new WP_Error('no_wallet', __('No wallet to link to', 'matrix-mlm'));
+        }
 
+        $pan_digits = self::sanitize_pan($card_pan);
+        if ($pan_digits === '') {
+            return new WP_Error('invalid_pan', __('A valid card PAN is required.', 'matrix-mlm'));
+        }
+
+        $customer_id = $this->resolve_user_customer_id($wallet);
+        if (is_wp_error($customer_id)) {
+            return $customer_id;
+        }
+
+        $payload = [
+            'cardMapId'         => $card->card_id,
+            'cardPan'           => $pan_digits,
+            'customerAccountNo' => $wallet->account_number,
+            'userId'            => $customer_id,
+        ];
+
+        $response = $this->make_request('PATCH', '/cards/link', $payload);
         if (is_wp_error($response)) {
             return $response;
         }
 
-        if (Matrix_MLM_Fintava::is_api_success($response) && isset($response['data'])) {
-            return $response['data'];
+        if (!Matrix_MLM_Fintava::is_api_success($response)) {
+            return new WP_Error(
+                'fintava_card_link_error',
+                $response['message'] ?? __('Failed to link card', 'matrix-mlm')
+            );
         }
 
-        return new WP_Error(
-            'fintava_card_status_error',
-            $response['message'] ?? __('Could not retrieve card status', 'matrix-mlm')
-        );
+        return [
+            'success' => true,
+            'message' => $response['message'] ?? __('Card linked successfully', 'matrix-mlm'),
+            'data'    => $response['data'] ?? [],
+        ];
     }
 
     /**
-     * Link card to user wallet
-     * POST /cards/link
-     * 
-     * @param string $card_id Card ID
-     * @param string $wallet_id Wallet ID to link
+     * Activate a card.
+     *
+     * PATCH /cards/activate — payload {cardNo, cardMapId}.
+     *
+     * Note: there is no PIN/CVV exchange on this endpoint. Earlier
+     * versions of this class invented those fields; Fintava ignores them
+     * (or rejects on stricter tiers).
+     *
+     * @param int    $user_id
+     * @param string $card_pan
      * @return array|WP_Error
      */
-    public function link_card($card_id, $wallet_id) {
-        $response = $this->make_request('POST', '/cards/link', [
-            'card_id' => $card_id,
-            'wallet_id' => $wallet_id,
-        ]);
+    public function activate_card($user_id, $card_pan) {
+        return $this->card_state_change($user_id, $card_pan, '/cards/activate', 'active');
+    }
 
+    /**
+     * Deactivate (freeze) a card.
+     *
+     * PATCH /cards/deactivate — payload {cardNo, cardMapId}.
+     *
+     * @param int    $user_id
+     * @param string $card_pan
+     * @return array|WP_Error
+     */
+    public function deactivate_card($user_id, $card_pan) {
+        return $this->card_state_change($user_id, $card_pan, '/cards/deactivate', 'frozen');
+    }
+
+    /**
+     * Shared body of activate / deactivate — they differ only in the
+     * endpoint and the local status we write on success.
+     */
+    private function card_state_change($user_id, $card_pan, $endpoint, $local_status_on_success) {
+        $card = $this->get_user_card($user_id);
+        if (!$card || empty($card->card_id)) {
+            return new WP_Error('no_card', __('No card found', 'matrix-mlm'));
+        }
+
+        $pan_digits = self::sanitize_pan($card_pan);
+        if ($pan_digits === '') {
+            return new WP_Error('invalid_pan', __('A valid card PAN is required.', 'matrix-mlm'));
+        }
+
+        $payload = [
+            'cardNo'    => $pan_digits,
+            'cardMapId' => $card->card_id,
+        ];
+
+        $response = $this->make_request('PATCH', $endpoint, $payload);
         if (is_wp_error($response)) {
             return $response;
         }
 
-        if (Matrix_MLM_Fintava::is_api_success($response)) {
-            return [
-                'success' => true,
-                'message' => $response['message'] ?? __('Card linked successfully', 'matrix-mlm'),
-                'data' => $response['data'] ?? [],
-            ];
+        if (!Matrix_MLM_Fintava::is_api_success($response)) {
+            return new WP_Error(
+                'fintava_card_state_error',
+                $response['message'] ?? __('Card state change failed', 'matrix-mlm')
+            );
         }
 
-        return new WP_Error(
-            'fintava_card_link_error',
-            $response['message'] ?? __('Failed to link card', 'matrix-mlm')
-        );
+        return [
+            'success'      => true,
+            'local_status' => $local_status_on_success,
+            'message'      => $response['message'] ?? __('Card updated successfully', 'matrix-mlm'),
+            'data'         => $response['data'] ?? [],
+        ];
     }
 
     /**
-     * Activate a physical card
-     * POST /cards/activate
-     * 
-     * @param string $card_id Card ID
-     * @param array $activation_data Additional activation data (e.g., PIN, CVV)
-     * @return array|WP_Error
+     * Combined link + activate. Single user step (one PAN entry) but two
+     * Fintava round-trips. If the link succeeds and the activate fails,
+     * the local card row is left at status='linked' so the user can retry
+     * activation without re-linking.
      */
-    public function activate_card($card_id, $activation_data = []) {
-        $payload = array_merge(['card_id' => $card_id], $activation_data);
-
-        $response = $this->make_request('POST', '/cards/activate', $payload);
-
-        if (is_wp_error($response)) {
-            return $response;
+    public function setup_card($user_id, $card_pan) {
+        $link = $this->link_card($user_id, $card_pan);
+        if (is_wp_error($link)) {
+            return $link;
         }
 
-        if (Matrix_MLM_Fintava::is_api_success($response)) {
-            return [
-                'success' => true,
-                'message' => $response['message'] ?? __('Card activated successfully', 'matrix-mlm'),
-                'data' => $response['data'] ?? [],
-            ];
+        // Persist linked state immediately so a subsequent activate
+        // failure leaves a recoverable row, not a phantom one.
+        global $wpdb;
+        $card = $this->get_user_card($user_id);
+        $last_four = substr(self::sanitize_pan($card_pan), -4);
+        $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
+            'status'     => 'linked',
+            'last_four'  => $last_four,
+            'updated_at' => current_time('mysql'),
+        ], ['id' => $card->id]);
+
+        $activate = $this->activate_card($user_id, $card_pan);
+        if (is_wp_error($activate)) {
+            return $activate;
         }
 
-        return new WP_Error(
-            'fintava_card_activate_error',
-            $response['message'] ?? __('Failed to activate card', 'matrix-mlm')
-        );
+        $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
+            'status'       => 'active',
+            'activated_at' => current_time('mysql'),
+            'updated_at'   => current_time('mysql'),
+        ], ['id' => $card->id]);
+
+        return [
+            'success' => true,
+            'message' => __('Card linked and activated.', 'matrix-mlm'),
+        ];
     }
 
     /**
-     * Fetch/view card details
-     * GET /cards/fetch/{id}
-     * 
-     * @param string $card_id Card ID
-     * @return array|WP_Error
+     * Fetch full card details (and current status) by cardMapId.
+     *
+     * GET /cards/fetch/{cardMapId}
+     *
+     * This subsumes the old /cards/status diagnostic — Fintava returns
+     * the card's status as part of the fetch response, so a separate
+     * status-only endpoint is unnecessary.
      */
-    public function fetch_card($card_id) {
-        $response = $this->make_request('GET', '/cards/fetch/' . $card_id);
-
+    public function fetch_card($card_map_id) {
+        $response = $this->make_request('GET', '/cards/fetch/' . rawurlencode($card_map_id));
         if (is_wp_error($response)) {
             return $response;
         }
@@ -248,6 +371,10 @@ class Matrix_MLM_Fintava_Card {
 
     /**
      * AJAX: Create a physical card record (Verve, pre-produced).
+     *
+     * Inputs (POST):
+     *   - first_name (falls back to user_meta)
+     *   - last_name  (falls back to user_meta)
      */
     public function ajax_request_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -261,81 +388,52 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Your account is suspended', 'matrix-mlm')]);
         }
 
-        // Check if user already has a card
-        $existing = $this->get_user_card($user_id);
-        if ($existing) {
+        if ($this->get_user_card($user_id)) {
             wp_send_json_error(['message' => __('You already have a card. Only one card per user is allowed.', 'matrix-mlm')]);
         }
 
-        // Check if user has a Fintava wallet (required so we can link the
-        // card to it in the next step).
-        $fintava = new Matrix_MLM_Fintava();
-        $wallet = $fintava->get_user_wallet($user_id);
-        if (!$wallet) {
-            wp_send_json_error(['message' => __('You need a Fintava wallet before creating a card. Please create one first.', 'matrix-mlm')]);
-        }
-
-        $user = get_userdata($user_id);
-        $meta = Matrix_MLM_User::get_meta($user_id);
-
         $first_name = sanitize_text_field($_POST['first_name'] ?? get_user_meta($user_id, 'first_name', true));
-        $last_name = sanitize_text_field($_POST['last_name'] ?? get_user_meta($user_id, 'last_name', true));
-        $address = sanitize_text_field($_POST['address'] ?? ($meta->address ?? ''));
-        $city = sanitize_text_field($_POST['city'] ?? ($meta->city ?? ''));
-        $state = sanitize_text_field($_POST['state'] ?? ($meta->state ?? ''));
+        $last_name  = sanitize_text_field($_POST['last_name']  ?? get_user_meta($user_id, 'last_name',  true));
 
-        if (empty($first_name) || empty($last_name)) {
+        if ($first_name === '' || $last_name === '') {
             wp_send_json_error(['message' => __('First name and last name are required', 'matrix-mlm')]);
         }
 
-        // Address fields are optional — the card is pre-produced and held
-        // by the merchant, so there's no shipping. We still pass them when
-        // available so Fintava has the customer's KYC details on file.
-
-        // Create the card record on Fintava's side. wallet_id is NOT sent
-        // here — linking happens in the next step (POST /cards/link).
-        $result = $this->request_physical_card([
-            'first_name' => $first_name,
-            'last_name' => $last_name,
-            'email' => $user->user_email,
-            'phone' => $meta->phone ?? '',
-            'address' => $address,
-            'city' => $city,
-            'state' => $state,
-            'country' => 'Nigeria',
-        ]);
-
+        $result = $this->request_physical_card($user_id, $first_name, $last_name);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
-        // Store card in database. wallet_id is recorded so the link step
-        // knows which wallet to link against, but the actual link is not
-        // performed yet.
+        // Persist. wallet_id is stored for cross-reference even though the
+        // link step (PATCH /cards/link) drives off the wallet's
+        // account_number, not its wallet_id.
+        $wallet = $this->fintava->get_user_wallet($user_id);
         global $wpdb;
         $wpdb->insert($wpdb->prefix . 'matrix_fintava_cards', [
-            'user_id' => $user_id,
-            'card_id' => $result['card_id'],
-            'wallet_id' => $wallet->wallet_id,
-            'card_type' => 'STATIC_NO_ACCOUNT',
+            'user_id'    => $user_id,
+            'card_id'    => $result['card_map_id'],
+            'wallet_id'  => $wallet ? $wallet->wallet_id : null,
+            'card_type'  => 'STATIC_NO_ACCOUNT',
             'card_brand' => 'VERVE',
-            'status' => $result['status'] ?? 'pending',
-            'delivery_address' => trim(implode(', ', array_filter([$address, $city, $state]))),
-            'metadata' => json_encode($result['data']),
+            'status'     => $result['status'] ?: 'pending',
+            'metadata'   => wp_json_encode($result['data']),
         ]);
 
         wp_send_json_success([
-            'message' => __('Verve card created. Next, link it to your wallet to start using it.', 'matrix-mlm'),
-            'card_id' => $result['card_id'],
-            'status' => $result['status'] ?? 'pending',
+            'message'     => __('Verve card created. Next, type in the PAN from your physical card to activate it.', 'matrix-mlm'),
+            'card_map_id' => $result['card_map_id'],
+            'status'      => $result['status'],
         ]);
     }
 
     /**
-     * AJAX: Check card status
+     * AJAX: Combined link + activate (the user's "Activate Card" button).
+     *
+     * Inputs (POST):
+     *   - pan: 16-digit card PAN
      */
-    public function ajax_card_status() {
+    public function ajax_setup_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
 
         $user_id = get_current_user_id();
@@ -343,42 +441,20 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        $card = $this->get_user_card($user_id);
-        if (!$card) {
-            wp_send_json_error(['message' => __('No card found', 'matrix-mlm'), 'has_card' => false]);
+        $pan = wp_unslash($_POST['pan'] ?? '');
+        $result = $this->setup_card($user_id, $pan);
+
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+            return;
         }
 
-        // Refresh status from API
-        if (!empty($card->card_id)) {
-            $api_status = $this->get_card_status($card->card_id);
-            if (!is_wp_error($api_status)) {
-                $new_status = $api_status['status'] ?? $card->status;
-                if ($new_status !== $card->status) {
-                    global $wpdb;
-                    $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
-                        'status' => $new_status,
-                        'updated_at' => current_time('mysql'),
-                    ], ['id' => $card->id]);
-                    $card->status = $new_status;
-                }
-            }
-        }
-
-        wp_send_json_success([
-            'has_card' => true,
-            'card' => [
-                'card_id' => $card->card_id,
-                'card_type' => $card->card_type,
-                'card_brand' => $card->card_brand,
-                'status' => $card->status,
-                'last_four' => $card->last_four,
-                'created_at' => $card->created_at,
-            ],
-        ]);
+        wp_send_json_success(['message' => $result['message']]);
     }
 
     /**
-     * AJAX: Link card to wallet
+     * AJAX: Link only. Useful for retrying a failed link without
+     * re-creating the card record.
      */
     public function ajax_link_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -388,27 +464,19 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        $card = $this->get_user_card($user_id);
-        if (!$card) {
-            wp_send_json_error(['message' => __('No card found', 'matrix-mlm')]);
-        }
-
-        $fintava = new Matrix_MLM_Fintava();
-        $wallet = $fintava->get_user_wallet($user_id);
-        if (!$wallet) {
-            wp_send_json_error(['message' => __('No Fintava wallet found', 'matrix-mlm')]);
-        }
-
-        $result = $this->link_card($card->card_id, $wallet->wallet_id);
+        $pan = wp_unslash($_POST['pan'] ?? '');
+        $result = $this->link_card($user_id, $pan);
 
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
+        $card = $this->get_user_card($user_id);
         global $wpdb;
         $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
-            'status' => 'linked',
+            'status'     => 'linked',
+            'last_four'  => substr(self::sanitize_pan($pan), -4),
             'updated_at' => current_time('mysql'),
         ], ['id' => $card->id]);
 
@@ -416,7 +484,8 @@ class Matrix_MLM_Fintava_Card {
     }
 
     /**
-     * AJAX: Activate card
+     * AJAX: Activate only. Used to recover from a setup_card() that linked
+     * but failed to activate.
      */
     public function ajax_activate_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -426,29 +495,48 @@ class Matrix_MLM_Fintava_Card {
             wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
         }
 
-        $card = $this->get_user_card($user_id);
-        if (!$card) {
-            wp_send_json_error(['message' => __('No card found', 'matrix-mlm')]);
-        }
-
-        $pin = sanitize_text_field($_POST['pin'] ?? '');
-        $cvv = sanitize_text_field($_POST['cvv'] ?? '');
-
-        $activation_data = [];
-        if (!empty($pin)) $activation_data['pin'] = $pin;
-        if (!empty($cvv)) $activation_data['cvv'] = $cvv;
-
-        $result = $this->activate_card($card->card_id, $activation_data);
+        $pan = wp_unslash($_POST['pan'] ?? '');
+        $result = $this->activate_card($user_id, $pan);
 
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
             return;
         }
 
+        $card = $this->get_user_card($user_id);
         global $wpdb;
         $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
-            'status' => 'active',
+            'status'       => 'active',
             'activated_at' => current_time('mysql'),
+            'updated_at'   => current_time('mysql'),
+        ], ['id' => $card->id]);
+
+        wp_send_json_success(['message' => $result['message']]);
+    }
+
+    /**
+     * AJAX: Deactivate (freeze) the user's card.
+     */
+    public function ajax_deactivate_card() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        $pan = wp_unslash($_POST['pan'] ?? '');
+        $result = $this->deactivate_card($user_id, $pan);
+
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+            return;
+        }
+
+        $card = $this->get_user_card($user_id);
+        global $wpdb;
+        $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', [
+            'status'     => 'frozen',
             'updated_at' => current_time('mysql'),
         ], ['id' => $card->id]);
 
@@ -456,7 +544,9 @@ class Matrix_MLM_Fintava_Card {
     }
 
     /**
-     * AJAX: Fetch card details
+     * AJAX: Fetch card details. Doubles as a status refresh — Fintava's
+     * fetch response includes the current status, which we normalize
+     * and persist back to the local row.
      */
     public function ajax_fetch_card() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -472,32 +562,30 @@ class Matrix_MLM_Fintava_Card {
         }
 
         $details = $this->fetch_card($card->card_id);
-
         if (is_wp_error($details)) {
             wp_send_json_error(['message' => $details->get_error_message()]);
             return;
         }
 
-        // Update local record with any new info
         global $wpdb;
-        $update_data = ['updated_at' => current_time('mysql')];
+        $update = ['updated_at' => current_time('mysql')];
         if (isset($details['last_four'])) {
-            $update_data['last_four'] = $details['last_four'];
+            $update['last_four'] = $details['last_four'];
         }
         if (isset($details['status'])) {
-            $update_data['status'] = $details['status'];
+            $update['status'] = self::normalize_status($details['status']);
         }
-        $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', $update_data, ['id' => $card->id]);
+        $wpdb->update($wpdb->prefix . 'matrix_fintava_cards', $update, ['id' => $card->id]);
 
         wp_send_json_success(['card' => $details]);
     }
 
     // =========================================================================
-    // HELPER METHODS
+    // HELPERS
     // =========================================================================
 
     /**
-     * Get user's card from local database
+     * Get the user's card row from the local DB.
      */
     public function get_user_card($user_id) {
         global $wpdb;
@@ -508,16 +596,83 @@ class Matrix_MLM_Fintava_Card {
     }
 
     /**
-     * Make API request (uses the same API endpoint as Matrix_MLM_Fintava)
+     * Resolve Fintava's customer_id (userInfo.id) for a given wallet row.
+     *
+     * Reads from wallets.customer_id when present (the fast path on
+     * KYC-era wallets). Falls back to Matrix_MLM_Fintava::resolve_customer_id(),
+     * which has a three-strategy resolver covering legacy wallets, and
+     * back-fills the row so subsequent calls hit the fast path.
+     *
+     * @return string|WP_Error
+     */
+    private function resolve_user_customer_id($wallet) {
+        if (!empty($wallet->customer_id)) {
+            return $wallet->customer_id;
+        }
+
+        $resolved = $this->fintava->resolve_customer_id($wallet);
+        if (is_wp_error($resolved)) {
+            return $resolved;
+        }
+
+        global $wpdb;
+        $wpdb->update(
+            $wpdb->prefix . 'matrix_fintava_wallets',
+            ['customer_id' => $resolved],
+            ['id' => $wallet->id]
+        );
+
+        return $resolved;
+    }
+
+    /**
+     * Strip everything that isn't a digit out of a PAN.
+     *
+     * Users typing PANs from their physical card commonly insert spaces or
+     * dashes ("5399 4400 1234 5678"). Fintava expects an unbroken digit
+     * string.
+     */
+    public static function sanitize_pan($pan) {
+        return preg_replace('/\D+/', '', (string) $pan);
+    }
+
+    /**
+     * Normalize a Fintava-side status to the local DB enum.
+     *
+     * Fintava emits UPPERCASE statuses (ACTIVE, FROZEN, INACTIVE, FAILED).
+     * Our DB enum is lowercase for legacy reasons. Unknown statuses fall
+     * back to 'pending' rather than ever rejecting a row.
+     */
+    public static function normalize_status($remote) {
+        if (!is_string($remote) || $remote === '') {
+            return 'pending';
+        }
+        $lower = strtolower(trim($remote));
+        $allowed = [
+            'pending'    => 1,
+            'processing' => 1,
+            'shipped'    => 1,
+            'delivered'  => 1,
+            'linked'     => 1,
+            'active'     => 1,
+            'frozen'     => 1,
+            'blocked'    => 1,
+            'expired'    => 1,
+            'inactive'   => 1,
+            'failed'     => 1,
+        ];
+        return isset($allowed[$lower]) ? $lower : 'pending';
+    }
+
+    /**
+     * Make an API request. Mirrors Matrix_MLM_Fintava's auth/headers so
+     * the card sub-gateway always honours the same env selector and
+     * wp-config overrides.
      */
     private function make_request($method, $endpoint, $body = null) {
-        // Delegate base URL resolution to Matrix_MLM_Fintava so the card
-        // sub-gateway always honours the same environment selector (and any
-        // wp-config override) the main gateway is using.
         $url = Matrix_MLM_Fintava::get_base_url() . $endpoint;
 
         $secret_key = get_option('matrix_mlm_fintava_secret_key', '');
-
         if (empty($secret_key)) {
             return new WP_Error(
                 'fintava_not_configured',
@@ -525,45 +680,51 @@ class Matrix_MLM_Fintava_Card {
             );
         }
 
-        // Merchant ID — same resolution logic as the main Fintava class.
         $merchant_id = defined('MATRIX_FINTAVA_MERCHANT_ID') && MATRIX_FINTAVA_MERCHANT_ID
             ? MATRIX_FINTAVA_MERCHANT_ID
             : trim(get_option('matrix_mlm_fintava_merchant_id', Matrix_MLM_Fintava::DEFAULT_MERCHANT_ID));
 
         $args = [
-            'method' => $method,
+            'method'  => $method,
             'headers' => [
                 'Authorization' => 'Bearer ' . $secret_key,
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
-                'Merchant-Id' => $merchant_id,
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json',
+                'Merchant-Id'   => $merchant_id,
             ],
             'timeout' => 30,
         ];
 
-        if ($body && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
-            $args['body'] = json_encode($body);
+        if ($body !== null && in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+            $args['body'] = wp_json_encode($body);
         }
 
         $response = wp_remote_request($url, $args);
-
         if (is_wp_error($response)) {
             return $response;
         }
 
         $status_code = wp_remote_retrieve_response_code($response);
-        $body = json_decode(wp_remote_retrieve_body($response), true);
+        $payload     = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($status_code >= 400) {
-            $error_message = $body['message'] ?? sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code);
+            $error_message = $payload['message']
+                ?? sprintf(__('API Error (HTTP %d) calling %s', 'matrix-mlm'), $status_code, $endpoint);
             return new WP_Error('fintava_card_api_error', $error_message);
         }
 
-        return $body;
+        return $payload;
     }
 
     /**
-     * Create the cards database table
+     * Create the cards table. Bootstrapped on every pageload via
+     * Matrix_MLM_Core::run().
+     *
+     * The status enum is widened from the original 9 values to add
+     * 'inactive' and 'failed', which Fintava can return on
+     * /cards/fetch. dbDelta does not reliably alter ENUM definitions on
+     * existing tables, so a one-shot ALTER is gated behind a
+     * schema-version option.
      */
     public static function create_table() {
         global $wpdb;
@@ -578,7 +739,7 @@ class Matrix_MLM_Fintava_Card {
             card_type varchar(50) NOT NULL DEFAULT 'STATIC_NO_ACCOUNT',
             card_brand varchar(20) NOT NULL DEFAULT 'VERVE',
             last_four varchar(4) DEFAULT NULL,
-            status enum('pending','processing','shipped','delivered','linked','active','frozen','blocked','expired') NOT NULL DEFAULT 'pending',
+            status enum('pending','processing','shipped','delivered','linked','active','frozen','blocked','expired','inactive','failed') NOT NULL DEFAULT 'pending',
             delivery_address text,
             activated_at datetime DEFAULT NULL,
             metadata text,
@@ -592,5 +753,14 @@ class Matrix_MLM_Fintava_Card {
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
         dbDelta($sql);
+
+        // Schema upgrade: existing installs predate the 'inactive'/'failed'
+        // enum values. Issue a one-shot ALTER and bump a schema-version
+        // option so we don't re-run it every pageload.
+        $current_version = (int) get_option('matrix_fintava_cards_schema_version', 1);
+        if ($current_version < 2) {
+            $wpdb->query("ALTER TABLE $table_name MODIFY status enum('pending','processing','shipped','delivered','linked','active','frozen','blocked','expired','inactive','failed') NOT NULL DEFAULT 'pending'");
+            update_option('matrix_fintava_cards_schema_version', 2);
+        }
     }
 }
