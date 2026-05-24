@@ -109,9 +109,26 @@ class Matrix_MLM_Admin_Backup {
     /**
      * Return (and create on first call) the directory backups are
      * written to. Lives under wp-content/uploads/ so it inherits the
-     * existing uploads writability checks; protected from direct web
-     * access via .htaccess + an empty index.html for servers that
-     * don't honour .htaccess.
+     * existing uploads writability checks.
+     *
+     * Audit H9 hardening: backups carry every member's bcrypt hash,
+     * BVN, KYC docs, and (until PR #228) plaintext TOTP secrets.
+     * Direct file access from the web has to be blocked on every
+     * server flavour:
+     *
+     *   - Apache: .htaccess "Require all denied" stanza.
+     *   - IIS:    web.config <denyUrlSequences> + <httpErrors errorMode>.
+     *   - Nginx:  cannot be configured per-directory; the docblock
+     *             on Matrix_MLM_Admin_Backup::render() points operators
+     *             at a copy-paste server-block snippet, and the
+     *             unguessable filename below is the primary defence
+     *             on this flavour.
+     *   - Generic fallback: index.html so a misconfigured server
+     *             that has directory-listing on can't enumerate.
+     *
+     * Combined with the random suffix in create_backup() this means
+     * an attacker on Nginx can't guess a backup URL even if they
+     * know the deployment time.
      */
     public static function get_backup_dir() {
         $uploads = wp_upload_dir();
@@ -133,9 +150,52 @@ class Matrix_MLM_Admin_Backup {
                 "<IfModule !mod_authz_core.c>\nOrder Deny,Allow\nDeny from all\n</IfModule>\n"
             );
         }
+
+        // IIS equivalent. <denyUrlSequences> blocks any path that
+        // resolves into this directory; <httpErrors errorMode="Custom">
+        // ensures the 403 doesn't accidentally fall through to a
+        // detailed error response that leaks the local path. Wrapping
+        // in a configBuilders-aware block isn't necessary because
+        // every supported IIS version (7.5+) honours this shape.
+        $webconfig = $dir . '/web.config';
+        if (!file_exists($webconfig)) {
+            @file_put_contents(
+                $webconfig,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" .
+                "<configuration>\n" .
+                "  <system.webServer>\n" .
+                "    <security>\n" .
+                "      <requestFiltering>\n" .
+                "        <denyUrlSequences>\n" .
+                "          <add sequence=\".sql\" />\n" .
+                "          <add sequence=\".gz\" />\n" .
+                "        </denyUrlSequences>\n" .
+                "        <hiddenSegments>\n" .
+                "          <add segment=\"matrix-mlm-backups\" />\n" .
+                "        </hiddenSegments>\n" .
+                "      </requestFiltering>\n" .
+                "    </security>\n" .
+                "    <httpErrors errorMode=\"Custom\" existingResponse=\"Replace\">\n" .
+                "      <remove statusCode=\"403\" />\n" .
+                "      <error statusCode=\"403\" path=\"\" responseMode=\"ExecuteURL\" />\n" .
+                "    </httpErrors>\n" .
+                "  </system.webServer>\n" .
+                "</configuration>\n"
+            );
+        }
+
         $index = $dir . '/index.html';
         if (!file_exists($index)) {
             @file_put_contents($index, '');
+        }
+
+        // Belt-and-braces index.php for hosts that prioritise PHP
+        // over .html in DirectoryIndex/index priority. Returns 403
+        // unconditionally — does NOT route to the WP frontend (which
+        // would be a wp_safe_redirect and reveal the directory exists).
+        $index_php = $dir . '/index.php';
+        if (!file_exists($index_php)) {
+            @file_put_contents($index_php, "<?php\nhttp_response_code(403);\nexit;\n");
         }
 
         return $dir;
@@ -197,7 +257,17 @@ class Matrix_MLM_Admin_Backup {
         // sanitize_file_name keeps the trigger string filesystem-safe
         // even though we only ever pass 'manual'/'auto' today.
         $trigger_s = sanitize_file_name($trigger ?: 'manual');
-        $filename  = "matrix-backup-{$stamp}-{$trigger_s}.{$ext}";
+        // Audit H9: append 32 hex chars of cryptographic randomness
+        // (16 bytes from the OS CSPRNG) to the filename so the URL is
+        // unguessable on hosts where direct file access can't be
+        // blocked at the webserver layer (notably Nginx, which doesn't
+        // honour .htaccess). Effective keyspace is 2^128 — an attacker
+        // who knows the deployment time can't enumerate the file even
+        // with directory listing on. Backups generated before this
+        // change retain their old (predictable) names; ops with such
+        // backups should re-create them after deploying this PR.
+        $token = bin2hex(random_bytes(16));
+        $filename  = "matrix-backup-{$stamp}-{$trigger_s}-{$token}.{$ext}";
         $filepath  = $dir . '/' . $filename;
 
         // Discover plugin tables. Scope to the wp prefix so a multisite
@@ -387,10 +457,179 @@ class Matrix_MLM_Admin_Backup {
      * ------------------------------------------------------------------ */
 
     /**
+     * Classify a single SQL statement for the restore allow-list.
+     *
+     * Audit H16: the previous restore loop ran every statement
+     * verbatim with $wpdb->query, so a tampered backup file (or a
+     * compromised admin) could embed `DROP USER`, `CREATE USER`,
+     * `GRANT ALL`, `INSERT INTO wp_users`, `UPDATE wp_options`, etc.
+     * That gave the restore path more authority than the rest of the
+     * plugin combined: a single uploaded .sql could take over the
+     * entire WordPress install, not just the Matrix MLM tables.
+     *
+     * The classifier rejects anything that isn't:
+     *
+     *   - One of our six expected DDL/DML keywords (CREATE TABLE,
+     *     DROP TABLE, INSERT INTO, ALTER TABLE, TRUNCATE [TABLE],
+     *     LOCK / UNLOCK TABLES — the last two are accepted as no-ops
+     *     to keep us compatible with dumps from external tools), AND
+     *
+     *   - Targeting a table whose name starts with `{wpdb->prefix}matrix_`,
+     *
+     * OR
+     *
+     *   - One of a fixed allow-list of session-scoped SET statements
+     *     (FOREIGN_KEY_CHECKS, SQL_MODE, NAMES, CHARACTER_SET_*) —
+     *     these don't take a table identifier but are necessary for
+     *     a clean restore.
+     *
+     * Anything else returns null and the caller refuses the row.
+     *
+     * @param string $stmt   Trimmed SQL statement (no trailing `;`).
+     * @param string $prefix WordPress table prefix from $wpdb.
+     * @return array|null    {kind, table} on accept; null on refuse.
+     */
+    private static function classify_statement($stmt, $prefix) {
+        // Strip leading whitespace + leading comments (line and block)
+        // for classification only — the actual query passes through
+        // untouched.
+        $head = ltrim((string) $stmt);
+        $head = preg_replace('/^(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*/', '', $head);
+        $head = ltrim($head);
+
+        if ($head === '') {
+            return null;
+        }
+
+        // Allow-list of session-scoped SET statements. We pin to the
+        // four keys our dump actually emits (and the two charset
+        // variants third-party tools also emit) — refuse arbitrary
+        // SET so an attacker can't, e.g., SET sql_log_bin=0 to make
+        // their next statement invisible to replication.
+        if (preg_match('/^SET\s+(@@)?(SESSION\s+|GLOBAL\s+)?(FOREIGN_KEY_CHECKS|SQL_MODE|NAMES|CHARACTER_SET_CLIENT|CHARACTER_SET_RESULTS|CHARACTER_SET_CONNECTION|TIME_ZONE)\b/i', $head)) {
+            return ['kind' => 'set', 'table' => null];
+        }
+
+        // Match the DDL/DML keyword.
+        $upper = strtoupper(substr($head, 0, 80));
+        $kinds = [
+            'CREATE TABLE'   => '/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i',
+            'DROP TABLE'     => '/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`([^`]+)`/i',
+            'INSERT INTO'    => '/^INSERT\s+(?:IGNORE\s+)?INTO\s+`([^`]+)`/i',
+            'ALTER TABLE'    => '/^ALTER\s+TABLE\s+`([^`]+)`/i',
+            'TRUNCATE TABLE' => '/^TRUNCATE\s+(?:TABLE\s+)?`([^`]+)`/i',
+        ];
+
+        foreach ($kinds as $kind => $regex) {
+            $kw = strtok($kind, ' '); // first word for the upper prefix probe
+            if (strpos($upper, $kw) !== 0) {
+                continue;
+            }
+            if (preg_match($regex, $head, $m)) {
+                $table = $m[1];
+                $expected_prefix = $prefix . 'matrix_';
+                if (strpos($table, $expected_prefix) !== 0) {
+                    return null;
+                }
+                return ['kind' => $kind, 'table' => $table];
+            }
+        }
+
+        // LOCK / UNLOCK TABLES are sometimes present in dumps from
+        // mysqldump-style tools. Accept LOCK only when every named
+        // table is in our prefix; UNLOCK is a session-state statement
+        // with no identifier and is always safe.
+        if (preg_match('/^UNLOCK\s+TABLES\b/i', $head)) {
+            return ['kind' => 'unlock', 'table' => null];
+        }
+        if (preg_match('/^LOCK\s+TABLES\s+(.+)$/is', $head, $m)) {
+            $expected_prefix = $prefix . 'matrix_';
+            // Each LOCK TABLES entry is `table` [AS alias] LOCK_TYPE
+            // separated by commas.
+            if (preg_match_all('/`([^`]+)`/', $m[1], $names)) {
+                foreach ($names[1] as $tn) {
+                    if (strpos($tn, $expected_prefix) !== 0) {
+                        return null;
+                    }
+                }
+                return ['kind' => 'lock', 'table' => null];
+            }
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Quote-aware "embedded second statement" detector.
+     *
+     * preg_split('/;\s*\n/', ...) in restore_backup() handles the
+     * normal case where dumps emit one statement per line. An
+     * attacker could craft a tampered backup with two statements on
+     * the same line (no newline between them) and the splitter would
+     * keep them as one chunk; classify_statement() would then match
+     * on the head of the first one and accept the whole thing.
+     *
+     * In practice $wpdb->query() calls mysqli_query() which does NOT
+     * support multi-statement execution by default — only the first
+     * statement runs. But that's a driver-layer mitigation we don't
+     * want to depend on; if a future refactor swaps in mysqli_multi_query
+     * the smuggling becomes live again.
+     *
+     * This helper walks the statement looking for any `;` outside a
+     * single-quoted SQL string. Honors backslash-escapes the way
+     * mysqli_real_escape_string emits them. Returns true if a smuggled
+     * second statement appears to be present (caller refuses), false
+     * otherwise.
+     */
+    private static function contains_embedded_statement($stmt) {
+        $len = strlen($stmt);
+        $in_quote = false;
+        for ($i = 0; $i < $len; $i++) {
+            $c = $stmt[$i];
+            if ($in_quote) {
+                if ($c === '\\' && $i + 1 < $len) {
+                    // Skip the escaped char — covers \', \\, \n,
+                    // \0, \032, etc.
+                    $i++;
+                    continue;
+                }
+                if ($c === "'") {
+                    $in_quote = false;
+                }
+                continue;
+            }
+            if ($c === "'") {
+                $in_quote = true;
+                continue;
+            }
+            if ($c === ';') {
+                $rest = ltrim(substr($stmt, $i + 1));
+                if ($rest !== '') {
+                    return true;
+                }
+                // Trailing `;` (rare — the splitter normally consumes
+                // it) is harmless, treat as no smuggle.
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Restore a backup file by re-running its statements against the
      * live database. Designed to round-trip our own dumps; uploaded
      * dumps from other tools may work if they use the same statement
-     * separator (a `;` followed by a newline).
+     * separator (a `;` followed by a newline) AND every statement
+     * passes the allow-list in classify_statement().
+     *
+     * Audit H16 hardening: every parsed statement is classified
+     * BEFORE execution. Rejected rows are recorded as errors but
+     * do not abort the restore — the operator sees the count and
+     * the first refused statement so they can investigate, while
+     * legitimate statements in the same file still apply. If the
+     * refusal count crosses 10 we abort the restore entirely
+     * (almost certainly a mismatched / malicious file).
      *
      * @return array|WP_Error
      */
@@ -438,8 +677,10 @@ class Matrix_MLM_Admin_Backup {
         // quotes; multi-line VALUES use `,\n` not `;\n`).
         $statements = preg_split('/;\s*\n/', $sql);
 
-        $errors   = [];
-        $executed = 0;
+        $errors        = [];
+        $executed      = 0;
+        $refused       = 0;
+        $first_refused = '';
 
         // Wrap the whole restore in a transaction so a failure halfway
         // doesn't leave the schema in a half-restored state on InnoDB
@@ -453,9 +694,37 @@ class Matrix_MLM_Admin_Backup {
                 continue;
             }
 
-            // Skip our own informational SET statements that we always
-            // re-emit at restore time anyway, to avoid duplicate work
-            // when a caller chains multiple restores.
+            // H16 allow-list gate. Refusing here keeps `DROP USER`,
+            // `CREATE USER`, `GRANT`, `INSERT INTO wp_users`, etc.,
+            // from running even if a malicious or tampered backup
+            // file makes it past the upload gate.
+            $cls = self::classify_statement($stmt, $wpdb->prefix);
+            if ($cls === null || self::contains_embedded_statement($stmt)) {
+                $refused++;
+                if ($first_refused === '') {
+                    // Log the first 80 characters of the refused
+                    // statement so an operator can identify it
+                    // without dumping multi-kilobyte INSERTs.
+                    $first_refused = substr(preg_replace('/\s+/', ' ', $stmt), 0, 80);
+                }
+                if ($refused > 10) {
+                    // Probably not our dump — abort.
+                    $wpdb->query('ROLLBACK');
+                    return new WP_Error(
+                        'matrix_restore_refused',
+                        __('Restore aborted — too many statements were refused by the allow-list. The backup file is not a Matrix MLM dump or has been tampered with.', 'matrix-mlm'),
+                        [
+                            'errors' => $errors,
+                            'executed' => $executed,
+                            'refused' => $refused,
+                            'first_refused' => $first_refused,
+                        ]
+                    );
+                }
+                continue;
+            }
+
+            // Allow-listed. Run.
             $result = $wpdb->query($stmt);
             if ($result === false) {
                 $errors[] = $wpdb->last_error;
@@ -474,13 +743,17 @@ class Matrix_MLM_Admin_Backup {
             return new WP_Error(
                 'matrix_restore_partial',
                 __('Restore failed — rolled back. See errors below.', 'matrix-mlm'),
-                ['errors' => $errors, 'executed' => $executed]
+                ['errors' => $errors, 'executed' => $executed, 'refused' => $refused]
             );
         }
 
         $wpdb->query('COMMIT');
 
-        return ['executed' => $executed];
+        return [
+            'executed' => $executed,
+            'refused'  => $refused,
+            'first_refused' => $first_refused,
+        ];
     }
 
     /* ------------------------------------------------------------------
@@ -688,17 +961,35 @@ class Matrix_MLM_Admin_Backup {
             $data     = $result->get_error_data();
             $executed = isset($data['executed']) ? (int) $data['executed'] : 0;
             $errors   = isset($data['errors']) && is_array($data['errors']) ? $data['errors'] : [];
+            $refused  = isset($data['refused']) ? (int) $data['refused'] : 0;
+            $first_refused = isset($data['first_refused']) ? (string) $data['first_refused'] : '';
             $first    = $errors ? ' [' . esc_html($errors[0]) . ']' : '';
+            $refused_note = $refused > 0
+                ? sprintf(
+                    /* translators: 1: number of refused statements, 2: first refused statement preview */
+                    ' (%1$d statements refused by allow-list%2$s)',
+                    $refused,
+                    $first_refused !== '' ? ': ' . $first_refused : ''
+                )
+                : '';
             self::redirect_with_notice(
                 'error',
-                $result->get_error_message() . sprintf(' (%d statements executed before failure)%s', $executed, $first)
+                $result->get_error_message()
+                    . sprintf(' (%d statements executed before failure)%s', $executed, $first)
+                    . $refused_note
             );
         }
 
-        self::redirect_with_notice(
-            'success',
-            sprintf(__('Restore complete. %d statements executed.', 'matrix-mlm'), $result['executed'])
-        );
+        $refused = isset($result['refused']) ? (int) $result['refused'] : 0;
+        $msg = sprintf(__('Restore complete. %d statements executed.', 'matrix-mlm'), $result['executed']);
+        if ($refused > 0) {
+            $msg .= ' ' . sprintf(
+                /* translators: %d: number of refused statements */
+                __('%d non-Matrix statements were refused by the allow-list.', 'matrix-mlm'),
+                $refused
+            );
+        }
+        self::redirect_with_notice('success', $msg);
     }
 
     public static function handle_save_settings() {
@@ -776,6 +1067,21 @@ class Matrix_MLM_Admin_Backup {
             <p class="description">
                 <?php _e('Backup and restore the Matrix MLM Pro database tables (every table prefixed with <code>matrix_</code>). WordPress core tables, posts, users, and other plugins are not included.', 'matrix-mlm'); ?>
             </p>
+
+            <!-- Nginx hardening notice -->
+            <div class="notice notice-warning" style="margin-top:16px;padding:12px 16px;">
+                <p style="margin:0 0 8px;">
+                    <strong><?php _e('Nginx server: extra step required.', 'matrix-mlm'); ?></strong>
+                    <?php _e('Backup files include every member\'s bcrypt password hash and KYC data. The plugin auto-protects them on Apache (.htaccess) and IIS (web.config), but Nginx ignores per-directory config. Add this server-block snippet to deny direct access:', 'matrix-mlm'); ?>
+                </p>
+                <pre style="background:#f6f7f7;padding:10px 12px;margin:0;border:1px solid #ddd;font-size:12px;overflow:auto;">location ^~ /wp-content/uploads/matrix-mlm-backups/ {
+    deny all;
+    return 403;
+}</pre>
+                <p style="margin:8px 0 0;font-size:12px;color:#555;">
+                    <?php _e('Even without this server block, backup filenames now include 32 hex chars of cryptographic randomness — an attacker cannot guess a backup URL even with directory listing on. The server block is defence-in-depth.', 'matrix-mlm'); ?>
+                </p>
+            </div>
 
             <!-- Run a backup now -->
             <div class="matrix-admin-card" style="padding:16px;border:1px solid #ddd;background:#fff;margin-top:16px;">
