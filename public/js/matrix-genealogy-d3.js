@@ -422,6 +422,8 @@
                 .attr('transform', function (d) { return 'translate(' + d.x + ',' + d.y + ')'; })
                 .style('opacity', 0)
                 .on('click', onNodeClick)
+                .on('mouseenter', onNodeMouseEnter)
+                .on('mouseleave', onNodeMouseLeave)
                 .on('keydown', function (event, d) {
                     // Enter / Space activate as click — required for
                     // keyboard a11y on focusable SVG elements. (We
@@ -1054,60 +1056,21 @@
             // "Back to live tree" button makes one click away.
             if (bootstrap.snapshot_mode) return;
 
-            // If the same node is already showing details, treat the
-            // second click as "close" — feels right for a popover.
+            // Click on a node that's already open (typically because
+            // hover opened it a moment ago) toggles the popover
+            // closed — preserves the original "click is sticky"
+            // mental model, while letting hover act as the cheap
+            // peek.
+            clearHoverTimers();
             if (openDetails && openDetails.positionId === d.data.id) {
                 closeDetails();
                 return;
             }
-            closeDetails();
 
-            // Spawn the details DOM panel BEFORE the AJAX call so
-            // the member gets immediate feedback. The panel shows a
-            // loading state, then fills in once the response lands.
-            var panel = spawnDetailsPanel(d);
-            openDetails = { positionId: d.data.id, panel: panel };
-
-            var endpoint = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
-            var nonce    = (window.matrixMLM && window.matrixMLM.nonce) || '';
-            if (!endpoint) {
-                renderDetailsError(panel, 'Cannot load details (offline).');
-                return;
-            }
-
-            var body = new FormData();
-            body.append('action', 'matrix_mlm_action');
-            body.append('matrix_action', 'node_details');
-            body.append('nonce', nonce);
-            body.append('position_id', String(d.data.id));
-
-            fetch(endpoint, {
-                method: 'POST',
-                body: body,
-                credentials: 'same-origin'
-            })
-            .then(function (r) { return r.json(); })
-            .then(function (response) {
-                if (!openDetails || openDetails.positionId !== d.data.id) {
-                    // Member clicked another node before this one
-                    // came back — drop the response, the new card
-                    // is already showing.
-                    return;
-                }
-                if (!response || !response.success || !response.data) {
-                    var msg = (response && response.data && response.data.message)
-                        ? response.data.message
-                        : 'Could not load details.';
-                    renderDetailsError(panel, msg);
-                    return;
-                }
-                fillDetailsPanel(panel, response.data, d);
-            })
-            .catch(function () {
-                if (openDetails && openDetails.positionId === d.data.id) {
-                    renderDetailsError(panel, 'Network error.');
-                }
-            });
+            // All other cases: open / replace. The shared helper
+            // handles the spawn + AJAX + render flow so the click
+            // and hover paths can't drift out of sync.
+            openDetailsForNode(d);
         }
 
         function spawnDetailsPanel(d) {
@@ -1134,6 +1097,24 @@
 
             canvas.appendChild(panel);
             panel.querySelector('.mtx-details-close').addEventListener('click', closeDetails);
+
+            // Keep the panel open while the cursor is over it —
+            // otherwise mouseleave on the source node fires a
+            // close timer that would yank the panel out from under
+            // a member trying to read it or click the
+            // "View their tree →" link inside. Re-arm the close
+            // timer on panel-leave so the bridge from one node to
+            // another still works the same way.
+            panel.addEventListener('mouseenter', clearHoverTimers);
+            panel.addEventListener('mouseleave', function () {
+                if (!supportsHoverD3) return;
+                clearHoverTimers();
+                hoverCloseTimer = setTimeout(function () {
+                    hoverCloseTimer = null;
+                    closeDetails();
+                }, HOVER_CLOSE_DELAY_MS);
+            });
+
             return panel;
         }
 
@@ -1189,6 +1170,145 @@
                 openDetails.panel.parentNode.removeChild(openDetails.panel);
             }
             openDetails = null;
+        }
+
+        // ==============================================================
+        // Hover-to-open details — desktop only.
+        //
+        // The classic recursive-HTML view above this canvas wires the
+        // shared #matrix-tree-hovercard element to its own
+        // .matrix-tree-node listeners, so members on the classic
+        // toggle have always seen member info on hover. The D3 view
+        // never had that affordance — only click-to-open. The
+        // unified UX expectation is "hover anywhere on a member
+        // card → see who they are", so we mirror that here for the
+        // SVG nodes.
+        //
+        // We deliberately reuse the existing in-canvas details panel
+        // (spawnDetailsPanel/fillDetailsPanel) rather than the page-
+        // level hovercard the classic view uses, for two reasons:
+        //
+        //   1. The in-canvas panel is positioned in canvas-relative
+        //      pixel space against an SVG <g>'s bounding rect — it
+        //      already knows how to anchor to a D3 node. The page-
+        //      level hovercard uses fixed viewport coords against a
+        //      DOM trigger element, which doesn't translate cleanly
+        //      to SVG.
+        //   2. The two panel styles already differ by view (the
+        //      click path was using the in-canvas one), so members
+        //      see one consistent style per view, not a flicker
+        //      between two when they alternate hover and click.
+        //
+        // Hover is gated on matchMedia(hover: hover) — touch devices
+        // get the click-only path. Same gate the classic-view
+        // hovercard uses, so the two views' UX stays consistent on
+        // a tablet (tap to open, never hover-flash).
+        //
+        // Snapshot mode skips hover entirely for the same reason
+        // click does: the details payload is current-state and
+        // would mislead members reading historical structure.
+        // ==============================================================
+        var hoverOpenTimer  = null;
+        var hoverCloseTimer = null;
+        var supportsHoverD3 = !!(window.matchMedia && window.matchMedia('(hover: hover)').matches);
+        var HOVER_OPEN_DELAY_MS  = 220;
+        var HOVER_CLOSE_DELAY_MS = 180;
+
+        function clearHoverTimers() {
+            if (hoverOpenTimer)  { clearTimeout(hoverOpenTimer);  hoverOpenTimer  = null; }
+            if (hoverCloseTimer) { clearTimeout(hoverCloseTimer); hoverCloseTimer = null; }
+        }
+
+        function onNodeMouseEnter(event, d) {
+            if (!supportsHoverD3) return;
+            if (!d.data.user_id) return;          // empty slot — nothing to show
+            if (bootstrap.snapshot_mode) return;  // see docblock above
+            // Already showing this exact node? Just keep it open
+            // (clear any pending close from a microsecond-earlier
+            // mouseleave on this same node — happens on the seam
+            // between the SVG <g>'s child elements).
+            if (openDetails && openDetails.positionId === d.data.id) {
+                clearHoverTimers();
+                return;
+            }
+            // Schedule open. Replaces any pending open/close from
+            // a previous node so moving between adjacent cards
+            // swaps content cleanly without flicker.
+            clearHoverTimers();
+            hoverOpenTimer = setTimeout(function () {
+                hoverOpenTimer = null;
+                openDetailsForNode(d);
+            }, HOVER_OPEN_DELAY_MS);
+        }
+
+        function onNodeMouseLeave(event, d) {
+            if (!supportsHoverD3) return;
+            // If the mouse moved INTO the open details panel,
+            // panel.mouseenter (wired in spawnDetailsPanel) will
+            // cancel the close before the timeout fires. Same
+            // shape the classic-view hovercard uses; lets members
+            // mouse over to click the "View their tree →" link.
+            clearHoverTimers();
+            hoverCloseTimer = setTimeout(function () {
+                hoverCloseTimer = null;
+                closeDetails();
+            }, HOVER_CLOSE_DELAY_MS);
+        }
+
+        // Open + populate the details panel for a given d3-hierarchy
+        // node. Shared between click (synchronous, immediate) and
+        // hover (delayed via the timers above). Returns early
+        // without re-rendering when the same node is already open
+        // — avoids flashing the loading spinner on a re-trigger.
+        function openDetailsForNode(d) {
+            if (!d || !d.data || !d.data.user_id) return;
+            if (bootstrap.snapshot_mode) return;
+            if (openDetails && openDetails.positionId === d.data.id) return;
+
+            // Replace any currently-open panel (different node).
+            closeDetails();
+
+            var panel = spawnDetailsPanel(d);
+            openDetails = { positionId: d.data.id, panel: panel };
+
+            var endpoint = (window.matrixMLM && window.matrixMLM.ajaxUrl) || '';
+            var nonce    = (window.matrixMLM && window.matrixMLM.nonce) || '';
+            if (!endpoint) {
+                renderDetailsError(panel, 'Cannot load details (offline).');
+                return;
+            }
+
+            var body = new FormData();
+            body.append('action', 'matrix_mlm_action');
+            body.append('matrix_action', 'node_details');
+            body.append('nonce', nonce);
+            body.append('position_id', String(d.data.id));
+
+            fetch(endpoint, {
+                method: 'POST',
+                body: body,
+                credentials: 'same-origin'
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (response) {
+                // Member moved on before the response landed —
+                // drop it. The new node's own request will paint
+                // its own panel.
+                if (!openDetails || openDetails.positionId !== d.data.id) return;
+                if (!response || !response.success || !response.data) {
+                    var msg = (response && response.data && response.data.message)
+                        ? response.data.message
+                        : 'Could not load details.';
+                    renderDetailsError(panel, msg);
+                    return;
+                }
+                fillDetailsPanel(panel, response.data, d);
+            })
+            .catch(function () {
+                if (openDetails && openDetails.positionId === d.data.id) {
+                    renderDetailsError(panel, 'Network error.');
+                }
+            });
         }
 
         // ESC closes; click outside the panel and outside any node
