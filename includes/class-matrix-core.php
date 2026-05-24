@@ -107,6 +107,18 @@ class Matrix_MLM_Core {
         // Email verification handler
         add_action('init', [$this, 'handle_email_verification']);
 
+        // Redirect users to the Matrix login page after they log out.
+        //
+        // The dashboard's logout link already passes a redirect_to
+        // value via wp_logout_url(), but logouts can also originate
+        // from the WP admin bar, an expired-session redirect to
+        // wp-login.php?action=logout, or any third-party plugin
+        // that calls wp_logout(). Registering this filter ensures
+        // every logout path lands on /matrix-login so users never
+        // get dropped onto the default wp-login.php?loggedout=true
+        // screen, which doesn't match the plugin's branded UI.
+        add_filter('logout_redirect', [$this, 'filter_logout_redirect'], 10, 3);
+
         // Suppress HTTP-level caching of any page that hosts the
         // [matrix_dashboard] shortcode. Reported symptom: after a
         // successful Wallet→Wallet transfer or e-pin recharge the
@@ -245,6 +257,30 @@ class Matrix_MLM_Core {
             return;
         }
         nocache_headers();
+    }
+
+    /**
+     * Send the user to the Matrix login page after logout.
+     *
+     * If a `redirect_to` was already supplied (e.g. from
+     * wp_logout_url() in the dashboard nav) and points at our own
+     * site, honour it so callers can override per-link. Otherwise
+     * fall back to /matrix-login. Off-site redirects are dropped
+     * for safety so a malicious open-redirect query string can't
+     * bounce a freshly-logged-out user to an attacker-controlled
+     * domain.
+     */
+    public function filter_logout_redirect($redirect_to, $requested_redirect_to, $user) {
+        $login_url = home_url('/matrix-login');
+
+        if (!empty($requested_redirect_to)) {
+            $safe = wp_validate_redirect($requested_redirect_to, '');
+            if (!empty($safe)) {
+                return $safe;
+            }
+        }
+
+        return $login_url;
     }
 
     public function enqueue_admin_assets($hook) {
