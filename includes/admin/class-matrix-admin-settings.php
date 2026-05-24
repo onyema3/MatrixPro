@@ -701,6 +701,22 @@ class Matrix_MLM_Admin_Settings {
     <?php }
 
     private function save_settings() {
+        // Defense-in-depth (H17). The submenu lives under
+        // 'manage_matrix_mlm' (broad reviewer cap), which is the right
+        // level for landing on the Settings page and inspecting the
+        // current values. Persisting changes is a different threat
+        // model: this surface includes 'matrix_mlm_custom_css' and
+        // 'matrix_mlm_livechat_code' (raw HTML/JS injected into every
+        // public page), captcha keys, SMS provider credentials, and
+        // financial gates. Reviewer-tier admins should not be able to
+        // alter any of those. Save now requires the higher
+        // 'manage_matrix_settings' cap, matching the
+        // Backup/E-Pin-export tier established in PR #226 and PR #235.
+        if (!current_user_can('manage_matrix_settings')) {
+            echo '<div class="notice notice-error"><p>' . esc_html__('You do not have permission to save Settings.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
         $tab = sanitize_text_field($_POST['settings_tab']);
 
         $settings = [];
@@ -769,9 +785,35 @@ class Matrix_MLM_Admin_Settings {
                 break;
         }
 
+        // Fields that intentionally accept raw HTML/JS for injection
+        // into a public surface (custom <style> block in <head>, third-
+        // party livechat widget script). These are gated on the
+        // WP-native 'unfiltered_html' capability — the same gate
+        // WordPress uses for raw <script> / <iframe> in posts and
+        // widgets. On multisite, non-super-admins (including a Matrix
+        // settings admin who isn't also a network super admin) do
+        // NOT have unfiltered_html, so they can save every other
+        // setting on the tab but cannot persist a script tag to be
+        // served to public visitors. On single-site installs every
+        // administrator-role user has unfiltered_html, so the
+        // legitimate workflow (operator pastes a Tawk.to / Crisp /
+        // Intercom snippet, or a brand stylesheet override) is
+        // unaffected.
+        $raw_code_fields = ['matrix_mlm_custom_css', 'matrix_mlm_livechat_code'];
+        $skipped_raw_fields = [];
+
         foreach ($settings as $setting) {
             $value = isset($_POST[$setting]) ? $_POST[$setting] : '';
-            if (in_array($setting, ['matrix_mlm_custom_css', 'matrix_mlm_livechat_code'])) {
+            if (in_array($setting, $raw_code_fields, true)) {
+                if (!current_user_can('unfiltered_html')) {
+                    // Skip silently-but-noticeably: leave the existing
+                    // value in place (do not overwrite) and remember
+                    // the field name for a grouped notice. Do NOT
+                    // short-circuit the rest of the save — the
+                    // operator's other edits still need to land.
+                    $skipped_raw_fields[] = $setting;
+                    continue;
+                }
                 $value = wp_unslash($value);
             } elseif (in_array($setting, ['matrix_mlm_login_logo_url'])) {
                 $value = esc_url_raw(wp_unslash($value));
@@ -789,6 +831,14 @@ class Matrix_MLM_Admin_Settings {
             }
         }
 
-        echo '<div class="notice notice-success"><p>' . __('Settings saved successfully!', 'matrix-mlm') . '</p></div>';
+        if (!empty($skipped_raw_fields)) {
+            echo '<div class="notice notice-warning"><p>' . esc_html(sprintf(
+                /* translators: %s: comma-separated list of field names */
+                __('The following fields were not saved because your role does not have the unfiltered_html capability required to inject raw HTML/JS: %s. Ask a super admin to update these fields.', 'matrix-mlm'),
+                implode(', ', $skipped_raw_fields)
+            )) . '</p></div>';
+        }
+
+        echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved successfully!', 'matrix-mlm') . '</p></div>';
     }
 }

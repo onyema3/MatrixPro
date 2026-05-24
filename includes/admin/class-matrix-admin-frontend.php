@@ -166,6 +166,23 @@ class Matrix_MLM_Admin_Frontend {
     <?php }
 
     private function save_settings($tab) {
+        // Defense-in-depth (H17). The submenu is registered with
+        // 'manage_matrix_mlm' — broad reviewer cap, the right level
+        // for landing on the page and reading the current values.
+        // Persisting changes is a different threat model: this surface
+        // includes 'matrix_mlm_custom_head_code', a raw HTML/JS dump
+        // injected into <head> on every public page, plus body-text
+        // fields that show on every public page (footer_text, policy,
+        // contact). Reviewer-tier admins should not be able to ship
+        // arbitrary content to public visitors. Save now requires the
+        // higher 'manage_matrix_settings' cap, matching the
+        // Backup/Settings/E-Pin-export tier established in PR #226 and
+        // PR #235.
+        if (!current_user_can('manage_matrix_settings')) {
+            echo '<div class="notice notice-error"><p>' . esc_html__('You do not have permission to save Frontend Manager settings.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
         $fields = [];
         switch ($tab) {
             case 'seo': $fields = ['matrix_mlm_seo_title', 'matrix_mlm_meta_description', 'matrix_mlm_meta_keywords', 'matrix_mlm_og_image', 'matrix_mlm_custom_head_code']; break;
@@ -177,11 +194,66 @@ class Matrix_MLM_Admin_Frontend {
             case 'policy': $fields = ['matrix_mlm_privacy_policy', 'matrix_mlm_terms_of_service', 'matrix_mlm_refund_policy']; break;
         }
 
+        // Fields that intentionally accept raw HTML/JS for injection
+        // into the public <head> (analytics, tracking pixels, custom
+        // CSS via <style>). These are gated on the WP-native
+        // 'unfiltered_html' capability — the same gate WordPress uses
+        // for raw <script> / <iframe> in posts and widgets. On
+        // multisite, non-super-admins (including a Matrix settings
+        // admin who isn't also a network super admin) do NOT have
+        // unfiltered_html, so they can save every other field on this
+        // tab but cannot persist a script tag to be served to public
+        // visitors. On single-site installs every administrator-role
+        // user has unfiltered_html, so the legitimate workflow
+        // (operator pastes a Google Analytics snippet) is unaffected.
+        $raw_code_fields = ['matrix_mlm_custom_head_code'];
+        $skipped_raw_fields = [];
+
         foreach ($fields as $field) {
-            $value = isset($_POST[$field]) ? wp_unslash($_POST[$field]) : '';
+            $raw = isset($_POST[$field]) ? wp_unslash($_POST[$field]) : '';
+
+            if (in_array($field, $raw_code_fields, true)) {
+                if (!current_user_can('unfiltered_html')) {
+                    // Skip silently-but-noticeably: leave the existing
+                    // value in place (do not overwrite) and remember
+                    // the field name so we can surface a single
+                    // grouped notice at the bottom. We deliberately do
+                    // NOT short-circuit the rest of the save — the
+                    // operator's other edits still need to land.
+                    $skipped_raw_fields[] = $field;
+                    continue;
+                }
+                $value = $raw;
+            } elseif (in_array($field, ['matrix_mlm_og_image', 'matrix_mlm_social_facebook', 'matrix_mlm_social_twitter', 'matrix_mlm_social_instagram', 'matrix_mlm_social_linkedin', 'matrix_mlm_social_youtube', 'matrix_mlm_social_telegram', 'matrix_mlm_social_whatsapp'], true)) {
+                $value = esc_url_raw($raw);
+            } elseif ($field === 'matrix_mlm_contact_email') {
+                $value = sanitize_email($raw);
+            } elseif (in_array($field, ['matrix_mlm_meta_description', 'matrix_mlm_contact_address', 'matrix_mlm_footer_text', 'matrix_mlm_footer_about', 'matrix_mlm_privacy_policy', 'matrix_mlm_terms_of_service', 'matrix_mlm_refund_policy'], true)) {
+                // Long-form body content shown on public pages. Allow
+                // basic post-grade HTML (links, lists, formatting) but
+                // strip script tags and event handlers via the WP
+                // post-content allow-list.
+                $value = wp_kses_post($raw);
+            } elseif ($field === 'matrix_mlm_faq_items') {
+                // Stored as JSON; keep raw shape but coerce to a
+                // string. Render-side already escapes per-field via
+                // esc_html, so we don't need to wp_kses here.
+                $value = is_string($raw) ? $raw : '';
+            } else {
+                $value = sanitize_text_field($raw);
+            }
+
             update_option($field, $value);
         }
 
-        echo '<div class="notice notice-success"><p>' . __('Settings saved!', 'matrix-mlm') . '</p></div>';
+        if (!empty($skipped_raw_fields)) {
+            echo '<div class="notice notice-warning"><p>' . esc_html(sprintf(
+                /* translators: %s: comma-separated list of field names */
+                __('The following fields were not saved because your role does not have the unfiltered_html capability required to inject raw HTML/JS: %s. Ask a super admin to update these fields.', 'matrix-mlm'),
+                implode(', ', $skipped_raw_fields)
+            )) . '</p></div>';
+        }
+
+        echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved!', 'matrix-mlm') . '</p></div>';
     }
 }
