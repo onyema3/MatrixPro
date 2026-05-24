@@ -54,10 +54,10 @@ class Matrix_MLM_User_Tickets {
             <tbody>
                 <?php foreach ($tickets as $ticket): ?>
                 <tr>
-                    <td>#<?php echo $ticket->id; ?></td>
+                    <td>#<?php echo (int) $ticket->id; ?></td>
                     <td><?php echo esc_html($ticket->subject); ?></td>
-                    <td><span class="matrix-badge matrix-badge-<?php echo $ticket->priority; ?>"><?php echo ucfirst($ticket->priority); ?></span></td>
-                    <td><span class="matrix-badge matrix-badge-<?php echo $ticket->status; ?>"><?php echo ucfirst(str_replace('_', ' ', $ticket->status)); ?></span></td>
+                    <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->priority); ?>"><?php echo esc_html(ucfirst($ticket->priority)); ?></span></td>
+                    <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($ticket->status); ?>"><?php echo esc_html(ucfirst(str_replace('_', ' ', $ticket->status))); ?></span></td>
                     <td><?php echo date('M d, Y', strtotime($ticket->updated_at)); ?></td>
                     <td><a href="<?php echo home_url('/matrix-dashboard/?tab=tickets&ticket_id=' . $ticket->id); ?>" class="matrix-btn matrix-btn-sm"><?php _e('View', 'matrix-mlm'); ?></a></td>
                 </tr>
