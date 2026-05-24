@@ -108,37 +108,190 @@ class Matrix_MLM_Admin_Backup {
 
     /**
      * Return (and create on first call) the directory backups are
-     * written to. Lives under wp-content/uploads/ so it inherits the
-     * existing uploads writability checks; protected from direct web
-     * access via .htaccess + an empty index.html for servers that
-     * don't honour .htaccess.
+     * written to.
+     *
+     * H9 hardening:
+     *
+     *   - Default location moved from wp-content/uploads/matrix-mlm-
+     *     backups/ to wp-content/matrix-mlm-backups-private/. The
+     *     uploads directory is unconditionally web-readable on every
+     *     hosting stack, while wp-content/<plugin-private-dir>/ is
+     *     only readable when the host's web server is configured to
+     *     serve arbitrary wp-content paths AND no deny rule is in
+     *     place — most modern stacks drop everything outside
+     *     wp-content/uploads/, wp-content/themes/, and wp-content/
+     *     plugins/ at the vhost level.
+     *
+     *   - Operators who want to fully eliminate the webroot exposure
+     *     (the audit's "broken on Nginx/IIS" point) can define
+     *     MATRIX_MLM_BACKUP_DIR in wp-config.php to point at any
+     *     directory outside the webroot. The constant takes
+     *     precedence over the default and is the recommended
+     *     production setup.
+     *
+     *   - Cross-server deny rules are written on first creation:
+     *       .htaccess        — Apache 2.2 + 2.4
+     *       web.config       — IIS 7+
+     *       nginx-deny.conf  — copy-pasteable snippet for Nginx
+     *                          (Nginx does not honor per-directory
+     *                          config files; the operator must splice
+     *                          the snippet into their site vhost).
+     *       index.html       — empty file as belt-and-braces against
+     *                          directory listing on stacks that don't
+     *                          honour any of the above.
+     *
+     *   - One-shot migration: if the legacy uploads-based path exists
+     *     AND the new location is empty, move every backup file
+     *     across. Idempotent — runs at most once because subsequent
+     *     calls find the new directory non-empty (or the old one
+     *     empty) and skip. Failed migrations leave both copies in
+     *     place rather than dropping a backup.
      */
     public static function get_backup_dir() {
-        $uploads = wp_upload_dir();
-        $dir = trailingslashit($uploads['basedir']) . 'matrix-mlm-backups';
+        // Operator override via wp-config.php constant. Documented
+        // exit hatch for production setups that want backups outside
+        // the webroot entirely. We do NOT validate that the path is
+        // actually outside the webroot — that's the operator's
+        // responsibility — but we do require that the directory
+        // either exists or is creatable and writable.
+        if (defined('MATRIX_MLM_BACKUP_DIR') && is_string(MATRIX_MLM_BACKUP_DIR) && MATRIX_MLM_BACKUP_DIR !== '') {
+            $dir = rtrim(MATRIX_MLM_BACKUP_DIR, '/\\');
+            if (!file_exists($dir)) {
+                wp_mkdir_p($dir);
+            }
+            self::write_protection_files($dir);
+            return $dir;
+        }
 
+        // Default: wp-content/matrix-mlm-backups-private/. Sibling of
+        // uploads/, themes/, plugins/, but NOT inside any of them, so
+        // a request for /wp-content/matrix-mlm-backups-private/<file>
+        // is not a path that the typical Nginx wp-content rule
+        // serves. The deny files give a second layer of protection on
+        // hosts that DO serve arbitrary wp-content paths.
+        $dir = rtrim(WP_CONTENT_DIR, '/\\') . '/matrix-mlm-backups-private';
         if (!file_exists($dir)) {
             wp_mkdir_p($dir);
         }
 
-        // Always (re)write the protection files even if the directory
-        // existed — they're cheap and a previous admin clean-up may
-        // have removed them.
+        self::write_protection_files($dir);
+        self::migrate_legacy_backups($dir);
+
+        return $dir;
+    }
+
+    /**
+     * Drop deny-all server config files into the backup directory for
+     * Apache, IIS, and Nginx. Idempotent — only writes a file if it
+     * does not already exist, so an operator who has customised any
+     * of these is not overwritten.
+     */
+    private static function write_protection_files($dir) {
+        // Apache 2.2 + 2.4 compatible "deny all" stanza.
         $htaccess = $dir . '/.htaccess';
         if (!file_exists($htaccess)) {
-            // Apache 2.2 + 2.4 compatible "deny all" stanza.
             @file_put_contents(
                 $htaccess,
                 "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n" .
                 "<IfModule !mod_authz_core.c>\nOrder Deny,Allow\nDeny from all\n</IfModule>\n"
             );
         }
+
+        // IIS 7+ deny rule.
+        $webconfig = $dir . '/web.config';
+        if (!file_exists($webconfig)) {
+            @file_put_contents(
+                $webconfig,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" .
+                "<configuration>\n" .
+                "  <system.webServer>\n" .
+                "    <authorization>\n" .
+                "      <deny users=\"*\" />\n" .
+                "    </authorization>\n" .
+                "  </system.webServer>\n" .
+                "</configuration>\n"
+            );
+        }
+
+        // Nginx does not honor per-directory config files. Drop a
+        // copy-pasteable snippet alongside the other deny files so
+        // the operator can splice it into their site vhost. The
+        // README header explains why this file exists.
+        $nginx_snippet = $dir . '/nginx-deny.conf.example';
+        if (!file_exists($nginx_snippet)) {
+            $rel = '/wp-content/' . basename($dir) . '/';
+            @file_put_contents(
+                $nginx_snippet,
+                "# Matrix MLM Pro — backup directory protection (Nginx)\n" .
+                "#\n" .
+                "# Nginx does not honor per-directory .htaccess or web.config.\n" .
+                "# Splice the following block into your site's server { } stanza\n" .
+                "# (alongside the existing wp-content rules) and reload nginx:\n" .
+                "#\n" .
+                "#     location {$rel} {\n" .
+                "#         deny all;\n" .
+                "#         return 404;\n" .
+                "#     }\n" .
+                "#\n" .
+                "# Or move backups outside the webroot entirely by defining\n" .
+                "# MATRIX_MLM_BACKUP_DIR in wp-config.php — the recommended\n" .
+                "# production setup. Example:\n" .
+                "#\n" .
+                "#     define('MATRIX_MLM_BACKUP_DIR', '/var/lib/matrix-mlm-backups');\n"
+            );
+        }
+
+        // Belt-and-braces against directory listing.
         $index = $dir . '/index.html';
         if (!file_exists($index)) {
             @file_put_contents($index, '');
         }
+    }
 
-        return $dir;
+    /**
+     * One-shot migration of backups from the legacy
+     * wp-content/uploads/matrix-mlm-backups/ location into the new
+     * dir. Idempotent: skipped when the legacy dir does not exist or
+     * is empty.
+     *
+     * Files are MOVED, not copied — leaving two on-disk copies of a
+     * sensitive dump would defeat the point. If a move fails for any
+     * reason (cross-filesystem, permissions, etc.) the source is
+     * left in place so the data is never lost; the operator can
+     * clean up manually after confirming the new location works.
+     */
+    private static function migrate_legacy_backups($new_dir) {
+        $uploads = wp_upload_dir();
+        $legacy_dir = trailingslashit($uploads['basedir']) . 'matrix-mlm-backups';
+        if (!is_dir($legacy_dir)) {
+            return;
+        }
+        if (rtrim($legacy_dir, '/\\') === rtrim($new_dir, '/\\')) {
+            return; // operator pointed MATRIX_MLM_BACKUP_DIR at the legacy dir
+        }
+
+        $files = @glob($legacy_dir . '/matrix-backup-*.{sql,sql.gz}', GLOB_BRACE);
+        if (!is_array($files) || empty($files)) {
+            return;
+        }
+
+        $moved = 0;
+        foreach ($files as $src) {
+            $dest = $new_dir . '/' . basename($src);
+            if (file_exists($dest)) {
+                continue; // do not clobber an existing same-named file
+            }
+            if (@rename($src, $dest)) {
+                $moved++;
+            }
+        }
+
+        if ($moved > 0) {
+            error_log(sprintf(
+                '[Matrix MLM] Migrated %d backup(s) from %s to %s',
+                $moved, $legacy_dir, $new_dir
+            ));
+        }
     }
 
     /**
@@ -197,7 +350,16 @@ class Matrix_MLM_Admin_Backup {
         // sanitize_file_name keeps the trigger string filesystem-safe
         // even though we only ever pass 'manual'/'auto' today.
         $trigger_s = sanitize_file_name($trigger ?: 'manual');
-        $filename  = "matrix-backup-{$stamp}-{$trigger_s}.{$ext}";
+        // H9: filename gets 8 hex chars of entropy from random_bytes
+        // so an attacker who can guess the timestamp window cannot
+        // also guess the filename (a per-second-precision timestamp
+        // is otherwise easy to enumerate). Belt-and-braces against
+        // any failure of the deny-rule layer above. Backwards
+        // compatible: list_backups() still globs matrix-backup-* so
+        // legacy timestamp-only filenames are still listed and
+        // restorable.
+        $rand_suffix = bin2hex(random_bytes(4));
+        $filename  = "matrix-backup-{$stamp}-{$trigger_s}-{$rand_suffix}.{$ext}";
         $filepath  = $dir . '/' . $filename;
 
         // Discover plugin tables. Scope to the wp prefix so a multisite
