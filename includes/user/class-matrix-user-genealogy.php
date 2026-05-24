@@ -386,7 +386,20 @@ class Matrix_MLM_User_Genealogy {
 
         <?php $this->render_mode_toggle($mode_raw, $heat_metric); ?>
 
-        <div class="matrix-genealogy-wrapper">
+        <?php
+        // View toggle: D3 SVG (pan + zoom, scales to thousands of
+        // nodes) vs the classic recursive HTML tree. Read from
+        // ?view=… and default to D3, because the SVG view's whole
+        // reason for existing is that the HTML tree degrades past
+        // ~50 nodes. Members on legacy bookmarks (or who opt out
+        // via the toggle) keep getting classic.
+        $view_param = isset($_GET['view']) ? sanitize_key((string) $_GET['view']) : '';
+        $active_view = ($view_param === 'classic') ? 'classic' : 'd3';
+        ?>
+
+        <?php $this->render_d3_view($tree, $display_position, $selected_plan_id, $display_user_id, $initial_render_depth, $active_view); ?>
+
+        <div class="matrix-genealogy-wrapper" data-view-role="classic" data-active-view="<?php echo esc_attr($active_view); ?>"<?php echo $active_view === 'd3' ? ' aria-hidden="true"' : ''; ?>>
             <div class="matrix-genealogy-tree<?php echo $mode_raw === 'activity' ? ' heatmap-active' : ''; ?>" id="genealogy-tree" data-plan-id="<?php echo (int) $selected_plan_id; ?>" data-plan-depth="<?php echo (int) $display_position->depth; ?>" data-plan-width="<?php echo (int) $display_position->width; ?>" data-root-user-id="<?php echo $display_user_id; ?>" data-active-metric="<?php echo esc_attr($heat_metric); ?>">
                 <?php if ($tree): ?>
                     <?php $this->render_tree_node($tree, $display_position->width, true, $display_user_id, $initial_render_depth); ?>
@@ -1267,6 +1280,303 @@ class Matrix_MLM_User_Genealogy {
         })();
         </script>
         <?php
+    }
+
+    /**
+     * Render the D3.js SVG tree surface — toolbar, mount target, and
+     * embedded JSON bootstrap data — alongside the classic HTML tree.
+     *
+     * The classic tree (rendered immediately above this) is kept as a
+     * progressive-enhancement fallback. Without this, members on
+     * locked-down browsers or with the D3 vendor file blocked would
+     * see an empty area where their genealogy used to be — clearly a
+     * regression. Layering the D3 surface on top of the same data the
+     * classic surface already renders means:
+     *
+     *   - No JS, or D3 fails to load → classic tree stays visible,
+     *     same UX as before this feature shipped.
+     *   - Toggle to ?view=classic → classic visible, D3 hidden via
+     *     CSS/data-attr, the JS module sees the URL flag and skips
+     *     mounting entirely.
+     *   - Default (or ?view=d3) → JS mounts D3 inside the canvas and
+     *     hides the classic wrapper at runtime by flipping its
+     *     data-active-view attribute.
+     *
+     * The tree data is embedded in a <script type="application/json">
+     * blob (NOT inlined into a JS string literal) for two reasons:
+     *
+     *   - Embedding into a JS string would force us to reason about
+     *     escaping for </script>, U+2028/U+2029, single quotes, and
+     *     unicode in usernames. The application/json container makes
+     *     the browser's own JSON.parse() responsible for that.
+     *   - It keeps the bootstrap synchronous (no extra round trip on
+     *     pageload). The first 4 levels of the tree are already in
+     *     the DOM as HTML; rendering them again client-side from the
+     *     same data is a deliberate redundancy that only costs a few
+     *     KB of JSON and makes the D3 mount feel instant.
+     *
+     * Lazy-loaded subtrees (deeper than the initial 4-level cap) come
+     * from the new fetch_subtree_json AJAX endpoint, NOT from the
+     * embedded blob — the blob is bootstrap-only.
+     *
+     * @param array|null $tree              The same tree array passed
+     *                                      to render_tree_node(). May
+     *                                      be null when the viewer
+     *                                      has no active position.
+     * @param object     $display_position  Plan + position metadata
+     *                                      so the JS knows the plan
+     *                                      shape for empty-slot
+     *                                      padding and depth limits.
+     * @param int        $plan_id           Currently-selected plan,
+     *                                      used by the AJAX endpoints.
+     * @param int        $root_user_id      Tree root user id —
+     *                                      drives direct/spillover
+     *                                      classification of every
+     *                                      descendant on both the
+     *                                      server and the client.
+     * @param int        $initial_depth     Absolute level the
+     *                                      embedded tree extends to;
+     *                                      D3's expand buttons start
+     *                                      from this level + 1.
+     * @param string     $active_view       'd3' or 'classic' — the
+     *                                      view-toggle URL param,
+     *                                      already sanitised.
+     */
+    private function render_d3_view($tree, $display_position, $plan_id, $root_user_id, $initial_depth, $active_view) {
+        // Build the URL the toggle button will navigate to. Keep all
+        // existing query params (plan_id, pivot_user_id, mode,
+        // heat_metric, …) so toggling views never loses the member's
+        // current pivot/mode/metric selection — the cardinal sin of
+        // a "view toggle" that resets state.
+        $current_view  = ($active_view === 'classic') ? 'classic' : 'd3';
+        $other_view    = ($current_view === 'd3') ? 'classic' : 'd3';
+        $other_url     = add_query_arg('view', $other_view);
+        // remove_query_arg + add_query_arg combo isn't strictly
+        // necessary here (add_query_arg replaces an existing value)
+        // but it documents intent.
+
+        // Sanitise the bootstrap tree once. The classic renderer has
+        // its own per-call escaping baked into render_tree_node;
+        // for the D3 path we have to ship clean structured data
+        // that the browser's JSON.parse() will accept, with all the
+        // fields the JS view needs and none of the ones it doesn't.
+        $bootstrap_tree = $tree ? $this->prepare_tree_for_d3($tree, (int) $root_user_id) : null;
+
+        // Bundle the runtime config the JS module needs alongside
+        // the tree itself so the application/json blob is the
+        // single source of truth — avoids one-attribute-here, one-
+        // attribute-there sprawl that's hard to keep consistent
+        // across the page render and AJAX expansions.
+        $bootstrap = [
+            'tree'         => $bootstrap_tree,
+            'plan_id'      => (int) $plan_id,
+            'plan_width'   => (int) $display_position->width,
+            'plan_depth'   => (int) $display_position->depth,
+            'root_user_id' => (int) $root_user_id,
+            'initial_depth' => (int) $initial_depth,
+            'active_view'  => $current_view,
+            // Pre-localised strings the JS module needs. We hand
+            // these in rather than re-localise on the JS side
+            // because translation belongs in PHP; the JS just
+            // displays whatever text it's given.
+            'i18n' => [
+                'you'           => __('You', 'matrix-mlm'),
+                'direct'        => __('Direct', 'matrix-mlm'),
+                'spillover'     => __('Spillover', 'matrix-mlm'),
+                'empty_slot'    => __('Empty Slot', 'matrix-mlm'),
+                'level'         => __('Level', 'matrix-mlm'),
+                'downline'      => __('downline', 'matrix-mlm'),
+                'show_more'     => __('Show more', 'matrix-mlm'),
+                'loading'       => __('Loading…', 'matrix-mlm'),
+                'load_error'    => __('Could not load deeper levels.', 'matrix-mlm'),
+                'view_member'   => __('View %s\'s tree', 'matrix-mlm'),
+                'no_data'       => __('No tree data available yet.', 'matrix-mlm'),
+                'zoom_in'       => __('Zoom in', 'matrix-mlm'),
+                'zoom_out'      => __('Zoom out', 'matrix-mlm'),
+                'fit_screen'    => __('Fit to screen', 'matrix-mlm'),
+                'reset_view'    => __('Reset view', 'matrix-mlm'),
+                'switch_classic' => __('Switch to classic view', 'matrix-mlm'),
+                'switch_d3'     => __('Switch to interactive view', 'matrix-mlm'),
+            ],
+        ];
+
+        // The toolbar sits above the canvas regardless of which view
+        // is active, because the toggle button itself lives there
+        // and members in classic mode still need a way to flip back.
+        // Zoom/fit/reset controls are shown only when D3 is active —
+        // they have no meaning over the static HTML tree.
+        ?>
+        <div class="matrix-genealogy-toolbar" data-active-view="<?php echo esc_attr($current_view); ?>">
+            <div class="matrix-genealogy-toolbar-controls" role="group" aria-label="<?php esc_attr_e('Tree view controls', 'matrix-mlm'); ?>">
+                <button type="button"
+                        class="matrix-genealogy-tool-btn"
+                        data-action="zoom-in"
+                        aria-label="<?php esc_attr_e('Zoom in', 'matrix-mlm'); ?>"
+                        title="<?php esc_attr_e('Zoom in', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-plus-alt2" aria-hidden="true"></span>
+                </button>
+                <button type="button"
+                        class="matrix-genealogy-tool-btn"
+                        data-action="zoom-out"
+                        aria-label="<?php esc_attr_e('Zoom out', 'matrix-mlm'); ?>"
+                        title="<?php esc_attr_e('Zoom out', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-minus" aria-hidden="true"></span>
+                </button>
+                <button type="button"
+                        class="matrix-genealogy-tool-btn"
+                        data-action="fit-screen"
+                        aria-label="<?php esc_attr_e('Fit to screen', 'matrix-mlm'); ?>"
+                        title="<?php esc_attr_e('Fit to screen', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-editor-expand" aria-hidden="true"></span>
+                </button>
+                <button type="button"
+                        class="matrix-genealogy-tool-btn"
+                        data-action="reset-view"
+                        aria-label="<?php esc_attr_e('Reset view', 'matrix-mlm'); ?>"
+                        title="<?php esc_attr_e('Reset view', 'matrix-mlm'); ?>">
+                    <span class="dashicons dashicons-image-rotate" aria-hidden="true"></span>
+                </button>
+            </div>
+            <div class="matrix-genealogy-toolbar-spacer"></div>
+            <a class="matrix-genealogy-view-toggle"
+               href="<?php echo esc_url($other_url); ?>"
+               data-target-view="<?php echo esc_attr($other_view); ?>"
+               aria-label="<?php echo esc_attr($current_view === 'd3'
+                    ? __('Switch to classic view', 'matrix-mlm')
+                    : __('Switch to interactive view', 'matrix-mlm')); ?>">
+                <span class="dashicons <?php echo $current_view === 'd3' ? 'dashicons-list-view' : 'dashicons-networking'; ?>" aria-hidden="true"></span>
+                <?php
+                echo esc_html($current_view === 'd3'
+                    ? __('Classic view', 'matrix-mlm')
+                    : __('Interactive view', 'matrix-mlm'));
+                ?>
+            </a>
+        </div>
+
+        <?php /*
+         * application/json bootstrap blob. Visible to the parser as
+         * data, never executed. WordPress already does sanitisation
+         * on the input fields that feed the tree (usernames are
+         * user_login values, IDs are integers). wp_json_encode adds
+         * the JSON_HEX_* flags by default so embedding in HTML is
+         * safe — but we belt-and-braces the </script> sequence
+         * anyway because nothing in the JSON contract currently
+         * forbids a username with literal </script> in it (a
+         * deliberately hostile user_login that survived registration
+         * could ship one).
+         */ ?>
+        <script type="application/json" id="matrix-genealogy-d3-data"><?php
+            $json = wp_json_encode($bootstrap);
+            // Defensive escape against a username smuggling </script>
+            // in. wp_json_encode escapes < and > by default with
+            // JSON_HEX_TAG, but we double-up anyway since some hosts
+            // ship modified PHP runtimes that disable those flags
+            // (notably some shared hosts pre-fork PHP into a mode
+            // where the default flags differ).
+            echo str_replace(
+                ['</script', '<!--', '-->'],
+                ['<\/script', '<\!--', '--\>'],
+                (string) $json
+            );
+        ?></script>
+
+        <div class="matrix-genealogy-d3-canvas"
+             id="matrix-genealogy-d3-canvas"
+             data-active-view="<?php echo esc_attr($current_view); ?>"
+             data-mounted="0"
+             role="region"
+             aria-label="<?php esc_attr_e('Interactive genealogy tree (drag to pan, scroll to zoom)', 'matrix-mlm'); ?>"
+             tabindex="0">
+            <div class="matrix-genealogy-d3-loading" aria-hidden="true">
+                <span class="dashicons dashicons-update matrix-tree-spin"></span>
+                <span><?php esc_html_e('Loading interactive view…', 'matrix-mlm'); ?></span>
+            </div>
+            <noscript>
+                <div class="matrix-alert matrix-alert-info">
+                    <?php esc_html_e('JavaScript is disabled. The classic tree below is fully usable.', 'matrix-mlm'); ?>
+                </div>
+            </noscript>
+        </div>
+        <?php
+    }
+
+    /**
+     * Strip and shape a build_tree_recursive() / build_subtree() node
+     * array into the JSON contract the D3 module expects.
+     *
+     * Two responsibilities:
+     *
+     *   1. Trim down to just the fields the JS view uses, dropping
+     *      anything that's only meaningful server-side (e.g.
+     *      'status' beyond the active/inactive split, internal
+     *      timestamps, etc.). Keeps the bootstrap JSON compact —
+     *      every byte counts because this ships inline on every
+     *      genealogy pageload.
+     *   2. Pre-compute the direct/spillover/you classification once
+     *      at serialisation time. The JS could compute this itself
+     *      from sponsor_id vs root_user_id, but doing it here means:
+     *      a) the JS doesn't need to know the relationship rule, b)
+     *      the rule stays consistent with render_tree_node()'s
+     *      existing classification, and c) future changes to the
+     *      rule (e.g. a third "personally-recruited spillover"
+     *      bucket) only need to be made server-side.
+     *
+     * Recursive — walks the entire $tree depth-first and returns a
+     * mirror structure with the trimmed shape. Returns null on a
+     * malformed input so the caller can short-circuit emitting an
+     * empty bootstrap blob.
+     *
+     * @param array $node          A build_tree_recursive() node.
+     * @param int   $root_user_id  Tree root, drives the direct vs
+     *                              spillover classification.
+     * @return array|null          Trimmed node, or null when $node
+     *                              is malformed.
+     */
+    private function prepare_tree_for_d3($node, $root_user_id) {
+        if (!is_array($node) || !isset($node['id'])) {
+            return null;
+        }
+
+        $node_user_id = (int) ($node['user_id'] ?? 0);
+        $sponsor_id   = isset($node['sponsor_id']) && $node['sponsor_id'] !== null
+            ? (int) $node['sponsor_id']
+            : 0;
+        $is_root      = ($node_user_id === (int) $root_user_id);
+
+        // Mirror render_tree_node()'s classification exactly —
+        // see the "Classify the node" block in that method for the
+        // semantics of 'you' vs 'direct' vs 'spillover'. Keeping
+        // both surfaces in lockstep is what lets the toggle feel
+        // like the same tree wearing two faces.
+        if ($is_root) {
+            $relationship = 'you';
+        } elseif ($sponsor_id > 0 && $sponsor_id === (int) $root_user_id) {
+            $relationship = 'direct';
+        } else {
+            $relationship = 'spillover';
+        }
+
+        $children = [];
+        if (!empty($node['children']) && is_array($node['children'])) {
+            foreach ($node['children'] as $child) {
+                $prepared = $this->prepare_tree_for_d3($child, $root_user_id);
+                if ($prepared !== null) {
+                    $children[] = $prepared;
+                }
+            }
+        }
+
+        return [
+            'id'             => (int) $node['id'],
+            'user_id'        => $node_user_id,
+            'sponsor_id'     => $sponsor_id > 0 ? $sponsor_id : null,
+            'username'       => (string) ($node['username'] ?? ('User #' . $node_user_id)),
+            'level'          => (int) ($node['level'] ?? 0),
+            'total_downline' => (int) ($node['total_downline'] ?? 0),
+            'status'         => (string) ($node['status'] ?? ''),
+            'relationship'   => $relationship,
+            'children'       => $children,
+        ];
     }
 
     /**

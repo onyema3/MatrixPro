@@ -1201,3 +1201,497 @@
         flex: 1 1 auto;
     }
 }
+
+
+/* ==========================================================================
+   D3.js Genealogy Tree View
+   --------------------------------------------------------------------------
+   Styles for the SVG-based tree (matrix-genealogy-d3-canvas) and its
+   surrounding toolbar. The classic recursive HTML tree above keeps its
+   own styles untouched — toggling between the two is a runtime concern
+   driven by data-active-view attributes on .matrix-genealogy-wrapper
+   and .matrix-genealogy-d3-canvas.
+   ========================================================================== */
+
+/* ----- Toolbar ----- */
+
+.matrix-genealogy-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    margin: 0 0 12px;
+    background: #ffffff;
+    border: 1px solid var(--matrix-border);
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.matrix-genealogy-toolbar-controls {
+    display: flex;
+    gap: 4px;
+}
+
+.matrix-genealogy-toolbar-spacer {
+    flex: 1 1 auto;
+}
+
+.matrix-genealogy-tool-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--matrix-dark);
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.matrix-genealogy-tool-btn:hover {
+    background: #f3f4f6;
+    border-color: var(--matrix-border);
+}
+
+.matrix-genealogy-tool-btn:focus {
+    outline: none;
+    border-color: var(--matrix-primary);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
+}
+
+.matrix-genealogy-tool-btn .dashicons {
+    width: 18px;
+    height: 18px;
+    font-size: 18px;
+}
+
+/*
+ * Hide zoom/fit/reset buttons when the page is in classic view —
+ * they have no meaning over the static HTML tree below. The
+ * view-toggle link itself stays visible because that's the way out
+ * of classic mode.
+ */
+.matrix-genealogy-toolbar[data-active-view="classic"] .matrix-genealogy-toolbar-controls {
+    display: none;
+}
+
+.matrix-genealogy-view-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: var(--matrix-primary);
+    color: #ffffff;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.matrix-genealogy-view-toggle:hover,
+.matrix-genealogy-view-toggle:focus {
+    background: #4338ca;
+    color: #ffffff;
+    text-decoration: none;
+    transform: translateY(-1px);
+}
+
+.matrix-genealogy-view-toggle .dashicons {
+    width: 16px;
+    height: 16px;
+    font-size: 16px;
+}
+
+/* ----- D3 canvas ----- */
+
+.matrix-genealogy-d3-canvas {
+    position: relative;
+    width: 100%;
+    /*
+     * Fixed-aspect-ratio surface chosen by experimentation: 60vh
+     * gives a 4-level tree room to breathe at default zoom on
+     * 13" laptops (the most common dashboard viewport) without
+     * pushing the legend below the fold. Members can pan/zoom
+     * to explore beyond the visible area, so taller doesn't buy
+     * us much.
+     */
+    height: 60vh;
+    min-height: 420px;
+    background: #f9fafb;
+    background-image:
+        linear-gradient(rgba(79, 70, 229, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(79, 70, 229, 0.04) 1px, transparent 1px);
+    background-size: 32px 32px;
+    border: 1px solid var(--matrix-border);
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: grab;
+}
+
+.matrix-genealogy-d3-canvas:active {
+    cursor: grabbing;
+}
+
+.matrix-genealogy-d3-canvas:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.2);
+}
+
+/*
+ * View-toggle visibility is enforced with CSS so the JS module
+ * doesn't have to micro-manage display states across the lifecycle.
+ *
+ *   - data-active-view="classic" on the canvas → hidden, no D3 mount
+ *     happens, classic tree below is the only thing visible.
+ *   - data-active-view="d3" on the canvas + same on the classic
+ *     wrapper means D3 mounted successfully and is in charge.
+ */
+.matrix-genealogy-d3-canvas[data-active-view="classic"] {
+    display: none;
+}
+
+.matrix-genealogy-wrapper[data-active-view="d3"] {
+    display: none;
+}
+
+/*
+ * If the JS module fails to mount (data-mounted="failed") we fall
+ * back to the classic view by setting the canvas to display:none
+ * via inline style — this rule is just belt-and-braces for SSR
+ * scenarios where the canvas was forced into d3 mode but the JS
+ * never ran.
+ */
+.matrix-genealogy-d3-canvas[data-mounted="failed"] {
+    display: none;
+}
+
+/* Loading shimmer shown until the JS mount removes it. */
+.matrix-genealogy-d3-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: #6b7280;
+    font-size: 14px;
+}
+
+.matrix-genealogy-d3-loading .dashicons {
+    font-size: 24px;
+    width: 24px;
+    height: 24px;
+    color: var(--matrix-primary);
+}
+
+.matrix-genealogy-d3-svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* ----- SVG: connector links ----- */
+
+.mtx-link {
+    fill: none;
+    stroke: #cbd5e1;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+}
+
+/* ----- SVG: nodes ----- */
+
+.mtx-node {
+    cursor: pointer;
+}
+
+/*
+ * Empty slots aren't interactive in v1 (the referral-copy CTA from
+ * the classic view hasn't been ported yet) so cursor stays default
+ * and the keyboard skips them via tabindex=-1.
+ */
+.mtx-node-empty {
+    cursor: default;
+}
+
+.mtx-node-body {
+    fill: #ffffff;
+    stroke: var(--matrix-border);
+    stroke-width: 1.5;
+    transition: stroke-width 0.15s ease;
+}
+
+.mtx-node-clickable:hover .mtx-node-body,
+.mtx-node-clickable:focus .mtx-node-body {
+    stroke-width: 2.5;
+    filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.08));
+}
+
+/* Relationship-driven colour palettes — match the classic view's
+ * .matrix-tree-node-* swatches so colour cues port across views. */
+.mtx-node-you .mtx-node-body {
+    fill: #eef2ff;
+    stroke: var(--matrix-primary);
+    stroke-width: 2;
+}
+
+.mtx-node-direct .mtx-node-body {
+    fill: #f0fdf4;
+    stroke: var(--matrix-success);
+}
+
+.mtx-node-spillover .mtx-node-body {
+    fill: #fffbeb;
+    stroke: #f59e0b;
+}
+
+.mtx-node-empty .mtx-node-body {
+    fill: #f9fafb;
+    stroke: #cbd5e1;
+    stroke-dasharray: 4 4;
+}
+
+/* Avatar circles */
+.mtx-node-avatar {
+    fill: #e0e7ff;
+    stroke: #ffffff;
+    stroke-width: 2;
+}
+
+.mtx-node-you .mtx-node-avatar     { fill: var(--matrix-primary); }
+.mtx-node-direct .mtx-node-avatar  { fill: var(--matrix-success); }
+.mtx-node-spillover .mtx-node-avatar { fill: #f59e0b; }
+.mtx-node-empty .mtx-node-avatar   { fill: #e5e7eb; }
+
+.mtx-node-initial {
+    fill: #ffffff;
+    font-size: 14px;
+    font-weight: 700;
+    pointer-events: none;
+    user-select: none;
+}
+
+.mtx-node-empty .mtx-node-initial {
+    fill: #9ca3af;
+}
+
+/* Text labels */
+.mtx-node-name {
+    fill: var(--matrix-dark);
+    font-size: 13px;
+    font-weight: 600;
+    pointer-events: none;
+}
+
+.mtx-node-meta {
+    fill: #6b7280;
+    font-size: 11px;
+    pointer-events: none;
+}
+
+.mtx-node-you .mtx-node-name { fill: var(--matrix-primary); }
+
+/* ----- SVG: expand badge ----- */
+
+.mtx-expand-badge {
+    cursor: pointer;
+    transition: opacity 0.15s ease;
+}
+
+.mtx-expand-badge rect {
+    fill: var(--matrix-primary);
+    stroke: none;
+}
+
+.mtx-expand-badge text {
+    fill: #ffffff;
+    font-size: 11px;
+    font-weight: 600;
+    pointer-events: none;
+    user-select: none;
+}
+
+.mtx-expand-badge:hover rect,
+.mtx-expand-badge:focus rect {
+    fill: #4338ca;
+}
+
+/* ----- Details mini-card (popover) ----- */
+
+.matrix-genealogy-d3-details {
+    position: absolute;
+    z-index: 50;
+    width: 280px;
+    max-width: calc(100% - 32px);
+    background: #ffffff;
+    border: 1px solid var(--matrix-border);
+    border-radius: 12px;
+    box-shadow: 0 12px 24px -8px rgba(0, 0, 0, 0.18);
+    padding: 14px 16px;
+    font-size: 13px;
+    color: var(--matrix-dark);
+    /*
+     * A small entrance animation sells the popover as a response
+     * to the click rather than a fixed overlay. Disabled under
+     * prefers-reduced-motion below.
+     */
+    animation: mtx-details-in 0.15s ease;
+}
+
+@keyframes mtx-details-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .matrix-genealogy-d3-details {
+        animation: none;
+    }
+}
+
+.mtx-details-close {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #6b7280;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 4px;
+}
+
+.mtx-details-close:hover,
+.mtx-details-close:focus {
+    background: #f3f4f6;
+    color: var(--matrix-dark);
+    outline: none;
+}
+
+.mtx-details-loading {
+    color: #6b7280;
+    text-align: center;
+    padding: 8px 0;
+}
+
+.mtx-details-error {
+    color: var(--matrix-danger);
+    padding: 4px 0;
+}
+
+.mtx-details-header {
+    margin-bottom: 10px;
+    padding-right: 24px; /* leave room for the close button */
+}
+
+.mtx-details-name {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--matrix-dark);
+}
+
+.mtx-details-username {
+    font-size: 12px;
+    color: #6b7280;
+    margin-top: 2px;
+}
+
+.mtx-details-list {
+    margin: 0 0 12px;
+    padding: 0;
+    display: grid;
+    grid-template-columns: 1fr 1.4fr;
+    gap: 4px 8px;
+    font-size: 12px;
+}
+
+.mtx-details-list dt {
+    color: #6b7280;
+    font-weight: 500;
+}
+
+.mtx-details-list dd {
+    margin: 0;
+    color: var(--matrix-dark);
+    font-weight: 600;
+}
+
+.mtx-details-pivot {
+    display: block;
+    text-align: center;
+    padding: 8px 12px;
+    background: var(--matrix-primary);
+    color: #ffffff;
+    border-radius: 8px;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background 0.15s ease;
+}
+
+.mtx-details-pivot:hover,
+.mtx-details-pivot:focus {
+    background: #4338ca;
+    color: #ffffff;
+    text-decoration: none;
+}
+
+/* ----- Inline error toast (lazy-load failures, etc.) ----- */
+
+.matrix-genealogy-d3-flash {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--matrix-danger);
+    color: #ffffff;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+    z-index: 60;
+    /* Same fade-in as the details card, so failure feedback feels
+     * coherent with success feedback. */
+    animation: mtx-details-in 0.15s ease;
+}
+
+/* ----- Responsive tweaks ----- */
+
+@media (max-width: 640px) {
+    .matrix-genealogy-toolbar {
+        flex-wrap: wrap;
+    }
+    .matrix-genealogy-toolbar-spacer {
+        display: none;
+    }
+    .matrix-genealogy-view-toggle {
+        margin-left: auto;
+    }
+    .matrix-genealogy-d3-canvas {
+        height: 70vh;
+        min-height: 360px;
+    }
+    .matrix-genealogy-d3-details {
+        /*
+         * On narrow viewports the popover would sit awkwardly
+         * floating next to the node — center it at the bottom
+         * instead, which is a more conventional mobile pattern.
+         */
+        position: fixed;
+        left: 16px;
+        right: 16px;
+        bottom: 16px;
+        top: auto !important;
+        width: auto;
+        max-width: none;
+    }
+}

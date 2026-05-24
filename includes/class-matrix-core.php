@@ -163,6 +163,55 @@ class Matrix_MLM_Core {
             'userEmail' => is_user_logged_in() ? wp_get_current_user()->user_email : '',
             'userName' => is_user_logged_in() ? wp_get_current_user()->display_name : '',
         ]);
+
+        // Conditionally enqueue the D3.js genealogy view.
+        //
+        // D3 is ~273 KB minified — significant enough that we don't
+        // want to ship it on every page of the site. We only need
+        // it where the dashboard shortcode renders, so we gate the
+        // enqueue on a fast has_shortcode() check against the
+        // current post. Same gate the nocache_dashboard_pages()
+        // method uses, kept inline here rather than factored out
+        // because there's only two callers and copy-paste is more
+        // readable than a one-line helper.
+        //
+        // Why we don't gate further (e.g. only on ?tab=genealogy):
+        //   - The dashboard tab is set after enqueue_scripts fires;
+        //     reading $_GET['tab'] here works for the initial pageload
+        //     but breaks if a future revision fetches tab content
+        //     via AJAX (the D3 module would never be enqueued in
+        //     that flow). Coupling the enqueue to tab detection
+        //     would also fight WordPress's caching layer, which
+        //     fingerprints by URL but not by POST/AJAX state.
+        //   - Members commonly land on /matrix-dashboard/ then click
+        //     the Genealogy tab. If the script weren't already
+        //     enqueued, that click would either need a fresh page
+        //     load or its own JS-side loader. Always-loaded-on-the-
+        //     dashboard is the simpler shape.
+        //
+        // Loading D3 BEFORE the genealogy module ensures `window.d3`
+        // is defined by the time matrix-genealogy-d3.js executes.
+        // Both are footer-loaded so they don't block paint.
+        if (is_singular()) {
+            global $post;
+            if ($post && has_shortcode((string) $post->post_content, 'matrix_dashboard')) {
+                wp_enqueue_script(
+                    'matrix-mlm-d3-vendor',
+                    MATRIX_MLM_PLUGIN_URL . 'public/vendor/d3/d3.v7.min.js',
+                    [],
+                    '7.9.0',
+                    true
+                );
+
+                wp_enqueue_script(
+                    'matrix-mlm-genealogy-d3',
+                    MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-genealogy-d3.js',
+                    ['matrix-mlm-d3-vendor', 'matrix-mlm-public'],
+                    MATRIX_MLM_VERSION,
+                    true
+                );
+            }
+        }
     }
 
     /**
@@ -282,6 +331,9 @@ class Matrix_MLM_Core {
                 break;
             case 'fetch_subtree':
                 $this->process_fetch_subtree();
+                break;
+            case 'fetch_subtree_json':
+                $this->process_fetch_subtree_json();
                 break;
             case 'search_genealogy':
                 $this->process_genealogy_search();
@@ -981,6 +1033,155 @@ class Matrix_MLM_Core {
         $html = ob_get_clean();
 
         wp_send_json_success(['html' => $html]);
+    }
+
+    /**
+     * AJAX: lazy-load a deeper subtree as raw JSON node data.
+     *
+     * Sibling of process_fetch_subtree() that powers the *D3.js*
+     * genealogy view (matrix-genealogy-d3.js). The two endpoints
+     * share their auth gate, their input shape, and the same
+     * Matrix_MLM_Plan_Engine::build_subtree() data fetcher — they
+     * differ only in the response format:
+     *
+     *   - process_fetch_subtree()      → ready-to-inject HTML chunk
+     *                                    (used by the classic CSS
+     *                                    tree's expand button).
+     *   - process_fetch_subtree_json() → raw nested node objects
+     *                                    (used by the D3 view, which
+     *                                    re-runs its own d3-hierarchy
+     *                                    layout when new nodes land).
+     *
+     * Why a separate endpoint rather than a `format=json` toggle on
+     * the existing one:
+     *
+     *   - The HTML response goes through render_children_inner()
+     *     which depends on per-render pivot_state (referral URL,
+     *     level commissions, currency symbol, heat data) AND a
+     *     fresh recursion partner instance of Matrix_MLM_User_Genealogy.
+     *     The JSON response needs none of that — it's just data.
+     *     A toggle on the existing method would mean every change
+     *     to the render path has to remember to early-return on
+     *     the JSON branch, which is exactly the kind of coupling
+     *     that lets bugs slip in.
+     *   - Two endpoints means the classic and D3 views can evolve
+     *     independently. If we ever simplify the classic view's
+     *     lazy-load (or remove it), this endpoint stays stable.
+     *
+     * Response shape on success:
+     *
+     *     {
+     *       success: true,
+     *       data: {
+     *         tree: {
+     *           id:            123,           // matrix_positions.id
+     *           user_id:       42,
+     *           sponsor_id:    7,             // or null
+     *           username:      "alice",
+     *           level:         5,             // absolute level in the
+     *                                        //  plan, NOT relative to
+     *                                        //  the requested root —
+     *                                        //  preserves continuity
+     *                                        //  with the page render
+     *                                        //  and lets the JS keep
+     *                                        //  level-aware UI (heat
+     *                                        //  bands, level badges)
+     *                                        //  consistent.
+     *           total_downline: 17,
+     *           status:         "active",
+     *           children:       [ ... recursive same shape ... ]
+     *         },
+     *         from_level: 4,                  // echo of the request
+     *                                        //  param so the client
+     *                                        //  can tell which call
+     *                                        //  this response answers
+     *                                        //  if multiple are in
+     *                                        //  flight.
+     *         max_depth:  7,                  // absolute depth covered
+     *                                        //  by this response.
+     *         plan_width: 3,                  // for empty-slot padding
+     *                                        //  on the D3 side, which
+     *                                        //  doesn't have access to
+     *                                        //  matrix_plans on its
+     *                                        //  own.
+     *         plan_depth: 9
+     *       }
+     *     }
+     *
+     * Authorization is identical to process_fetch_subtree(): the
+     * caller must be the owner of the requested position OR an
+     * ancestor of it (validated by user_can_view_position(), which
+     * walks parent_id up the chain). Returning JSON instead of HTML
+     * doesn't change the auth contract — what a viewer is allowed
+     * to *see* is the same regardless of how the response is
+     * formatted.
+     *
+     * Cap: same as the HTML endpoint — three more absolute levels
+     * per click, bounded by the plan's depth. Tuning the chunk size
+     * would be a coordinated change across both endpoints.
+     */
+    private function process_fetch_subtree_json() {
+        $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
+        $from_level  = isset($_POST['from_level'])  ? (int) $_POST['from_level']  : 0;
+
+        if ($position_id <= 0 || $from_level <= 0) {
+            wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+
+        // Same single-row position+plan join used by the HTML
+        // endpoint — see process_fetch_subtree() for the rationale.
+        // We need plan_width and plan_depth on the response so the
+        // D3 client can pad empty slots and stop-condition its
+        // expand buttons without a separate plan-metadata round
+        // trip.
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT p.id AS position_id, p.user_id AS owner_user_id, p.plan_id,
+                    pl.width AS plan_width, pl.depth AS plan_depth
+               FROM {$wpdb->prefix}matrix_positions p
+               LEFT JOIN {$wpdb->prefix}matrix_plans pl ON pl.id = p.plan_id
+              WHERE p.id = %d",
+            $position_id
+        ));
+
+        if (!$row || !$row->plan_id) {
+            wp_send_json_error(['message' => __('Position not found.', 'matrix-mlm')]);
+        }
+
+        $current_user_id = get_current_user_id();
+        $plan_engine     = new Matrix_MLM_Plan_Engine();
+
+        // Same auth gate the HTML endpoint uses — caller must be on
+        // the parent_id chain of the requested position. This is the
+        // only access-control check the JSON endpoint needs because
+        // build_subtree() only follows parent_id downwards from the
+        // authorised root.
+        if (!$plan_engine->user_can_view_position($current_user_id, $position_id)) {
+            wp_send_json_error(['message' => __('You do not have access to this part of the genealogy.', 'matrix-mlm')]);
+        }
+
+        // Same chunk-size policy as the HTML endpoint: 3 more
+        // absolute levels per click, never deeper than the plan's
+        // configured depth. Keeping the two endpoints in lockstep
+        // means a member who toggles between classic and D3 views
+        // sees the same expand granularity in both, so muscle
+        // memory ports across.
+        $expand_levels = 3;
+        $max_depth     = min((int) $row->plan_depth, $from_level + $expand_levels);
+
+        $tree = $plan_engine->build_subtree($position_id, (int) $row->plan_id, $from_level, $max_depth);
+        if (!$tree) {
+            wp_send_json_error(['message' => __('Could not build subtree.', 'matrix-mlm')]);
+        }
+
+        wp_send_json_success([
+            'tree'       => $tree,
+            'from_level' => (int) $from_level,
+            'max_depth'  => (int) $max_depth,
+            'plan_width' => (int) $row->plan_width,
+            'plan_depth' => (int) $row->plan_depth,
+        ]);
     }
 
     /**
