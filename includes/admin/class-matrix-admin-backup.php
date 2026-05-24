@@ -387,10 +387,80 @@ class Matrix_MLM_Admin_Backup {
      * ------------------------------------------------------------------ */
 
     /**
+     * Statement-shape allow-list for restore_backup().
+     *
+     * Every statement read from a backup file is matched against
+     * exactly one of these patterns BEFORE any execution begins.
+     * If any statement fails to classify, the entire restore is
+     * aborted with no rows touched. Threat model:
+     *
+     *   - The audit (H16) flagged that `$wpdb->query()` was called
+     *     on every statement in the file with no scoping or
+     *     statement-type check. A compromised admin uploading a
+     *     malicious .sql file could include `DROP TABLE wp_users`
+     *     or `INSERT INTO wp_options ('siteurl', 'attacker.example')`
+     *     and pivot to full WordPress takeover.
+     *
+     *   - This allow-list is the choke point. It enforces:
+     *
+     *       1. Statement TYPE is one of the four shapes that
+     *          create_backup() emits: SET FOREIGN_KEY_CHECKS, SET
+     *          SQL_MODE, DROP TABLE [IF EXISTS], CREATE TABLE [IF
+     *          NOT EXISTS], INSERT INTO. UPDATE, DELETE, ALTER,
+     *          GRANT, CREATE USER, etc. are all rejected.
+     *
+     *       2. Any DDL/DML target table is identified by its
+     *          leading backticked identifier and verified to
+     *          start with the {prefix}matrix_ scope. Core WP
+     *          tables (wp_users, wp_options, wp_usermeta) and any
+     *          other plugin's tables cannot be touched.
+     *
+     * Future change to create_backup() must add a corresponding
+     * pattern here, otherwise legitimate dumps will start failing
+     * to restore — that's the point: extending the allow-list is
+     * a deliberate decision, not an oversight.
+     *
+     * @return array<string,string> Map of label => regex.
+     */
+    private static function get_restore_statement_patterns() {
+        global $wpdb;
+        $prefix = preg_quote($wpdb->prefix, '/');
+        // matrix_* table identifiers in this plugin are alphanumeric
+        // plus underscore; this character class matches that exactly.
+        $tbl = "{$prefix}matrix_[A-Za-z0-9_]+";
+        return [
+            // SET FOREIGN_KEY_CHECKS = 0 | 1   (with or without surrounding whitespace)
+            'set_fk_checks' => '/^SET\s+FOREIGN_KEY_CHECKS\s*=\s*[01]\s*$/i',
+            // SET SQL_MODE='...'    only single-quoted, alpha + underscore + comma chars
+            'set_sql_mode'  => "/^SET\s+SQL_MODE\s*=\s*'[A-Z0-9_,\\s]*'\s*$/i",
+            // DROP TABLE [IF EXISTS] `{prefix}matrix_<name>`
+            'drop_table'    => "/^DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+`{$tbl}`\s*$/i",
+            // CREATE TABLE [IF NOT EXISTS] `{prefix}matrix_<name>` ( ... )
+            'create_table'  => "/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`{$tbl}`\s*\\(/i",
+            // INSERT INTO `{prefix}matrix_<name>` ...
+            'insert_into'   => "/^INSERT\s+INTO\s+`{$tbl}`/i",
+        ];
+    }
+
+    /**
+     * Classify a single restore statement against the allow-list.
+     * Returns the matching label, or false if no pattern accepts it.
+     */
+    private static function classify_restore_statement($stmt) {
+        foreach (self::get_restore_statement_patterns() as $label => $pattern) {
+            if (preg_match($pattern, $stmt)) {
+                return $label;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Restore a backup file by re-running its statements against the
      * live database. Designed to round-trip our own dumps; uploaded
      * dumps from other tools may work if they use the same statement
-     * separator (a `;` followed by a newline).
+     * separator (a `;` followed by a newline) AND every statement
+     * passes the allow-list (audit H16). Anything else is refused.
      *
      * @return array|WP_Error
      */
@@ -438,6 +508,48 @@ class Matrix_MLM_Admin_Backup {
         // quotes; multi-line VALUES use `,\n` not `;\n`).
         $statements = preg_split('/;\s*\n/', $sql);
 
+        // Pre-validate every statement against the allow-list before
+        // running any of them. This is a two-pass restore so that an
+        // attempt that contains a single rogue statement is rejected
+        // up-front with the schema untouched, rather than partially
+        // applied and then rolled back (DDL auto-commits on MySQL,
+        // so the rollback safety net only protects the INSERT phase
+        // anyway). (audit H16)
+        $validated = [];
+        foreach ($statements as $idx => $stmt) {
+            $stmt = trim($stmt);
+            if ($stmt === '') {
+                continue;
+            }
+
+            $kind = self::classify_restore_statement($stmt);
+            if ($kind === false) {
+                // Surface a short excerpt so the operator can see
+                // why the file was rejected, but cap it so a multi-
+                // megabyte INSERT doesn't end up in a flash notice.
+                $excerpt = mb_substr($stmt, 0, 200);
+                if (mb_strlen($stmt) > 200) {
+                    $excerpt .= '...';
+                }
+                return new WP_Error(
+                    'matrix_restore_rejected',
+                    sprintf(
+                        /* translators: 1: 1-based statement index, 2: short SQL excerpt */
+                        __('Restore aborted: statement #%1$d is not on the allow-list. Backups must contain only Matrix MLM table operations (DROP/CREATE TABLE and INSERT INTO scoped to {prefix}matrix_*). Excerpt: %2$s', 'matrix-mlm'),
+                        $idx + 1,
+                        $excerpt
+                    ),
+                    ['rejected_index' => $idx + 1, 'excerpt' => $excerpt]
+                );
+            }
+
+            $validated[] = $stmt;
+        }
+
+        if (empty($validated)) {
+            return new WP_Error('matrix_restore_empty', __('Backup file contained no recognised SQL statements.', 'matrix-mlm'));
+        }
+
         $errors   = [];
         $executed = 0;
 
@@ -447,15 +559,7 @@ class Matrix_MLM_Admin_Backup {
         // protects the INSERT phase, but it's a worthwhile safety net.
         $wpdb->query('START TRANSACTION');
 
-        foreach ($statements as $stmt) {
-            $stmt = trim($stmt);
-            if ($stmt === '') {
-                continue;
-            }
-
-            // Skip our own informational SET statements that we always
-            // re-emit at restore time anyway, to avoid duplicate work
-            // when a caller chains multiple restores.
+        foreach ($validated as $stmt) {
             $result = $wpdb->query($stmt);
             if ($result === false) {
                 $errors[] = $wpdb->last_error;
