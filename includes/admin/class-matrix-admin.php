@@ -302,11 +302,14 @@ class Matrix_MLM_Admin {
                 $generated_pins = $result['pins'];
                 if (!empty($result['failed'])) {
                     echo '<div class="notice notice-warning"><p>' . sprintf(
+                        /* translators: 1: count generated, 2: total attempted, 3: count failed, 4: opaque support reference, possibly empty */
                         __('%1$d of %2$d E-Pins generated. %3$d failed to save. %4$s', 'matrix-mlm'),
                         $result['count'],
                         $result['count'] + $result['failed'],
                         $result['failed'],
-                        !empty($result['error']) ? '(' . esc_html($result['error']) . ')' : ''
+                        !empty($result['error_ref'])
+                            ? sprintf(__('(Reference: %s)', 'matrix-mlm'), esc_html($result['error_ref']))
+                            : ''
                     ) . '</p></div>';
                 } else {
                     echo '<div class="notice notice-success"><p>' . sprintf(__('%d E-Pins generated successfully! Amount: %s per pin.', 'matrix-mlm'), $result['count'], $currency . number_format($result['amount'], 2)) . '</p></div>';

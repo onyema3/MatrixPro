@@ -626,7 +626,12 @@ class Matrix_MLM_Admin_Loans {
         );
 
         if ($result === false) {
-            self::admin_notice('error', __('Could not update loan application.', 'matrix-mlm') . ' ' . esc_html($wpdb->last_error));
+            $ref = Matrix_MLM_DB_Error::log_and_token('loans.update', $wpdb->last_error);
+            self::admin_notice('error', sprintf(
+                /* translators: %s: opaque support reference */
+                __('Could not update loan application. Reference: %s.', 'matrix-mlm'),
+                esc_html($ref)
+            ));
             return;
         }
 
