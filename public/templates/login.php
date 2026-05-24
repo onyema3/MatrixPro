@@ -11,6 +11,21 @@
             <h2><?php _e('Login to Your Account', 'matrix-mlm'); ?></h2>
             <p><?php _e('Enter your credentials to access your dashboard', 'matrix-mlm'); ?></p>
         </div>
+        <?php
+        // Inline status banners for the post-registration / post-verify
+        // landings. Both messages are static strings on intentional
+        // values of the query parameter — never echoing the parameter
+        // itself, so there's no XSS surface here. (audit H13)
+        if (!empty($_GET['registered'])) {
+            echo '<div class="matrix-alert matrix-alert-info" style="margin-bottom:16px;">'
+                . esc_html__('Account created. Check your email and click the verification link before signing in.', 'matrix-mlm')
+                . '</div>';
+        } elseif (!empty($_GET['verified'])) {
+            echo '<div class="matrix-alert matrix-alert-success" style="margin-bottom:16px;">'
+                . esc_html__('Email verified. You can now sign in.', 'matrix-mlm')
+                . '</div>';
+        }
+        ?>
         <form id="matrix-login-form" class="matrix-form">
             <div class="matrix-form-group">
                 <label><?php _e('Username or Email', 'matrix-mlm'); ?></label>
