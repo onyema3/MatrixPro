@@ -315,10 +315,19 @@ class Matrix_MLM_Fintava_Card {
      * Fintava round-trips. If the link succeeds and the activate fails,
      * the local card row is left at status='linked' so the user can retry
      * activation without re-linking.
+     *
+     * Tolerates "already linked" responses on the link call. This recovers
+     * cards whose local state desynced from Fintava — most often legacy
+     * rows whose old POST /cards/link call (pre-API-rewrite, wrong body
+     * shape) wrote status='linked' to the local DB without Fintava
+     * actually linking anything; running the proper PATCH /cards/link now
+     * may surface as "already linked" if Fintava DID quietly accept the
+     * old call, or succeed cleanly if it didn't. Either way we proceed to
+     * activate, which is the source of truth.
      */
     public function setup_card($user_id, $card_pan) {
         $link = $this->link_card($user_id, $card_pan);
-        if (is_wp_error($link)) {
+        if (is_wp_error($link) && !self::is_already_linked_error($link)) {
             return $link;
         }
 
@@ -348,6 +357,31 @@ class Matrix_MLM_Fintava_Card {
             'success' => true,
             'message' => __('Card linked and activated.', 'matrix-mlm'),
         ];
+    }
+
+    /**
+     * Detect "card is already linked" responses from PATCH /cards/link so
+     * setup_card can treat them as success and proceed to activate.
+     *
+     * Fintava's exact wording isn't documented and varies by tier, so we
+     * match a small set of common substrings rather than an exact string.
+     * False positives are bounded: the worst case is that we proceed to
+     * activate when we shouldn't, and the activate call rejects with its
+     * own clear error message — the user sees something diagnosable
+     * either way.
+     */
+    public static function is_already_linked_error($wp_error) {
+        if (!is_wp_error($wp_error)) {
+            return false;
+        }
+        $msg = strtolower((string) $wp_error->get_error_message());
+        if ($msg === '') {
+            return false;
+        }
+        return (bool) preg_match(
+            '/\balready\b.{0,40}\b(linked|mapped|exists|associated|active)\b|\bduplicate\b|\bconflict\b/',
+            $msg
+        );
     }
 
     /**
