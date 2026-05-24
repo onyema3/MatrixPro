@@ -3504,11 +3504,30 @@ class Matrix_MLM_User_Genealogy {
             background: #fff;
             border: 1px solid #e5e7eb;
             border-radius: 10px;
-            box-shadow: 0 18px 36px -10px rgba(0, 0, 0, 0.18);
-            padding: 14px 16px 12px;
+            box-shadow: 0 18px 36px -10px rgba(99, 102, 241, 0.28),
+                        0 0 0 1px rgba(139, 92, 246, 0.06);
+            padding: 16px 16px 12px;
             font-size: 13px;
             color: #111827;
             line-height: 1.4;
+        }
+        /* Decorative gradient stripe across the top of the card. Pure
+           CSS via ::before so the JS-managed markup contract stays
+           untouched. Stripe colours echo the per-field accents below
+           (indigo → violet → pink → amber) so the card reads as one
+           coordinated palette rather than four random colours. */
+        .matrix-tree-hovercard::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg,
+                #6366f1 0%, #8b5cf6 35%, #ec4899 70%, #f59e0b 100%);
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            pointer-events: none;
         }
         .matrix-tree-hovercard[hidden] { display: none; }
 
@@ -3579,17 +3598,26 @@ class Matrix_MLM_User_Genealogy {
         .matrix-tree-hovercard-header {
             display: flex;
             flex-direction: column;
-            gap: 2px;
+            align-items: flex-start;
+            gap: 4px;
             margin-bottom: 10px;
             padding-right: 22px; /* leave space for the close X */
         }
         .matrix-tree-hovercard-name {
             font-size: 15px;
             font-weight: 700;
+            background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 60%, #db2777 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            color: #4f46e5; /* fallback for browsers that ignore background-clip:text */
         }
         .matrix-tree-hovercard-username {
             font-size: 12px;
-            color: #6b7280;
+            color: #6d28d9;
+            background: #ede9fe;
+            border-radius: 999px;
+            padding: 2px 8px;
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         }
 
@@ -3607,7 +3635,32 @@ class Matrix_MLM_User_Genealogy {
             color: #6b7280;
             margin: 0;
             padding-top: 1px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
+        /* Coloured dot before each label, tinted to match the row's
+           semantic accent. Order is fixed (Joined / Sponsor / Plans /
+           Branch commission) so :nth-of-type is safe — the markup is
+           rendered server-side in render_hovercard() in the same
+           order on every load. */
+        .matrix-tree-hovercard-fields dt::before {
+            content: "";
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #9ca3af;
+            flex: 0 0 auto;
+        }
+        .matrix-tree-hovercard-fields dt:nth-of-type(1) { color: #2563eb; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(1)::before { background: #2563eb; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(2) { color: #db2777; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(2)::before { background: #db2777; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(3) { color: #7c3aed; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(3)::before { background: #7c3aed; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(4) { color: #047857; }
+        .matrix-tree-hovercard-fields dt:nth-of-type(4)::before { background: #047857; }
         .matrix-tree-hovercard-fields dd {
             margin: 0;
             font-size: 13px;
@@ -3629,13 +3682,24 @@ class Matrix_MLM_User_Genealogy {
         .matrix-tree-hovercard-profile {
             display: inline-block;
             margin-top: 4px;
+            padding: 6px 12px;
             font-size: 12px;
             font-weight: 600;
-            color: #6d28d9;
+            color: #fff;
             text-decoration: none;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #ec4899 100%);
+            border-radius: 999px;
+            box-shadow: 0 2px 8px -2px rgba(139, 92, 246, 0.5);
+            transition: transform .15s ease, box-shadow .15s ease;
         }
         .matrix-tree-hovercard-profile[hidden] { display: none; }
-        .matrix-tree-hovercard-profile:hover { text-decoration: underline; }
+        .matrix-tree-hovercard-profile:hover,
+        .matrix-tree-hovercard-profile:focus-visible {
+            text-decoration: none;
+            color: #fff;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 14px -2px rgba(139, 92, 246, 0.6);
+        }
 
         /* Mobile: the indented vertical tree leaves no good horizontal
            anchor, so we promote the card to a centered "mini modal"
