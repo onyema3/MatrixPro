@@ -2582,7 +2582,11 @@ class Matrix_MLM_Admin_Import {
                 'currency'       => 'NGN',
                 'customer_email' => $row->email ?: null,
                 'customer_phone' => $row->mobile ?: null,
-                'bvn'            => $row->bvn ?: null,
+                // Encrypt BVN at rest via Matrix_MLM_Crypto (audit H5).
+                // Source rows from the Laravel side carry plaintext BVN
+                // by design; this is where they land in the WordPress
+                // schema, so we encrypt at the boundary.
+                'bvn'            => $row->bvn ? Matrix_MLM_Fintava::encrypt_bvn((string) $row->bvn) : null,
                 'status'         => $status,
                 'metadata'       => $metadata,
                 'created_at'     => $row->created_at ?: current_time('mysql'),

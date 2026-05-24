@@ -382,6 +382,92 @@ class Matrix_MLM_Fintava {
             $wpdb->query("ALTER TABLE `$payouts_table` MODIFY COLUMN `bank_code` varchar(20) DEFAULT NULL");
         }
 
+        // ---------------------------------------------------------------
+        // BVN at-rest encryption migration.
+        //
+        // Audit finding H5: matrix_fintava_wallets.bvn was a plaintext
+        // varchar(20) column. Combined with H9 (backup files were
+        // protected only by .htaccess — unenforced on Nginx/IIS), an
+        // unauthorised file-system read or a stolen backup gave the
+        // attacker every member's BVN in clear text. This migration
+        // moves BVN to the shared Matrix_MLM_Crypto envelope (AEAD
+        // libsodium secretbox or OpenSSL AES-256-GCM fallback) under
+        // a domain-separating context, so a future leak yields opaque
+        // ciphertext rather than a national-ID identifier.
+        //
+        // The migration runs at most once per install — gated on the
+        // matrix_fintava_wallets_bvn_version option, mirroring the
+        // pattern already used for matrix_fintava_cards.status. Steps:
+        //
+        //   1. Widen the column to varchar(255) so the v1: envelope
+        //      (~100 chars typical, 255 leaves headroom for future
+        //      algorithm tag changes) fits without truncation.
+        //
+        //   2. Encrypt every existing row whose bvn is non-null,
+        //      non-empty, and not already an envelope (the WHERE
+        //      clause picks legacy plaintext only; rows already
+        //      written by the new insert path are skipped).
+        //
+        //   3. Bump the version option so subsequent boots are no-ops.
+        //
+        // Defensive: if class_exists('Matrix_MLM_Crypto') is false at
+        // table-init time (load order quirk under unusual SAPIs), we
+        // skip the encryption phase and DO NOT bump the version, so
+        // the next pageload retries — better to defer the migration
+        // than to claim it ran when nothing actually got encrypted.
+        // The widen step is safe to run independently and can land
+        // first.
+        $bvn_version = (int) get_option('matrix_fintava_wallets_bvn_version', 1);
+        if ($bvn_version < 2) {
+            $current_len = $wpdb->get_var($wpdb->prepare(
+                "SELECT CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'bvn'",
+                DB_NAME,
+                $wallets_table
+            ));
+            if ($current_len !== null && (int) $current_len < 255) {
+                $wpdb->query("ALTER TABLE `$wallets_table` MODIFY COLUMN `bvn` varchar(255) DEFAULT NULL");
+            }
+
+            if (class_exists('Matrix_MLM_Crypto')) {
+                $rows = $wpdb->get_results(
+                    "SELECT id, bvn FROM `$wallets_table`
+                      WHERE bvn IS NOT NULL AND bvn != '' AND bvn NOT LIKE 'v1:%'"
+                );
+                $migrated = 0;
+                foreach ($rows as $row) {
+                    $encrypted = self::encrypt_bvn($row->bvn);
+                    // Only persist if encryption actually produced a v1
+                    // envelope. If Matrix_MLM_Crypto fell through to a
+                    // plaintext return (no sodium AND no openssl AND no
+                    // AUTH_KEY) we'd be re-writing the same plaintext —
+                    // a no-op that wastes a write. Skip those rows; the
+                    // operator's deployment will surface the helper's
+                    // own error_log line and the migration will retry
+                    // when the missing extension is installed.
+                    if (is_string($encrypted) && strpos($encrypted, 'v1:') === 0) {
+                        $wpdb->update(
+                            $wallets_table,
+                            ['bvn' => $encrypted],
+                            ['id' => (int) $row->id],
+                            ['%s'],
+                            ['%d']
+                        );
+                        $migrated++;
+                    }
+                }
+                if (count($rows) === 0 || $migrated === count($rows)) {
+                    update_option('matrix_fintava_wallets_bvn_version', 2);
+                } else {
+                    error_log(sprintf(
+                        '[Matrix Fintava] BVN encryption migration: %d/%d rows encrypted; not bumping version, will retry on next load.',
+                        $migrated,
+                        count($rows)
+                    ));
+                }
+            }
+        }
+
         return ['errors' => $errors];
     }
 
@@ -5498,36 +5584,39 @@ class Matrix_MLM_Fintava {
             'funding_method' => 'STATIC_FUND',
         ]);
 
-        // ---- TEMPORARY DIAGNOSTIC LOG ------------------------------------
-        // Dumps the raw /create/customer outcome so we can distinguish
-        // the three reasons we fall through to /virtual-wallet/generate
-        // (which is what causes wallets to come back named after the
-        // merchant — e.g. "LIBERTY HUB INTERNATIONAL LIMITED" — instead
-        // of the user):
-        //   1. WP_Error: Fintava rejected the call (duplicate email/phone,
-        //      validation, auth/network). Code + message + data make it
-        //      clear which.
-        //   2. Success without an embedded wallet object: tier returns
-        //      the customer record but no `wallet`, so we have no
-        //      account_number to persist and must fall through.
-        //   3. Success WITH a wallet object but a missing/empty
-        //      virtualAcctName: bank-side name binding is async; the
-        //      ajax handler then falls through to firstName/lastName.
-        // Remove this block once the wallet-naming issue is diagnosed.
-        if (is_wp_error($customer)) {
-            error_log(
-                '[Matrix Fintava][debug] create_customer WP_Error for user_id=' . $user_id
-                . ' code=' . $customer->get_error_code()
-                . ' message=' . $customer->get_error_message()
-                . ' data=' . wp_json_encode($customer->get_error_data())
-            );
-        } else {
-            error_log(
-                '[Matrix Fintava][debug] create_customer response for user_id=' . $user_id
-                . ': ' . wp_json_encode($customer)
-            );
+        // ---- Diagnostic log (gated on WP_DEBUG, PII redacted) ----------
+        // The wallet-naming-disagreement investigation that originally
+        // motivated this dump still benefits from operator-visible
+        // structure on /create/customer outcomes — but the verbatim
+        // Fintava response carries the user's BVN, date of birth,
+        // address, and phone in clear text (Fintava echoes the
+        // request fields back inside `userInfo`). Logging that is an
+        // NDPR / GDPR violation: every shipped log destination
+        // (PHP error_log, syslog forwarders, DataDog, CloudWatch,
+        // Papertrail, full-disk backups) becomes a KYC store the
+        // moment one of these lines is written.
+        //
+        // The block now: (a) only runs when WP_DEBUG is ON, so a
+        // production install with WP_DEBUG OFF emits nothing; (b)
+        // routes both branches through redact_pii_for_log() so the
+        // log records WHICH KEYS were present and HOW LONG the
+        // values were, but never the values themselves.
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            if (is_wp_error($customer)) {
+                error_log(
+                    '[Matrix Fintava][debug] create_customer WP_Error for user_id=' . $user_id
+                    . ' code=' . $customer->get_error_code()
+                    . ' message=' . $customer->get_error_message()
+                    . ' data=' . wp_json_encode(self::redact_pii_for_log($customer->get_error_data()))
+                );
+            } else {
+                error_log(
+                    '[Matrix Fintava][debug] create_customer response for user_id=' . $user_id
+                    . ': ' . wp_json_encode(self::redact_pii_for_log($customer))
+                );
+            }
         }
-        // ---- END TEMPORARY DIAGNOSTIC LOG --------------------------------
+        // ---- END diagnostic log ----------------------------------------
 
         // Duplicate-customer recovery.
         //
@@ -5730,13 +5819,20 @@ class Matrix_MLM_Fintava {
                 'currency' => $result['currency'],
                 'customer_email' => $email,
                 'customer_phone' => $phone,
-                // Persist BVN to the dedicated column. KYC fields that
-                // don't have their own column (date_of_birth, address)
-                // go into the metadata JSON below — they're part of
-                // the audit trail for what we sent to Fintava on this
-                // wallet's creation, so support can reconcile if a
-                // KYC challenge ever comes up.
-                'bvn' => $bvn ?: null,
+                // BVN goes to the dedicated column. Encrypted at rest via
+                // the shared Matrix_MLM_Crypto helper (libsodium secretbox
+                // with OpenSSL AES-256-GCM fallback) under a domain-
+                // separating context so a leaked DB dump or backup file
+                // (audit H9) can no longer hand an attacker every
+                // member's BVN. Other KYC fields without their own
+                // column (date_of_birth, address) go into the metadata
+                // JSON below; they're part of the audit trail of what we
+                // sent to Fintava on this wallet's creation, useful if
+                // a KYC challenge ever comes up. Note that metadata is
+                // also a PII surface — H4 redacts the diagnostic log
+                // that previously dumped it; encrypting metadata at rest
+                // is a candidate for a follow-up PR.
+                'bvn' => $bvn ? self::encrypt_bvn($bvn) : null,
                 'status' => 'active',
                 'metadata' => json_encode([
                     'first_name'    => $first_name,
@@ -5863,10 +5959,24 @@ class Matrix_MLM_Fintava {
      * AJAX endpoint that lets a logged-in user fill in their own missing
      * Fintava Wallet ID directly from the dashboard.
      *
-     * Security guarantee: the wallet_id is only saved if Fintava confirms it
-     * resolves to the SAME account_number that's already on the user's local
-     * matrix_fintava_wallets row. This prevents anyone from typing a stranger's
-     * wallet_id to peek at their balance.
+     * Security guarantee (audit H6): the wallet_id is only saved if
+     * Fintava POSITIVELY confirms it resolves to the SAME account_number
+     * that's already on the user's local matrix_fintava_wallets row.
+     *
+     * Earlier revisions of this handler treated an upstream verification
+     * error (HTTP 404, network failure, tier-not-supported) as "save
+     * anyway, the user typed it from their Fintava dashboard". That
+     * behaviour was the vulnerability: a user could type ANY wallet_id
+     * — including a stranger's — and the gateway would accept it on the
+     * first transient upstream blip, binding the stranger's wallet_id to
+     * the attacker's account row. Subsequent /balance calls would then
+     * return the stranger's balance.
+     *
+     * The new contract: no verification = no save. The user gets a clear
+     * "could not verify, please try again" message and the local row is
+     * untouched. Operators with a legitimate need to set wallet_id when
+     * the verification endpoint is unavailable should use admin-side
+     * Migration → Link, which already requires manage_matrix_mlm.
      */
     public function ajax_set_my_wallet_id() {
         check_ajax_referer('matrix_mlm_nonce', 'nonce');
@@ -5894,32 +6004,47 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Your wallet already has a Wallet ID. Contact an admin if it needs to change.', 'matrix-mlm')]);
         }
 
-        // Try to verify the wallet ID against Fintava's API.
-        // If the API is unavailable (404 / endpoint not on this tier), save
-        // the wallet_id directly — the user is authenticated and owns this row.
+        // Mandatory positive verification against Fintava.
         $details = $this->get_virtual_wallet_details(
             $wallet_id,
             $wallet->account_number,
             $wallet->customer_id ?? null
         );
-        $bank_code = $wallet->bank_code;
 
-        if (!is_wp_error($details)) {
-            // API responded — verify account number matches as a safety check.
-            $remote_account_number = self::extract_account_number($details);
-
-            if (!empty($remote_account_number) && !empty($wallet->account_number)) {
-                if (trim($remote_account_number) !== trim($wallet->account_number)) {
-                    wp_send_json_error([
-                        'message' => __('That Wallet ID belongs to a different account number than the one on file. Double-check the Wallet ID in your Fintava dashboard.', 'matrix-mlm'),
-                    ]);
-                }
-            }
-            $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? $wallet->bank_code;
+        if (is_wp_error($details)) {
+            // Verification failed — refuse to bind a wallet_id we can't
+            // confirm belongs to this user. The user sees a clean retry
+            // message; operators see the upstream cause in the log.
+            error_log(sprintf(
+                '[Matrix Fintava] ajax_set_my_wallet_id refused for user_id=%d wallet_id=%s: verification failed (%s)',
+                $user_id,
+                $wallet_id,
+                $details->get_error_message()
+            ));
+            wp_send_json_error([
+                'message'             => __('Could not verify that Wallet ID with Fintava right now. The Wallet ID was not saved. Please try again in a moment, or contact an administrator if the problem persists.', 'matrix-mlm'),
+                'verification_failed' => true,
+            ]);
         }
-        // If API returned an error (404, etc.), we still save — the user
-        // provided the wallet_id from their Fintava dashboard and the API
-        // simply isn't available for verification on this tier.
+
+        // Verification reached. Require an explicit account-number match
+        // — never trust a "verified" response with no account_number on
+        // it (some tiers return a thin envelope with just a status), and
+        // never trust the local row carrying no account_number to be a
+        // sufficient anchor either.
+        $remote_account_number = self::extract_account_number($details);
+        if (empty($remote_account_number) || empty($wallet->account_number)) {
+            wp_send_json_error([
+                'message' => __('Could not confirm that Wallet ID matches your account. The Wallet ID was not saved.', 'matrix-mlm'),
+            ]);
+        }
+        if (trim($remote_account_number) !== trim($wallet->account_number)) {
+            wp_send_json_error([
+                'message' => __('That Wallet ID belongs to a different account number than the one on file. Double-check the Wallet ID in your Fintava dashboard.', 'matrix-mlm'),
+            ]);
+        }
+
+        $bank_code = $details['bank_code'] ?? $details['bankCode'] ?? $wallet->bank_code;
 
         // Persist.
         global $wpdb;
@@ -6454,6 +6579,106 @@ class Matrix_MLM_Fintava {
      * @param string $raw User-supplied phone string.
      * @return string Canonical "+234..." form or ''.
      */
+    /**
+     * Domain-separating context for BVN at-rest encryption.
+     *
+     * Routed through the shared Matrix_MLM_Crypto helper (introduced in
+     * PR #228 for TOTP secrets and explicitly designed to also house
+     * BVN). The context string keeps a BVN ciphertext from being
+     * decryptable as a TOTP secret (or vice-versa) under the same
+     * site-level key — every domain gets its own HKDF-derived subkey.
+     *
+     * @see includes/class-matrix-crypto.php
+     */
+    const BVN_CRYPTO_CONTEXT = 'matrix_mlm:fintava:bvn';
+
+    /**
+     * Encrypt a BVN for at-rest storage in matrix_fintava_wallets.bvn.
+     *
+     * Returns the v1: envelope on success. On the rare path where the
+     * site has no usable crypto extension (neither sodium nor openssl)
+     * AND no AUTH_KEY salt, Matrix_MLM_Crypto::encrypt falls back to
+     * returning the plaintext — we surface that case as the input
+     * unchanged so the surrounding INSERT still succeeds. The site
+     * operator's monitoring will see the helper's own warning line.
+     */
+    public static function encrypt_bvn($bvn) {
+        if (!is_string($bvn) || $bvn === '') {
+            return $bvn;
+        }
+        if (!class_exists('Matrix_MLM_Crypto')) {
+            return $bvn;
+        }
+        return Matrix_MLM_Crypto::encrypt($bvn, self::BVN_CRYPTO_CONTEXT);
+    }
+
+    /**
+     * Decrypt a stored BVN. Transparent to legacy plaintext rows
+     * (anything not starting with the 'v1:' envelope prefix is
+     * returned as-is) so this is safe to call on rows from before
+     * the encryption migration ran. Returns '' on a real decryption
+     * failure (corrupt envelope, salt rotation) so callers can render
+     * a clean blank instead of leaking the envelope.
+     */
+    public static function decrypt_bvn($stored) {
+        if (!is_string($stored) || $stored === '') {
+            return $stored;
+        }
+        if (!class_exists('Matrix_MLM_Crypto')) {
+            return $stored;
+        }
+        $pt = Matrix_MLM_Crypto::decrypt($stored, self::BVN_CRYPTO_CONTEXT);
+        return $pt === null ? '' : (string) $pt;
+    }
+
+    /**
+     * Recursive PII redactor for diagnostic error_log() output.
+     *
+     * NDPR/GDPR: any structured payload we send to error_log() can end
+     * up in operator logs, log-aggregator services (DataDog, CloudWatch,
+     * Papertrail), and full-disk backups. Echoing a verbatim Fintava
+     * /create/customer response leaks the user's BVN, date of birth,
+     * residential address, and phone number into all of those — none
+     * of which are designed to host KYC data. Redact known PII keys
+     * before encoding so the log line still tells an operator WHAT
+     * happened (which keys were present, how long the values were)
+     * without leaking WHO it happened to.
+     *
+     * Match is case-insensitive and covers the camelCase, snake_case,
+     * and lowercase variants Fintava has used across tier upgrades.
+     */
+    public static function redact_pii_for_log($data) {
+        static $sensitive_keys = [
+            'bvn', 'nin',
+            'dateofbirth', 'date_of_birth', 'dob',
+            'address', 'residentialaddress', 'homeaddress', 'businessaddress',
+            'phonenumber', 'phone', 'mobile', 'msisdn',
+            'password', 'pin', 'cvv', 'cardpan', 'cardnumber', 'card_no', 'cardno',
+            'token', 'secret', 'authorization', 'apikey', 'api_key',
+            'firstname', 'lastname', 'first_name', 'last_name',
+            'fullname', 'full_name', 'displayname',
+        ];
+        if (is_array($data)) {
+            $out = [];
+            foreach ($data as $k => $v) {
+                $key_lc = strtolower((string) $k);
+                if (in_array($key_lc, $sensitive_keys, true)) {
+                    if (is_string($v)) {
+                        $out[$k] = '[REDACTED:' . strlen($v) . 'ch]';
+                    } elseif (is_scalar($v)) {
+                        $out[$k] = '[REDACTED]';
+                    } else {
+                        $out[$k] = '[REDACTED:non-scalar]';
+                    }
+                } else {
+                    $out[$k] = self::redact_pii_for_log($v);
+                }
+            }
+            return $out;
+        }
+        return $data;
+    }
+
     public static function normalize_ng_phone($raw) {
         $digits = preg_replace('/\D/', '', (string) $raw);
         if ($digits === '') {
