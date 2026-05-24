@@ -4972,6 +4972,37 @@ class Matrix_MLM_Fintava {
             'funding_method' => 'STATIC_FUND',
         ]);
 
+        // ---- TEMPORARY DIAGNOSTIC LOG ------------------------------------
+        // Dumps the raw /create/customer outcome so we can distinguish
+        // the three reasons we fall through to /virtual-wallet/generate
+        // (which is what causes wallets to come back named after the
+        // merchant — e.g. "LIBERTY HUB INTERNATIONAL LIMITED" — instead
+        // of the user):
+        //   1. WP_Error: Fintava rejected the call (duplicate email/phone,
+        //      validation, auth/network). Code + message + data make it
+        //      clear which.
+        //   2. Success without an embedded wallet object: tier returns
+        //      the customer record but no `wallet`, so we have no
+        //      account_number to persist and must fall through.
+        //   3. Success WITH a wallet object but a missing/empty
+        //      virtualAcctName: bank-side name binding is async; the
+        //      ajax handler then falls through to firstName/lastName.
+        // Remove this block once the wallet-naming issue is diagnosed.
+        if (is_wp_error($customer)) {
+            error_log(
+                '[Matrix Fintava][debug] create_customer WP_Error for user_id=' . $user_id
+                . ' code=' . $customer->get_error_code()
+                . ' message=' . $customer->get_error_message()
+                . ' data=' . wp_json_encode($customer->get_error_data())
+            );
+        } else {
+            error_log(
+                '[Matrix Fintava][debug] create_customer response for user_id=' . $user_id
+                . ': ' . wp_json_encode($customer)
+            );
+        }
+        // ---- END TEMPORARY DIAGNOSTIC LOG --------------------------------
+
         if (!is_wp_error($customer)) {
             $wallet_data = (isset($customer['wallet']) && is_array($customer['wallet']))
                 ? $customer['wallet']
