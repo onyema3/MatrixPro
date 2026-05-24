@@ -32,6 +32,7 @@ class Matrix_MLM_Admin_Settings {
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=livechat'); ?>" class="nav-tab <?php echo $tab === 'livechat' ? 'nav-tab-active' : ''; ?>"><?php _e('Livechat', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=subscription'); ?>" class="nav-tab <?php echo $tab === 'subscription' ? 'nav-tab-active' : ''; ?>"><?php _e('Subscription', 'matrix-mlm'); ?></a>
                 <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=fintava'); ?>" class="nav-tab <?php echo $tab === 'fintava' ? 'nav-tab-active' : ''; ?>"><?php _e('Fintava', 'matrix-mlm'); ?></a>
+                <a href="<?php echo admin_url('admin.php?page=matrix-mlm-settings&tab=bill_payments'); ?>" class="nav-tab <?php echo $tab === 'bill_payments' ? 'nav-tab-active' : ''; ?>"><?php _e('Bill Payments', 'matrix-mlm'); ?></a>
             </nav>
 
             <form method="post" class="matrix-admin-card">
@@ -52,6 +53,7 @@ class Matrix_MLM_Admin_Settings {
                     case 'livechat': $this->render_livechat_tab(); break;
                     case 'subscription': $this->render_subscription_tab(); break;
                     case 'fintava': $this->render_fintava_tab(); break;
+                    case 'bill_payments': $this->render_bill_payments_tab(); break;
                 }
                 ?>
 
@@ -775,6 +777,90 @@ class Matrix_MLM_Admin_Settings {
         </table>
     <?php }
 
+    /**
+     * Bill Payments tab — per-category visibility toggles for the
+     * user-facing /matrix-dashboard/billing surface.
+     *
+     * Storage: matrix_mlm_billing_category_visibility (JSON-encoded
+     * category => 0|1 map). Read at render-and-AJAX time by
+     * Matrix_MLM_Fintava_Billing::is_category_enabled(); see that
+     * helper for the resolution semantics.
+     *
+     * Use cases:
+     *   - Pause Electricity during a disco outage without breaking
+     *     Airtime / Data / Cable.
+     *   - Disable Cable for a particular tenant whose contract
+     *     doesn't include cable resale.
+     *   - Soft-launch a new category by leaving it off until the
+     *     UI / margin config is ready.
+     *
+     * Unlike the dashboard-menus toggle (which hides the whole
+     * Bill Payments tab from the sidebar), these toggles operate
+     * INSIDE the tab. An admin can use either; they compose
+     * naturally because the dashboard-menu hide takes effect
+     * before this tab even renders.
+     */
+    private function render_bill_payments_tab() {
+        $categories = [
+            'airtime'     => [
+                'label'       => __('Airtime', 'matrix-mlm'),
+                'description' => __('MTN, GLO, Airtel, 9mobile airtime top-ups via Fintava /billing/airtime.', 'matrix-mlm'),
+            ],
+            'data' => [
+                'label'       => __('Data Bundles', 'matrix-mlm'),
+                'description' => __('Per-network data plans via Fintava /billing/data-bundles + /billing/data-bundle.', 'matrix-mlm'),
+            ],
+            'cable' => [
+                'label'       => __('Cable TV', 'matrix-mlm'),
+                'description' => __('DSTV, GOTV, Startimes etc. subscription renewals via Fintava /billing/cable-subscription.', 'matrix-mlm'),
+            ],
+            'electricity' => [
+                'label'       => __('Electricity', 'matrix-mlm'),
+                'description' => __('Prepaid + postpaid bill payments via Fintava /billing/electricity. Disabling this also disables the meter-verify lookup, since it is only useful inside this flow.', 'matrix-mlm'),
+            ],
+        ];
+        $stored = get_option('matrix_mlm_billing_category_visibility', '');
+        $stored = is_string($stored) && $stored !== '' ? json_decode($stored, true) : [];
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+        ?>
+        <h2><?php _e('Bill Payments — Category Visibility', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom:14px;">
+            <?php _e('Enable or disable individual bill categories on the user dashboard. A disabled category is hidden from the Bill Payments tab strip and its AJAX endpoints reject incoming purchases server-side &mdash; safe to use for short-notice outages without redeploying. Existing transaction history remains visible regardless of these toggles.', 'matrix-mlm'); ?>
+        </p>
+        <table class="form-table">
+            <?php foreach ($categories as $slug => $meta):
+                // Default ON when no per-slug preference has been
+                // saved yet — matches is_category_enabled()'s
+                // missing-key default.
+                $checked = array_key_exists($slug, $stored) ? (bool) $stored[$slug] : true;
+                ?>
+                <tr>
+                    <th scope="row"><?php echo esc_html($meta['label']); ?></th>
+                    <td>
+                        <label>
+                            <input type="checkbox"
+                                   name="matrix_mlm_billing_category_visibility[<?php echo esc_attr($slug); ?>]"
+                                   value="1"
+                                   <?php checked($checked); ?>>
+                            <?php
+                            printf(
+                                /* translators: %s: category label, e.g. "Airtime" */
+                                esc_html__('Allow %s purchases on the user dashboard.', 'matrix-mlm'),
+                                esc_html($meta['label'])
+                            );
+                            ?>
+                        </label>
+                        <p class="description" style="margin-top:4px;">
+                            <?php echo esc_html($meta['description']); ?>
+                        </p>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+        </table>
+    <?php }
+
     private function save_settings() {
         $tab = sanitize_text_field($_POST['settings_tab']);
 
@@ -870,6 +956,27 @@ class Matrix_MLM_Admin_Settings {
                 // Credentials live on the Gateways page now; only save
                 // operational fields here.
                 $settings = ['matrix_mlm_fintava_min_payout', 'matrix_mlm_fintava_max_payout', 'matrix_mlm_fintava_charge_type', 'matrix_mlm_fintava_charge_value'];
+                break;
+            case 'bill_payments':
+                // Per-category visibility for the user-dashboard
+                // Bill Payments tab. POST shape is
+                //   matrix_mlm_billing_category_visibility[<slug>] = "1"
+                // for ticked boxes; unchecked boxes are absent from
+                // POST, which is how we know to record them as 0.
+                // Stored as a JSON map so adding a new category in
+                // a future version is a one-line BILL_CATEGORIES
+                // change without an option-key migration.
+                $posted_raw = isset($_POST['matrix_mlm_billing_category_visibility']) && is_array($_POST['matrix_mlm_billing_category_visibility'])
+                    ? $_POST['matrix_mlm_billing_category_visibility']
+                    : [];
+                $map = [];
+                foreach (Matrix_MLM_Fintava_Billing::BILL_CATEGORIES as $slug) {
+                    $map[$slug] = !empty($posted_raw[$slug]) ? 1 : 0;
+                }
+                update_option('matrix_mlm_billing_category_visibility', wp_json_encode($map));
+                // Settings stays empty; the JSON blob above is the
+                // only persisted change for this tab.
+                $settings = [];
                 break;
         }
 

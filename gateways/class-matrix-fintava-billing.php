@@ -50,8 +50,100 @@ class Matrix_MLM_Fintava_Billing {
     /** Lower bound — refuse zero/negative or absurdly small purchases. */
     const MIN_AMOUNT = 50;
 
+    /**
+     * Canonical list of bill categories. The order here is the
+     * display order in the user-facing tab strip and on the admin
+     * Bill Payments visibility toggle page. Adding a new category
+     * is a one-row change here PLUS:
+     *   - a render_<type>() method on Matrix_MLM_User_Billing,
+     *   - an entry in get_user_history() schema (see
+     *     Matrix_MLM_User_Billing::render_history_details()),
+     *   - a buy_<type>() method + ajax_buy_<type>() handler here,
+     *   - a row in DEFAULT_CAPS above.
+     */
+    const BILL_CATEGORIES = ['airtime', 'data', 'cable', 'electricity'];
+
     public function __construct() {
         $this->register_hooks();
+    }
+
+    /**
+     * Whether a given bill category is currently enabled for the
+     * user-facing dashboard.
+     *
+     * Resolution order:
+     *   1. Unknown / unregistered category -> false. Defensive: an
+     *      AJAX handler that lets a typo'd type through would be a
+     *      bug, so we fail closed.
+     *   2. The matrix_mlm_billing_category_visibility option is
+     *      read as a JSON-encoded category=>0|1 map. Missing keys
+     *      and an unparseable blob both default to TRUE so:
+     *        a. Fresh installs with no option saved show every
+     *           category (preserves the pre-toggle behaviour).
+     *        b. New categories added in a future plugin version
+     *           are visible by default until an admin toggles them.
+     *
+     * Called from three layers:
+     *   - The user-facing sub-tab nav (cosmetic — hides the link).
+     *   - The user-facing render_<type>() methods (defensive — a
+     *     direct ?service= URL or a stale page-cached link to a
+     *     since-disabled category falls through to the first
+     *     enabled category instead of rendering an orphan form).
+     *   - Each buy_<type> AJAX handler + verify_meter (server-side
+     *     defensive — refuses calls that bypass the rendered UI).
+     *
+     * The list_<type> handlers (data bundles, cable providers,
+     * cable plans, discos) are NOT gated — they return innocuous
+     * public Fintava catalog data, gating them would just stale
+     * the in-flight UI for an admin who toggled mid-session, and
+     * they all funnel into a buy_* call that IS gated.
+     *
+     * @param string $category One of self::BILL_CATEGORIES.
+     * @return bool TRUE if the category is enabled / visible.
+     */
+    public static function is_category_enabled($category) {
+        if (!in_array($category, self::BILL_CATEGORIES, true)) {
+            return false;
+        }
+
+        $raw = get_option('matrix_mlm_billing_category_visibility', '');
+        if (!is_string($raw) || $raw === '') {
+            return true;
+        }
+
+        $map = json_decode($raw, true);
+        if (!is_array($map) || !array_key_exists($category, $map)) {
+            return true;
+        }
+
+        return (bool) $map[$category];
+    }
+
+    /**
+     * Reject the in-flight AJAX request when the targeted bill
+     * category has been disabled by the admin. Centralised so the
+     * rejection message stays consistent across all five gated
+     * handlers (buy_airtime/data/cable/electricity, verify_meter)
+     * and so the gate sits in exactly one place — adding category
+     * #5 won't drift the gate semantics for the existing four.
+     *
+     * Note: this short-circuits via wp_send_json_error + exit, so
+     * callers do not need to handle a return value.
+     *
+     * @param string $category One of self::BILL_CATEGORIES.
+     */
+    private static function require_category_enabled_or_die($category) {
+        if (self::is_category_enabled($category)) {
+            return;
+        }
+        wp_send_json_error([
+            'message' => sprintf(
+                /* translators: %s: the bill category (e.g. "airtime"). */
+                __('%s purchases are temporarily disabled. Please try again later or contact support.', 'matrix-mlm'),
+                ucfirst($category)
+            ),
+            'category_disabled' => $category,
+        ]);
     }
 
     private function register_hooks() {
@@ -232,6 +324,12 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('Too many airtime purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
+        // Per-category kill switch (admin -> Settings -> Bill Payments).
+        // Runs AFTER the rate limit so a flood against a disabled
+        // category still costs the attacker counter slots, not just
+        // a cheap probe of the visibility option.
+        self::require_category_enabled_or_die('airtime');
+
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);
         $network = sanitize_text_field($_POST['network'] ?? '');
@@ -288,6 +386,8 @@ class Matrix_MLM_Fintava_Billing {
         )) {
             wp_send_json_error(['message' => __('Too many data purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
+
+        self::require_category_enabled_or_die('data');
 
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
@@ -355,6 +455,8 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('Too many cable purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
+        self::require_category_enabled_or_die('cable');
+
         $smartcard = sanitize_text_field($_POST['smartcard_number'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
         $provider = sanitize_text_field($_POST['provider'] ?? '');
@@ -411,6 +513,10 @@ class Matrix_MLM_Fintava_Billing {
             wp_send_json_error(['message' => __('Too many meter lookups. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
 
+        // verify_meter is only useful inside the Electricity flow,
+        // so it shares the electricity kill switch.
+        self::require_category_enabled_or_die('electricity');
+
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $disco = sanitize_text_field($_POST['disco'] ?? '');
         $meter_type = sanitize_text_field($_POST['meter_type'] ?? 'prepaid');
@@ -438,6 +544,8 @@ class Matrix_MLM_Fintava_Billing {
         )) {
             wp_send_json_error(['message' => __('Too many electricity purchases. Please wait a few minutes and try again.', 'matrix-mlm')]);
         }
+
+        self::require_category_enabled_or_die('electricity');
 
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);
