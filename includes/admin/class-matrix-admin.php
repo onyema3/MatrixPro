@@ -643,19 +643,111 @@ class Matrix_MLM_Admin {
         wp_send_json_success(['message' => __('User unbanned', 'matrix-mlm')]);
     }
 
+    /**
+     * Admin: directly credit a user's wallet.
+     *
+     * Hardened in audit fix C9:
+     *   - Re-checks the manage_matrix_settings capability (not just the
+     *     broader manage_matrix_mlm gate on the dispatcher), since
+     *     direct balance manipulation belongs alongside Settings/Backup
+     *     and not alongside day-to-day deposit/withdrawal review.
+     *   - Refuses non-positive amounts (a negative or zero "credit"
+     *     was previously a silent debit-via-credit path).
+     *   - Caps the per-call amount at a configurable ceiling so a
+     *     compromised admin session can't drain unlimited float in one
+     *     click.
+     *   - Records the acting admin's user id in the wallet description
+     *     and includes a stable reference (ADMIN-CREDIT-<actor>-<target>-<ts>)
+     *     so the matrix_wallet auditor row carries the actor identity
+     *     and is straightforward to reconcile.
+     */
     private function add_user_balance() {
-        $user_id = intval($_POST['user_id']);
-        $amount = floatval($_POST['amount']);
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_send_json_error(['message' => __('You do not have permission to adjust user balances.', 'matrix-mlm')]);
+        }
+
+        $user_id = intval($_POST['user_id'] ?? 0);
+        $amount = floatval($_POST['amount'] ?? 0);
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+        if ($amount <= 0) {
+            wp_send_json_error(['message' => __('Amount must be greater than zero.', 'matrix-mlm')]);
+        }
+
+        $cap = floatval(get_option('matrix_mlm_admin_balance_adjust_max', 1000000));
+        if ($cap > 0 && $amount > $cap) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: max allowed amount */
+                    __('Amount exceeds the per-action limit (%s).', 'matrix-mlm'),
+                    number_format($cap, 2)
+                ),
+            ]);
+        }
+
+        $actor_id = get_current_user_id();
+        $actor = get_userdata($actor_id);
+        $actor_login = $actor ? $actor->user_login : 'admin';
+        $reference = sprintf('ADMIN-CREDIT-%d-%d-%d', $actor_id, $user_id, time());
+        $description = sprintf(
+            /* translators: 1: admin login, 2: admin user id */
+            __('Admin credit by %1$s (#%2$d)', 'matrix-mlm'),
+            $actor_login,
+            $actor_id
+        );
+
         $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit($user_id, $amount, 'admin_credit', __('Admin credit', 'matrix-mlm'));
+        $result = $wallet->credit($user_id, $amount, 'admin_credit', $description, $reference);
+        if ($result === false) {
+            wp_send_json_error(['message' => __('Could not credit balance. Please try again.', 'matrix-mlm')]);
+        }
+
         wp_send_json_success(['message' => __('Balance added', 'matrix-mlm')]);
     }
 
+    /**
+     * Admin: directly debit a user's wallet. Same hardening as
+     * add_user_balance — see that method's docblock.
+     */
     private function subtract_user_balance() {
-        $user_id = intval($_POST['user_id']);
-        $amount = floatval($_POST['amount']);
+        if (!current_user_can('manage_matrix_settings')) {
+            wp_send_json_error(['message' => __('You do not have permission to adjust user balances.', 'matrix-mlm')]);
+        }
+
+        $user_id = intval($_POST['user_id'] ?? 0);
+        $amount = floatval($_POST['amount'] ?? 0);
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+        if ($amount <= 0) {
+            wp_send_json_error(['message' => __('Amount must be greater than zero.', 'matrix-mlm')]);
+        }
+
+        $cap = floatval(get_option('matrix_mlm_admin_balance_adjust_max', 1000000));
+        if ($cap > 0 && $amount > $cap) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s: max allowed amount */
+                    __('Amount exceeds the per-action limit (%s).', 'matrix-mlm'),
+                    number_format($cap, 2)
+                ),
+            ]);
+        }
+
+        $actor_id = get_current_user_id();
+        $actor = get_userdata($actor_id);
+        $actor_login = $actor ? $actor->user_login : 'admin';
+        $reference = sprintf('ADMIN-DEBIT-%d-%d-%d', $actor_id, $user_id, time());
+        $description = sprintf(
+            /* translators: 1: admin login, 2: admin user id */
+            __('Admin debit by %1$s (#%2$d)', 'matrix-mlm'),
+            $actor_login,
+            $actor_id
+        );
+
         $wallet = new Matrix_MLM_Wallet();
-        $result = $wallet->debit($user_id, $amount, 'admin_debit', __('Admin debit', 'matrix-mlm'));
+        $result = $wallet->debit($user_id, $amount, 'admin_debit', $description, $reference);
         if ($result === false) {
             wp_send_json_error(['message' => __('Insufficient balance', 'matrix-mlm')]);
         }
@@ -671,6 +763,30 @@ class Matrix_MLM_Admin {
         $user = get_userdata($user_id);
         if (!$user) {
             wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+
+        // Authorization: mirror the same gates change_user_password uses.
+        // The dispatcher's manage_matrix_mlm cap is too broad — it lets a
+        // deposit/withdrawal-reviewer admin rewrite any user's email,
+        // including the super admin's, which combined with WordPress
+        // password reset is a full account-takeover path (audit C8).
+        //
+        //   1. edit_user — same gate WordPress core uses on the user-edit
+        //      screen. Refuses to let a low-privileged admin edit a user
+        //      whose role they don't have permission for.
+        //   2. Self-edit — admins should change their own profile from
+        //      the standard WP profile screen so the standard re-auth
+        //      flow runs.
+        //   3. On multisite, refuse to let a non-super admin edit a
+        //      super admin.
+        if ($user_id === get_current_user_id()) {
+            wp_send_json_error(['message' => __('Use your WordPress profile page to edit your own account.', 'matrix-mlm')]);
+        }
+        if (is_multisite() && is_super_admin($user_id) && !is_super_admin()) {
+            wp_send_json_error(['message' => __('You do not have permission to edit a super admin\'s profile.', 'matrix-mlm')]);
+        }
+        if (!current_user_can('edit_user', $user_id)) {
+            wp_send_json_error(['message' => __('You do not have permission to edit this user.', 'matrix-mlm')]);
         }
 
         // Update WordPress user fields
