@@ -62,6 +62,15 @@ class Matrix_MLM_Admin {
         add_submenu_page('matrix-mlm', __('Payment Gateways', 'matrix-mlm'), __('Gateways', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-gateways', [new Matrix_MLM_Admin_Gateways(), 'render']);
         add_submenu_page('matrix-mlm', __('Deposits', 'matrix-mlm'), __('Deposits', 'matrix-mlm'), 'manage_matrix_deposits', 'matrix-mlm-deposits', [new Matrix_MLM_Admin_Deposits(), 'render']);
         add_submenu_page('matrix-mlm', __('Withdrawals', 'matrix-mlm'), __('Withdrawals', 'matrix-mlm'), 'manage_matrix_withdrawals', 'matrix-mlm-withdrawals', [new Matrix_MLM_Admin_Withdrawals(), 'render']);
+        // Bill Payments History (Item D). Sits between Withdrawals
+        // and Tickets so the three financial-ledger surfaces
+        // (Deposits / Withdrawals / Bill Payments) are
+        // visually adjacent. Page-level capability is
+        // manage_matrix_mlm — the same reviewer tier as Reports —
+        // so support staff can inspect the ledger; the per-row
+        // Refund button inside the page is gated separately on
+        // manage_options because issuing a refund moves money.
+        add_submenu_page('matrix-mlm', __('Bill Payments History', 'matrix-mlm'), __('Bill Payments', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-billing-history', [new Matrix_MLM_Admin_Billing_History(), 'render']);
         add_submenu_page('matrix-mlm', __('Support Tickets', 'matrix-mlm'), __('Tickets', 'matrix-mlm'), 'manage_matrix_tickets', 'matrix-mlm-tickets', [new Matrix_MLM_Admin_Tickets(), 'render']);
         add_submenu_page('matrix-mlm', __('Reports', 'matrix-mlm'), __('Reports', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-reports', [new Matrix_MLM_Admin_Reports(), 'render']);
         add_submenu_page('matrix-mlm', __('Frontend Manager', 'matrix-mlm'), __('Frontend', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-frontend', [new Matrix_MLM_Admin_Frontend(), 'render']);

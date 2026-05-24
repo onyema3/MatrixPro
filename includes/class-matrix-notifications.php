@@ -691,6 +691,97 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send a "we refunded your bill purchase" notification to the
+     * user. Fired by Matrix_MLM_Admin_Billing_History::ajax_refund()
+     * after the wallet credit and the audit row both land — at
+     * which point the refund is final from the user's POV and they
+     * deserve a clear, in-channel record of what was returned and
+     * why.
+     *
+     * Email-only by default; SMS twin sent when the operator has
+     * SMS verification enabled and the user has a phone on file,
+     * matching the existing send_commission_notification gating.
+     * No dedicated email template — uses the lightweight inline
+     * HTML body (matches send_deposit_notification on installs that
+     * don't have a deposit.php template either, defending against
+     * a missing template silently dropping the notice).
+     *
+     * Wallet-only: this notification does NOT claim Fintava
+     * reversed the underlying telco purchase. The body says "your
+     * Matrix wallet has been credited" because that is what
+     * actually happened — Fintava's billing endpoints do not
+     * expose a reversal API, so the platform absorbs the loss or
+     * recovers off-platform.
+     *
+     * @param int    $user_id        Recipient.
+     * @param string $type           One of airtime|data|cable|electricity (used in subject + body).
+     * @param float  $amount         Refund amount (in major units, e.g. naira).
+     * @param string $reason         Operator-entered reason. Surfaced verbatim
+     *                               to the user so the message is honest about
+     *                               why the refund happened.
+     * @param int    $transaction_id The matrix_billing_transactions row id; surfaced
+     *                               in the body so a user opening a support
+     *                               ticket can quote it back.
+     * @return void
+     */
+    public static function send_billing_refund_notification($user_id, $type, $amount, $reason, $transaction_id) {
+        $user = get_userdata((int) $user_id);
+        if (!$user) return;
+
+        $currency  = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount_str = $currency . number_format((float) $amount, 2);
+        $type_label = ucfirst(strtolower((string) $type));
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: bill category, e.g. "Airtime" */
+            __('[%1$s] %2$s Bill Payment Refunded', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $type_label
+        );
+
+        $dashboard_url = home_url('/matrix-dashboard/?tab=billing');
+
+        // Inline HTML body. We don't ship a refund-specific email
+        // template; building one would mean a new file in
+        // public/templates/emails/ for a single notification, and
+        // the deposit / withdrawal helpers above use the templated
+        // path because those landed earlier — newer surfaces
+        // (level-completion etc.) build the body inline. Same
+        // approach here.
+        $body  = '<p>' . sprintf(
+            /* translators: 1: username */
+            esc_html__('Hi %1$s,', 'matrix-mlm'),
+            esc_html($user->user_login)
+        ) . '</p>';
+        $body .= '<p>' . sprintf(
+            /* translators: 1: amount string, 2: bill type, 3: transaction id */
+            esc_html__('Your Matrix wallet has been credited with %1$s as a refund for %2$s purchase #%3$d.', 'matrix-mlm'),
+            esc_html($amount_str),
+            esc_html($type_label),
+            (int) $transaction_id
+        ) . '</p>';
+        $body .= '<p><strong>' . esc_html__('Reason:', 'matrix-mlm') . '</strong> ' . esc_html((string) $reason) . '</p>';
+        $body .= '<p>' . esc_html__('You can review the refund on your dashboard:', 'matrix-mlm') . ' <a href="' . esc_url($dashboard_url) . '">' . esc_html($dashboard_url) . '</a></p>';
+        $body .= '<p>' . esc_html__('If you believe this refund was issued in error, reply to this email or open a support ticket.', 'matrix-mlm') . '</p>';
+        $body .= '<p>— ' . esc_html(get_bloginfo('name')) . '</p>';
+
+        self::send_email($user->user_email, $subject, $body);
+
+        // SMS twin — same gating as send_commission_notification.
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone((int) $user_id);
+            if ($phone) {
+                self::send_sms($phone, sprintf(
+                    /* translators: 1: amount string, 2: bill type */
+                    __('Your Matrix wallet was credited with %1$s as a refund for your %2$s purchase. Log in to your dashboard for details.', 'matrix-mlm'),
+                    $amount_str,
+                    strtolower($type_label)
+                ));
+            }
+        }
+    }
+
+    /**
      * Send admin notification
      */
     public static function send_admin_notification($type, $message) {

@@ -48,6 +48,7 @@ class Matrix_MLM_Database {
         'matrix_fintava_wallets',
         'matrix_fintava_cards',
         'matrix_billing_transactions',
+        'matrix_billing_refunds',
         'matrix_subscriptions',
         'matrix_benefits',
         'matrix_cug_requests',

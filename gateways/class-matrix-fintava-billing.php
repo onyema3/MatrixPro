@@ -1009,7 +1009,8 @@ class Matrix_MLM_Fintava_Billing {
     }
 
     /**
-     * Create / migrate the matrix_billing_transactions table.
+     * Create / migrate the matrix_billing_transactions table and the
+     * sibling matrix_billing_refunds audit table.
      *
      * Idempotent. Runs on every plugin pageload via
      * Matrix_MLM_Database, so any new column / index added here
@@ -1024,11 +1025,32 @@ class Matrix_MLM_Fintava_Billing {
      * log_transaction) in lock-step with nominal_amount so any
      * third-party reader that hardcoded `SELECT amount` keeps
      * working until they migrate.
+     *
+     * Item D (this PR) adds:
+     *   - refunded_amount column on matrix_billing_transactions
+     *     (per-row cumulative sum of admin-initiated refunds; the
+     *     refund-cap on every new refund is total_charged minus
+     *     this value).
+     *   - Two new statuses on the status enum: `refunded` (cumulative
+     *     refunds == total_charged) and `partial_refund` (0 <
+     *     refunded_amount < total_charged). The pre-D `completed`
+     *     status no longer covers refunded rows, which is the
+     *     intended semantic — any third-party reader that compared
+     *     `status === 'completed'` will correctly stop counting a
+     *     refunded row toward "completed" totals.
+     *   - matrix_billing_refunds: append-only audit table, one row
+     *     per admin refund click. Holds admin_user_id + reason +
+     *     wallet_credit_reference so reconciliation can trace the
+     *     wallet credit back to the billing row that triggered it.
+     *     A separate table (vs. extending the transactions row) is
+     *     load-bearing because partial refunds emit multiple rows
+     *     against one transaction.
      */
     public static function create_table() {
         global $wpdb;
         $charset_collate = $wpdb->get_charset_collate();
         $table = $wpdb->prefix . 'matrix_billing_transactions';
+        $refunds_table = $wpdb->prefix . 'matrix_billing_refunds';
 
         // Detect whether the C-era columns already exist BEFORE
         // dbDelta runs, so we know whether to backfill afterwards.
@@ -1049,13 +1071,15 @@ class Matrix_MLM_Fintava_Billing {
             nominal_amount decimal(12,2) NOT NULL DEFAULT 0.00,
             service_fee decimal(12,2) NOT NULL DEFAULT 0.00,
             total_charged decimal(12,2) NOT NULL DEFAULT 0.00,
+            refunded_amount decimal(12,2) NOT NULL DEFAULT 0.00,
             details text,
             api_response text,
-            status enum('pending','completed','failed') NOT NULL DEFAULT 'completed',
+            status enum('pending','completed','failed','refunded','partial_refund') NOT NULL DEFAULT 'completed',
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             KEY user_id (user_id),
-            KEY type (type)
+            KEY type (type),
+            KEY status (status)
         ) $charset_collate;";
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
@@ -1080,6 +1104,69 @@ class Matrix_MLM_Fintava_Billing {
                    AND amount > 0"
             );
         }
+
+        // D-migration step 1: ensure the refunded_amount column
+        // exists. dbDelta DOES add the column reliably on tables
+        // that already had the table CREATE run — but the matching
+        // belt-and-braces probe-and-ALTER pattern is what the rest
+        // of the schema uses (see matrix-database.php's
+        // two_factor_recovery_codes block) so we mirror it here.
+        // Idempotent: the COUNT(*) skips the ALTER once the column
+        // exists.
+        $refunded_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+               AND COLUMN_NAME = 'refunded_amount'",
+            DB_NAME, $table
+        ));
+        if ($refunded_col_exists === 0) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   ADD COLUMN refunded_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00
+                   AFTER total_charged"
+            );
+        }
+
+        // D-migration step 2: widen the status enum to include
+        // 'refunded' and 'partial_refund'. dbDelta does not
+        // reliably extend enum values on an existing column across
+        // MySQL versions (the parser sometimes treats the enum
+        // spec as a no-op when the column already exists), so we
+        // probe COLUMN_TYPE directly. Same idiom matrix-database
+        // uses for the matrix_user_meta `inactive` enum widening.
+        // Idempotent: the strpos() check skips the ALTER once both
+        // values are already in the enum.
+        $status_col = $wpdb->get_row($wpdb->prepare(
+            "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'status'",
+            DB_NAME, $table
+        ));
+        if ($status_col
+            && (stripos((string) $status_col->COLUMN_TYPE, "'refunded'") === false
+                || stripos((string) $status_col->COLUMN_TYPE, "'partial_refund'") === false)) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   MODIFY status ENUM('pending','completed','failed','refunded','partial_refund')
+                          NOT NULL DEFAULT 'completed'"
+            );
+        }
+
+        // D-migration step 3: create the refunds audit table.
+        // CREATE TABLE IF NOT EXISTS via dbDelta is idempotent.
+        $refunds_sql = "CREATE TABLE $refunds_table (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            transaction_id bigint(20) UNSIGNED NOT NULL,
+            admin_user_id bigint(20) UNSIGNED NOT NULL,
+            amount decimal(12,2) NOT NULL,
+            reason text NOT NULL,
+            wallet_credit_reference varchar(100) NOT NULL,
+            created_at datetime DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY wallet_credit_reference (wallet_credit_reference),
+            KEY transaction_id (transaction_id),
+            KEY admin_user_id (admin_user_id)
+        ) $charset_collate;";
+        dbDelta($refunds_sql);
     }
 
     /**

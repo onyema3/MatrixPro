@@ -200,10 +200,23 @@ class Matrix_MLM_User_Billing {
                         ? floatval($tx->total_charged)
                         : floatval($tx->amount);
                     $display_fee = isset($tx->service_fee) ? floatval($tx->service_fee) : 0.0;
+                    // Item D: surface partial / full refunds. Legacy
+                    // rows pre-D have refunded_amount = 0 (column
+                    // default), so the subtitle is hidden for any row
+                    // that has not been touched by an admin refund.
+                    $display_refunded = isset($tx->refunded_amount) ? floatval($tx->refunded_amount) : 0.0;
+                    $tx_status        = isset($tx->status) ? (string) $tx->status : '';
                 ?>
                 <tr>
                     <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
-                    <td><span class="matrix-badge"><?php echo ucfirst($tx->type); ?></span></td>
+                    <td>
+                        <span class="matrix-badge"><?php echo ucfirst($tx->type); ?></span>
+                        <?php if ($tx_status === 'refunded' || $tx_status === 'partial_refund'): ?>
+                            <span class="matrix-badge matrix-badge-<?php echo esc_attr($tx_status); ?>" style="margin-left:4px;font-size:10px;">
+                                <?php echo $tx_status === 'refunded' ? esc_html__('Refunded', 'matrix-mlm') : esc_html__('Partial Refund', 'matrix-mlm'); ?>
+                            </span>
+                        <?php endif; ?>
+                    </td>
                     <td>
                         <?php echo esc_html($currency . number_format($display_total, 2)); ?>
                         <?php if ($display_fee > 0): ?>
@@ -213,6 +226,17 @@ class Matrix_MLM_User_Billing {
                                     /* translators: %s: currency-formatted service fee */
                                     esc_html__('inc. %s service fee', 'matrix-mlm'),
                                     esc_html($currency . number_format($display_fee, 2))
+                                );
+                                ?>
+                            </small>
+                        <?php endif; ?>
+                        <?php if ($display_refunded > 0): ?>
+                            <small style="display:block;color:#059669;font-size:11px;font-weight:600;">
+                                <?php
+                                printf(
+                                    /* translators: %s: currency-formatted refund amount */
+                                    esc_html__('refunded %s', 'matrix-mlm'),
+                                    esc_html($currency . number_format($display_refunded, 2))
                                 );
                                 ?>
                             </small>
