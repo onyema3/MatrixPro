@@ -1712,6 +1712,22 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => $eligibility['reason']]);
         }
 
+        // Dedicated "Transfer to Bank" toggle (matrix_mlm_fintava_payouts_enabled,
+        // default ON). Independent from is_active() and can_withdraw() so an
+        // admin can disable just the external bank-payout flow without taking
+        // down the entire Fintava integration or freezing every "money out"
+        // path. See Matrix_MLM_Admin_Gateways::save_fintava_settings() and the
+        // toggle's description on Gateways → Fintava for the rationale and
+        // operator semantics. This is the defence-in-depth gate paired with
+        // the UI-level hide in Matrix_MLM_User_Wallet::render_action_buttons —
+        // a tampered POST that bypasses the hidden button still hits this
+        // server-side check and gets a clean rejection.
+        if (!(int) get_option('matrix_mlm_fintava_payouts_enabled', 1)) {
+            wp_send_json_error([
+                'message' => __('Bank transfers via Fintava are currently disabled by the administrator. Please use the Bank Transfers (manual) request form instead, or try again later.', 'matrix-mlm'),
+            ]);
+        }
+
         if (!$this->is_active()) {
             wp_send_json_error(['message' => __('Bank payouts are not available at the moment.', 'matrix-mlm')]);
         }
