@@ -318,10 +318,10 @@ class Matrix_MLM_Admin_Migration {
                     <th><?php _e('Card Status', 'matrix-mlm'); ?></th>
                     <td>
                         <select id="link_card_status">
-                            <option value="active"><?php _e('Active', 'matrix-mlm'); ?></option>
+                            <option value="pending"><?php _e('Pending', 'matrix-mlm'); ?></option>
                             <option value="linked"><?php _e('Linked', 'matrix-mlm'); ?></option>
                             <option value="delivered"><?php _e('Delivered', 'matrix-mlm'); ?></option>
-                            <option value="pending"><?php _e('Pending', 'matrix-mlm'); ?></option>
+                            <option value="active"><?php _e('Active', 'matrix-mlm'); ?></option>
                         </select>
                     </td>
                 </tr>
@@ -1253,7 +1253,12 @@ class Matrix_MLM_Admin_Migration {
                         'card_type' => sanitize_text_field($data['card_type'] ?? 'STATIC_NO_ACCOUNT'),
                         'card_brand' => sanitize_text_field($data['card_brand'] ?? 'VERVE'),
                         'last_four' => sanitize_text_field($data['last_four'] ?? ''),
-                        'status' => sanitize_text_field($data['card_status'] ?? 'active'),
+                        // Default to 'pending' rather than 'active' so a row
+                        // imported with no explicit card_status doesn't claim
+                        // the card is live on Fintava when it's actually
+                        // never been linked. The dashboard's pending-state
+                        // flow lets the user run link+activate themselves.
+                        'status' => sanitize_text_field($data['card_status'] ?? 'pending'),
                     ];
 
                     if ($existing_card) {

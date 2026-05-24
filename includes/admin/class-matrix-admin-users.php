@@ -258,6 +258,18 @@ class Matrix_MLM_Admin_Users {
                 </table>
 
                 <h3><?php _e('Quick Actions', 'matrix-mlm'); ?></h3>
+                <?php
+                // Only surface the Reset Card affordance when the user
+                // actually has a card row to reset. The button is the
+                // recovery lever for cards whose local state desynced
+                // from Fintava (e.g. imported with status='active' but
+                // never actually linked); see reset_card() in
+                // class-matrix-admin.php.
+                $user_card_row = $wpdb->get_row($wpdb->prepare(
+                    "SELECT id, status FROM {$wpdb->prefix}matrix_fintava_cards WHERE user_id = %d ORDER BY id DESC LIMIT 1",
+                    $user_id
+                ));
+                ?>
                 <div class="matrix-admin-actions">
                     <?php if ($meta->status === 'active'): ?>
                     <button class="button button-secondary" onclick="matrixAdminAction('ban_user', {user_id: <?php echo $user_id; ?>})"><?php _e('Ban User', 'matrix-mlm'); ?></button>
@@ -266,6 +278,9 @@ class Matrix_MLM_Admin_Users {
                     <?php endif; ?>
                     <button class="button" onclick="matrixAddBalance(<?php echo $user_id; ?>)"><?php _e('Add Balance', 'matrix-mlm'); ?></button>
                     <button class="button" onclick="matrixSubtractBalance(<?php echo $user_id; ?>)"><?php _e('Subtract Balance', 'matrix-mlm'); ?></button>
+                    <?php if ($user_card_row): ?>
+                    <button class="button" onclick="matrixResetCard(<?php echo $user_id; ?>, '<?php echo esc_js($user_card_row->status); ?>')"><?php _e('Reset Card', 'matrix-mlm'); ?></button>
+                    <?php endif; ?>
                 </div>
             </div>
 
@@ -347,6 +362,17 @@ class Matrix_MLM_Admin_Users {
                     alert(res.success ? res.data.message : (res.data.message || 'Error'));
                     if (res.success) location.reload();
                 });
+            }
+
+            // Admin "Reset Card" — clears local card row state (status,
+            // last_four, activated_at) so the user can re-run the proper
+            // link+activate flow from their dashboard. The Fintava
+            // cardMapId on the row is preserved.
+            function matrixResetCard(userId, currentStatus) {
+                var msg = 'Reset this user\'s card from "' + currentStatus + '" back to "pending"?\n\n'
+                    + 'They will need to reload their card page and re-enter their card PAN to link and activate it. The cardMapId on Fintava is preserved.';
+                if (!confirm(msg)) return;
+                matrixAdminAction('reset_card', { user_id: userId });
             }
             </script>
 
