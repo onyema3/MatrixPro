@@ -2515,21 +2515,34 @@ class Matrix_MLM_Fintava {
             $reference
         ));
 
-        if (!$payout || $payout->status === 'completed') {
+        if (!$payout) {
             return;
         }
 
-        $wpdb->update(
+        // Conditional UPDATE: transition pending/processing -> completed
+        // exactly once. Refuses to "promote" a payout that is already
+        // failed or refunded — that closes M3, where a delayed
+        // transfer.success delivery arriving after the refund flow
+        // could otherwise re-mark the row as completed and leave the
+        // user with both the refund AND the bank settlement.
+        $rows = $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_payouts',
             [
                 'status' => 'completed',
                 'completed_at' => current_time('mysql'),
                 'updated_at' => current_time('mysql'),
             ],
-            ['id' => $payout->id],
+            ['id' => $payout->id, 'status' => 'pending'],
             ['%s', '%s', '%s'],
-            ['%d']
+            ['%d', '%s']
         );
+
+        if ($rows !== 1) {
+            // Either another delivery already completed this row, or
+            // it has moved to failed/refunded — don't double-fire the
+            // user notification.
+            return;
+        }
 
         $user = get_userdata($payout->user_id);
         if ($user) {
@@ -2555,26 +2568,60 @@ class Matrix_MLM_Fintava {
             $reference
         ));
 
-        if (!$payout || in_array($payout->status, ['failed', 'refunded'], true)) {
+        if (!$payout) {
             return;
         }
 
-        $wpdb->update(
+        // Conditional UPDATE: only the first delivery that flips
+        // pending -> failed wins the right to credit the refund. A
+        // duplicate webhook (or an at-least-once redelivery) sees
+        // affected_rows == 0 and bails before the wallet credit. This
+        // closes the H3 TOCTOU where the original SELECT-then-UPDATE
+        // pattern could let two parallel deliveries both pass the
+        // status check, both update, and both refund.
+        $rows = $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_payouts',
-            ['status' => 'failed', 'failure_reason' => $reason, 'updated_at' => current_time('mysql')],
-            ['id' => $payout->id],
+            [
+                'status' => 'failed',
+                'failure_reason' => $reason,
+                'updated_at' => current_time('mysql'),
+            ],
+            ['id' => $payout->id, 'status' => 'pending'],
             ['%s', '%s', '%s'],
-            ['%d']
+            ['%d', '%s']
         );
 
+        if ($rows !== 1) {
+            // Already failed/refunded by another delivery, or the row
+            // is past the in-flight window. Either way, don't refund
+            // again.
+            return;
+        }
+
         $wallet = new Matrix_MLM_Wallet();
-        $wallet->credit(
+        $credited = $wallet->credit(
             $payout->user_id,
             $payout->total_debit,
             'fintava_payout_refund',
             sprintf(__('Refund: Bank transfer failed - %s (Ref: %s)', 'matrix-mlm'), $reason, $reference),
             $reference
         );
+
+        if ($credited === false) {
+            // Refund could not be persisted. Don't move to 'refunded'
+            // — leaving the row in 'failed' so a later reconciliation
+            // job can detect the gap. Alarm operators.
+            error_log(sprintf(
+                '[Matrix Fintava] CRITICAL: refund credit failed for payout ref=%s user_id=%d amount=%.2f',
+                $reference, $payout->user_id, $payout->total_debit
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_payout_refund_failed',
+                sprintf(__('Bank payout failed but refund could not be persisted. Ref: %s, User: #%d, Amount: %.2f', 'matrix-mlm'),
+                    $reference, $payout->user_id, $payout->total_debit)
+            );
+            return;
+        }
 
         $wpdb->update(
             $wpdb->prefix . 'matrix_fintava_payouts',

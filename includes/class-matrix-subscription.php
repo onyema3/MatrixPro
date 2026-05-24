@@ -60,7 +60,15 @@ class Matrix_MLM_Subscription {
     }
 
     /**
-     * Charge all active users for the monthly subscription
+     * Charge all active users for the monthly subscription.
+     *
+     * Per-user serialization: each user-month gets a MySQL advisory
+     * lock for the duration of the charge so a manual pay_subscription
+     * request firing concurrently with the cron sweep can't both
+     * debit and both insert as 'paid'. The UNIQUE KEY (user_id,
+     * billing_month) on matrix_subscriptions is the secondary guard,
+     * but we still want to avoid duplicate debits, which the unique
+     * key alone does not prevent.
      */
     private function charge_active_users($amount, $billing_month) {
         global $wpdb;
@@ -70,30 +78,45 @@ class Matrix_MLM_Subscription {
         );
 
         $wallet = new Matrix_MLM_Wallet();
-        $currency = get_option('matrix_mlm_currency_symbol', '₦');
 
         foreach ($active_users as $user) {
-            // Check if already paid for this month
-            if ($this->has_paid_for_month($user->user_id, $billing_month)) {
+            $lock_name = 'mlm_sub_' . md5($user->user_id . ':' . $billing_month);
+            $got_lock = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 2)", $lock_name));
+            if ($got_lock !== 1) {
+                // Another process is mid-charge for this user-month;
+                // skip this iteration. The next cron tick will pick up
+                // any users that legitimately remained unpaid.
                 continue;
             }
 
-            $balance = $wallet->get_balance($user->user_id);
+            try {
+                if ($this->has_paid_for_month($user->user_id, $billing_month)) {
+                    continue;
+                }
 
-            if ($balance >= $amount) {
-                // Auto-debit from Matrix wallet
-                $wallet->debit(
-                    $user->user_id,
-                    $amount,
-                    'subscription',
-                    sprintf(__('Monthly subscription fee - %s', 'matrix-mlm'), date('F Y'))
-                );
+                $balance = $wallet->get_balance($user->user_id);
 
-                // Record payment
-                $this->record_payment($user->user_id, $amount, $billing_month, 'paid');
-            } else {
-                // Record as unpaid (will be deactivated after grace period)
-                $this->record_payment($user->user_id, $amount, $billing_month, 'unpaid');
+                if ($balance >= $amount) {
+                    $debited = $wallet->debit(
+                        $user->user_id,
+                        $amount,
+                        'subscription',
+                        sprintf(__('Monthly subscription fee - %s', 'matrix-mlm'), date('F Y')),
+                        'SUB-' . $user->user_id . '-' . $billing_month
+                    );
+                    if ($debited === false) {
+                        // Race or insufficient balance — fall through
+                        // to record as unpaid so the grace-period sweep
+                        // can retry.
+                        $this->record_payment($user->user_id, $amount, $billing_month, 'unpaid');
+                        continue;
+                    }
+                    $this->record_payment($user->user_id, $amount, $billing_month, 'paid');
+                } else {
+                    $this->record_payment($user->user_id, $amount, $billing_month, 'unpaid');
+                }
+            } finally {
+                $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
             }
         }
     }
@@ -212,7 +235,13 @@ class Matrix_MLM_Subscription {
     }
 
     /**
-     * Manually pay subscription (user action from dashboard)
+     * Manually pay subscription (user action from dashboard).
+     *
+     * Per-user-month advisory lock prevents the parallel-clicks /
+     * cron-collision race where two requests both pass
+     * has_paid_for_month, both debit the wallet, and the second
+     * record_payment INSERT collides on the UNIQUE (user_id,
+     * billing_month) — leaving the wallet double-debited.
      */
     public function manual_pay($user_id) {
         $amount = floatval(get_option('matrix_mlm_subscription_amount', 0));
@@ -222,35 +251,49 @@ class Matrix_MLM_Subscription {
 
         $current_month = date('Y-m');
 
-        if ($this->has_paid_for_month($user_id, $current_month)) {
-            return ['success' => false, 'message' => __('You have already paid for this month.', 'matrix-mlm')];
-        }
-
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
-
-        if ($balance < $amount) {
-            return ['success' => false, 'message' => __('Insufficient Matrix wallet balance.', 'matrix-mlm')];
-        }
-
-        $wallet->debit(
-            $user_id,
-            $amount,
-            'subscription',
-            sprintf(__('Monthly subscription fee - %s', 'matrix-mlm'), date('F Y'))
-        );
-
-        $this->record_payment($user_id, $amount, $current_month, 'paid');
-
-        // Reactivate user if they were inactive due to subscription
         global $wpdb;
-        $wpdb->update(
-            $wpdb->prefix . 'matrix_user_meta',
-            ['status' => 'active'],
-            ['user_id' => $user_id, 'status' => 'inactive']
-        );
+        $lock_name = 'mlm_sub_' . md5($user_id . ':' . $current_month);
+        $got_lock = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 5)", $lock_name));
+        if ($got_lock !== 1) {
+            return ['success' => false, 'message' => __('Another payment is in progress, please try again.', 'matrix-mlm')];
+        }
 
-        return ['success' => true, 'message' => __('Subscription paid successfully! Your account is active.', 'matrix-mlm')];
+        try {
+            if ($this->has_paid_for_month($user_id, $current_month)) {
+                return ['success' => false, 'message' => __('You have already paid for this month.', 'matrix-mlm')];
+            }
+
+            $wallet = new Matrix_MLM_Wallet();
+            $balance = $wallet->get_balance($user_id);
+
+            if ($balance < $amount) {
+                return ['success' => false, 'message' => __('Insufficient Matrix wallet balance.', 'matrix-mlm')];
+            }
+
+            $debited = $wallet->debit(
+                $user_id,
+                $amount,
+                'subscription',
+                sprintf(__('Monthly subscription fee - %s', 'matrix-mlm'), date('F Y')),
+                'SUB-' . $user_id . '-' . $current_month
+            );
+            if ($debited === false) {
+                return ['success' => false, 'message' => __('Could not debit wallet. Please try again.', 'matrix-mlm')];
+            }
+
+            $this->record_payment($user_id, $amount, $current_month, 'paid');
+
+            // Reactivate user if they were inactive due to subscription
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_user_meta',
+                ['status' => 'active'],
+                ['user_id' => $user_id, 'status' => 'inactive']
+            );
+
+            return ['success' => true, 'message' => __('Subscription paid successfully! Your account is active.', 'matrix-mlm')];
+        } finally {
+            $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
+        }
     }
 
     /**
