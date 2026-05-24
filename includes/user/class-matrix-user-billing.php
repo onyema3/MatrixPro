@@ -17,22 +17,47 @@ class Matrix_MLM_User_Billing {
         $billing = new Matrix_MLM_Fintava_Billing();
         $history = $billing->get_user_history($user_id, null, 10);
         $sub_tab = sanitize_text_field($_GET['service'] ?? 'airtime');
-        $fintava = new Matrix_MLM_Fintava();
-        $has_fintava_wallet = $fintava->user_has_wallet($user_id);
+        // Matrix_MLM_Fintava_Billing::MIN_AMOUNT is the floor every
+        // upstream call enforces (see validate_amount), so use it as
+        // the threshold for the "your balance is too low" inline
+        // warning rather than a magic number that could drift.
+        $min_amount = Matrix_MLM_Fintava_Billing::MIN_AMOUNT;
+        $low_balance = ($balance < $min_amount);
         ?>
         <h2><?php _e('Bill Payments', 'matrix-mlm'); ?></h2>
-        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Fintava virtual wallet.', 'matrix-mlm'); ?></p>
+        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Matrix wallet.', 'matrix-mlm'); ?></p>
 
-        <?php if (!$has_fintava_wallet): ?>
-        <div class="matrix-alert matrix-alert-warning">
-            <?php _e('You need a Fintava virtual wallet to pay bills. All bill payments are debited directly from your Fintava wallet balance.', 'matrix-mlm'); ?>
-            <a href="<?php echo Matrix_MLM_User_Dashboard::tab_url('wallet'); ?>" class="matrix-btn matrix-btn-primary" style="margin-left: 12px;"><?php _e('Create Fintava Wallet', 'matrix-mlm'); ?></a>
-        </div>
-        <?php else: ?>
+        <?php
+        // Note: bill payments do NOT require a Fintava virtual wallet.
+        // Fintava charges the merchant master account when the billing
+        // endpoints are called; we reimburse the merchant by debiting
+        // the user's matrix_user_meta.balance up-front (see the
+        // class-level docblock on Matrix_MLM_Fintava_Billing). An
+        // earlier revision of this template gated the whole page on
+        // user_has_wallet() and told users they needed a Fintava
+        // virtual wallet first — that gate was incorrect and blocked
+        // legitimate users from a feature they could otherwise use.
+        ?>
 
         <div class="matrix-info-box" style="margin-bottom:16px;">
-            <p><strong><?php _e('Payment Source:', 'matrix-mlm'); ?></strong> <?php _e('Fintava Virtual Wallet', 'matrix-mlm'); ?></p>
-            <p style="font-size:12px;color:#6b7280;"><?php _e('All bill payments are charged to your Fintava wallet. Ensure your Fintava wallet has sufficient balance.', 'matrix-mlm'); ?></p>
+            <p style="margin:0;"><strong><?php _e('Payment Source:', 'matrix-mlm'); ?></strong> <?php _e('Matrix Wallet', 'matrix-mlm'); ?></p>
+            <p style="margin:6px 0 0;font-size:13px;color:#374151;">
+                <?php _e('Available balance:', 'matrix-mlm'); ?>
+                <strong><?php echo esc_html($currency . number_format($balance, 2)); ?></strong>
+                <a href="<?php echo esc_url(Matrix_MLM_User_Dashboard::tab_url('deposits')); ?>" style="margin-left:10px;font-size:12px;"><?php _e('Add funds &rarr;', 'matrix-mlm'); ?></a>
+            </p>
+            <?php if ($low_balance): ?>
+            <p style="margin:6px 0 0;font-size:12px;color:#b91c1c;">
+                <?php
+                printf(
+                    /* translators: %1$s: currency symbol, %2$s: minimum amount, formatted */
+                    esc_html__('Your balance is below the minimum bill amount of %1$s%2$s. Please fund your wallet before submitting a purchase.', 'matrix-mlm'),
+                    esc_html($currency),
+                    esc_html(number_format($min_amount, 2))
+                );
+                ?>
+            </p>
+            <?php endif; ?>
         </div>
 
         <!-- Service Tabs -->
@@ -67,14 +92,12 @@ class Matrix_MLM_User_Billing {
                     <td><?php echo date('M d, Y H:i', strtotime($tx->created_at)); ?></td>
                     <td><span class="matrix-badge"><?php echo ucfirst($tx->type); ?></span></td>
                     <td><?php echo $currency . number_format($tx->amount, 2); ?></td>
-                    <td><small><?php echo esc_html(implode(' | ', array_filter($details ?? []))); ?></small></td>
+                    <td><small><?php echo $this->render_history_details($tx->type, $details); ?></small></td>
                 </tr>
                 <?php endforeach; ?>
             </tbody>
         </table>
         <?php endif; ?>
-
-        <?php endif; // end has_fintava_wallet check ?>
 
         <style>
         .matrix-subtitle { color: #6b7280; margin: -10px 0 20px; font-size: 14px; }
@@ -84,6 +107,95 @@ class Matrix_MLM_User_Billing {
         .matrix-billing-tabs a:hover { color: #4f46e5; }
         </style>
         <?php
+    }
+
+    /**
+     * Render the details cell of a row in the user-facing bill-history
+     * table as a compact list of "Label: value" pairs scoped to fields
+     * the user actually cares about, separated by a middle-dot.
+     *
+     * Example outputs:
+     *   airtime     -> "Phone: 08012345678 · Network: MTN"
+     *   data        -> "Phone: 08012345678 · Network: MTN · Plan: P-1GB-30D"
+     *   cable       -> "Smartcard: 1234567890 · Provider: DSTV · Plan: COMPACT"
+     *   electricity -> "Meter: 04123456789 · Disco: EKEDC · Type: prepaid · Token: 1234-5678-9012"
+     *
+     * The internal accounting field `debit_ref` is intentionally NOT
+     * surfaced — it lives in matrix_wallet alongside the BILL-… and
+     * REFUND-BILL-… auditor rows, which is where ops reconcile from.
+     * Showing it in the user history was just visual noise.
+     *
+     * Per-type schemas declare both the key in the JSON `details`
+     * payload and the user-facing label, in display order. Adding a
+     * new bill type or a new surfaceable field is a one-row change
+     * here. Unknown types fall back to a generic "show every scalar
+     * value, exclude debit_ref" rendering so a partially-rolled-out
+     * type doesn't render an empty cell.
+     *
+     * @param string $type    One of airtime|data|cable|electricity.
+     * @param mixed  $details Decoded JSON from matrix_billing_transactions.details.
+     * @return string Safe-to-echo HTML (only <strong> from this method;
+     *                values pass through esc_html).
+     */
+    private function render_history_details($type, $details) {
+        if (!is_array($details) || empty($details)) {
+            return '';
+        }
+
+        // Per-type field schema: key-in-JSON => user-facing label.
+        // Order is the display order. __() runs at request time so
+        // translations are honoured.
+        $schemas = [
+            'airtime' => [
+                'phone'   => __('Phone', 'matrix-mlm'),
+                'network' => __('Network', 'matrix-mlm'),
+            ],
+            'data' => [
+                'phone'   => __('Phone', 'matrix-mlm'),
+                'network' => __('Network', 'matrix-mlm'),
+                'plan_id' => __('Plan', 'matrix-mlm'),
+            ],
+            'cable' => [
+                'smartcard' => __('Smartcard', 'matrix-mlm'),
+                'provider'  => __('Provider', 'matrix-mlm'),
+                'plan_id'   => __('Plan', 'matrix-mlm'),
+            ],
+            'electricity' => [
+                'meter' => __('Meter', 'matrix-mlm'),
+                'disco' => __('Disco', 'matrix-mlm'),
+                'type'  => __('Type', 'matrix-mlm'),
+                'token' => __('Token', 'matrix-mlm'),
+            ],
+        ];
+
+        $schema = $schemas[$type] ?? null;
+        $rows = [];
+
+        if (is_array($schema)) {
+            foreach ($schema as $key => $label) {
+                $val = $details[$key] ?? null;
+                if ($val === null || $val === '') {
+                    continue;
+                }
+                $rows[] = '<strong>' . esc_html($label) . ':</strong> ' . esc_html((string) $val);
+            }
+        } else {
+            // Defensive fallback: unknown type. Show every scalar
+            // entry except the internal debit_ref / api_response so
+            // a future bill category that ships before this method
+            // is taught about it still renders something useful.
+            foreach ($details as $key => $val) {
+                if ($key === 'debit_ref' || $key === 'api_response') {
+                    continue;
+                }
+                if (!is_scalar($val) || $val === '') {
+                    continue;
+                }
+                $rows[] = '<strong>' . esc_html(ucfirst(str_replace('_', ' ', (string) $key))) . ':</strong> ' . esc_html((string) $val);
+            }
+        }
+
+        return implode(' &middot; ', $rows);
     }
 
     // =========================================================================
