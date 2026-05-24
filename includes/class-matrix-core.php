@@ -777,6 +777,14 @@ class Matrix_MLM_Core {
     private function process_fetch_subtree() {
         $position_id = isset($_POST['position_id']) ? (int) $_POST['position_id'] : 0;
         $from_level  = isset($_POST['from_level'])  ? (int) $_POST['from_level']  : 0;
+        // Optional: when the genealogy view is rendered against a
+        // pivoted root (?pivot_user_id=X), the JS forwards the current
+        // tree's root user id so the lazy-loaded subtree is classified
+        // as direct vs spillover relative to that pivot — matching how
+        // every node already on the page was rendered. Falls back to
+        // the actual viewer when the request omits it (the unpivoted
+        // case, which is also the common case).
+        $root_user_id_raw = isset($_POST['root_user_id']) ? (int) $_POST['root_user_id'] : 0;
 
         if ($position_id <= 0 || $from_level <= 0) {
             wp_send_json_error(['message' => __('Invalid request.', 'matrix-mlm')]);
@@ -827,6 +835,29 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => __('Could not build subtree.', 'matrix-mlm')]);
         }
 
+        // Decide which user id the renderer should treat as the tree's
+        // root for direct/spillover classification. Defaults to the
+        // viewer themselves; if the client passed a different
+        // root_user_id (the pivoted-view case) we accept it only when
+        // that user has a position in this plan AND the viewer can see
+        // it — i.e., the same auth gate the page-level pivot uses, so
+        // the AJAX path can never grant visibility the pivoted page
+        // wouldn't have.
+        $effective_root_user_id = $current_user_id;
+        if ($root_user_id_raw > 0 && $root_user_id_raw !== $current_user_id) {
+            $root_position_id = $plan_engine->get_position_id_for_user_in_plan(
+                $root_user_id_raw,
+                (int) $row->plan_id
+            );
+            if ($root_position_id > 0
+                && $plan_engine->user_can_view_position($current_user_id, $root_position_id)) {
+                $effective_root_user_id = $root_user_id_raw;
+            }
+            // Silently fall back to the viewer otherwise — same
+            // behaviour as the page render rejects an unauthorised
+            // ?pivot_user_id and shows the viewer's own tree.
+        }
+
         // Render only the children block (the parent node itself is
         // already on the page — this AJAX call replaces the expand
         // button under it with a freshly-rendered .matrix-tree-children
@@ -837,7 +868,7 @@ class Matrix_MLM_Core {
         $renderer->render_children_inner(
             $tree,
             (int) $row->plan_width,
-            $current_user_id,
+            $effective_root_user_id,
             $max_depth
         );
         echo '</div>';

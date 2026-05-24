@@ -860,6 +860,132 @@ class Matrix_MLM_Plan_Engine {
     }
 
     /**
+     * Resolve a (user_id, plan_id) pair to the matrix_positions.id of
+     * that user's active position in that plan.
+     *
+     * Lightweight lookup pulled out as its own method because both the
+     * click-to-pivot URL handler and the lazy-load AJAX authoriser
+     * need it: the pivot flow has to translate the user id in
+     * ?pivot_user_id=X to a position id before user_can_view_position()
+     * can vet the request, and the AJAX endpoint does the same when
+     * validating the root_user_id POST parameter.
+     *
+     * Returns 0 (rather than null) when the user has no active
+     * position in the plan, so callers can keep the int contract and
+     * use a single comparator. Status is filtered to 'active' to
+     * match every other place the genealogy view treats inactive /
+     * completed positions as not-on-the-tree.
+     *
+     * @param int $user_id  WP user id.
+     * @param int $plan_id  Plan id.
+     * @return int matrix_positions.id, or 0 when no active position.
+     */
+    public function get_position_id_for_user_in_plan($user_id, $plan_id) {
+        global $wpdb;
+        $user_id = (int) $user_id;
+        $plan_id = (int) $plan_id;
+        if ($user_id <= 0 || $plan_id <= 0) {
+            return 0;
+        }
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}matrix_positions
+              WHERE user_id = %d AND plan_id = %d AND status = 'active'
+              ORDER BY id ASC LIMIT 1",
+            $user_id, $plan_id
+        ));
+    }
+
+    /**
+     * Compute the breadcrumb path from a viewer down to a pivoted
+     * descendant in the genealogy tree.
+     *
+     * Returns an ordered list of [position_id, user_id, username]
+     * entries running from the viewer (first element) to the pivot
+     * (last element), inclusive on both ends. The genealogy renderer
+     * uses this to draw a clickable trail above the tree when a
+     * member has navigated into someone else's subtree — each
+     * intermediate crumb is a one-click jump back to that ancestor's
+     * view, and the first crumb (the viewer themselves) un-pivots the
+     * URL entirely.
+     *
+     * Implementation walks parent_id up from $pivot_position_id and
+     * stops as soon as it lands on a position owned by
+     * $viewer_user_id. The capped iteration count (30) matches
+     * user_can_view_position()'s ceiling so a corrupted parent chain
+     * can't spin forever; in practice every legitimate matrix tops
+     * out at depth 20 (the validate_matrix() upper bound).
+     *
+     * Returns an empty array when the pivot is not in the viewer's
+     * downline (for example, a stale URL after an admin moved the
+     * pivot user into a different sub-tree). Callers should already
+     * have authorised via user_can_view_position() before calling
+     * this — an empty return is then strictly a "couldn't render
+     * crumbs" defensive path, not a fresh access-control gate.
+     *
+     * @param int $pivot_position_id matrix_positions.id of the user
+     *                                being pivoted onto.
+     * @param int $viewer_user_id    WP user id of the actual logged-in
+     *                                viewer (the root of the trail).
+     * @return array<int, array{position_id:int, user_id:int, username:string}>
+     */
+    public function build_pivot_breadcrumbs($pivot_position_id, $viewer_user_id) {
+        global $wpdb;
+
+        $pivot_position_id = (int) $pivot_position_id;
+        $viewer_user_id    = (int) $viewer_user_id;
+        if ($pivot_position_id <= 0 || $viewer_user_id <= 0) {
+            return [];
+        }
+
+        $path       = [];
+        $current_id = $pivot_position_id;
+
+        for ($hops = 0; $hops < 30; $hops++) {
+            $row = $wpdb->get_row($wpdb->prepare(
+                "SELECT p.id, p.user_id, p.parent_id, u.user_login
+                   FROM {$wpdb->prefix}matrix_positions p
+                   LEFT JOIN {$wpdb->users} u ON p.user_id = u.ID
+                  WHERE p.id = %d",
+                $current_id
+            ));
+            if (!$row) {
+                // A row went missing between our auth check and now
+                // (race with admin Move-in-Genealogy or deletion).
+                // Bail with whatever crumbs we already collected — at
+                // worst the breadcrumb bar is short, never wrong.
+                break;
+            }
+
+            $path[] = [
+                'position_id' => (int) $row->id,
+                'user_id'     => (int) $row->user_id,
+                'username'    => (string) ($row->user_login ?: ''),
+            ];
+
+            // Reached the viewer's own position — that's the top of
+            // the trail. Stop here so we don't keep walking past the
+            // viewer into someone else's tree (would only happen on
+            // a corrupted chain, but defensive).
+            if ((int) $row->user_id === $viewer_user_id) {
+                break;
+            }
+
+            // Hit the global root without finding the viewer. Should
+            // not happen if user_can_view_position() said yes, but
+            // bail defensively rather than loop forever.
+            if (!$row->parent_id) {
+                break;
+            }
+
+            $current_id = (int) $row->parent_id;
+        }
+
+        // Walk produced the path from pivot up to viewer; flip it so
+        // crumb[0] is the viewer and crumb[count-1] is the pivot.
+        return array_reverse($path);
+    }
+
+    /**
      * Build a partial subtree starting from an arbitrary position id.
      *
      * Public wrapper around the recursive builder that the genealogy
