@@ -96,8 +96,12 @@ class Matrix_MLM_Fintava_Card {
      *
      * POST /cards/physical/request
      *
-     * Payload (all camelCase, per Fintava's DTO):
-     *   - cardBrand:     'Verve' (only brand currently supported)
+     * Payload (all camelCase keys, per Fintava's DTO):
+     *   - cardBrand:     'VERVE' — Fintava enforces a strict UPPERCASE
+     *                    enum (VISA | MASTERCARD | VERVE). Sending
+     *                    'Verve' yields:
+     *                    "cardBrand must be one of the following
+     *                     values: VISA, MASTERCARD, VERVE".
      *   - cardName:      Embossed name on the card.
      *   - accountNumber: The customer's virtual NUBAN
      *                    (= $wallet->account_number).
@@ -133,7 +137,7 @@ class Matrix_MLM_Fintava_Card {
         }
 
         $payload = [
-            'cardBrand'     => 'Verve',
+            'cardBrand'     => 'VERVE',
             'cardName'      => $card_name,
             'accountNumber' => $wallet->account_number,
             'cardType'      => 'STATIC_NO_ACCOUNT',
