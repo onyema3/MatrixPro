@@ -585,6 +585,12 @@ class Matrix_MLM_Admin {
             case 'approve_deposit':
                 $this->approve_deposit();
                 break;
+            case 'zebra_capture_deposit':
+                $this->zebra_capture_deposit();
+                break;
+            case 'zebra_cancel_deposit':
+                $this->zebra_cancel_deposit();
+                break;
             case 'ban_user':
                 $this->ban_user();
                 break;
@@ -750,6 +756,74 @@ class Matrix_MLM_Admin {
 
         Matrix_MLM_Notifications::send_deposit_notification($deposit->user_id, $deposit->amount, 'completed');
         wp_send_json_success(['message' => __('Deposit approved', 'matrix-mlm')]);
+    }
+
+    /**
+     * Capture a held Zebra Wallet (Bibimoney) pre-auth deposit.
+     *
+     * Flow: admin clicks Capture on a row with status='pending_capture'
+     * and gateway='zebra'. We forward to Matrix_MLM_Zebra::capture_deposit()
+     * which posts /CaptureOrCancel with EventType=CAPTURE, then on
+     * success transitions pending_capture -> completed (idempotent
+     * conditional UPDATE) and credits the Matrix wallet via the
+     * shared finaliser. The matching CAPTURE IPN will arrive after,
+     * and the same conditional UPDATE means it's a no-op.
+     *
+     * The capability is gated by manage_matrix_deposits at the
+     * page-registration level (Matrix_MLM_Admin::add_admin_menus
+     * uses that cap on the Deposits submenu) and the
+     * matrix_admin_action nonce is verified at the dispatch
+     * boundary in handle_admin_ajax(). We also re-check
+     * manage_matrix_deposits here as defense in depth so a stray
+     * AJAX caller from a lower-cap operator can't slip through.
+     */
+    private function zebra_capture_deposit() {
+        if (!current_user_can('manage_matrix_deposits')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'matrix-mlm')]);
+        }
+        $id   = (int) ($_POST['id'] ?? 0);
+        $note = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid deposit id', 'matrix-mlm')]);
+        }
+        if (!class_exists('Matrix_MLM_Zebra')) {
+            wp_send_json_error(['message' => __('Zebra gateway not available.', 'matrix-mlm')]);
+        }
+        $zebra  = new Matrix_MLM_Zebra();
+        $result = $zebra->capture_deposit($id, $note);
+        if (!empty($result['success'])) {
+            wp_send_json_success(['message' => $result['message'] ?? __('Capture completed.', 'matrix-mlm')]);
+        }
+        wp_send_json_error(['message' => $result['message'] ?? __('Capture failed.', 'matrix-mlm')]);
+    }
+
+    /**
+     * Cancel a held Zebra Wallet (Bibimoney) pre-auth deposit.
+     *
+     * Mirror of zebra_capture_deposit(). On success, transitions
+     * pending_capture -> cancelled. No Matrix wallet credit, no
+     * refund — the customer was never credited Matrix-side, and
+     * the platform releases the hold back to the customer's
+     * Zebra wallet on /CaptureOrCancel success.
+     */
+    private function zebra_cancel_deposit() {
+        if (!current_user_can('manage_matrix_deposits')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'matrix-mlm')]);
+        }
+        $id   = (int) ($_POST['id'] ?? 0);
+        $note = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid deposit id', 'matrix-mlm')]);
+        }
+        if (!class_exists('Matrix_MLM_Zebra')) {
+            wp_send_json_error(['message' => __('Zebra gateway not available.', 'matrix-mlm')]);
+        }
+        $zebra  = new Matrix_MLM_Zebra();
+        $result = $zebra->cancel_deposit($id, $note);
+        if (!empty($result['success'])) {
+            wp_send_json_success(['message' => $result['message'] ?? __('Cancel completed.', 'matrix-mlm')]);
+        }
+        wp_send_json_error(['message' => $result['message'] ?? __('Cancel failed.', 'matrix-mlm')]);
     }
 
     private function ban_user() {

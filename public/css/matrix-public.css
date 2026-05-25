@@ -339,6 +339,7 @@
 
 .matrix-badge-active, .matrix-badge-completed, .matrix-badge-approved, .matrix-badge-credit { background: #ecfdf5; color: #065f46; }
 .matrix-badge-pending, .matrix-badge-medium { background: #fffbeb; color: #92400e; }
+.matrix-badge-pending_capture { background: #eef2ff; color: #3730a3; }
 .matrix-badge-inactive, .matrix-badge-rejected, .matrix-badge-cancelled, .matrix-badge-debit { background: #fef2f2; color: #991b1b; }
 .matrix-badge-open, .matrix-badge-info, .matrix-badge-low { background: #eff6ff; color: #1e40af; }
 .matrix-badge-high, .matrix-badge-urgent, .matrix-badge-customer_reply { background: #fef2f2; color: #991b1b; }

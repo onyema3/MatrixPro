@@ -87,6 +87,40 @@
         matrixAdminAction('reject_withdrawal', { id: id, note: note });
     };
 
+    // Capture a held Zebra Wallet (Bibimoney) pre-auth deposit.
+    // Confirms first because Capture credits the Matrix wallet
+    // and is the irreversible side of the state machine —
+    // there's no "uncapture" call on the platform. Optional
+    // note is plumbed through to UserData.note in the
+    // /CaptureOrCancel request so support can correlate later.
+    window.matrixCaptureZebraDeposit = function(id) {
+        if (!confirm('Capture this held authorisation? The customer\'s Zebra wallet will be charged and the Matrix wallet credited. This cannot be undone.')) {
+            return;
+        }
+        const note = prompt('Optional note (visible to support, blank = skip):') || '';
+        matrixAdminAction('zebra_capture_deposit', { id: id, note: note });
+    };
+
+    // Cancel a held Zebra Wallet (Bibimoney) pre-auth deposit.
+    // Confirms first; no Matrix wallet credit and no refund are
+    // issued on this path — the customer was never charged
+    // Matrix-side, and the platform releases the hold back to
+    // their Zebra wallet on success. Reason is required because
+    // a cancelled hold is the kind of thing a user will write a
+    // ticket about.
+    window.matrixCancelZebraDeposit = function(id) {
+        if (!confirm('Cancel this held authorisation? The customer\'s Zebra wallet hold will be released; no funds will move.')) {
+            return;
+        }
+        const note = prompt('Reason for cancellation (required):');
+        if (note === null) return;
+        if (!note.trim()) {
+            alert('A reason is required to cancel a held authorisation.');
+            return;
+        }
+        matrixAdminAction('zebra_cancel_deposit', { id: id, note: note.trim() });
+    };
+
     // Add balance to user
     window.matrixAddBalance = function(userId) {
         const amount = prompt('Enter amount to add:');

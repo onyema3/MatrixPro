@@ -404,6 +404,48 @@ class Matrix_MLM_Database {
             update_option('matrix_mlm_position_history_backfill_count', (int) $rows, false);
         }
 
+        // 1.0.16: widen matrix_deposits.status enum to include
+        // 'pending_capture' for the Zebra Wallet (Bibimoney)
+        // /CaptureOrCancel pre-auth state machine. Pre-auth flow:
+        // /PaymentAuth + /Payment with EventType=PRE_AUTH parks
+        // the deposit at 'pending_capture' (auth held but not
+        // charged); admin then triggers /CaptureOrCancel to
+        // either capture (-> 'completed', wallet credited) or
+        // cancel (-> 'cancelled', no credit, no refund needed
+        // because the customer's wallet was never debited).
+        //
+        // dbDelta does not reliably alter ENUM definitions on
+        // existing tables, so we probe COLUMN_TYPE via
+        // INFORMATION_SCHEMA and run the MODIFY only when
+        // 'pending_capture' is missing. Idempotent — a fresh
+        // install gets the wider enum from the CREATE TABLE
+        // above and skips this block; a 1.0.15 install gets the
+        // ALTER once and then skips it on every subsequent
+        // load. Default 'pending' is preserved so a deposit row
+        // INSERTed without an explicit status still lands at
+        // 'pending' (matches today's process_deposit() insert).
+        $deposits_table = $wpdb->prefix . 'matrix_deposits';
+        $deposits_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $deposits_table
+        ));
+        if ($deposits_exists > 0) {
+            $deposits_status_type = (string) $wpdb->get_var($wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'status'",
+                DB_NAME, $deposits_table
+            ));
+            if ($deposits_status_type !== '' && stripos($deposits_status_type, "'pending_capture'") === false) {
+                $wpdb->query(
+                    "ALTER TABLE {$deposits_table}
+                       MODIFY status ENUM('pending','pending_capture','completed','rejected','cancelled')
+                              NOT NULL DEFAULT 'pending'"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -589,13 +631,20 @@ class Matrix_MLM_Database {
             currency varchar(10) NOT NULL DEFAULT 'NGN',
             transaction_id varchar(255) DEFAULT NULL,
             gateway_response text,
-            status enum('pending','completed','rejected','cancelled') NOT NULL DEFAULT 'pending',
+            status enum('pending','pending_capture','completed','rejected','cancelled') NOT NULL DEFAULT 'pending',
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             KEY user_id (user_id),
             KEY status (status)
         ) $charset_collate;";
+        // Note: 'pending_capture' was added to the enum in 1.0.16
+        // for the Zebra Wallet (Bibimoney) /CaptureOrCancel pre-auth
+        // state machine. dbDelta does not reliably alter ENUM
+        // definitions on tables that already exist, so the
+        // matching ALTER lives in maybe_upgrade() (probes
+        // COLUMN_TYPE via INFORMATION_SCHEMA and only runs when
+        // 'pending_capture' is missing — idempotent).
         dbDelta($sql_deposits);
 
         // Withdrawals
