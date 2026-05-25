@@ -67,21 +67,21 @@ class Matrix_MLM_Admin_Deposits {
                 <tbody>
                     <?php foreach ($deposits as $deposit): ?>
                     <tr>
-                        <td><?php echo $deposit->id; ?></td>
+                        <td><?php echo (int) $deposit->id; ?></td>
                         <td><?php echo esc_html($deposit->user_login); ?><br><small><?php echo esc_html($deposit->user_email); ?></small></td>
                         <td><?php echo esc_html(ucfirst($deposit->gateway)); ?></td>
-                        <td><?php echo $currency . number_format($deposit->amount, 2); ?></td>
-                        <td><?php echo $currency . number_format($deposit->charge, 2); ?></td>
-                        <td><?php echo $currency . number_format($deposit->net_amount, 2); ?></td>
+                        <td><?php echo esc_html($currency . number_format($deposit->amount, 2)); ?></td>
+                        <td><?php echo esc_html($currency . number_format($deposit->charge, 2)); ?></td>
+                        <td><?php echo esc_html($currency . number_format($deposit->net_amount, 2)); ?></td>
                         <td><code><?php echo esc_html($deposit->transaction_id ?? '-'); ?></code></td>
-                        <td><span class="matrix-badge matrix-badge-<?php echo $deposit->status; ?>"><?php echo esc_html(ucwords(str_replace('_', ' ', $deposit->status))); ?></span></td>
-                        <td><?php echo date('M d, Y H:i', strtotime($deposit->created_at)); ?></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($deposit->status); ?>"><?php echo esc_html(ucwords(str_replace('_', ' ', $deposit->status))); ?></span></td>
+                        <td><?php echo esc_html(date('M d, Y H:i', strtotime($deposit->created_at))); ?></td>
                         <td>
                             <?php if ($deposit->status === 'pending'): ?>
-                            <button class="button button-small button-primary" onclick="matrixAdminAction('approve_deposit', {id: <?php echo $deposit->id; ?>})"><?php _e('Approve', 'matrix-mlm'); ?></button>
+                            <button class="button button-small button-primary" onclick="matrixAdminAction('approve_deposit', {id: <?php echo (int) $deposit->id; ?>})"><?php _e('Approve', 'matrix-mlm'); ?></button>
                             <?php elseif ($deposit->status === 'pending_capture' && $deposit->gateway === 'zebra'): ?>
-                            <button class="button button-small button-primary" onclick="matrixCaptureZebraDeposit(<?php echo $deposit->id; ?>)"><?php _e('Capture', 'matrix-mlm'); ?></button>
-                            <button class="button button-small" onclick="matrixCancelZebraDeposit(<?php echo $deposit->id; ?>)"><?php _e('Cancel', 'matrix-mlm'); ?></button>
+                            <button class="button button-small button-primary" onclick="matrixCaptureZebraDeposit(<?php echo (int) $deposit->id; ?>)"><?php _e('Capture', 'matrix-mlm'); ?></button>
+                            <button class="button button-small" onclick="matrixCancelZebraDeposit(<?php echo (int) $deposit->id; ?>)"><?php _e('Cancel', 'matrix-mlm'); ?></button>
                             <?php endif; ?>
                         </td>
                     </tr>

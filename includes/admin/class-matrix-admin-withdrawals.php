@@ -105,13 +105,13 @@ class Matrix_MLM_Admin_Withdrawals {
                         $status_label = ucwords(str_replace('_', ' ', (string) $w->status));
                     ?>
                     <tr>
-                        <td><?php echo $w->id; ?></td>
+                        <td><?php echo (int) $w->id; ?></td>
                         <td><?php echo esc_html($w->user_login); ?><br><small><?php echo esc_html($w->user_email); ?></small></td>
                         <td><?php echo esc_html(ucfirst($w->method)); ?></td>
                         <td><span class="matrix-badge matrix-badge-gateway-<?php echo esc_attr($w->gateway ?: 'legacy'); ?>"><?php echo esc_html($gw_label); ?></span></td>
-                        <td><?php echo $currency . number_format($w->amount, 2); ?></td>
-                        <td><?php echo $currency . number_format($w->charge, 2); ?></td>
-                        <td><?php echo $currency . number_format($w->net_amount, 2); ?></td>
+                        <td><?php echo esc_html($currency . number_format($w->amount, 2)); ?></td>
+                        <td><?php echo esc_html($currency . number_format($w->charge, 2)); ?></td>
+                        <td><?php echo esc_html($currency . number_format($w->net_amount, 2)); ?></td>
                         <td><small><?php echo esc_html(self::format_account_details($w)); ?></small></td>
                         <td>
                             <?php if (!empty($w->transaction_id)): ?>
@@ -121,11 +121,11 @@ class Matrix_MLM_Admin_Withdrawals {
                             <?php endif; ?>
                         </td>
                         <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($w->status); ?>"><?php echo esc_html($status_label); ?></span></td>
-                        <td><?php echo date('M d, Y H:i', strtotime($w->created_at)); ?></td>
+                        <td><?php echo esc_html(date('M d, Y H:i', strtotime($w->created_at))); ?></td>
                         <td>
                             <?php if ($w->status === 'pending'): ?>
-                                <button class="button button-small button-primary" onclick="matrixAdminAction('approve_withdrawal', {id: <?php echo $w->id; ?>})"><?php _e('Approve', 'matrix-mlm'); ?></button>
-                                <button class="button button-small" onclick="matrixRejectWithdrawal(<?php echo $w->id; ?>)"><?php _e('Reject', 'matrix-mlm'); ?></button>
+                                <button class="button button-small button-primary" onclick="matrixAdminAction('approve_withdrawal', {id: <?php echo (int) $w->id; ?>})"><?php _e('Approve', 'matrix-mlm'); ?></button>
+                                <button class="button button-small" onclick="matrixRejectWithdrawal(<?php echo (int) $w->id; ?>)"><?php _e('Reject', 'matrix-mlm'); ?></button>
                             <?php elseif ($w->status === 'processing'): ?>
                                 <?php /* Processing rows are mid-flight Zebra /Remit calls
                                        that haven't finalised yet. The reject button is
@@ -135,7 +135,7 @@ class Matrix_MLM_Admin_Withdrawals {
                                        crashed between the lock acquire and the post()).
                                        Reject from processing -> rejected refunds the
                                        Matrix wallet just like rejecting from pending. */ ?>
-                                <button class="button button-small" onclick="matrixRejectWithdrawal(<?php echo $w->id; ?>)" title="<?php esc_attr_e('Force-reject a stuck Remit; refunds the Matrix wallet.', 'matrix-mlm'); ?>"><?php _e('Force Reject', 'matrix-mlm'); ?></button>
+                                <button class="button button-small" onclick="matrixRejectWithdrawal(<?php echo (int) $w->id; ?>)" title="<?php esc_attr_e('Force-reject a stuck Remit; refunds the Matrix wallet.', 'matrix-mlm'); ?>"><?php _e('Force Reject', 'matrix-mlm'); ?></button>
                             <?php endif; ?>
                             <?php if (!empty($w->gateway_response)): ?>
                                 <button class="button button-small" type="button" onclick="this.nextElementSibling.style.display = (this.nextElementSibling.style.display === 'block') ? 'none' : 'block';"><?php _e('Audit', 'matrix-mlm'); ?></button>

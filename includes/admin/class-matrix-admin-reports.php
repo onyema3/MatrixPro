@@ -139,15 +139,15 @@ class Matrix_MLM_Admin_Reports {
         $charges_earned = $wpdb->get_var("SELECT COALESCE(SUM(charge), 0) FROM {$wpdb->prefix}matrix_deposits WHERE status = 'completed' $dc") + $wpdb->get_var("SELECT COALESCE(SUM(charge), 0) FROM {$wpdb->prefix}matrix_withdrawals WHERE status = 'approved' $dc");
         ?>
         <div class="matrix-admin-stats">
-            <div class="stat-card stat-success"><h3><?php echo $currency . number_format($net_revenue, 2); ?></h3><p><?php _e('Total Revenue (Deposits)', 'matrix-mlm'); ?></p></div>
-            <div class="stat-card stat-danger"><h3><?php echo $currency . number_format($net_payouts, 2); ?></h3><p><?php _e('Total Payouts', 'matrix-mlm'); ?></p></div>
-            <div class="stat-card stat-info"><h3><?php echo $currency . number_format($net_revenue - $net_payouts, 2); ?></h3><p><?php _e('Net Balance', 'matrix-mlm'); ?></p></div>
-            <div class="stat-card stat-warning"><h3><?php echo $currency . number_format($charges_earned, 2); ?></h3><p><?php _e('Charges/Fees Earned', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-success"><h3><?php echo esc_html($currency . number_format($net_revenue, 2)); ?></h3><p><?php _e('Total Revenue (Deposits)', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-danger"><h3><?php echo esc_html($currency . number_format($net_payouts, 2)); ?></h3><p><?php _e('Total Payouts', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-info"><h3><?php echo esc_html($currency . number_format($net_revenue - $net_payouts, 2)); ?></h3><p><?php _e('Net Balance', 'matrix-mlm'); ?></p></div>
+            <div class="stat-card stat-warning"><h3><?php echo esc_html($currency . number_format($charges_earned, 2)); ?></h3><p><?php _e('Charges/Fees Earned', 'matrix-mlm'); ?></p></div>
         </div>
         <h2><?php _e('Daily Revenue', 'matrix-mlm'); ?></h2>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php foreach ($daily_revenue as $row): ?>
-        <tr><td><?php echo date('M d, Y', strtotime($row->date)); ?></td><td><?php echo $currency . number_format($row->total, 2); ?></td></tr>
+        <tr><td><?php echo esc_html(date('M d, Y', strtotime($row->date))); ?></td><td><?php echo esc_html($currency . number_format($row->total, 2)); ?></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
@@ -168,7 +168,7 @@ class Matrix_MLM_Admin_Reports {
         </div>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Username', 'matrix-mlm'); ?></th><th><?php _e('Email', 'matrix-mlm'); ?></th><th><?php _e('Phone', 'matrix-mlm'); ?></th><th><?php _e('Balance', 'matrix-mlm'); ?></th><th><?php _e('Referral Code', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th><th><?php _e('Joined', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php $currency = get_option('matrix_mlm_currency_symbol', '₦'); foreach ($users as $u): ?>
-        <tr><td><?php echo esc_html($u->user_login); ?></td><td><?php echo esc_html($u->user_email); ?></td><td><?php echo esc_html($u->phone ?? '-'); ?></td><td><?php echo $currency . number_format($u->balance, 2); ?></td><td><code><?php echo esc_html($u->referral_code); ?></code></td><td><span class="matrix-badge matrix-badge-<?php echo $u->status; ?>"><?php echo ucfirst($u->status); ?></span></td><td><?php echo date('M d, Y', strtotime($u->user_registered)); ?></td></tr>
+        <tr><td><?php echo esc_html($u->user_login); ?></td><td><?php echo esc_html($u->user_email); ?></td><td><?php echo esc_html($u->phone ?? '-'); ?></td><td><?php echo esc_html($currency . number_format($u->balance, 2)); ?></td><td><code><?php echo esc_html($u->referral_code); ?></code></td><td><span class="matrix-badge matrix-badge-<?php echo esc_attr($u->status); ?>"><?php echo esc_html(ucfirst($u->status)); ?></span></td><td><?php echo esc_html(date('M d, Y', strtotime($u->user_registered))); ?></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
@@ -182,12 +182,12 @@ class Matrix_MLM_Admin_Reports {
         ?>
         <div class="matrix-admin-stats">
         <?php foreach ($by_type as $t): ?>
-            <div class="stat-card stat-info"><h3><?php echo $currency . number_format($t->total, 2); ?></h3><p><?php echo ucfirst(str_replace('_', ' ', $t->type)); ?> (<?php echo $t->count; ?>)</p></div>
+            <div class="stat-card stat-info"><h3><?php echo esc_html($currency . number_format($t->total, 2)); ?></h3><p><?php echo esc_html(ucfirst(str_replace('_', ' ', $t->type))); ?> (<?php echo (int) $t->count; ?>)</p></div>
         <?php endforeach; ?>
         </div>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('User', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('From', 'matrix-mlm'); ?></th><th><?php _e('Plan', 'matrix-mlm'); ?></th><th><?php _e('Level', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php foreach ($commissions as $c): ?>
-        <tr><td><?php echo date('M d, Y', strtotime($c->created_at)); ?></td><td><?php echo esc_html($c->user_login); ?></td><td><?php echo ucfirst(str_replace('_', ' ', $c->type)); ?></td><td><?php echo esc_html($c->from_username ?? '-'); ?></td><td><?php echo esc_html($c->plan_name ?? '-'); ?></td><td><?php echo $c->level ?: '-'; ?></td><td><?php echo $currency . number_format($c->amount, 2); ?></td></tr>
+        <tr><td><?php echo esc_html(date('M d, Y', strtotime($c->created_at))); ?></td><td><?php echo esc_html($c->user_login); ?></td><td><?php echo esc_html(ucfirst(str_replace('_', ' ', $c->type))); ?></td><td><?php echo esc_html($c->from_username ?? '-'); ?></td><td><?php echo esc_html($c->plan_name ?? '-'); ?></td><td><?php echo esc_html((string) ($c->level ?: '-')); ?></td><td><?php echo esc_html($currency . number_format($c->amount, 2)); ?></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
@@ -200,7 +200,7 @@ class Matrix_MLM_Admin_Reports {
         ?>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Plan', 'matrix-mlm'); ?></th><th><?php _e('Matrix', 'matrix-mlm'); ?></th><th><?php _e('Price', 'matrix-mlm'); ?></th><th><?php _e('Members', 'matrix-mlm'); ?></th><th><?php _e('Completed', 'matrix-mlm'); ?></th><th><?php _e('Total Commissions', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php foreach ($plans as $p): ?>
-        <tr><td><?php echo esc_html($p->name); ?></td><td><?php echo $p->width . 'x' . $p->depth; ?></td><td><?php echo $currency . number_format($p->price, 2); ?></td><td><?php echo number_format($p->members); ?></td><td><?php echo number_format($p->completed); ?></td><td><?php echo $currency . number_format($p->total_commissions, 2); ?></td><td><span class="matrix-badge matrix-badge-<?php echo $p->status; ?>"><?php echo ucfirst($p->status); ?></span></td></tr>
+        <tr><td><?php echo esc_html($p->name); ?></td><td><?php echo esc_html($p->width . 'x' . $p->depth); ?></td><td><?php echo esc_html($currency . number_format($p->price, 2)); ?></td><td><?php echo esc_html(number_format($p->members)); ?></td><td><?php echo esc_html(number_format($p->completed)); ?></td><td><?php echo esc_html($currency . number_format($p->total_commissions, 2)); ?></td><td><span class="matrix-badge matrix-badge-<?php echo esc_attr($p->status); ?>"><?php echo esc_html(ucfirst($p->status)); ?></span></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
@@ -216,18 +216,18 @@ class Matrix_MLM_Admin_Reports {
         ?>
         <div class="matrix-admin-stats">
         <?php foreach ($by_status as $s): ?>
-            <div class="stat-card stat-<?php echo $s->status === 'completed' ? 'success' : ($s->status === 'pending' ? 'warning' : 'danger'); ?>"><h3><?php echo $currency . number_format($s->total, 2); ?></h3><p><?php echo ucfirst($s->status); ?> (<?php echo $s->count; ?>)</p></div>
+            <div class="stat-card stat-<?php echo esc_attr($s->status === 'completed' ? 'success' : ($s->status === 'pending' ? 'warning' : 'danger')); ?>"><h3><?php echo esc_html($currency . number_format($s->total, 2)); ?></h3><p><?php echo esc_html(ucfirst($s->status)); ?> (<?php echo (int) $s->count; ?>)</p></div>
         <?php endforeach; ?>
         </div>
         <h3><?php _e('By Gateway', 'matrix-mlm'); ?></h3>
         <div class="matrix-admin-stats">
         <?php foreach ($by_gateway as $g): ?>
-            <div class="stat-card stat-info"><h3><?php echo $currency . number_format($g->total, 2); ?></h3><p><?php echo ucfirst($g->gateway); ?> (<?php echo $g->count; ?>)</p></div>
+            <div class="stat-card stat-info"><h3><?php echo esc_html($currency . number_format($g->total, 2)); ?></h3><p><?php echo esc_html(ucfirst($g->gateway)); ?> (<?php echo (int) $g->count; ?>)</p></div>
         <?php endforeach; ?>
         </div>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('User', 'matrix-mlm'); ?></th><th><?php _e('Gateway', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Charge', 'matrix-mlm'); ?></th><th><?php _e('Net', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php foreach ($deposits as $d): ?>
-        <tr><td><?php echo date('M d, Y H:i', strtotime($d->created_at)); ?></td><td><?php echo esc_html($d->user_login); ?></td><td><?php echo ucfirst($d->gateway); ?></td><td><?php echo $currency . number_format($d->amount, 2); ?></td><td><?php echo $currency . number_format($d->charge, 2); ?></td><td><?php echo $currency . number_format($d->net_amount, 2); ?></td><td><span class="matrix-badge matrix-badge-<?php echo $d->status; ?>"><?php echo ucfirst($d->status); ?></span></td></tr>
+        <tr><td><?php echo esc_html(date('M d, Y H:i', strtotime($d->created_at))); ?></td><td><?php echo esc_html($d->user_login); ?></td><td><?php echo esc_html(ucfirst($d->gateway)); ?></td><td><?php echo esc_html($currency . number_format($d->amount, 2)); ?></td><td><?php echo esc_html($currency . number_format($d->charge, 2)); ?></td><td><?php echo esc_html($currency . number_format($d->net_amount, 2)); ?></td><td><span class="matrix-badge matrix-badge-<?php echo esc_attr($d->status); ?>"><?php echo esc_html(ucfirst($d->status)); ?></span></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
@@ -241,12 +241,12 @@ class Matrix_MLM_Admin_Reports {
         ?>
         <div class="matrix-admin-stats">
         <?php foreach ($by_status as $s): ?>
-            <div class="stat-card stat-<?php echo $s->status === 'approved' ? 'success' : ($s->status === 'pending' ? 'warning' : 'danger'); ?>"><h3><?php echo $currency . number_format($s->total, 2); ?></h3><p><?php echo ucfirst($s->status); ?> (<?php echo $s->count; ?>)</p></div>
+            <div class="stat-card stat-<?php echo esc_attr($s->status === 'approved' ? 'success' : ($s->status === 'pending' ? 'warning' : 'danger')); ?>"><h3><?php echo esc_html($currency . number_format($s->total, 2)); ?></h3><p><?php echo esc_html(ucfirst($s->status)); ?> (<?php echo (int) $s->count; ?>)</p></div>
         <?php endforeach; ?>
         </div>
         <table class="wp-list-table widefat fixed striped"><thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('User', 'matrix-mlm'); ?></th><th><?php _e('Method', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Charge', 'matrix-mlm'); ?></th><th><?php _e('Net', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th></tr></thead><tbody>
         <?php foreach ($withdrawals as $w): ?>
-        <tr><td><?php echo date('M d, Y H:i', strtotime($w->created_at)); ?></td><td><?php echo esc_html($w->user_login); ?></td><td><?php echo ucfirst($w->method); ?></td><td><?php echo $currency . number_format($w->amount, 2); ?></td><td><?php echo $currency . number_format($w->charge, 2); ?></td><td><?php echo $currency . number_format($w->net_amount, 2); ?></td><td><span class="matrix-badge matrix-badge-<?php echo $w->status; ?>"><?php echo ucfirst($w->status); ?></span></td></tr>
+        <tr><td><?php echo esc_html(date('M d, Y H:i', strtotime($w->created_at))); ?></td><td><?php echo esc_html($w->user_login); ?></td><td><?php echo esc_html(ucfirst($w->method)); ?></td><td><?php echo esc_html($currency . number_format($w->amount, 2)); ?></td><td><?php echo esc_html($currency . number_format($w->charge, 2)); ?></td><td><?php echo esc_html($currency . number_format($w->net_amount, 2)); ?></td><td><span class="matrix-badge matrix-badge-<?php echo esc_attr($w->status); ?>"><?php echo esc_html(ucfirst($w->status)); ?></span></td></tr>
         <?php endforeach; ?></tbody></table>
         <?php
     }
