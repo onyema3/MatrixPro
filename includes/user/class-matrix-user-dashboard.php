@@ -241,7 +241,32 @@ class Matrix_MLM_User_Dashboard {
 
         $user_id = get_current_user_id();
         if (!Matrix_MLM_User::is_active($user_id)) {
-            return '<div class="matrix-alert matrix-alert-danger">' . __('Your account has been suspended. Please contact support.', 'matrix-mlm') . '</div>';
+            // Status-aware recovery branch (was: flat suspended-account
+            // alert that locked every non-active user out of the
+            // dashboard).
+            //
+            // The deactivation email at
+            // Matrix_MLM_Notifications::send_subscription_deactivation_notification
+            // tells lapsed users to "click Pay Subscription on the
+            // dashboard" — but the previous early-return blocked the
+            // dashboard from loading at all once the user flipped to
+            // status='inactive'. That stranded subscription-deactivated
+            // users in a dead loop: dashboard refuses to load because
+            // they're inactive, but the only self-heal path is through
+            // the dashboard.
+            //
+            // render_inactive_account_view() distinguishes:
+            //   - status='inactive' (subscription-driven, recoverable)
+            //     → Pay Subscription view with render_field('subscription')
+            //     and an inline submit handler posting matrix_action=
+            //     pay_subscription. After a successful manual_pay() the
+            //     server flips status back to 'active' and the page
+            //     reload lands on the normal dashboard.
+            //   - any other non-active status (banned, pending, manually
+            //     deactivated) → falls through to the legacy suspended
+            //     alert, since those states require operator action and
+            //     have no user-facing self-heal.
+            return $this->render_inactive_account_view($user_id);
         }
 
         $tab = $this->resolve_active_tab();
@@ -287,6 +312,213 @@ class Matrix_MLM_User_Dashboard {
                 <?php $this->render_tab($tab, $user_id); ?>
             </div>
         </div>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Recovery view for users whose account is currently in the
+     * 'inactive' state.
+     *
+     * Two callers, two outcomes:
+     *
+     *   1. status === 'inactive' AND subscription is enabled AND
+     *      amount > 0 — the typical post-cron lapsed-payment case.
+     *      Render a self-contained "Pay Subscription" mini-view
+     *      with the wallet balance, the amount due, the PIN field
+     *      drop-in, and an inline submit handler that posts
+     *      matrix_action=pay_subscription. On success the server
+     *      flips status back to 'active' (see
+     *      Matrix_MLM_Subscription::manual_pay()) and the page
+     *      reload lands on the normal dashboard.
+     *
+     *   2. Any other path — banned, pending, manually deactivated
+     *      with subscription disabled, etc. — fall through to the
+     *      legacy "account suspended" alert. Those states require
+     *      operator action and intentionally have no user-facing
+     *      self-heal.
+     *
+     * The render_field('subscription') call uses the same
+     * should_gate() predicate as the matching require_pin_for_request
+     * gate in Matrix_MLM_Core::process_pay_subscription, so the
+     * server never demands a PIN the form didn't ask for and vice
+     * versa. Users without a PIN configured (or installs where the
+     * admin hasn't enabled matrix_mlm_pin_required_for_subscription)
+     * see no PIN field — the recovery surface stays usable for
+     * pre-PIN-rollout accounts.
+     *
+     * The button is suppressed when balance < amount and an
+     * informational note tells the user how much more they need.
+     * This avoids surfacing a button that would just bounce off
+     * manual_pay()'s "Insufficient Matrix wallet balance" check
+     * and gives the user the actionable next step (earn / top up).
+     *
+     * @param int $user_id Current user id.
+     * @return string Self-contained HTML string (the dashboard
+     *                shortcode returns this verbatim, so the
+     *                caller's ob_start/ob_get_clean wrapping does
+     *                not apply here).
+     */
+    private function render_inactive_account_view($user_id) {
+        $user_id = (int) $user_id;
+        global $wpdb;
+
+        $status = (string) $wpdb->get_var($wpdb->prepare(
+            "SELECT status FROM {$wpdb->prefix}matrix_user_meta WHERE user_id = %d",
+            $user_id
+        ));
+
+        $sub_enabled = (int) get_option('matrix_mlm_subscription_enabled', 0);
+        $amount      = (float) get_option('matrix_mlm_subscription_amount', 0);
+
+        // Recovery view applies only to subscription-driven
+        // inactivity. 'banned' / 'pending' / inactive-with-no-
+        // subscription fall through to the legacy alert.
+        if ($status !== 'inactive' || $sub_enabled !== 1 || $amount <= 0) {
+            return '<div class="matrix-alert matrix-alert-danger">'
+                . esc_html__('Your account has been suspended. Please contact support.', 'matrix-mlm')
+                . '</div>';
+        }
+
+        $wallet   = new Matrix_MLM_Wallet();
+        $balance  = (float) $wallet->get_balance($user_id);
+        $currency = (string) get_option('matrix_mlm_currency_symbol', '₦');
+        $period   = date_i18n('F Y');
+        $can_pay  = $balance >= $amount;
+        $logout   = wp_logout_url(home_url('/matrix-login'));
+
+        ob_start();
+        ?>
+        <div class="matrix-dashboard matrix-dashboard-recovery">
+            <div class="matrix-dashboard-content">
+                <div class="matrix-alert matrix-alert-warning">
+                    <h2 style="margin-top:0;"><?php esc_html_e('Your account is currently inactive', 'matrix-mlm'); ?></h2>
+                    <p>
+                        <?php
+                        printf(
+                            /* translators: 1: amount, 2: billing period */
+                            esc_html__('Your monthly subscription of %1$s for %2$s is unpaid. Pay now from your Matrix wallet to reactivate your account.', 'matrix-mlm'),
+                            esc_html($currency . number_format($amount, 2)),
+                            esc_html($period)
+                        );
+                        ?>
+                    </p>
+                </div>
+
+                <div class="matrix-form-card">
+                    <p>
+                        <strong><?php esc_html_e('Amount due:', 'matrix-mlm'); ?></strong>
+                        <?php echo esc_html($currency . number_format($amount, 2)); ?>
+                    </p>
+                    <p>
+                        <strong><?php esc_html_e('Matrix wallet balance:', 'matrix-mlm'); ?></strong>
+                        <?php echo esc_html($currency . number_format($balance, 2)); ?>
+                    </p>
+
+                    <?php if (!$can_pay): ?>
+                        <div class="matrix-alert matrix-alert-info">
+                            <?php
+                            printf(
+                                /* translators: %s: shortfall amount */
+                                esc_html__('You need %s more in your Matrix wallet to pay this month. Earn more commissions or top up your wallet to continue.', 'matrix-mlm'),
+                                esc_html($currency . number_format($amount - $balance, 2))
+                            );
+                            ?>
+                        </div>
+                    <?php else: ?>
+                        <form id="matrix-pay-subscription-form" class="matrix-form">
+                            <?php
+                            // Transaction PIN field — rendered only
+                            // when the admin requires PIN for
+                            // path='subscription' AND the current
+                            // user has one set. Helper returns ''
+                            // for ungated paths or users without a
+                            // PIN, so the inactive-recovery surface
+                            // stays usable for users who never
+                            // enrolled. Server gate at
+                            // Matrix_MLM_Core::process_pay_subscription
+                            // mirrors the same predicate via
+                            // should_gate(), so prompt and
+                            // enforcement stay locked together.
+                            echo Matrix_MLM_Transaction_Pin::render_field($user_id, 'subscription');
+                            ?>
+                            <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="matrix-pay-subscription-btn">
+                                <?php esc_html_e('Pay Subscription', 'matrix-mlm'); ?>
+                            </button>
+                        </form>
+                    <?php endif; ?>
+
+                    <p style="margin-top:16px;text-align:center;">
+                        <a href="<?php echo esc_url($logout); ?>"><?php esc_html_e('Log out', 'matrix-mlm'); ?></a>
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <?php if ($can_pay): ?>
+        <script>
+        (function($) {
+            // Defensive guard against caching plugins / asset
+            // optimizers that strip matrix-public.js — same idiom
+            // used by the wallet and bank-payout surfaces. Without
+            // matrixMLM the form has no AJAX endpoint to post to,
+            // so disable the button rather than surface a confusing
+            // silent failure.
+            if (typeof matrixMLM === 'undefined' || !matrixMLM.ajaxUrl) {
+                $('#matrix-pay-subscription-btn').prop('disabled', true)
+                    .text('<?php echo esc_js(__('Page assets failed to load — please refresh.', 'matrix-mlm')); ?>');
+                return;
+            }
+
+            $('#matrix-pay-subscription-form').on('submit', function(e) {
+                e.preventDefault();
+
+                var $form = $(this);
+                var $btn  = $('#matrix-pay-subscription-btn');
+                $btn.prop('disabled', true).text('<?php echo esc_js(__('Processing…', 'matrix-mlm')); ?>');
+
+                $.post(matrixMLM.ajaxUrl, {
+                    action: 'matrix_mlm_action',
+                    matrix_action: 'pay_subscription',
+                    nonce: matrixMLM.nonce,
+                    // Always-post-empty contract: the server-side
+                    // require_pin_for_request gate decides whether
+                    // to enforce, so the JS doesn't branch on the
+                    // same predicate. If render_field() emitted
+                    // nothing (ungated / no PIN set), .val()
+                    // returns undefined and || '' coalesces to ''
+                    // — the server treats empty as "PIN gate not
+                    // active for this caller" and proceeds.
+                    transaction_pin: ($form.find('[name=transaction_pin]').val() || '')
+                }, function(res) {
+                    if (res && res.success) {
+                        alert(res.data && res.data.message
+                            ? res.data.message
+                            : '<?php echo esc_js(__('Subscription paid successfully.', 'matrix-mlm')); ?>');
+                        // Hard reload — manual_pay() flipped status
+                        // back to 'active', so the next render of
+                        // render_dashboard() will skip this view
+                        // entirely and show the full dashboard.
+                        (typeof matrixMLMReload === 'function'
+                            ? matrixMLMReload
+                            : function(){ window.location.reload(); })();
+                    } else {
+                        var msg = (res && res.data && res.data.message)
+                            ? res.data.message
+                            : '<?php echo esc_js(__('Payment failed.', 'matrix-mlm')); ?>';
+                        alert(msg);
+                        $btn.prop('disabled', false)
+                            .text('<?php echo esc_js(__('Pay Subscription', 'matrix-mlm')); ?>');
+                    }
+                }).fail(function() {
+                    alert('<?php echo esc_js(__('Network error. Please try again.', 'matrix-mlm')); ?>');
+                    $btn.prop('disabled', false)
+                        .text('<?php echo esc_js(__('Pay Subscription', 'matrix-mlm')); ?>');
+                });
+            });
+        })(jQuery);
+        </script>
+        <?php endif; ?>
         <?php
         return ob_get_clean();
     }
