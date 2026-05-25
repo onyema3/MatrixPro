@@ -138,6 +138,21 @@ class Matrix_MLM_Core {
         // screen, which doesn't match the plugin's branded UI.
         add_filter('logout_redirect', [$this, 'filter_logout_redirect'], 10, 3);
 
+        // Hide the WordPress admin bar on the front-end for everyone
+        // except admins. The black "Howdy, <user>" bar is part of the
+        // WP core chrome; for an MLM platform it leaks the underlying
+        // CMS surface to members who shouldn't see WP-flavoured links
+        // (Edit Profile, dashboard shortcuts, the WP logo menu) and
+        // it visually clashes with the branded header above the
+        // /matrix-dashboard shortcode. The filter runs early enough
+        // that wp_head() never emits the bar's CSS for filtered users
+        // and the bar's <div id="wpadminbar"> never reaches the DOM,
+        // so this is purely a server-side suppression — no FOUC and
+        // no CSS override needed. Admins (capability manage_options)
+        // keep the bar so they can still jump back into wp-admin from
+        // any front-end page.
+        add_filter('show_admin_bar', [$this, 'filter_show_admin_bar']);
+
         // Suppress HTTP-level caching of any page that hosts the
         // [matrix_dashboard] shortcode. Reported symptom: after a
         // successful Wallet→Wallet transfer or e-pin recharge the
@@ -388,6 +403,36 @@ class Matrix_MLM_Core {
         }
 
         return $login_url;
+    }
+
+    /**
+     * show_admin_bar filter callback. Returns false for any
+     * front-end visitor who is not a site admin, so members,
+     * subscribers, and customers never see the WP admin bar above
+     * the Matrix dashboard. Admins (capability manage_options)
+     * keep it so they can still navigate into wp-admin from the
+     * front-end.
+     *
+     * Capability check rather than a role check because some
+     * installs grant manage_options to roles other than
+     * 'administrator' (network admins, white-labelled custom
+     * roles), and the intent is "people who run the site keep
+     * the bar; everyone else doesn't".
+     *
+     * Logged-out visitors aren't a concern — WP doesn't show the
+     * admin bar to them anyway — but current_user_can() correctly
+     * returns false in that case so the filter is a no-op for
+     * them.
+     *
+     * @param bool $show The incoming WP decision (typically true
+     *                   for logged-in users on the front-end).
+     * @return bool      Whether to render the admin bar.
+     */
+    public function filter_show_admin_bar($show) {
+        if (current_user_can('manage_options')) {
+            return $show;
+        }
+        return false;
     }
 
     public function enqueue_admin_assets($hook) {
