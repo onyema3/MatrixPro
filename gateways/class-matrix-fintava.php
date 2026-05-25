@@ -2535,6 +2535,55 @@ class Matrix_MLM_Fintava {
             ['%d']
         );
 
+        // Append a row to matrix_wallet so this bank payout shows
+        // up in the user's unified Transaction History on the
+        // Wallet page. The ACTUAL money moves on the user's
+        // Fintava virtual wallet (the Matrix internal balance is
+        // intentionally untouched on this path — see the long
+        // comment above the user_wallet lookup), so we use
+        // record_ledger() instead of debit(): it writes the audit
+        // row without mutating matrix_user_meta.balance, and lets
+        // us stamp post_balance against the wallet that was
+        // actually affected (the virtual one).
+        //
+        // Best-effort post_balance read: if get_virtual_wallet_balance()
+        // fails (transient Fintava issue, endpoint not surfaced on
+        // this tier, response in a shape we can't parse) we still
+        // record the row with post_balance=0.0 — same fail-open
+        // posture the pre-flight balance check uses above. The
+        // history row's "Post Balance" cell will read 0.00 for
+        // that one row, which is preferable to dropping the row
+        // entirely and having the user wonder why their bank
+        // transfer didn't appear in their history.
+        $post_balance = 0.0;
+        $balance_after = $this->get_virtual_wallet_balance(
+            $user_wallet->wallet_id,
+            $user_wallet->account_number,
+            $user_wallet->customer_id ?? null
+        );
+        if (!is_wp_error($balance_after)
+            && isset($balance_after['available_balance'])
+            && is_numeric($balance_after['available_balance'])) {
+            $post_balance = (float) $balance_after['available_balance'];
+        }
+
+        $matrix_wallet_logger = new Matrix_MLM_Wallet();
+        $matrix_wallet_logger->record_ledger(
+            $user_id,
+            $amount,
+            'debit',
+            'bank_transfer',
+            sprintf(
+                /* translators: 1: account name, 2: bank name, 3: account number */
+                __('Bank transfer to %1$s (%2$s %3$s) - from Virtual Wallet', 'matrix-mlm'),
+                $account_name,
+                $bank_name,
+                $account_number
+            ),
+            $post_balance,
+            $reference
+        );
+
         Matrix_MLM_Notifications::send_admin_notification(
             'fintava_payout',
             sprintf(

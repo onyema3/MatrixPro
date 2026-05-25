@@ -835,6 +835,50 @@ class Matrix_MLM_Admin_Billing_History {
                 );
                 wp_send_json_error(['message' => __('Refund to virtual wallet failed — see error log. The transaction row was rolled back so this refund can be retried.', 'matrix-mlm')]);
             }
+
+            // Refund landed on the virtual wallet. Append a row
+            // to matrix_wallet so this credit shows up in the
+            // user's unified Transaction History on the Wallet
+            // page. The actual credit is on the user's Fintava
+            // virtual wallet (not the Matrix internal wallet),
+            // so we use record_ledger() — that helper writes the
+            // audit row WITHOUT mutating matrix_user_meta.balance,
+            // preserving the source-wallet truth the
+            // matrix_billing_transactions row already records.
+            // The corresponding wallet_credit_reference on the
+            // matrix_billing_refunds audit row (inserted in
+            // step 4 below) ties this ledger row back to the
+            // refund event for cross-reference.
+            //
+            // post_balance is read back from the user's virtual
+            // wallet after the credit landed. Best-effort: same
+            // fail-open posture as the purchase-success path —
+            // a zero-stamped row is preferable to dropping the
+            // audit row entirely.
+            $post_balance_after_refund = 0.0;
+            if ($user_wlt) {
+                $balance_after = $fintava->get_virtual_wallet_balance(
+                    $user_wlt->wallet_id ?? '',
+                    $user_wlt->account_number ?? null,
+                    $user_wlt->customer_id ?? null
+                );
+                if (!is_wp_error($balance_after)
+                    && isset($balance_after['available_balance'])
+                    && is_numeric($balance_after['available_balance'])) {
+                    $post_balance_after_refund = (float) $balance_after['available_balance'];
+                }
+            }
+
+            $ledger = new Matrix_MLM_Wallet();
+            $ledger->record_ledger(
+                (int) $tx->user_id,
+                (float) $amount,
+                'credit',
+                'bill_admin_refund_virtual',
+                $description . ' (refund to Virtual Wallet)',
+                $post_balance_after_refund,
+                $reference
+            );
         } else {
             // Legacy path — credit the user's Matrix internal
             // wallet. Reached for pre-PR-#294 rows (source_wallet
