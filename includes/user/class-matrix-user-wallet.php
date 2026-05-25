@@ -825,11 +825,11 @@ class Matrix_MLM_User_Wallet {
                     var amount    = parseFloat($('#matrix-w2w-amount').val());
 
                     if (!recipient) {
-                        alert('<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
+                        window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
                         return;
                     }
                     if (!amount || amount < w2wMin) {
-                        alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                        window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
                         return;
                     }
 
@@ -839,7 +839,7 @@ class Matrix_MLM_User_Wallet {
                     charge = Math.round(charge * 100) / 100;
                     var total = amount + charge;
                     if (total > w2wBalance) {
-                        alert('<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
+                        window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
                         return;
                     }
 
@@ -872,15 +872,35 @@ class Matrix_MLM_User_Wallet {
                         },
                         success: function(res) {
                             if (res && res.success) {
-                                alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                                (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
+                                // Show success inline INSTEAD of
+                                // alert() + matrixMLMReload(). The
+                                // reload was the disorienting page-
+                                // refresh users complained about —
+                                // same fix as PR #277 made for
+                                // airtime. Reset the form so a
+                                // second transfer starts from a
+                                // clean slate, and update the local
+                                // balance cache so the on-form
+                                // ceiling stays correct without a
+                                // page refresh.
+                                window.matrixWalletShowNotice('#matrix-w2w-form', 'success', (res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
+                                $('#matrix-w2w-recipient').val('');
+                                $('#matrix-w2w-amount').val('');
+                                $('#matrix-w2w-form [name=transaction_pin]').val('');
+                                $('#matrix-w2w-charge-info').hide();
+                                if (res.data && typeof res.data.new_balance !== 'undefined' && isFinite(parseFloat(res.data.new_balance))) {
+                                    w2wBalance = parseFloat(res.data.new_balance);
+                                } else {
+                                    w2wBalance = Math.max(0, w2wBalance - total);
+                                }
+                                $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                             } else {
-                                alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
+                                window.matrixWalletShowNotice('#matrix-w2w-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                                 $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                             }
                         },
                         error: function(xhr, textStatus, errorMsg) {
-                            var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
+                            var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                         }
                     });
@@ -1141,6 +1161,66 @@ class Matrix_MLM_User_Wallet {
         ));
         ?>
         <h3><?php esc_html_e('Wallet to Wallet Transfer', 'matrix-mlm'); ?></h3>
+
+        <script>
+        // Inline status banner shown above the W2W form on submit
+        // outcome (and on pre-submit validation failure). Same shape
+        // as window.matrixBillingShowNotice in
+        // class-matrix-user-billing.php — kept as a separate helper
+        // because the wallet page never includes the billing helper
+        // and vice versa, so a shared definition would mean either
+        // duplicating it or introducing a third "common" file. The
+        // localized helper keeps the diff scoped to this form.
+        //
+        // Replaces the previous alert() + matrixMLMReload() pattern.
+        // The reload was the disorienting side-effect users called
+        // out across all the money-moving forms — same complaint
+        // shape as the airtime fix in PR #277. The new transaction
+        // will appear in "Recent Wallet Transfers" + "Transaction
+        // History" the next time the user refreshes the dashboard
+        // manually; the inline notice contains the per-transfer
+        // confirmation so they don't NEED to refresh to know it
+        // worked.
+        //
+        // Idempotent: defined once and short-circuits on subsequent
+        // renders (the wallet page can re-render this form via the
+        // pane-toggle UI without reloading).
+        if (typeof window.matrixWalletShowNotice !== 'function') {
+            window.matrixWalletShowNotice = function(formSelector, kind, message) {
+                if (typeof window.jQuery !== 'function') return;
+                var $ = window.jQuery;
+                var $form = $(formSelector);
+                if (!$form.length) return;
+                if (kind !== 'success') { kind = 'error'; }
+                var $notice = $form.find('.matrix-wallet-notice').first();
+                if (!$notice.length) {
+                    $notice = $('<div class="matrix-wallet-notice" role="status" aria-live="polite" tabindex="-1"></div>');
+                    $form.prepend($notice);
+                }
+                $notice
+                    .removeClass('matrix-wallet-notice-success matrix-wallet-notice-error')
+                    .addClass('matrix-wallet-notice-' + kind)
+                    .text(typeof message === 'string' && message.length ? message : '')
+                    .show();
+                // Bring into view and focus for a11y. Same pattern as
+                // matrixBillingShowNotice — try/catch because
+                // scrollIntoView options aren't universally supported
+                // and a focus failure (e.g. detached node) would
+                // otherwise abort whatever flow ran the notice.
+                try { $notice[0].scrollIntoView({behavior: 'smooth', block: 'nearest'}); } catch (e) {}
+                try { $notice.focus(); } catch (e) {}
+            };
+        }
+        </script>
+        <style>
+        /* Inline status banner injected by matrixWalletShowNotice
+           above the first form field on submit outcome / validation
+           failure. Same visual contract as the .matrix-billing-notice
+           styles defined in class-matrix-user-billing.php. */
+        .matrix-wallet-notice { padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:13px; line-height:1.45; outline:none; }
+        .matrix-wallet-notice-success { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+        .matrix-wallet-notice-error { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+        </style>
 
         <div class="matrix-transfer-note">
             <?php esc_html_e('Send funds from your Matrix wallet to another user\'s Matrix wallet by entering their username. The recipient will be notified by email.', 'matrix-mlm'); ?>
@@ -1854,7 +1934,7 @@ class Matrix_MLM_User_Wallet {
 
                 var amount = parseFloat($('#matrix-own-wallet-amount').val());
                 if (!amount || amount <= 0) {
-                    alert('<?php echo esc_js(__('Please enter a valid amount.', 'matrix-mlm')); ?>');
+                    window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'error', '<?php echo esc_js(__('Please enter a valid amount.', 'matrix-mlm')); ?>');
                     return;
                 }
                 var charge = ownChargeType === 'percent'
@@ -1862,7 +1942,7 @@ class Matrix_MLM_User_Wallet {
                     : ownChargeValue;
                 var total = amount + charge;
                 if (total > ownBalance) {
-                    alert('<?php echo esc_js(__('Insufficient Matrix wallet balance.', 'matrix-mlm')); ?>');
+                    window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'error', '<?php echo esc_js(__('Insufficient Matrix wallet balance.', 'matrix-mlm')); ?>');
                     return;
                 }
                 if (!confirm('<?php echo esc_js(__('Transfer', 'matrix-mlm')); ?> ' + ownCurrency + amount.toLocaleString() + ' <?php echo esc_js(__('from your Matrix wallet to your Virtual account?', 'matrix-mlm')); ?>\n\n<?php echo esc_js(__('Charge:', 'matrix-mlm')); ?> ' + ownCurrency + charge.toFixed(2) + '\n<?php echo esc_js(__('Total Debit:', 'matrix-mlm')); ?> ' + ownCurrency + total.toFixed(2))) {
@@ -1896,15 +1976,33 @@ class Matrix_MLM_User_Wallet {
                     },
                     success: function(res) {
                         if (res && res.success) {
-                            alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
+                            // Inline success — same rationale as the
+                            // W2W form below. matrixWalletShowNotice
+                            // is defined by render_wallet_to_wallet_form
+                            // which is also rendered on this page (in
+                            // the user-wallet pane), so it's available
+                            // here regardless of which pane the user
+                            // opens first. Update the local balance
+                            // cache so the on-form ceiling stays
+                            // correct for a follow-up transfer
+                            // without a page refresh.
+                            window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'success', (res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
+                            $('#matrix-own-wallet-amount').val('');
+                            $('#matrix-transfer-to-own-wallet-form [name=transaction_pin]').val('');
+                            $('#matrix-own-wallet-charge-info').hide();
+                            if (res.data && typeof res.data.new_balance !== 'undefined' && isFinite(parseFloat(res.data.new_balance))) {
+                                ownBalance = parseFloat(res.data.new_balance);
+                            } else {
+                                ownBalance = Math.max(0, ownBalance - total);
+                            }
+                            $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
                         } else {
-                            alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
+                            window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
                         }
                     },
                     error: function(xhr, textStatus, errorMsg) {
-                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
+                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'error', '<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
                     }
                 });
@@ -1959,11 +2057,11 @@ class Matrix_MLM_User_Wallet {
                 var amount    = parseFloat($('#matrix-w2w-amount').val());
 
                 if (!recipient) {
-                    alert('<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
+                    window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Please enter the recipient\'s username.', 'matrix-mlm')); ?>');
                     return;
                 }
                 if (!amount || amount < w2wMin) {
-                    alert('<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
+                    window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Amount must be at least the minimum transfer.', 'matrix-mlm')); ?>');
                     return;
                 }
 
@@ -1973,7 +2071,7 @@ class Matrix_MLM_User_Wallet {
                 charge = Math.round(charge * 100) / 100;
                 var total = amount + charge;
                 if (total > w2wBalance) {
-                    alert('<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
+                    window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Insufficient Matrix wallet balance for amount + charge.', 'matrix-mlm')); ?>');
                     return;
                 }
 
@@ -2000,15 +2098,31 @@ class Matrix_MLM_User_Wallet {
                     },
                     success: function(res) {
                         if (res && res.success) {
-                            alert((res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
-                            (typeof matrixMLMReload === "function" ? matrixMLMReload : function(){ window.location.reload(); })();
+                            // Inline success — same rationale as
+                            // the matching handler in
+                            // render_scripts_no_wallet(). Reset the
+                            // form for a second transfer and update
+                            // the local balance cache so the on-form
+                            // ceiling stays correct without a page
+                            // refresh.
+                            window.matrixWalletShowNotice('#matrix-w2w-form', 'success', (res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
+                            $('#matrix-w2w-recipient').val('');
+                            $('#matrix-w2w-amount').val('');
+                            $('#matrix-w2w-form [name=transaction_pin]').val('');
+                            $('#matrix-w2w-charge-info').hide();
+                            if (res.data && typeof res.data.new_balance !== 'undefined' && isFinite(parseFloat(res.data.new_balance))) {
+                                w2wBalance = parseFloat(res.data.new_balance);
+                            } else {
+                                w2wBalance = Math.max(0, w2wBalance - total);
+                            }
+                            $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                         } else {
-                            alert((res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
+                            window.matrixWalletShowNotice('#matrix-w2w-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                         }
                     },
                     error: function(xhr, textStatus, errorMsg) {
-                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } alert('<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
+                        var diag = (xhr ? ('HTTP ' + (xhr.status || 0) + (xhr.statusText ? ' ' + xhr.statusText : '')) : 'no xhr'); var bodySnippet = (xhr && xhr.responseText) ? (' :: ' + String(xhr.responseText).replace(/\s+/g, ' ').substring(0, 200)) : ''; if (window.console && console.error) { console.error('matrix ajax error', { url: matrixMLM && matrixMLM.ajaxUrl, status: xhr && xhr.status, statusText: xhr && xhr.statusText, textStatus: textStatus, errorMsg: errorMsg, responseText: xhr && xhr.responseText }); } window.matrixWalletShowNotice('#matrix-w2w-form', 'error', '<?php echo esc_js(__('Network error', 'matrix-mlm')); ?> [' + diag + (textStatus && textStatus !== 'error' ? ' / ' + textStatus : '') + (errorMsg ? ' / ' + errorMsg : '') + ']' + bodySnippet);
                         $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
                     }
                 });
