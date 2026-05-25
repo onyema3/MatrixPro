@@ -141,6 +141,14 @@ if (is_admin()) {
     // hook before WordPress dispatches the request.
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-billing-history.php';
     Matrix_MLM_Admin_Billing_History::init();
+    // Member announcements composer. Capability-gated on
+    // manage_matrix_settings (admin tier) — see the class
+    // header for the rationale on why it's not the lower
+    // manage_matrix_mlm cap. No init() call needed: it has
+    // no AJAX handlers (the compose → review → send wizard
+    // is fully form-driven), so the admin_menu registration
+    // in class-matrix-admin.php is the only wiring required.
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-announcements.php';
 }
 
 // User Dashboard
