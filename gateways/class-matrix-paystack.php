@@ -337,10 +337,24 @@ class Matrix_MLM_Paystack {
         }
 
         // Static map - the well-known Nigerian commercial and merchant
-        // banks. Source: NIBSS sortCode publication + CBN code list.
-        // Edit this map when a new bank's sortCode <-> CBN code pair
-        // becomes stable; until then the dynamic name-match fallback
-        // below picks up new banks Paystack adds.
+        // banks plus the major fintechs. Source: NIBSS sortCode
+        // publication + Paystack's published bank list. Two flavours:
+        //
+        //   - Commercial / merchant banks: Fintava sortCode (3-digit
+        //     CBN with leading zeros, e.g. "000014") translates to
+        //     Paystack CBN code (3-digit no-leading-zero, e.g. "044").
+        //
+        //   - Fintech / digital banks (OPay, PalmPay, Kuda,
+        //     Moniepoint, 9PSB, etc.): Fintava and Paystack both use
+        //     the NIBSS-issued institution code verbatim, so the map
+        //     is an identity (e.g. "100004" -> "100004" for OPay).
+        //     The identity entries look redundant but they sit in the
+        //     fast path so we don't pay a Paystack /bank round-trip
+        //     for the most common fintech lookups.
+        //
+        // When a new bank's sortCode <-> CBN code pair becomes stable,
+        // add it here. Until then the dynamic name-match and identity
+        // fallbacks below pick up new banks Paystack adds.
         $map = [
             // Commercial banks
             '000014' => '044', // Access Bank
@@ -373,17 +387,35 @@ class Matrix_MLM_Paystack {
             '060001' => '559', // Coronation Merchant Bank
             '060002' => '401', // FBNQuest Merchant Bank
             '060003' => '060', // Nova Merchant Bank
+            // Fintech / digital banks. NIBSS-identity codes - both
+            // Fintava and Paystack accept the sortCode as the CBN
+            // code on /bank/resolve for these institutions.
+            '100004' => '100004', // OPay (PayCom)
+            '100033' => '100033', // PalmPay
+            '100002' => '100002', // Paga
+            '100003' => '100003', // Parkway Readycash
+            '50211'  => '50211',  // Kuda Microfinance Bank
+            '50515'  => '50515',  // Moniepoint Microfinance Bank
+            '120001' => '120001', // 9 Payment Service Bank (9PSB)
+            '51310'  => '51310',  // Sparkle Microfinance Bank
+            '565'    => '565',    // Carbon (One Finance MFB)
+            '566'    => '566',    // VFD Microfinance Bank
+            '125'    => '125',    // Rubies Microfinance Bank
         ];
         if (isset($map[$sortcode])) {
             return $map[$sortcode];
         }
 
-        // Dynamic fallback. If the operator gave us a bank name from
-        // Fintava's /banks row, look for a Paystack bank whose name
-        // matches by normalised compare (case + whitespace + "bank"
-        // suffix tolerance). This keeps fintech banks (OPay, Kuda,
-        // PalmPay, Moniepoint, etc.) working without us shipping a
-        // new map every time Paystack onboards one.
+        // Dynamic fallback #1: name match.
+        //
+        // If the operator gave us a bank name from Fintava's /banks
+        // row, look for a Paystack bank whose name matches by
+        // normalised compare. The normaliser strips parenthetical
+        // content, corporate suffixes, and the "bank" trailer so
+        // "OPay (PayCom)" and "OPay Digital Services Limited (OPay)"
+        // both collide on "opay". This keeps fintech banks working
+        // when Paystack onboards a new one before we ship a static
+        // map update.
         if ($bank_name !== '') {
             $needle = self::normalize_bank_name_for_match($bank_name);
             if ($needle !== '') {
@@ -395,23 +427,62 @@ class Matrix_MLM_Paystack {
             }
         }
 
+        // Dynamic fallback #2: identity match against Paystack's
+        // bank list.
+        //
+        // Many institutions (every fintech, plus a handful of
+        // microfinance banks) carry the same NIBSS-issued code on
+        // both Fintava's /banks and Paystack's /bank. If Paystack
+        // returns a bank with code == our sortCode, it's safe to
+        // use the sortCode as-is. This catches anything the static
+        // map and name match miss without any code archaeology -
+        // we're literally just confirming Paystack accepts this
+        // code.
+        foreach ($this->get_banks() as $bank) {
+            if (isset($bank['code']) && $bank['code'] === $sortcode) {
+                return $sortcode;
+            }
+        }
+
         return '';
     }
 
     /**
-     * Normalise a bank name for fuzzy matching. Lowercase, strip
-     * surrounding whitespace, collapse internal whitespace, strip
-     * common-noise tokens ("plc", "limited", "ltd", trailing "bank"
-     * with no further qualifier). Symmetric on both sides so e.g.
-     * "Access Bank Plc" / "Access Bank" / "Access" all collide on
-     * the same key.
+     * Normalise a bank name for fuzzy matching across Fintava's and
+     * Paystack's /banks responses, which use different naming
+     * conventions for the same institution.
+     *
+     * Steps:
+     *   1. Lowercase + trim.
+     *   2. Strip parenthetical content. This is the critical step
+     *      for fintechs: Fintava returns "OPay (PayCom)" and
+     *      Paystack returns "OPay Digital Services Limited (OPay)".
+     *      Without this, the two never match.
+     *   3. Strip corporate-noise tokens (plc/ltd/limited/nigeria,
+     *      "digital services", "financial services", "fintech").
+     *   4. Strip a trailing "bank" / "microfinance bank" / "mfb"
+     *      so "Wema Bank" / "Wema Bank Plc" / "Wema" all collide.
+     *   5. Collapse whitespace, trim again.
+     *
+     * Symmetric on both sides — Fintava's name and Paystack's name
+     * both go through the same transform and either both match or
+     * neither does.
      */
     public static function normalize_bank_name_for_match($name) {
         $n = strtolower((string) $name);
-        $n = preg_replace('/\b(plc|limited|ltd|nigeria|nig)\b/u', ' ', $n);
+        // Strip parenthetical content first so contents inside parens
+        // can't survive into later steps and trip up the trailing
+        // "bank" stripper.
+        $n = preg_replace('/\([^)]*\)/u', ' ', $n);
+        // Corporate / common-noise tokens.
+        $n = preg_replace('/\b(plc|limited|ltd|nigeria|nig|digital|services|financial|fintech)\b/u', ' ', $n);
         $n = preg_replace('/\s+/', ' ', $n);
         $n = trim($n);
-        $n = preg_replace('/\s+bank$/u', '', $n);
+        // Trailing institution-type tokens. "microfinance bank" /
+        // "mfb" / "bank" — order matters so the longer phrase
+        // gets stripped before the shorter "bank" suffix would
+        // partial-match it.
+        $n = preg_replace('/\s+(microfinance bank|mfb|bank)$/u', '', $n);
         return trim($n);
     }
 
