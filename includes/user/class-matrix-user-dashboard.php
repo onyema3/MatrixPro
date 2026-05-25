@@ -323,12 +323,18 @@ class Matrix_MLM_User_Dashboard {
                         }
                         $is_active = ($tab === $item['slug']) ? 'active' : '';
                         ?>
-                        <a href="<?php echo esc_url(self::tab_url($item['slug'])); ?>" class="<?php echo esc_attr($is_active); ?>"><span class="dashicons <?php echo esc_attr($item['icon']); ?>"></span> <?php echo esc_html($item['label']); ?></a>
+                        <?php /* style="font-family:dashicons!important" defends against theme nav resets that win the cascade against class-based rules.
+                                 PR #335 added the same rule via .matrix-dashboard-nav a .dashicons {} but DevTools
+                                 showed font-family computed as the system stack on the live site (libertyhub.ng) —
+                                 meaning the theme's own !important + later source order beat the plugin selector.
+                                 Inline style has specificity (1,0,0,0), un-overridable except by another inline
+                                 style assigned via JS, which themes don't do for nav children. See PR #336. */ ?>
+                        <a href="<?php echo esc_url(self::tab_url($item['slug'])); ?>" class="<?php echo esc_attr($is_active); ?>"><span class="dashicons <?php echo esc_attr($item['icon']); ?>" style="font-family:dashicons!important"></span> <?php echo esc_html($item['label']); ?></a>
                         <?php
                     }
                     ?>
                     <?php echo $this->build_notification_bell($user_id); ?>
-                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit" style="font-family:dashicons!important"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>
             <div class="matrix-dashboard-content">
@@ -1436,7 +1442,7 @@ class Matrix_MLM_User_Dashboard {
                     aria-expanded="false"
                     aria-haspopup="true"
                     data-matrix-notif-trigger>
-                <span class="dashicons dashicons-bell" aria-hidden="true"></span>
+                <span class="dashicons dashicons-bell" aria-hidden="true" style="font-family:dashicons!important"></span>
                 <span class="matrix-notif-bell-label"><?php esc_html_e('Notifications', 'matrix-mlm'); ?></span>
                 <span class="matrix-notif-bell-badge<?php echo $unread > 0 ? ' is-visible' : ''; ?>"
                       data-matrix-notif-badge
@@ -1480,7 +1486,7 @@ class Matrix_MLM_User_Dashboard {
                             data-matrix-notif-item
                             data-id="<?php echo (int) $row->id; ?>"
                             data-link="<?php echo esc_attr($href); ?>">
-                            <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true"></span>
+                            <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true" style="font-family:dashicons!important"></span>
                             <div class="matrix-notif-body">
                                 <div class="matrix-notif-title"><?php echo esc_html($row->title); ?></div>
                                 <?php if (!empty($row->body)): ?>
@@ -1624,7 +1630,7 @@ class Matrix_MLM_User_Dashboard {
                     <li class="matrix-notif-page-item<?php echo $is_read ? ' is-read' : ' is-unread'; ?>"
                         data-matrix-notif-page-item
                         data-id="<?php echo (int) $row->id; ?>">
-                        <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true"></span>
+                        <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true" style="font-family:dashicons!important"></span>
                         <div class="matrix-notif-page-body">
                             <div class="matrix-notif-page-title">
                                 <?php if (!empty($row->link_url)): ?>
