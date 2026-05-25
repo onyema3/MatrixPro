@@ -44,13 +44,31 @@ class Matrix_MLM_GDPR {
             </div>
         </div>
         <script>
+        // Cookie attributes: SameSite=Lax pins the consent cookie to
+        // first-party navigation and forbids the browser from sending
+        // it along with cross-site sub-requests, which closes a
+        // theoretical CSRF-style ambiguity around cross-origin reads
+        // of the banner state. Secure is appended only on HTTPS so a
+        // local-dev HTTP origin can still set the cookie at all
+        // (browsers reject Secure cookies on plain HTTP). Path stays
+        // root so the consent state is shared across every page on
+        // the site, and max-age stays 1 year. Both accept and reject
+        // paths get the same shape so future changes only have to
+        // edit one helper.
+        function matrixCookieAttrs() {
+            var attrs = "; path=/; max-age=" + (365 * 24 * 60 * 60) + "; SameSite=Lax";
+            if (window.location && window.location.protocol === 'https:') {
+                attrs += "; Secure";
+            }
+            return attrs;
+        }
         function matrixAcceptCookies() {
-            document.cookie = "matrix_cookie_consent=accepted; path=/; max-age=" + (365 * 24 * 60 * 60);
+            document.cookie = "matrix_cookie_consent=accepted" + matrixCookieAttrs();
             document.getElementById('matrix-cookie-consent').style.display = 'none';
             jQuery.post(matrixMLM.ajaxUrl, {action: 'matrix_accept_cookies', consent: 'accepted'});
         }
         function matrixRejectCookies() {
-            document.cookie = "matrix_cookie_consent=rejected; path=/; max-age=" + (365 * 24 * 60 * 60);
+            document.cookie = "matrix_cookie_consent=rejected" + matrixCookieAttrs();
             document.getElementById('matrix-cookie-consent').style.display = 'none';
         }
         </script>
