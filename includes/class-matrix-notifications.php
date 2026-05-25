@@ -823,6 +823,10 @@ class Matrix_MLM_Notifications {
                 return self::send_nexmo_sms($phone, $message, $sms_api_key, $sms_api_secret, $sms_sender_id);
             case 'termii':
                 return self::send_termii_sms($phone, $message, $sms_api_key, $sms_sender_id);
+            case 'bulksmsnigeria':
+                return self::send_bulksmsnigeria_sms($phone, $message, $sms_api_key, $sms_sender_id);
+            case 'kudisms':
+                return self::send_kudisms_sms($phone, $message, $sms_api_key, $sms_sender_id);
             default:
                 return false;
         }
@@ -861,6 +865,83 @@ class Matrix_MLM_Notifications {
                 'type' => 'plain',
                 'channel' => 'generic'
             ])
+        ]);
+        return !is_wp_error($response);
+    }
+
+    /**
+     * BulkSMS Nigeria — REST API v2.
+     *
+     * Endpoint: POST https://www.bulksmsnigeria.com/api/v2/sms
+     * Auth:     Bearer token in the Authorization header. The dashboard
+     *           API token is what the operator pastes into the
+     *           "API Key / SID" field on the SMS settings tab; "API
+     *           Secret" is unused for this provider.
+     * Body:     JSON with from / to / body keys.
+     *
+     * Sender ID must be pre-registered on the BulkSMS Nigeria dashboard
+     * before a send will succeed; the API rejects unregistered IDs at
+     * submit time. We surface that as a generic boolean here for parity
+     * with the other providers in this class — the deeper diagnostic
+     * path is the operator inspecting their BulkSMS Nigeria dashboard
+     * (delivery reports + usage logs are visible there).
+     *
+     * The response is success-shaped (HTTP 200 with a JSON body that
+     * has a `data` envelope on success) but for consistency with the
+     * existing Twilio / Nexmo / Termii helpers we just gate on
+     * !is_wp_error(); a structured response check would tighten the
+     * error model uniformly across all providers, which is out of
+     * scope for adding the provider itself.
+     */
+    private static function send_bulksmsnigeria_sms($phone, $message, $api_token, $sender_id) {
+        $response = wp_remote_post('https://www.bulksmsnigeria.com/api/v2/sms', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $api_token,
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json',
+            ],
+            'body' => wp_json_encode([
+                'from' => $sender_id,
+                'to'   => $phone,
+                'body' => $message,
+            ])
+        ]);
+        return !is_wp_error($response);
+    }
+
+    /**
+     * KudiSMS — REST API.
+     *
+     * Endpoint: POST https://my.kudisms.net/api/sms
+     * Auth:     dashboard token passed as the `token` form field. The
+     *           operator pastes the token into the "API Key / SID"
+     *           field on the SMS settings tab; "API Secret" is unused
+     *           for this provider.
+     * Body:     application/x-www-form-urlencoded with token / senderID
+     *           / message / recipient. Multiple recipients in one call
+     *           are comma-separated; we only ever send to one recipient
+     *           from the notification helper, so no comma handling is
+     *           needed here.
+     *
+     * Sender ID must be pre-registered on the KudiSMS dashboard. The
+     * `gateway` parameter (corporate vs generic routing) is omitted
+     * here so KudiSMS uses the account's default route — operators
+     * who need a specific gateway can configure it on the dashboard
+     * side.
+     *
+     * Same is_wp_error() boolean shape as the other providers; the
+     * KudiSMS response carries a JSON `status` field (success/error)
+     * and an `error_code` that a tighter implementation could parse,
+     * but that's out of scope for adding the provider itself.
+     */
+    private static function send_kudisms_sms($phone, $message, $token, $sender_id) {
+        $response = wp_remote_post('https://my.kudisms.net/api/sms', [
+            'body' => [
+                'token'     => $token,
+                'senderID'  => $sender_id,
+                'recipient' => $phone,
+                'message'   => $message,
+            ]
         ]);
         return !is_wp_error($response);
     }

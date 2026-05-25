@@ -712,7 +712,17 @@ class Matrix_MLM_Admin_Settings {
                     <option value="twilio" <?php selected(get_option('matrix_mlm_sms_provider'), 'twilio'); ?>>Twilio</option>
                     <option value="nexmo" <?php selected(get_option('matrix_mlm_sms_provider'), 'nexmo'); ?>>Nexmo/Vonage</option>
                     <option value="termii" <?php selected(get_option('matrix_mlm_sms_provider'), 'termii'); ?>>Termii</option>
-                </select></td></tr>
+                    <option value="bulksmsnigeria" <?php selected(get_option('matrix_mlm_sms_provider'), 'bulksmsnigeria'); ?>>BulkSMS Nigeria</option>
+                    <option value="kudisms" <?php selected(get_option('matrix_mlm_sms_provider'), 'kudisms'); ?>>KudiSMS</option>
+                </select>
+                <p class="description">
+                    <?php _e('Per-provider field usage:', 'matrix-mlm'); ?><br>
+                    &bull; <strong>Twilio</strong> &mdash; <?php _e('API Key/SID = Account SID, API Secret = Auth Token, Sender ID = From number.', 'matrix-mlm'); ?><br>
+                    &bull; <strong>Nexmo/Vonage</strong> &mdash; <?php _e('API Key, API Secret, Sender ID/From number.', 'matrix-mlm'); ?><br>
+                    &bull; <strong>Termii</strong> &mdash; <?php _e('API Key only; Sender ID required, Secret unused.', 'matrix-mlm'); ?><br>
+                    &bull; <strong>BulkSMS Nigeria</strong> &mdash; <?php _e('API Key = your dashboard API token (used as Bearer auth), Sender ID required, Secret unused.', 'matrix-mlm'); ?><br>
+                    &bull; <strong>KudiSMS</strong> &mdash; <?php _e('API Key = your dashboard token, Sender ID required, Secret unused.', 'matrix-mlm'); ?>
+                </p></td></tr>
             <tr><th><?php _e('API Key / SID', 'matrix-mlm'); ?></th>
                 <td><input type="text" name="matrix_mlm_sms_api_key" class="regular-text" value="<?php echo esc_attr(get_option('matrix_mlm_sms_api_key', '')); ?>"></td></tr>
             <tr><th><?php _e('API Secret / Token', 'matrix-mlm'); ?></th>
