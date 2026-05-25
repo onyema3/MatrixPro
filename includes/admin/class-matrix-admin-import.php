@@ -39,8 +39,11 @@
  *  - All hooks register via init() so cron/AJAX/admin-post wire up
  *    on every request. Every method is static; there is no
  *    per-instance state.
- *  - Upload streams the .sql/.sql.gz file into wp-content/uploads/
- *    matrix-mlm-imports/ (deny-all .htaccess, same as backups).
+ *  - Upload streams the .sql/.sql.gz file into a private staging
+ *    directory outside wp-content/uploads/ (audit L6 — moved from
+ *    wp-content/uploads/matrix-mlm-imports/ to
+ *    wp-content/matrix-mlm-imports-private/, with the same Apache /
+ *    IIS / Nginx-snippet deny rules the backup tool drops).
  *  - Stage parses the dump's INSERT statements with a tiny string-
  *    aware state machine (handles multi-row VALUES, escapes, and
  *    backtick identifiers) and replays them into temporary
@@ -375,30 +378,194 @@ class Matrix_MLM_Admin_Import {
      * ================================================================ */
 
     /**
-     * Return the directory where uploaded Laravel dumps live. Created
-     * lazily with the same .htaccess + index.html guards the backup
-     * tool uses, since dumps contain bcrypt password hashes and
-     * full member contact details that should never be web-readable.
+     * Return (and create on first call) the directory uploaded
+     * Laravel dumps live in.
+     *
+     * Audit L6 hardening — mirrors the H9 fix the backup module
+     * already shipped:
+     *
+     *   - Default location moved from wp-content/uploads/matrix-mlm-
+     *     imports/ to wp-content/matrix-mlm-imports-private/. The
+     *     uploads directory is unconditionally web-readable on every
+     *     hosting stack; sibling private dirs under wp-content/ are
+     *     not, on most modern Nginx and IIS configurations whose
+     *     vhost rules only serve uploads/, themes/, plugins/.
+     *
+     *   - Operator override: define MATRIX_MLM_IMPORT_DIR in
+     *     wp-config.php to point at a directory outside the webroot
+     *     entirely. Recommended for production setups handling real
+     *     member dumps. The constant takes precedence over the
+     *     default and is not validated for path safety — the
+     *     operator owns that.
+     *
+     *   - Cross-server deny rules written on first creation:
+     *       .htaccess        — Apache 2.2 + 2.4
+     *       web.config       — IIS 7+
+     *       nginx-deny.conf.example
+     *                        — copy-pasteable Nginx snippet (Nginx
+     *                          does not honour per-directory configs;
+     *                          operator must splice it into the
+     *                          vhost server { } block)
+     *       index.html       — empty, belt-and-braces against
+     *                          directory listing
+     *
+     *   - One-shot migration of any leftover dumps from the legacy
+     *     wp-content/uploads/matrix-mlm-imports/ location into the
+     *     new dir. Idempotent — files are MOVED, not copied, and a
+     *     same-named destination is skipped rather than clobbered so
+     *     a partial migration never destroys data.
+     *
+     * The protection matters more here than on the backup dir:
+     * Laravel dumps carry bcrypt password hashes, BVNs, NINs, full
+     * phone numbers and contact details for every imported member.
      */
     private static function get_import_dir() {
-        $uploads = wp_upload_dir();
-        $dir = trailingslashit($uploads['basedir']) . 'matrix-mlm-imports';
+        // Operator override via wp-config.php constant. Documented
+        // exit hatch for production setups that want imports outside
+        // the webroot entirely.
+        if (defined('MATRIX_MLM_IMPORT_DIR') && is_string(MATRIX_MLM_IMPORT_DIR) && MATRIX_MLM_IMPORT_DIR !== '') {
+            $dir = rtrim(MATRIX_MLM_IMPORT_DIR, '/\\');
+            if (!file_exists($dir)) {
+                wp_mkdir_p($dir);
+            }
+            self::write_protection_files($dir);
+            return $dir;
+        }
+
+        // Default: wp-content/matrix-mlm-imports-private/. Sibling of
+        // uploads/, themes/, plugins/ but NOT inside any of them, so
+        // a request for /wp-content/matrix-mlm-imports-private/<file>
+        // is not a path that the typical Nginx wp-content rule
+        // serves. The deny files give a second layer of protection
+        // on hosts that DO serve arbitrary wp-content paths.
+        $dir = rtrim(WP_CONTENT_DIR, '/\\') . '/matrix-mlm-imports-private';
         if (!file_exists($dir)) {
             wp_mkdir_p($dir);
         }
-        $h = $dir . '/.htaccess';
-        if (!file_exists($h)) {
+
+        self::write_protection_files($dir);
+        self::migrate_legacy_imports($dir);
+
+        return $dir;
+    }
+
+    /**
+     * Drop deny-all server config files into the import directory
+     * for Apache, IIS, and Nginx. Idempotent — only writes a file
+     * if it does not already exist, so an operator who has
+     * customised any of these is not overwritten.
+     */
+    private static function write_protection_files($dir) {
+        // Apache 2.2 + 2.4 compatible "deny all" stanza.
+        $htaccess = $dir . '/.htaccess';
+        if (!file_exists($htaccess)) {
             @file_put_contents(
-                $h,
+                $htaccess,
                 "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n" .
                 "<IfModule !mod_authz_core.c>\nOrder Deny,Allow\nDeny from all\n</IfModule>\n"
             );
         }
-        $i = $dir . '/index.html';
-        if (!file_exists($i)) {
-            @file_put_contents($i, '');
+
+        // IIS 7+ deny rule.
+        $webconfig = $dir . '/web.config';
+        if (!file_exists($webconfig)) {
+            @file_put_contents(
+                $webconfig,
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" .
+                "<configuration>\n" .
+                "  <system.webServer>\n" .
+                "    <authorization>\n" .
+                "      <deny users=\"*\" />\n" .
+                "    </authorization>\n" .
+                "  </system.webServer>\n" .
+                "</configuration>\n"
+            );
         }
-        return $dir;
+
+        // Nginx does not honour per-directory config files. Drop a
+        // copy-pasteable snippet alongside the other deny files so
+        // the operator can splice it into their site vhost. The
+        // README header explains why this file exists.
+        $nginx_snippet = $dir . '/nginx-deny.conf.example';
+        if (!file_exists($nginx_snippet)) {
+            $rel = '/wp-content/' . basename($dir) . '/';
+            @file_put_contents(
+                $nginx_snippet,
+                "# Matrix MLM Pro — import staging directory protection (Nginx)\n" .
+                "#\n" .
+                "# Nginx does not honour per-directory .htaccess or web.config.\n" .
+                "# Splice the following block into your site's server { } stanza\n" .
+                "# (alongside the existing wp-content rules) and reload nginx:\n" .
+                "#\n" .
+                "#     location {$rel} {\n" .
+                "#         deny all;\n" .
+                "#         return 404;\n" .
+                "#     }\n" .
+                "#\n" .
+                "# Or move imports outside the webroot entirely by defining\n" .
+                "# MATRIX_MLM_IMPORT_DIR in wp-config.php — the recommended\n" .
+                "# production setup. Example:\n" .
+                "#\n" .
+                "#     define('MATRIX_MLM_IMPORT_DIR', '/var/lib/matrix-mlm-imports');\n"
+            );
+        }
+
+        // Belt-and-braces against directory listing.
+        $index = $dir . '/index.html';
+        if (!file_exists($index)) {
+            @file_put_contents($index, '');
+        }
+    }
+
+    /**
+     * One-shot migration of dumps from the legacy
+     * wp-content/uploads/matrix-mlm-imports/ location into the new
+     * dir. Idempotent: skipped when the legacy dir does not exist
+     * or is empty.
+     *
+     * Files are MOVED, not copied — leaving two on-disk copies of a
+     * sensitive dump (bcrypt hashes, BVNs, NINs) would defeat the
+     * point. If a move fails for any reason (cross-filesystem,
+     * permissions, etc.) the source is left in place so the data is
+     * never lost; the operator can clean up manually after
+     * confirming the new location works.
+     */
+    private static function migrate_legacy_imports($new_dir) {
+        $uploads = wp_upload_dir();
+        $legacy_dir = trailingslashit($uploads['basedir']) . 'matrix-mlm-imports';
+        if (!is_dir($legacy_dir)) {
+            return;
+        }
+        if (rtrim($legacy_dir, '/\\') === rtrim($new_dir, '/\\')) {
+            return; // operator pointed MATRIX_MLM_IMPORT_DIR at the legacy dir
+        }
+
+        // The importer's handle_upload writes files as
+        // 'laravel-<timestamp>-<sanitised-original>.{sql,sql.gz}'.
+        // Match that shape so we don't sweep up arbitrary other
+        // files an admin may have stashed in the legacy dir.
+        $files = @glob($legacy_dir . '/laravel-*.{sql,sql.gz}', GLOB_BRACE);
+        if (!is_array($files) || empty($files)) {
+            return;
+        }
+
+        $moved = 0;
+        foreach ($files as $src) {
+            $dest = $new_dir . '/' . basename($src);
+            if (file_exists($dest)) {
+                continue; // do not clobber an existing same-named file
+            }
+            if (@rename($src, $dest)) {
+                $moved++;
+            }
+        }
+
+        if ($moved > 0) {
+            error_log(sprintf(
+                '[Matrix MLM] Migrated %d import dump(s) from %s to %s',
+                $moved, $legacy_dir, $new_dir
+            ));
+        }
     }
 
     /** Fully-qualified staging table name. */
