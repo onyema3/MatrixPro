@@ -1005,17 +1005,35 @@ class Matrix_MLM_User_Wallet {
                         },
                         success: function(res) {
                             if (res && res.success) {
-                                // Show success inline INSTEAD of
-                                // alert() + matrixMLMReload(). The
-                                // reload was the disorienting page-
-                                // refresh users complained about —
-                                // same fix as PR #277 made for
-                                // airtime. Reset the form so a
-                                // second transfer starts from a
-                                // clean slate, and update the local
-                                // balance cache so the on-form
-                                // ceiling stays correct without a
-                                // page refresh.
+                                // Show the success notice briefly,
+                                // then reload the page through the
+                                // cache-busting helper so the
+                                // Matrix Wallet card at the top
+                                // and the Transaction History
+                                // table at the bottom both reflect
+                                // the new state. The local form
+                                // reset and balance-cache update
+                                // below are kept as a graceful
+                                // fallback for the rare case where
+                                // matrixMLMReload() is unavailable
+                                // (e.g. matrix-public.js failed to
+                                // load) — without that fallback
+                                // the form would stay in its
+                                // pre-submit state forever.
+                                //
+                                // History note: an earlier revision
+                                // (parallel to PR #277 for airtime)
+                                // suppressed the reload entirely
+                                // because LiteSpeed was serving
+                                // stale dashboard HTML, making
+                                // the refresh feel like nothing
+                                // happened. PR #328 fixed the
+                                // cache layer (4-layer no-cache
+                                // headers in nocache_dashboard_pages
+                                // + post-upgrade purge), so the
+                                // reload now returns fresh data
+                                // and the wallet card / ledger
+                                // both update correctly.
                                 window.matrixWalletShowNotice('#matrix-w2w-form', 'success', (res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
                                 $('#matrix-w2w-recipient').val('');
                                 $('#matrix-w2w-amount').val('');
@@ -1027,6 +1045,26 @@ class Matrix_MLM_User_Wallet {
                                     w2wBalance = Math.max(0, w2wBalance - total);
                                 }
                                 $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
+                                // Auto-refresh the page so the
+                                // Matrix Wallet balance card and
+                                // the Transaction History table
+                                // pick up the new transfer. Delay
+                                // is long enough for the inline
+                                // success toast to register
+                                // visually before the reload kicks
+                                // in (matches the 1500ms used by
+                                // the e-pin and ticket flows in
+                                // matrix-public.js). The recipient
+                                // does not get an auto-refresh —
+                                // they'll see the credit on their
+                                // next page load, which is fresh
+                                // because PR #328 stops LiteSpeed
+                                // from caching dashboard pages.
+                                if (typeof window.matrixMLMReload === 'function') {
+                                    setTimeout(window.matrixMLMReload, 1500);
+                                } else {
+                                    setTimeout(function() { window.location.reload(); }, 1500);
+                                }
                             } else {
                                 window.matrixWalletShowNotice('#matrix-w2w-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                                 $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
@@ -2640,13 +2678,32 @@ class Matrix_MLM_User_Wallet {
                     },
                     success: function(res) {
                         if (res && res.success) {
-                            // Inline success — same rationale as
-                            // the matching handler in
-                            // render_scripts_no_wallet(). Reset the
-                            // form for a second transfer and update
-                            // the local balance cache so the on-form
-                            // ceiling stays correct without a page
-                            // refresh.
+                            // Show the success notice briefly, then
+                            // auto-refresh the page through the
+                            // cache-busting helper so the Matrix
+                            // Wallet card at the top and the
+                            // Transaction History table at the
+                            // bottom both pick up the new transfer.
+                            // The form-reset and local-balance
+                            // update below are kept as a graceful
+                            // fallback in case matrixMLMReload() is
+                            // unavailable (e.g. matrix-public.js
+                            // didn't load) — without the fallback
+                            // the form would stay disabled-looking
+                            // forever.
+                            //
+                            // History note: an earlier revision
+                            // (parallel to PR #277 for airtime)
+                            // suppressed the reload entirely
+                            // because LiteSpeed was serving stale
+                            // dashboard HTML, making the refresh
+                            // feel like nothing happened. PR #328
+                            // fixed the cache layer (4-layer
+                            // no-cache headers in
+                            // nocache_dashboard_pages + post-
+                            // upgrade purge), so the reload now
+                            // returns fresh data and the wallet
+                            // card / ledger both update correctly.
                             window.matrixWalletShowNotice('#matrix-w2w-form', 'success', (res.data && res.data.message) || '<?php echo esc_js(__('Transfer successful.', 'matrix-mlm')); ?>');
                             $('#matrix-w2w-recipient').val('');
                             $('#matrix-w2w-amount').val('');
@@ -2658,6 +2715,25 @@ class Matrix_MLM_User_Wallet {
                                 w2wBalance = Math.max(0, w2wBalance - total);
                             }
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
+                            // Auto-refresh so both the header
+                            // balance card and the ledger table at
+                            // the bottom of the page reflect the
+                            // new transfer. 1500ms is long enough
+                            // for the inline success toast to
+                            // register visually before the reload
+                            // kicks in (matches the e-pin and
+                            // ticket flows in matrix-public.js).
+                            // The recipient does not get an auto-
+                            // refresh from here — they'll see the
+                            // credit on their next page load,
+                            // which is fresh because PR #328 stops
+                            // LiteSpeed from caching dashboard
+                            // pages for logged-in users.
+                            if (typeof window.matrixMLMReload === 'function') {
+                                setTimeout(window.matrixMLMReload, 1500);
+                            } else {
+                                setTimeout(function() { window.location.reload(); }, 1500);
+                            }
                         } else {
                             window.matrixWalletShowNotice('#matrix-w2w-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Send Transfer', 'matrix-mlm')); ?>');
