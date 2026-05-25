@@ -416,6 +416,9 @@ class Matrix_MLM_Core {
             case 'disable_transaction_pin':
                 $this->process_disable_transaction_pin();
                 break;
+            case 'forgot_transaction_pin':
+                $this->process_forgot_transaction_pin();
+                break;
             case 'pay_subscription':
                 $this->process_pay_subscription();
                 break;
@@ -2860,7 +2863,10 @@ class Matrix_MLM_Core {
         if (Matrix_MLM_Rate_Limiter::throttle(
             'transaction_pin_set',
             Matrix_MLM_Rate_Limiter::key_for_request(),
-            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+            [
+                'max_attempts'   => Matrix_MLM_Transaction_Pin::VERIFY_MAX_ATTEMPTS,
+                'window_seconds' => Matrix_MLM_Transaction_Pin::VERIFY_WINDOW_SECONDS,
+            ]
         )) {
             wp_send_json_error([
                 'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
@@ -2883,8 +2889,7 @@ class Matrix_MLM_Core {
         }
 
         $pin = isset($_POST['pin']) ? $_POST['pin'] : '';
-        $transaction_pin = new Matrix_MLM_Transaction_Pin();
-        $result = $transaction_pin->set($user_id, $pin);
+        $result = Matrix_MLM_Transaction_Pin::set($user_id, $pin);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
@@ -2922,7 +2927,10 @@ class Matrix_MLM_Core {
         if (Matrix_MLM_Rate_Limiter::throttle(
             'transaction_pin_change',
             Matrix_MLM_Rate_Limiter::key_for_request(),
-            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+            [
+                'max_attempts'   => Matrix_MLM_Transaction_Pin::VERIFY_MAX_ATTEMPTS,
+                'window_seconds' => Matrix_MLM_Transaction_Pin::VERIFY_WINDOW_SECONDS,
+            ]
         )) {
             wp_send_json_error([
                 'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
@@ -2940,8 +2948,7 @@ class Matrix_MLM_Core {
         $current_pin = isset($_POST['current_pin']) ? $_POST['current_pin'] : '';
         $new_pin     = isset($_POST['new_pin'])     ? $_POST['new_pin']     : '';
 
-        $transaction_pin = new Matrix_MLM_Transaction_Pin();
-        $result = $transaction_pin->change($user_id, $current_pin, $new_pin);
+        $result = Matrix_MLM_Transaction_Pin::change($user_id, $current_pin, $new_pin);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
@@ -2987,7 +2994,10 @@ class Matrix_MLM_Core {
         if (Matrix_MLM_Rate_Limiter::throttle(
             'transaction_pin_disable',
             Matrix_MLM_Rate_Limiter::key_for_request(),
-            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+            [
+                'max_attempts'   => Matrix_MLM_Transaction_Pin::VERIFY_MAX_ATTEMPTS,
+                'window_seconds' => Matrix_MLM_Transaction_Pin::VERIFY_WINDOW_SECONDS,
+            ]
         )) {
             wp_send_json_error([
                 'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
@@ -3016,8 +3026,7 @@ class Matrix_MLM_Core {
 
         $current_pin = isset($_POST['current_pin']) ? $_POST['current_pin'] : '';
 
-        $transaction_pin = new Matrix_MLM_Transaction_Pin();
-        $result = $transaction_pin->disable($user_id, $current_pin);
+        $result = Matrix_MLM_Transaction_Pin::disable($user_id, $current_pin);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
@@ -3029,6 +3038,69 @@ class Matrix_MLM_Core {
 
         wp_send_json_success([
             'message' => __('Transaction PIN disabled.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Self-service "Forgot PIN" recovery (PIN-hardening item #17).
+     *
+     * Distinct from process_disable_transaction_pin: that one
+     * requires the user to remember the current PIN. The forgot
+     * flow is what saves a user who has, by definition, forgotten
+     * it. Same threat-model ordering as the other PIN handlers:
+     *
+     *   rate-limit  →  master-feature probe  →  password reauth  →
+     *   wipe hash + lockout + counter  →  reset throttle  →  done
+     *
+     * The password reauth is the integrity gate — if the user has
+     * lost both their PIN AND their password, the account-recovery
+     * path is the standard WordPress lost-password flow, NOT this.
+     *
+     * Audit + notification are handled inside Matrix_MLM_Transaction_Pin::forgot
+     * (the user is emailed, the event lands in the error log).
+     *
+     * POST shape:
+     *   - current_password : existing WP password (re-auth gate)
+     */
+    private function process_forgot_transaction_pin() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'transaction_pin_forgot',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            [
+                'max_attempts'   => Matrix_MLM_Transaction_Pin::VERIFY_MAX_ATTEMPTS,
+                'window_seconds' => Matrix_MLM_Transaction_Pin::VERIFY_WINDOW_SECONDS,
+            ]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        if (!Matrix_MLM_Transaction_Pin::is_master_enabled()) {
+            wp_send_json_error([
+                'message' => __('Transaction PIN is not enabled on this site.', 'matrix-mlm'),
+            ]);
+        }
+
+        $this->require_password_reauth($user_id);
+
+        $result = Matrix_MLM_Transaction_Pin::forgot($user_id);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+
+        Matrix_MLM_Rate_Limiter::reset(
+            'transaction_pin_forgot',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
+        wp_send_json_success([
+            'message' => __('Transaction PIN cleared. You can set a new PIN from your Security tab.', 'matrix-mlm'),
         ]);
     }
 

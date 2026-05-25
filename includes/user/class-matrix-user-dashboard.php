@@ -812,7 +812,11 @@ class Matrix_MLM_User_Dashboard {
         if (!Matrix_MLM_Transaction_Pin::is_master_enabled()) {
             return;
         }
-        $is_set = Matrix_MLM_Transaction_Pin::is_set($user_id);
+        $is_set      = Matrix_MLM_Transaction_Pin::is_set($user_id);
+        $is_locked   = Matrix_MLM_Transaction_Pin::is_locked($user_id);
+        $set_at      = Matrix_MLM_Transaction_Pin::set_at($user_id);
+        $last_used   = Matrix_MLM_Transaction_Pin::last_used_at($user_id);
+        $lockout     = Matrix_MLM_Transaction_Pin::lockout_info($user_id);
         ?>
         <h2><?php _e('Transaction PIN', 'matrix-mlm'); ?></h2>
         <div class="matrix-security-section">
@@ -829,9 +833,13 @@ class Matrix_MLM_User_Dashboard {
 
             <div class="matrix-2fa-status">
                 <strong><?php _e('Status:', 'matrix-mlm'); ?></strong>
-                <?php if ($is_set): ?>
+                <?php if ($is_locked): ?>
+                    <span class="matrix-badge matrix-badge-danger"><?php _e('Locked', 'matrix-mlm'); ?></span>
+                    <button class="matrix-btn matrix-btn-primary" onclick="matrixTogglePinForm('forgot')"><?php _e('Forgot PIN', 'matrix-mlm'); ?></button>
+                <?php elseif ($is_set): ?>
                     <span class="matrix-badge matrix-badge-active"><?php _e('Set', 'matrix-mlm'); ?></span>
                     <button class="matrix-btn matrix-btn-secondary" onclick="matrixTogglePinForm('change')"><?php _e('Change PIN', 'matrix-mlm'); ?></button>
+                    <button class="matrix-btn matrix-btn-secondary" onclick="matrixTogglePinForm('forgot')"><?php _e('Forgot PIN', 'matrix-mlm'); ?></button>
                     <button class="matrix-btn matrix-btn-danger" onclick="matrixTogglePinForm('disable')"><?php _e('Disable PIN', 'matrix-mlm'); ?></button>
                 <?php else: ?>
                     <span class="matrix-badge matrix-badge-inactive"><?php _e('Not set', 'matrix-mlm'); ?></span>
@@ -839,7 +847,44 @@ class Matrix_MLM_User_Dashboard {
                 <?php endif; ?>
             </div>
 
-            <?php if (!$is_set): ?>
+            <?php if ($is_locked && !empty($lockout['unlock_at'])): ?>
+                <p class="description" style="margin-top:8px; color:#b32d2e;">
+                    <?php
+                    printf(
+                        /* translators: %s: human time at which the lock auto-expires */
+                        esc_html__('PIN locked after too many wrong attempts. Auto-unlocks at %s, or use Forgot PIN to reset it now.', 'matrix-mlm'),
+                        esc_html(date_i18n('Y-m-d H:i', $lockout['unlock_at']))
+                    );
+                    ?>
+                </p>
+            <?php endif; ?>
+
+            <?php if ($is_set && !$is_locked): ?>
+                <p class="description" style="margin-top:8px;">
+                    <?php if ($set_at): ?>
+                        <?php
+                        printf(
+                            /* translators: %s: date the PIN was last set */
+                            esc_html__('Set on %s.', 'matrix-mlm'),
+                            esc_html(date_i18n('Y-m-d H:i', strtotime($set_at)))
+                        );
+                        ?>
+                    <?php endif; ?>
+                    <?php if ($last_used): ?>
+                        <?php
+                        printf(
+                            /* translators: %s: human time of the last successful PIN verification */
+                            esc_html__('Last used %s.', 'matrix-mlm'),
+                            esc_html(human_time_diff(strtotime($last_used), current_time('timestamp')) . ' ' . __('ago', 'matrix-mlm'))
+                        );
+                        ?>
+                    <?php else: ?>
+                        <?php esc_html_e('Not yet used to authorise a transaction.', 'matrix-mlm'); ?>
+                    <?php endif; ?>
+                </p>
+            <?php endif; ?>
+
+            <?php if (!$is_set && !$is_locked): ?>
                 <p class="description" style="margin-top:8px;">
                     <?php _e('Until you set a PIN, fund-movement actions configured to require one will fall through ungated. The admin may still require a PIN for some paths &mdash; setting one now means a single configuration change away from a UI prompt won\'t lock you out mid-transaction.', 'matrix-mlm'); ?>
                 </p>

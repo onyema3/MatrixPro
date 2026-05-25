@@ -494,7 +494,7 @@
     // above — server-rendered hidden form, JS swaps the visible
     // input rows and dispatches the right AJAX action based on mode.
     //
-    // matrixTogglePinForm(mode) where mode is 'set' | 'change' | 'disable'.
+    // matrixTogglePinForm(mode) where mode is 'set' | 'change' | 'disable' | 'forgot'.
     var matrixPinState = { mode: null };
 
     window.matrixTogglePinForm = function(mode) {
@@ -535,6 +535,18 @@
             $newRow.hide();
             $confirmRow.hide();
             $submit.text('Disable PIN');
+        } else if (mode === 'forgot') {
+            // Forgot-PIN flow: the user has, by definition, lost the
+            // current PIN — so we don't show the current-PIN row.
+            // Password reauth is the integrity gate; the server-side
+            // process_forgot_transaction_pin handler wipes the hash
+            // and the lockout atomically.
+            $title.text('Reset transaction PIN');
+            $help.text('Confirm your password to clear your transaction PIN. You will be able to set a new PIN afterwards.');
+            $currentRow.hide();
+            $newRow.hide();
+            $confirmRow.hide();
+            $submit.text('Reset PIN');
         }
 
         $form.show();
@@ -623,6 +635,17 @@
                 current_pin: currentPin
             }, function(data) {
                 showNotification(data.message || 'PIN disabled.', 'success');
+                setTimeout(function() { matrixMLMReload(); }, 1200);
+            });
+        } else if (mode === 'forgot') {
+            // No PIN to validate client-side — the server clears the
+            // hash + lockout under the password reauth gate alone.
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'forgot_transaction_pin',
+                current_password: password
+            }, function(data) {
+                showNotification(data.message || 'PIN reset.', 'success');
                 setTimeout(function() { matrixMLMReload(); }, 1200);
             });
         }

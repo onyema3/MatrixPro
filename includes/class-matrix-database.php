@@ -267,6 +267,75 @@ class Matrix_MLM_Database {
             }
         }
 
+        // 1.0.13: Defensive ADD COLUMN for the five PIN-policy
+        // columns introduced alongside the transaction-PIN
+        // hardening pass (weak-PIN denylist, hard lockout, history
+        // / no-reuse, set/used timestamps, forgot-PIN flow). Same
+        // lazy-migration idiom as transaction_pin_hash above.
+        //
+        //   - transaction_pin_set_at        : DATETIME — written
+        //         on every set/change, surfaced on the dashboard's
+        //         Security tab as "PIN set on …" so users can spot
+        //         a rotation they didn't initiate. Also feeds any
+        //         future "PIN older than N days, please rotate"
+        //         policy without a second migration.
+        //
+        //   - transaction_pin_last_used_at  : DATETIME — written
+        //         on every successful require_pin_for_request gate
+        //         pass. Surfaces "Last used 3 minutes ago" so a
+        //         user who logs in to a clean session can spot a
+        //         rogue authorised transaction.
+        //
+        //   - transaction_pin_history       : LONGTEXT JSON array
+        //         of the prior N bcrypt hashes (oldest first).
+        //         change() rejects a candidate that password_verify
+        //         matches against any entry, blocking trivial
+        //         rotation (1234 → 4321 → 1234 …). LONGTEXT
+        //         mirrors the two_factor_recovery_codes column
+        //         rationale — expansion-safe, no varchar
+        //         truncation surprises.
+        //
+        //   - transaction_pin_failed_attempts : INT UNSIGNED — a
+        //         hard counter of consecutive verify failures
+        //         since the last success. Distinct from the
+        //         rolling rate-limiter counter: the rate limiter
+        //         resets every 15 min, this counter only resets
+        //         on a verified-correct PIN. Crossing the
+        //         HARD_LOCKOUT_THRESHOLD trips the lockout below.
+        //
+        //   - transaction_pin_locked_until  : DATETIME — when the
+        //         hard counter trips, this is set to NOW() +
+        //         HARD_LOCKOUT_HOURS. require_pin_for_request
+        //         refuses with a "PIN locked, use Forgot PIN"
+        //         message until the timestamp passes; the
+        //         forgot-PIN flow clears it atomically with the
+        //         hash wipe.
+        if ($um_exists > 0) {
+            $pin_extra_cols = [
+                'transaction_pin_set_at'
+                    => "ALTER TABLE {$um_table} ADD COLUMN transaction_pin_set_at DATETIME DEFAULT NULL AFTER transaction_pin_hash",
+                'transaction_pin_last_used_at'
+                    => "ALTER TABLE {$um_table} ADD COLUMN transaction_pin_last_used_at DATETIME DEFAULT NULL AFTER transaction_pin_set_at",
+                'transaction_pin_history'
+                    => "ALTER TABLE {$um_table} ADD COLUMN transaction_pin_history LONGTEXT DEFAULT NULL AFTER transaction_pin_last_used_at",
+                'transaction_pin_failed_attempts'
+                    => "ALTER TABLE {$um_table} ADD COLUMN transaction_pin_failed_attempts INT UNSIGNED NOT NULL DEFAULT 0 AFTER transaction_pin_history",
+                'transaction_pin_locked_until'
+                    => "ALTER TABLE {$um_table} ADD COLUMN transaction_pin_locked_until DATETIME DEFAULT NULL AFTER transaction_pin_failed_attempts",
+            ];
+            foreach ($pin_extra_cols as $col => $alter) {
+                $exists = (int) $wpdb->get_var($wpdb->prepare(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                      WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                        AND COLUMN_NAME = %s",
+                    DB_NAME, $um_table, $col
+                ));
+                if ($exists === 0) {
+                    $wpdb->query($alter);
+                }
+            }
+        }
+
         // 1.0.11: one-time backfill of matrix_position_history with
         // a 'backfilled' row per existing position, dated at the
         // position's joined_at column. Without this, the genealogy
@@ -618,6 +687,11 @@ class Matrix_MLM_Database {
             two_factor_secret varchar(255) DEFAULT NULL,
             two_factor_recovery_codes longtext DEFAULT NULL,
             transaction_pin_hash varchar(255) DEFAULT NULL,
+            transaction_pin_set_at datetime DEFAULT NULL,
+            transaction_pin_last_used_at datetime DEFAULT NULL,
+            transaction_pin_history longtext DEFAULT NULL,
+            transaction_pin_failed_attempts int(10) unsigned NOT NULL DEFAULT 0,
+            transaction_pin_locked_until datetime DEFAULT NULL,
             email_verified tinyint(1) NOT NULL DEFAULT 0,
             sms_verified tinyint(1) NOT NULL DEFAULT 0,
             kyc_verified tinyint(1) NOT NULL DEFAULT 0,
