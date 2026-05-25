@@ -1082,16 +1082,34 @@ class Matrix_MLM_User_Wallet {
      *
      * If the cap of 50 rows starts feeling restrictive we can grow
      * this into a paginated view; the underlying
-     * Matrix_MLM_Wallet::get_transactions() already accepts a limit,
-     * and adding offset/page params is a localized change that
-     * doesn't affect the rest of the wallet page.
+     * Matrix_MLM_Wallet::get_unified_transactions() already accepts
+     * a limit, and adding offset/page params is a localized change
+     * that doesn't affect the rest of the wallet page.
+     *
+     * Source coverage: the table merges the canonical Matrix wallet
+     * ledger (matrix_wallet — already covers deposits, withdrawals,
+     * commissions, plan purchases, transfers, e-pin redemptions,
+     * admin adjustments, bill payments, Matrix→Virtual moves) with
+     * the Fintava bank-payout ledger (matrix_fintava_payouts —
+     * outbound bank transfers that debit the Fintava virtual wallet
+     * directly and therefore never write a matrix_wallet row).
+     * That gives the user a single timeline that answers "where did
+     * my money go?" regardless of which rail it left on. Each row
+     * is tagged with a Source badge so the rail is visible at a
+     * glance, and bank-payout rows show the post_balance column as
+     * a dash (the Matrix balance is unaffected by those movements
+     * — the Fintava-side balance lives on the Virtual Account card
+     * at the top of the page).
      */
     private function render_transaction_history($user_id, $currency) {
         $wallet       = new Matrix_MLM_Wallet();
-        $transactions = $wallet->get_transactions($user_id, 50);
+        $transactions = $wallet->get_unified_transactions($user_id, 50);
         ?>
         <section class="matrix-wallet-tx-history">
             <h2><?php esc_html_e('Transaction History', 'matrix-mlm'); ?></h2>
+            <p class="matrix-subtitle">
+                <?php esc_html_e('Every credit and debit across your Matrix wallet and bank transfers, in one timeline.', 'matrix-mlm'); ?>
+            </p>
 
             <?php if (empty($transactions)): ?>
                 <div class="matrix-info-box">
@@ -1102,21 +1120,43 @@ class Matrix_MLM_User_Wallet {
                     <thead>
                         <tr>
                             <th><?php esc_html_e('Date', 'matrix-mlm'); ?></th>
+                            <th><?php esc_html_e('Source', 'matrix-mlm'); ?></th>
                             <th><?php esc_html_e('Type', 'matrix-mlm'); ?></th>
                             <th><?php esc_html_e('Amount', 'matrix-mlm'); ?></th>
                             <th><?php esc_html_e('Post Balance', 'matrix-mlm'); ?></th>
+                            <th><?php esc_html_e('Status', 'matrix-mlm'); ?></th>
                             <th><?php esc_html_e('Description', 'matrix-mlm'); ?></th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php foreach ($transactions as $tx): ?>
+                        <?php foreach ($transactions as $tx):
+                            $source       = isset($tx->source) ? (string) $tx->source : 'matrix';
+                            $source_label = $source === 'bank'
+                                ? __('Bank Transfer', 'matrix-mlm')
+                                : __('Matrix Wallet', 'matrix-mlm');
+                            $status       = isset($tx->status) ? (string) $tx->status : 'completed';
+                            $status_label = ucfirst(str_replace('_', ' ', $status));
+                        ?>
                         <tr>
                             <td><?php echo esc_html(date('M d, Y H:i', strtotime($tx->created_at))); ?></td>
+                            <td><span class="matrix-badge matrix-badge-source-<?php echo esc_attr($source); ?>"><?php echo esc_html($source_label); ?></span></td>
                             <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($tx->type); ?>"><?php echo esc_html(ucfirst($tx->type)); ?></span></td>
                             <td class="<?php echo $tx->type === 'credit' ? 'text-success' : 'text-danger'; ?>">
-                                <?php echo esc_html(($tx->type === 'credit' ? '+' : '-') . $currency . number_format($tx->amount, 2)); ?>
+                                <?php echo esc_html(($tx->type === 'credit' ? '+' : '-') . $currency . number_format((float) $tx->amount, 2)); ?>
                             </td>
-                            <td><?php echo esc_html($currency . number_format($tx->post_balance, 2)); ?></td>
+                            <td>
+                                <?php
+                                // Bank-payout rows have no Matrix-side
+                                // post-balance — show a dash rather
+                                // than a misleading zero.
+                                if ($tx->post_balance === null) {
+                                    echo '<span class="matrix-tx-dash">—</span>';
+                                } else {
+                                    echo esc_html($currency . number_format((float) $tx->post_balance, 2));
+                                }
+                                ?>
+                            </td>
+                            <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($status); ?>"><?php echo esc_html($status_label); ?></span></td>
                             <td><?php echo esc_html($tx->description); ?></td>
                         </tr>
                         <?php endforeach; ?>

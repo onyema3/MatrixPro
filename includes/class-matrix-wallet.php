@@ -249,6 +249,141 @@ class Matrix_MLM_Wallet {
     }
 
     /**
+     * Get a unified transaction timeline for the user.
+     *
+     * matrix_wallet is already the canonical ledger for every
+     * movement that touches the Matrix balance — plan purchases,
+     * deposits credited from gateway callbacks, admin-approved
+     * withdrawals, user-to-user transfers, commissions, e-pin
+     * redemptions, admin manual adjustments, bill payments,
+     * Matrix→Virtual transfers, etc. All of those go through
+     * Matrix_MLM_Wallet::credit() / ::debit() which always writes
+     * an auditor row here, so get_transactions() above already
+     * surfaces them.
+     *
+     * The one class of money movement that does NOT touch
+     * matrix_wallet is the Fintava bank-payout flow ("Transfer to
+     * Bank"): those debit the user's Fintava virtual wallet
+     * directly and never transit the Matrix balance, so they live
+     * only in matrix_fintava_payouts. Without this method the
+     * wallet page's Transaction History would silently omit every
+     * outbound bank transfer the user has ever made — which is
+     * exactly the gap the unified-history requirement closes.
+     *
+     * Strategy: SELECT $limit rows from each source by created_at
+     * DESC, normalize them to a common stdClass shape with a
+     * `source` discriminator ('matrix' | 'bank') and a uniform
+     * (created_at, type, amount, post_balance, description,
+     * status) projection, merge in PHP, re-sort by created_at
+     * DESC, and trim to $limit. Over-fetching from each side and
+     * trimming after the merge is correct because the union of the
+     * top-N from each source is a superset of the global top-N.
+     *
+     * post_balance is nullable on the unified row: bank-payout
+     * rows don't have a Matrix-side post-balance (the post-balance
+     * lives on the Fintava virtual wallet, which the user can see
+     * in the Virtual Account header card above) so we return null
+     * and the renderer shows a dash rather than a misleading zero.
+     *
+     * The matrix_fintava_payouts table is created lazily by
+     * Matrix_MLM_Fintava::ensure_tables_exist() on plugin activation
+     * with the Fintava gateway configured. We probe for its
+     * existence via INFORMATION_SCHEMA before SELECTing so this
+     * method also works on installs where Fintava has never been
+     * enabled and the table simply doesn't exist (otherwise the
+     * SELECT would emit a "table doesn't exist" warning into the
+     * wallet page render).
+     */
+    public function get_unified_transactions($user_id, $limit = 50) {
+        global $wpdb;
+
+        $rows = [];
+
+        // Source 1: the canonical Matrix wallet ledger. Already
+        // covers every credit/debit that touches the Matrix
+        // balance.
+        $wallet_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT created_at, type, amount, post_balance, description, status, transaction_type, reference
+             FROM {$wpdb->prefix}matrix_wallet
+             WHERE user_id = %d
+             ORDER BY created_at DESC
+             LIMIT %d",
+            $user_id, $limit
+        ));
+        foreach ($wallet_rows as $r) {
+            $r->source = 'matrix';
+            $rows[] = $r;
+        }
+
+        // Source 2: Fintava bank payouts. These never touch
+        // matrix_wallet, so we have to merge them in here. Probe
+        // for the table first (Fintava-disabled installs won't
+        // have it).
+        $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
+        $table_exists = (bool) $wpdb->get_var($wpdb->prepare(
+            "SELECT 1 FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s LIMIT 1",
+            DB_NAME, $payouts_table
+        ));
+        if ($table_exists) {
+            $payout_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT created_at, total_debit, bank_name, account_number, narration, status, reference, failure_reason
+                 FROM $payouts_table
+                 WHERE user_id = %d
+                 ORDER BY created_at DESC
+                 LIMIT %d",
+                $user_id, $limit
+            ));
+            foreach ($payout_rows as $p) {
+                // Mask the destination account in the description
+                // so the unified history doesn't print full bank
+                // account numbers in plain text on a page that
+                // sits behind a single-factor session. The full
+                // number is still on the dedicated Bank Payout
+                // history page.
+                $acct = (string) $p->account_number;
+                $masked = strlen($acct) >= 4
+                    ? '****' . substr($acct, -4)
+                    : $acct;
+                $desc = sprintf(
+                    /* translators: 1: bank name, 2: masked account number */
+                    __('Transfer to Bank — %1$s %2$s', 'matrix-mlm'),
+                    $p->bank_name,
+                    $masked
+                );
+                if (!empty($p->narration)) {
+                    $desc .= ' — ' . $p->narration;
+                }
+                if ($p->status === 'failed' && !empty($p->failure_reason)) {
+                    $desc .= ' (' . $p->failure_reason . ')';
+                }
+
+                $rows[] = (object) [
+                    'created_at'       => $p->created_at,
+                    'type'             => 'debit',
+                    'amount'           => $p->total_debit,
+                    'post_balance'     => null,
+                    'description'      => $desc,
+                    'status'           => $p->status,
+                    'transaction_type' => 'bank_transfer',
+                    'reference'        => $p->reference,
+                    'source'           => 'bank',
+                ];
+            }
+        }
+
+        // Merge-sort and trim. created_at is a MySQL DATETIME
+        // string ('YYYY-MM-DD HH:MM:SS') so a lexicographic
+        // strcmp gives us correct chronological ordering without
+        // a strtotime() round-trip per row.
+        usort($rows, function ($a, $b) {
+            return strcmp((string) $b->created_at, (string) $a->created_at);
+        });
+
+        return array_slice($rows, 0, $limit);
+    }
+
+    /**
      * Get total transactions count
      */
     public function get_transactions_count($user_id, $type = null) {
