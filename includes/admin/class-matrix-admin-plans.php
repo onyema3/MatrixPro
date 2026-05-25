@@ -23,6 +23,13 @@ class Matrix_MLM_Admin_Plans {
             $this->delete_plan(intval($_GET['id']));
         }
 
+        // Handle force delete (cascades through plan-scoped tables;
+        // intended for retiring import-remnant or test plans whose
+        // positions are not real downlines worth preserving).
+        if (isset($_GET['action']) && $_GET['action'] === 'force_delete' && isset($_GET['id']) && wp_verify_nonce($_GET['_wpnonce'] ?? '', 'matrix_force_delete_plan')) {
+            $this->force_delete_plan(intval($_GET['id']));
+        }
+
         if (isset($_GET['action']) && $_GET['action'] === 'edit' && isset($_GET['id'])) {
             $this->render_edit_form(intval($_GET['id']));
             return;
@@ -74,6 +81,12 @@ class Matrix_MLM_Admin_Plans {
                             <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-plans&action=delete&id=' . $plan->id), 'matrix_delete_plan'); ?>" class="button button-small" style="color:#dc2626;" onclick="return confirm('<?php _e('Are you sure you want to delete this plan? This cannot be undone.', 'matrix-mlm'); ?>')"><?php _e('Delete', 'matrix-mlm'); ?></a>
                             <?php else: ?>
                             <span class="description" style="font-size:11px;"><?php _e('Has members', 'matrix-mlm'); ?></span>
+                            <?php if (current_user_can('manage_options')): ?>
+                            <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=matrix-mlm-plans&action=force_delete&id=' . $plan->id), 'matrix_force_delete_plan'); ?>"
+                               class="button button-small"
+                               style="color:#dc2626; border-color:#dc2626; margin-left:6px;"
+                               onclick="return confirm('<?php echo esc_js(sprintf(__('FORCE DELETE plan \"%1$s\"?\n\nThis will permanently:\n  - Remove all %2$d active member position(s) for this plan\n  - Delete related genealogy history, level-completion ledger, and share tokens\n  - Anonymize commission and e-pin history (plan_id set to NULL, rows preserved for audit)\n  - Delete the plan row itself\n\nThis CANNOT be undone. Type the plan name to confirm on the next prompt.', 'matrix-mlm'), $plan->name, $members)); ?>') && prompt('<?php echo esc_js(sprintf(__('Type the plan name exactly to confirm: %s', 'matrix-mlm'), $plan->name)); ?>') === '<?php echo esc_js($plan->name); ?>'"><?php _e('Force Delete', 'matrix-mlm'); ?></a>
+                            <?php endif; ?>
                             <?php endif; ?>
                         </td>
                     </tr>
@@ -305,6 +318,136 @@ class Matrix_MLM_Admin_Plans {
         $wpdb->delete($wpdb->prefix . 'matrix_plans', ['id' => $plan_id]);
 
         echo '<div class="notice notice-success"><p>' . sprintf(__('Plan "%s" has been deleted.', 'matrix-mlm'), esc_html($plan->name)) . '</p></div>';
+    }
+
+    /**
+     * Force-delete a plan including its active member positions and
+     * all dependent plan-scoped rows.
+     *
+     * Use case: retiring plans that were created by the Laravel
+     * import or by testing, whose `matrix_positions` rows are not
+     * real downlines worth preserving. The conservative
+     * delete_plan() blocks this; this method bypasses that block
+     * after a manage_options + nonce + name-typed-confirmation
+     * gauntlet on the caller side.
+     *
+     * Cleanup strategy per table:
+     *   - Plan-scoped rows where plan_id is NOT NULL are DELETEd
+     *     (matrix_positions, matrix_position_history,
+     *     matrix_level_completions, matrix_share_tokens). Share
+     *     tokens have a nullable plan_id but are semantically
+     *     plan-specific (a token resolves to a plan's tree), so
+     *     they're deleted rather than orphaned.
+     *   - Audit-trail rows where plan_id is NULLABLE are kept and
+     *     anonymized (matrix_commissions, matrix_epins). The
+     *     reports/listing pages already LEFT JOIN against
+     *     matrix_plans, so the plan column will read as "-" or
+     *     "Custom" for these historical rows post-cleanup.
+     *
+     * The sequence is wrapped in a SQL transaction. On InnoDB this
+     * gives all-or-nothing semantics; on MyISAM the ROLLBACK is a
+     * no-op and partial cleanup is recoverable by re-running this
+     * action (each step is idempotent against an already-cleaned
+     * plan).
+     */
+    private function force_delete_plan($plan_id) {
+        global $wpdb;
+
+        if (!current_user_can('manage_options')) {
+            echo '<div class="notice notice-error"><p>' . __('You do not have permission to perform this action.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        $plan = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_plans WHERE id = %d", $plan_id));
+        if (!$plan) {
+            echo '<div class="notice notice-error"><p>' . __('Plan not found.', 'matrix-mlm') . '</p></div>';
+            return;
+        }
+
+        $counts = [
+            'positions'         => 0,
+            'position_history'  => 0,
+            'level_completions' => 0,
+            'share_tokens'      => 0,
+            'commissions'       => 0,
+            'epins'             => 0,
+        ];
+
+        $wpdb->query('START TRANSACTION');
+        $error = null;
+
+        // Delete plan-bound rows (plan_id NOT NULL columns + share tokens).
+        $delete_targets = [
+            'positions'         => 'matrix_positions',
+            'position_history'  => 'matrix_position_history',
+            'level_completions' => 'matrix_level_completions',
+            'share_tokens'      => 'matrix_share_tokens',
+        ];
+        foreach ($delete_targets as $key => $table) {
+            // Some installs may pre-date a given table (matrix_position_history,
+            // matrix_level_completions, matrix_share_tokens were added later).
+            // Skip silently if the table doesn't exist; the activator's normal
+            // create_tables() pass would have created it on next plugin load.
+            $full = $wpdb->prefix . $table;
+            $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $full));
+            if (!$exists) {
+                continue;
+            }
+            $r = $wpdb->delete($full, ['plan_id' => $plan_id]);
+            if ($r === false) {
+                $error = $table . ': ' . $wpdb->last_error;
+                break;
+            }
+            $counts[$key] = (int) $r;
+        }
+
+        // Anonymize audit-trail rows (plan_id NULLABLE).
+        if (!$error) {
+            $anonymize_targets = [
+                'commissions' => 'matrix_commissions',
+                'epins'       => 'matrix_epins',
+            ];
+            foreach ($anonymize_targets as $key => $table) {
+                $full = $wpdb->prefix . $table;
+                $r = $wpdb->update($full, ['plan_id' => null], ['plan_id' => $plan_id]);
+                if ($r === false) {
+                    $error = $table . ': ' . $wpdb->last_error;
+                    break;
+                }
+                $counts[$key] = (int) $r;
+            }
+        }
+
+        // Finally drop the plan row itself.
+        if (!$error) {
+            $r = $wpdb->delete($wpdb->prefix . 'matrix_plans', ['id' => $plan_id]);
+            if ($r === false) {
+                $error = 'matrix_plans: ' . $wpdb->last_error;
+            }
+        }
+
+        if ($error) {
+            $wpdb->query('ROLLBACK');
+            echo '<div class="notice notice-error"><p>' . sprintf(
+                __('Force delete failed for plan "%1$s". Database error: %2$s', 'matrix-mlm'),
+                esc_html($plan->name),
+                esc_html($error)
+            ) . '</p></div>';
+            return;
+        }
+
+        $wpdb->query('COMMIT');
+
+        echo '<div class="notice notice-success"><p>' . sprintf(
+            __('Plan "%1$s" force-deleted. Removed: %2$d position(s), %3$d position-history row(s), %4$d level-completion row(s), %5$d share token(s). Anonymized: %6$d commission row(s), %7$d e-pin row(s).', 'matrix-mlm'),
+            esc_html($plan->name),
+            $counts['positions'],
+            $counts['position_history'],
+            $counts['level_completions'],
+            $counts['share_tokens'],
+            $counts['commissions'],
+            $counts['epins']
+        ) . '</p></div>';
     }
 
     private function save_plan() {
