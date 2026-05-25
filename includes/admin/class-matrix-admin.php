@@ -1207,14 +1207,80 @@ class Matrix_MLM_Admin {
         ]);
     }
 
+    /**
+     * Admin: ban a user.
+     *
+     * Mirrors the three-guard authorization pattern from
+     * update_user_profile() (audit C8). The dispatcher's
+     * manage_matrix_mlm capability is too broad on its own — it lets
+     * a deposit/withdrawal-reviewer admin lock any account on the
+     * site, including the super admin's or their own. Layered gates:
+     *
+     *   1. Self-ban refused — even reversibly, an admin should not
+     *      be able to lock themselves out via this endpoint. Removes
+     *      the foot-gun and the small-but-real "compromised admin
+     *      session locks the legitimate user out before they notice"
+     *      attack shape.
+     *   2. On multisite, refuse to let a non-super admin ban a
+     *      super admin.
+     *   3. edit_user gate — the same capability WordPress core uses
+     *      on the user-edit screen. Keeps role-based moderation
+     *      hierarchy honest (e.g. a Shop Manager can't ban an
+     *      Administrator).
+     */
     private function ban_user() {
-        $user_id = intval($_POST['user_id']);
+        $user_id = intval($_POST['user_id'] ?? 0);
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+        $user = get_userdata($user_id);
+        if (!$user) {
+            wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+        if ($user_id === get_current_user_id()) {
+            wp_send_json_error(['message' => __('You cannot ban your own account.', 'matrix-mlm')]);
+        }
+        if (is_multisite() && is_super_admin($user_id) && !is_super_admin()) {
+            wp_send_json_error(['message' => __('You do not have permission to ban a super admin.', 'matrix-mlm')]);
+        }
+        if (!current_user_can('edit_user', $user_id)) {
+            wp_send_json_error(['message' => __('You do not have permission to ban this user.', 'matrix-mlm')]);
+        }
+
         Matrix_MLM_User::ban($user_id);
         wp_send_json_success(['message' => __('User banned', 'matrix-mlm')]);
     }
 
+    /**
+     * Admin: unban a user. Same gates as ban_user() — see that
+     * method's docblock for the rationale.
+     */
     private function unban_user() {
-        $user_id = intval($_POST['user_id']);
+        $user_id = intval($_POST['user_id'] ?? 0);
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Invalid user', 'matrix-mlm')]);
+        }
+        $user = get_userdata($user_id);
+        if (!$user) {
+            wp_send_json_error(['message' => __('User not found', 'matrix-mlm')]);
+        }
+        // Self-unban is logically harmless (you can only reach this
+        // endpoint while authenticated, so you're already not banned)
+        // but we still refuse it for symmetry with ban_user — the
+        // edit_user gate below would normally allow it, but mixing
+        // self-edits with admin-on-other-user moderation in the same
+        // endpoint is the kind of confusion that turned into the
+        // audit C8 finding for update_user_profile.
+        if ($user_id === get_current_user_id()) {
+            wp_send_json_error(['message' => __('You cannot unban your own account here; use your WordPress profile page.', 'matrix-mlm')]);
+        }
+        if (is_multisite() && is_super_admin($user_id) && !is_super_admin()) {
+            wp_send_json_error(['message' => __('You do not have permission to unban a super admin.', 'matrix-mlm')]);
+        }
+        if (!current_user_can('edit_user', $user_id)) {
+            wp_send_json_error(['message' => __('You do not have permission to unban this user.', 'matrix-mlm')]);
+        }
+
         Matrix_MLM_User::unban($user_id);
         wp_send_json_success(['message' => __('User unbanned', 'matrix-mlm')]);
     }
