@@ -354,7 +354,10 @@ class Matrix_MLM_User_Virtual_Wallet {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -648,7 +651,10 @@ class Matrix_MLM_User_Virtual_Wallet {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {

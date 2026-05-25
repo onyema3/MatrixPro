@@ -497,7 +497,14 @@ class Matrix_MLM_User_Dashboard {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale. The
+                    // pay-subscription form is the recovery path for
+                    // inactive-status users (every other tab is
+                    // locked out behind that gate), so a click that
+                    // silently no-ops here strands them entirely.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
