@@ -91,6 +91,18 @@ class Matrix_MLM_Database {
         // logged in for months still sees every commission they
         // earned while away.
         'matrix_notifications',
+        // Zebra Wallet /Notify dispute / fraud / chargeback
+        // feed (1.0.18). One row per inbound /Notify event from
+        // Bibimoney's IPN. Distinct from matrix_notifications
+        // (which is the member-facing in-app notifications
+        // table) — this one is operator-facing and tracks an
+        // actionable lifecycle (received -> acknowledged /
+        // actioned / dismissed) rather than read/unread. The
+        // related deposit/withdrawal is referenced via
+        // (related_type, related_id) so the admin Notifications
+        // page can deep-link back to the matrix_deposits or
+        // matrix_withdrawals row Bibimoney is disputing.
+        'matrix_zebra_notifications',
     ];
 
     /**
@@ -551,6 +563,54 @@ class Matrix_MLM_Database {
                               NOT NULL DEFAULT 'pending'"
                 );
             }
+        }
+
+        // 1.0.18 — Zebra Wallet /Notify dispute / fraud /
+        // chargeback feed. New table matrix_zebra_notifications.
+        // dbDelta in create_tables() handles a fresh CREATE
+        // TABLE; this idempotent probe handles upgraded installs
+        // whose create_tables() may have run before the schema
+        // existed.
+        $zebra_notif_table = $wpdb->prefix . 'matrix_zebra_notifications';
+        $zebra_notif_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $zebra_notif_table
+        ));
+        if ($zebra_notif_exists === 0) {
+            // Use a direct CREATE TABLE IF NOT EXISTS rather than
+            // dbDelta because the surrounding code path is the
+            // upgrade slow path and we want a deterministic
+            // single-statement create. Schema mirrors the dbDelta
+            // version in create_tables().
+            $charset = $wpdb->get_charset_collate();
+            $wpdb->query("CREATE TABLE IF NOT EXISTS {$zebra_notif_table} (
+                id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                event_type varchar(50) NOT NULL,
+                status_code varchar(20) DEFAULT NULL,
+                severity enum('info','warning','critical') NOT NULL DEFAULT 'warning',
+                vendor_reference varchar(255) DEFAULT NULL,
+                psp_reference varchar(255) DEFAULT NULL,
+                related_type enum('deposit','withdrawal','unknown') NOT NULL DEFAULT 'unknown',
+                related_id bigint(20) UNSIGNED DEFAULT NULL,
+                amount decimal(12,2) DEFAULT NULL,
+                currency varchar(10) DEFAULT NULL,
+                message text,
+                raw_payload longtext,
+                state enum('received','acknowledged','actioned','dismissed') NOT NULL DEFAULT 'received',
+                handled_by_user_id bigint(20) UNSIGNED DEFAULT NULL,
+                handled_at datetime DEFAULT NULL,
+                handler_note text,
+                created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY state (state),
+                KEY event_type (event_type),
+                KEY vendor_reference (vendor_reference),
+                KEY psp_reference (psp_reference),
+                KEY related (related_type, related_id),
+                KEY created_at (created_at)
+            ) {$charset};");
         }
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
@@ -1411,6 +1471,67 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_notifications);
 
+        // Zebra Wallet /Notify dispute / fraud / chargeback feed
+        // (1.0.18). One row per inbound /Notify event from
+        // Bibimoney's IPN. The schema deliberately decouples
+        // the relationship from a foreign key so a /Notify event
+        // referencing a deposit/withdrawal we don't recognise
+        // (a probe for the wrong VendorReference, a stale
+        // notification arriving after we've cleared the original
+        // row, etc.) can still be persisted with related_type='unknown'
+        // for operator review rather than dropped on the floor.
+        //
+        // related_type / related_id is a polymorphic pointer
+        // because /Notify events can attach to either side of the
+        // money flow:
+        //   - DISPUTE / FRAUD on a deposit (matrix_deposits)
+        //   - CHARGEBACK / REVERSAL on a withdrawal (matrix_withdrawals)
+        // Resolved at IPN-receive time by find_related_record()
+        // matching VendorReference and PSPReference against both
+        // tables.
+        //
+        // state lifecycle:
+        //   received     -> initial state on IPN receipt
+        //   acknowledged -> operator has seen it, no action taken
+        //   actioned     -> operator has frozen the related withdrawal
+        //   dismissed    -> operator has marked it as a false positive
+        //
+        // handled_by_user_id / handled_at / handler_note record
+        // who responded and how, for audit. raw_payload stores
+        // the full JSON envelope so support can replay an event
+        // (or a future reconciliation worker can re-derive
+        // related_id if find_related_record's heuristics get
+        // smarter).
+        $table_zebra_notifications = $wpdb->prefix . 'matrix_zebra_notifications';
+        $sql_zebra_notifications = "CREATE TABLE $table_zebra_notifications (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            event_type varchar(50) NOT NULL,
+            status_code varchar(20) DEFAULT NULL,
+            severity enum('info','warning','critical') NOT NULL DEFAULT 'warning',
+            vendor_reference varchar(255) DEFAULT NULL,
+            psp_reference varchar(255) DEFAULT NULL,
+            related_type enum('deposit','withdrawal','unknown') NOT NULL DEFAULT 'unknown',
+            related_id bigint(20) UNSIGNED DEFAULT NULL,
+            amount decimal(12,2) DEFAULT NULL,
+            currency varchar(10) DEFAULT NULL,
+            message text,
+            raw_payload longtext,
+            state enum('received','acknowledged','actioned','dismissed') NOT NULL DEFAULT 'received',
+            handled_by_user_id bigint(20) UNSIGNED DEFAULT NULL,
+            handled_at datetime DEFAULT NULL,
+            handler_note text,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY state (state),
+            KEY event_type (event_type),
+            KEY vendor_reference (vendor_reference),
+            KEY psp_reference (psp_reference),
+            KEY related (related_type, related_id),
+            KEY created_at (created_at)
+        ) $charset_collate;";
+        dbDelta($sql_zebra_notifications);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -1434,6 +1555,7 @@ class Matrix_MLM_Database {
             'matrix_share_tokens',
             'matrix_position_history',
             'matrix_notifications',
+            'matrix_zebra_notifications',
         ];
 
         foreach ($tables as $table) {
