@@ -856,10 +856,25 @@ class Matrix_MLM_User_Wallet {
                     var $pane = $modal.find('.matrix-wallet-pane[data-pane="' + target + '"]');
                     if (!$pane.length) { return; }
 
+                    // First-open relocation. See render_scripts() for
+                    // the full rationale — short version: an ancestor
+                    // with transform/filter/will-change inside
+                    // .matrix-dashboard turns the dashboard column
+                    // itself into the containing block for fixed-
+                    // position descendants, pinning the dialog inside
+                    // the column instead of the viewport. Reparenting
+                    // to <body> on first open sidesteps every
+                    // version of that trap.
+                    if (!$modal.data('reparented')) {
+                        $modal.appendTo('body').data('reparented', true);
+                    }
+
                     $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
                     $pane.removeAttr('hidden').css('display', '');
 
-                    $modal.removeAttr('hidden');
+                    // .is-open class wins via !important; [hidden]
+                    // is the graceful-degradation fallback.
+                    $modal.removeAttr('hidden').addClass('is-open').css('display', '');
                     $('body').addClass('matrix-modal-open');
                     $modal.find('.matrix-wallet-modal-body').scrollTop(0);
 
@@ -874,7 +889,7 @@ class Matrix_MLM_User_Wallet {
                 function matrixWalletCloseModal() {
                     var $modal = $('#matrix-wallet-modal');
                     if (!$modal.length) { return; }
-                    $modal.attr('hidden', 'hidden');
+                    $modal.removeClass('is-open').attr('hidden', 'hidden').css('display', '');
                     $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
                     $('body').removeClass('matrix-modal-open');
                 }
@@ -893,7 +908,7 @@ class Matrix_MLM_User_Wallet {
 
                 $(document).on('keydown.matrixWalletModal', function(e) {
                     if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
-                    if ($('#matrix-wallet-modal').is('[hidden]')) { return; }
+                    if (!$('#matrix-wallet-modal').hasClass('is-open')) { return; }
                     matrixWalletCloseModal();
                 });
 
@@ -1785,20 +1800,54 @@ class Matrix_MLM_User_Wallet {
              markup already adapts (the wallet-exists transfer forms
              use a single-column layout below 900px). */
         .matrix-wallet-modal {
+            /* Hidden by default. Visibility is driven by toggling
+               the .is-open class in JS rather than the [hidden]
+               attribute, because some optimizer plugins
+               (Autoptimize, WP Rocket's "Delay JS" mode) inject
+               very high-specificity CSS that can survive
+               attribute toggling — !important on the .is-open
+               rule below is the belt-and-braces guarantee that
+               clicking a transfer button always reveals the
+               dialog.
+
+               Explicit top/right/bottom/left instead of `inset: 0`
+               for older mobile browsers (pre-Chrome 87 / Safari
+               14.1) that don't recognise the shorthand and would
+               otherwise leave the modal at its natural document
+               position with no size. */
+            display: none;
             position: fixed;
-            inset: 0;
-            z-index: 9998;
-            display: flex;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 99999;
             align-items: flex-start;
             justify-content: center;
             padding: 40px 20px;
             box-sizing: border-box;
             overflow: hidden;
         }
+        .matrix-wallet-modal.is-open {
+            /* !important required because some themes' base
+               selectors land on .matrix-wallet-modal with display:
+               none through descendant rules, and would otherwise
+               keep the dialog hidden even after the JS toggles
+               this class. */
+            display: flex !important;
+        }
+        /* Keep the [hidden] attribute working as a graceful-
+           degradation fallback for the rare path where the JS
+           never runs (the form-submit handlers below still need
+           the dialog hidden). The .is-open class wins when both
+           are set because it's later in the cascade and !important. */
         .matrix-wallet-modal[hidden] { display: none; }
         .matrix-wallet-modal-backdrop {
             position: absolute;
-            inset: 0;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
             background: rgba(15, 23, 42, 0.55);
             backdrop-filter: blur(2px);
             -webkit-backdrop-filter: blur(2px);
@@ -2026,6 +2075,25 @@ class Matrix_MLM_User_Wallet {
                 var $pane = $modal.find('.matrix-wallet-pane[data-pane="' + target + '"]');
                 if (!$pane.length) { return; }
 
+                // First-open relocation: move the modal element to be
+                // a direct child of <body>. The dashboard renders the
+                // wallet page inside .matrix-dashboard-content, which
+                // sits inside .matrix-dashboard with overflow:hidden.
+                // While `position: fixed` should normally escape
+                // overflow:hidden, the moment ANY ancestor picks up a
+                // `transform`, `filter`, `perspective`, or
+                // `will-change: transform` (CSS hover effects, optimizer
+                // plugins like WP Rocket's lazy-render, theme animations,
+                // even some accessibility plugins), it becomes the
+                // containing block for fixed-position descendants and
+                // pins the modal inside the dashboard column instead of
+                // the viewport. Reparenting to <body> sidesteps every
+                // version of that trap. The .data() flag prevents
+                // moving on every reopen.
+                if (!$modal.data('reparented')) {
+                    $modal.appendTo('body').data('reparented', true);
+                }
+
                 // Hide every pane, then reveal only the target. Belt
                 // and braces with both [hidden] and inline display:
                 // some themes ship `section { display: block !important }`
@@ -2033,12 +2101,13 @@ class Matrix_MLM_User_Wallet {
                 $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
                 $pane.removeAttr('hidden').css('display', '');
 
-                // Reveal the modal itself and lock body scroll. We
-                // also reset the body's scroll position to the top of
-                // the modal so re-opening lands the user at the form
-                // header even if they had scrolled inside an embedded
-                // history table during a previous session.
-                $modal.removeAttr('hidden');
+                // Reveal via .is-open class (CSS uses !important to
+                // beat theme overrides) AND remove the [hidden]
+                // attribute (graceful-degradation fallback). Belt-
+                // and-braces: a stray inline `style="display:none"`
+                // would still hide it, so we also clear that
+                // explicitly.
+                $modal.removeAttr('hidden').addClass('is-open').css('display', '');
                 $('body').addClass('matrix-modal-open');
                 $modal.find('.matrix-wallet-modal-body').scrollTop(0);
 
@@ -2060,7 +2129,7 @@ class Matrix_MLM_User_Wallet {
             function matrixWalletCloseModal() {
                 var $modal = $('#matrix-wallet-modal');
                 if (!$modal.length) { return; }
-                $modal.attr('hidden', 'hidden');
+                $modal.removeClass('is-open').attr('hidden', 'hidden').css('display', '');
                 $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
                 $('body').removeClass('matrix-modal-open');
             }
@@ -2086,7 +2155,7 @@ class Matrix_MLM_User_Wallet {
             // of which element inside the modal currently has focus.
             $(document).on('keydown.matrixWalletModal', function(e) {
                 if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
-                if ($('#matrix-wallet-modal').is('[hidden]')) { return; }
+                if (!$('#matrix-wallet-modal').hasClass('is-open')) { return; }
                 matrixWalletCloseModal();
             });
 
