@@ -729,50 +729,161 @@ class Matrix_MLM_Admin_Billing_History {
             (int) $tx->id,
             $reason
         );
-        $wallet  = new Matrix_MLM_Wallet();
-        $credited = $wallet->credit(
-            (int) $tx->user_id,
-            $amount,
-            'bill_admin_refund',
-            $description,
-            $reference
-        );
-        if ($credited === false) {
-            // Wallet credit failed AFTER we already bumped
-            // refunded_amount + status. Compensate by rolling
-            // back the CAS so the row's state matches the
-            // wallet's. Both writes are scoped to one row
-            // and one wallet auditor row, so the worst case
-            // is the audit log shows a CAS-then-revert pair —
-            // which is exactly the trail an operator wants
-            // when they're investigating a refund that
-            // reportedly didn't land.
-            $rollback_sql = $wpdb->prepare(
-                "UPDATE $tx_table
-                    SET refunded_amount = refunded_amount - %f,
-                        status = CASE
-                            WHEN refunded_amount - %f <= %f
-                                 THEN 'completed'
-                            ELSE 'partial_refund'
-                        END
-                  WHERE id = %d
-                    AND refunded_amount >= %f",
-                $amount, $amount, self::FLOAT_EPSILON, $transaction_id, $amount - self::FLOAT_EPSILON
+
+        // PR #294: dispatch on the row's source_wallet so a
+        // refund settles to the wallet that was actually debited
+        // when the original purchase ran. Pre-PR-#294 rows are
+        // tagged 'matrix' (the column DEFAULT) and refund into
+        // the Matrix internal wallet via the legacy credit()
+        // path; post-PR-#294 rows are tagged 'virtual' and
+        // refund into the user's Fintava virtual wallet via a
+        // /transaction/wallet-to-wallet from the merchant
+        // operating account. Reading the column rather than
+        // inferring from row age is the migration-safety
+        // guarantee documented on the source_wallet column —
+        // an admin clicking refund on a stale pending row from
+        // before the source-wallet flip will route correctly
+        // even years after the deploy.
+        //
+        // Defensive default 'matrix' for any row missing the
+        // column or carrying an unexpected value, which matches
+        // the schema DEFAULT and preserves the legacy refund
+        // path's behaviour rather than risking a wallet-to-wallet
+        // dispatch for a row whose original debit was on the
+        // Matrix wallet.
+        $row_source_wallet = isset($tx->source_wallet) ? (string) $tx->source_wallet : 'matrix';
+        if (!in_array($row_source_wallet, ['matrix', 'virtual'], true)) {
+            $row_source_wallet = 'matrix';
+        }
+
+        if ($row_source_wallet === 'virtual') {
+            // Reverse the wallet-to-wallet by sending the same
+            // amount back from the merchant operating wallet to
+            // the user's Fintava virtual wallet. The
+            // customer_reference embeds the ADMIN-REFUND token
+            // so Fintava's audit trail links the refund leg
+            // back to the failing purchase one-to-one.
+            $fintava   = new Matrix_MLM_Fintava();
+            $user_wlt  = $fintava->get_user_wallet((int) $tx->user_id);
+            $sender    = preg_replace('/\s+/', '', (string) get_option('matrix_mlm_fintava_operating_account', ''));
+            $receiver  = $user_wlt && !empty($user_wlt->account_number)
+                ? preg_replace('/\s+/', '', (string) $user_wlt->account_number)
+                : '';
+
+            if ($sender === '' || $receiver === '') {
+                // Roll back the CAS — same compensating logic as
+                // the credit-failed branch below. We didn't move
+                // any funds, so the row's refunded_amount must
+                // come back down or the next refund attempt is
+                // mis-capped.
+                $rollback_sql = $wpdb->prepare(
+                    "UPDATE $tx_table
+                        SET refunded_amount = refunded_amount - %f,
+                            status = CASE
+                                WHEN refunded_amount - %f <= %f
+                                     THEN 'completed'
+                                ELSE 'partial_refund'
+                            END
+                      WHERE id = %d
+                        AND refunded_amount >= %f",
+                    $amount, $amount, self::FLOAT_EPSILON, $transaction_id, $amount - self::FLOAT_EPSILON
+                );
+                $wpdb->query($rollback_sql);
+                error_log(sprintf(
+                    '[Matrix Billing Refund] virtual-wallet refund missing NUBAN. tx_id=%d amount=%.2f sender=%s receiver=%s',
+                    $transaction_id, $amount, $sender, $receiver
+                ));
+                wp_send_json_error(['message' => empty($sender)
+                    ? __('Cannot refund to virtual wallet: merchant operating account NUBAN is not configured.', 'matrix-mlm')
+                    : __('Cannot refund to virtual wallet: this user does not have a Fintava virtual wallet on file.', 'matrix-mlm')
+                ]);
+            }
+
+            $transfer = $fintava->wallet_to_wallet_transfer([
+                'amount'             => floatval($amount),
+                'sender_account'     => $sender,
+                'receiver_account'   => $receiver,
+                'narration'          => $description,
+                'customer_reference' => $reference,
+            ]);
+
+            if (is_wp_error($transfer)) {
+                $rollback_sql = $wpdb->prepare(
+                    "UPDATE $tx_table
+                        SET refunded_amount = refunded_amount - %f,
+                            status = CASE
+                                WHEN refunded_amount - %f <= %f
+                                     THEN 'completed'
+                                ELSE 'partial_refund'
+                            END
+                      WHERE id = %d
+                        AND refunded_amount >= %f",
+                    $amount, $amount, self::FLOAT_EPSILON, $transaction_id, $amount - self::FLOAT_EPSILON
+                );
+                $rolled = $wpdb->query($rollback_sql);
+                error_log(sprintf(
+                    '[Matrix Billing Refund] CRITICAL: virtual-wallet refund failed after CAS. tx_id=%d amount=%.2f reference=%s upstream=%s rollback_rows=%s',
+                    $transaction_id, $amount, $reference, $transfer->get_error_message(), var_export($rolled, true)
+                ));
+                Matrix_MLM_Notifications::send_admin_notification(
+                    'billing_refund_wallet_credit_failed',
+                    sprintf(
+                        /* translators: 1: tx id, 2: amount, 3: reference, 4: upstream error */
+                        __('Manual bill refund failed at the Fintava wallet-to-wallet step. Transaction #%1$d, amount %2$.2f, reference %3$s. Upstream error: %4$s. The transaction row was rolled back if the rollback succeeded — verify in admin and inspect error_log.', 'matrix-mlm'),
+                        $transaction_id, $amount, $reference, $transfer->get_error_message()
+                    )
+                );
+                wp_send_json_error(['message' => __('Refund to virtual wallet failed — see error log. The transaction row was rolled back so this refund can be retried.', 'matrix-mlm')]);
+            }
+        } else {
+            // Legacy path — credit the user's Matrix internal
+            // wallet. Reached for pre-PR-#294 rows (source_wallet
+            // = 'matrix') whose original debit landed there.
+            $wallet  = new Matrix_MLM_Wallet();
+            $credited = $wallet->credit(
+                (int) $tx->user_id,
+                $amount,
+                'bill_admin_refund',
+                $description,
+                $reference
             );
-            $rolled = $wpdb->query($rollback_sql);
-            error_log(sprintf(
-                '[Matrix Billing Refund] CRITICAL: wallet credit failed after CAS. tx_id=%d amount=%.2f reference=%s rollback_rows=%s',
-                $transaction_id, $amount, $reference, var_export($rolled, true)
-            ));
-            Matrix_MLM_Notifications::send_admin_notification(
-                'billing_refund_wallet_credit_failed',
-                sprintf(
-                    /* translators: 1: tx id, 2: amount, 3: reference */
-                    __('Manual bill refund failed at the wallet credit step. Transaction #%1$d, amount %2$.2f, reference %3$s. The transaction row was rolled back if the rollback succeeded — verify in admin and inspect error_log.', 'matrix-mlm'),
-                    $transaction_id, $amount, $reference
-                )
-            );
-            wp_send_json_error(['message' => __('Wallet credit failed. The refund was not applied — see error log.', 'matrix-mlm')]);
+            if ($credited === false) {
+                // Wallet credit failed AFTER we already bumped
+                // refunded_amount + status. Compensate by rolling
+                // back the CAS so the row's state matches the
+                // wallet's. Both writes are scoped to one row
+                // and one wallet auditor row, so the worst case
+                // is the audit log shows a CAS-then-revert pair —
+                // which is exactly the trail an operator wants
+                // when they're investigating a refund that
+                // reportedly didn't land.
+                $rollback_sql = $wpdb->prepare(
+                    "UPDATE $tx_table
+                        SET refunded_amount = refunded_amount - %f,
+                            status = CASE
+                                WHEN refunded_amount - %f <= %f
+                                     THEN 'completed'
+                                ELSE 'partial_refund'
+                            END
+                      WHERE id = %d
+                        AND refunded_amount >= %f",
+                    $amount, $amount, self::FLOAT_EPSILON, $transaction_id, $amount - self::FLOAT_EPSILON
+                );
+                $rolled = $wpdb->query($rollback_sql);
+                error_log(sprintf(
+                    '[Matrix Billing Refund] CRITICAL: wallet credit failed after CAS. tx_id=%d amount=%.2f reference=%s rollback_rows=%s',
+                    $transaction_id, $amount, $reference, var_export($rolled, true)
+                ));
+                Matrix_MLM_Notifications::send_admin_notification(
+                    'billing_refund_wallet_credit_failed',
+                    sprintf(
+                        /* translators: 1: tx id, 2: amount, 3: reference */
+                        __('Manual bill refund failed at the wallet credit step. Transaction #%1$d, amount %2$.2f, reference %3$s. The transaction row was rolled back if the rollback succeeded — verify in admin and inspect error_log.', 'matrix-mlm'),
+                        $transaction_id, $amount, $reference
+                    )
+                );
+                wp_send_json_error(['message' => __('Wallet credit failed. The refund was not applied — see error log.', 'matrix-mlm')]);
+            }
         }
 
         // 4. Insert the audit row. The unique
