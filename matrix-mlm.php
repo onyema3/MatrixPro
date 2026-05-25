@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Matrix MLM Pro
  * Plugin URI: https://github.com/onyema3/Matrix
- * Description: A comprehensive Matrix MLM plugin with multiple plan structures, payment gateways (Paystack & Flutterwave), user dashboards, admin management, 2FA security, multi-language support, and more.
+ * Description: A comprehensive Matrix MLM plugin with multiple plan structures, payment gateways (Paystack, Flutterwave, Fintava, Zebra Wallet), user dashboards, admin management, 2FA security, multi-language support, and more.
  * Version: 1.0.0
  * Author: Matrix Team
  * Author URI: https://github.com/onyema3
@@ -70,6 +70,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-flutterwave.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-card.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-fintava-billing.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'gateways/class-matrix-zebra.php';
 
 // Always loaded — used by the self-healing seed in Matrix_MLM_Core::run().
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-gateways.php';

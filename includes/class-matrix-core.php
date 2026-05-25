@@ -510,6 +510,17 @@ class Matrix_MLM_Core {
             case 'deposit':
                 $this->process_deposit();
                 break;
+            case 'zebra_complete_otp':
+                // Step 2 of the Zebra Wallet 2-step OTP deposit
+                // flow. Step 1 (matrix_action=deposit with
+                // gateway=zebra) returned requires_otp=true plus a
+                // psp_reference; the frontend asks the user for the
+                // OTP that was SMS'd to the wallet phone, and posts
+                // it back here together with the deposit_id and
+                // psp_reference. See process_zebra_complete_otp()
+                // for the server-side checks.
+                $this->process_zebra_complete_otp();
+                break;
             case 'transfer':
                 $this->process_transfer();
                 break;
@@ -1238,12 +1249,86 @@ class Matrix_MLM_Core {
         } elseif ($gateway === 'flutterwave') {
             $flutterwave = new Matrix_MLM_Flutterwave();
             $result = $flutterwave->initialize_payment($deposit_id, $amount, $user_id);
+        } elseif ($gateway === 'zebra') {
+            // Zebra Wallet (Bibimoney / Nazmo Banking Platform) is a
+            // direct-debit-with-OTP flow, NOT a hosted-checkout
+            // redirect. The frontend collects the customer's wallet
+            // identifier (IWAN, local reference, or MSISDN) in the
+            // same form as the amount and posts it through as
+            // `wallet_account`. initialize_payment() runs step 1
+            // (POST /PaymentAuth) which causes the platform to SMS
+            // an OTP to the wallet's primary phone number; the
+            // returned response carries requires_otp=true and a
+            // psp_reference, which the frontend echoes back in the
+            // separate `matrix_action=zebra_complete_otp` call once
+            // the user has entered their OTP. See
+            // gateways/class-matrix-zebra.php for the full flow.
+            $primary_account = sanitize_text_field((string) ($_POST['wallet_account'] ?? ''));
+            $zebra  = new Matrix_MLM_Zebra();
+            $result = $zebra->initialize_payment($deposit_id, $amount, $user_id, $primary_account);
         } else {
             wp_send_json_error(['message' => __('Unsupported gateway', 'matrix-mlm')]);
             return;
         }
 
         if ($result['success']) {
+            wp_send_json_success($result);
+        } else {
+            wp_send_json_error($result);
+        }
+    }
+
+    /**
+     * Step 2 of the Zebra Wallet two-step OTP deposit flow.
+     *
+     * Step 1 (process_deposit with gateway='zebra') has already
+     *   - inserted a matrix_deposits row in 'pending' status
+     *   - called /PaymentAuth and stored the platform's PSPreference
+     *     in the deposit's gateway_response JSON
+     *   - returned { requires_otp: true, psp_reference } to the JS
+     *
+     * The frontend then asks the user for the OTP that Bibimoney
+     * SMS'd to the wallet's primary phone, and posts the OTP back
+     * here together with the deposit_id and the psp_reference echo.
+     * This method:
+     *
+     *   1. Validates the deposit_id belongs to the current user and
+     *      the gateway is 'zebra' (defense in depth — the gateway
+     *      class re-checks this too, but failing fast at the AJAX
+     *      boundary keeps error messages cleaner).
+     *
+     *   2. Hands off to Matrix_MLM_Zebra::complete_otp_payment()
+     *      which calls /Payment with the OTP, runs amount/currency
+     *      mismatch defenses on the response, and credits the
+     *      Matrix wallet through the same idempotent code path the
+     *      IPN webhook uses.
+     *
+     *   3. Returns the result envelope to the JS so the modal can
+     *      render success or surface the specific error (e.g.
+     *      "OTP expired", "OTP already used", "HMAC invalid").
+     */
+    private function process_zebra_complete_otp() {
+        if (!is_user_logged_in()) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        $user_id       = get_current_user_id();
+        $deposit_id    = (int) ($_POST['deposit_id'] ?? 0);
+        $psp_reference = sanitize_text_field((string) ($_POST['psp_reference'] ?? ''));
+        // OTPs are short numeric/alphanumeric tokens — strip
+        // surrounding whitespace from paste, but keep the raw value
+        // otherwise. sanitize_text_field is enough; the gateway
+        // class trims again.
+        $otp = sanitize_text_field((string) ($_POST['otp'] ?? ''));
+
+        if ($deposit_id <= 0 || $psp_reference === '' || $otp === '') {
+            wp_send_json_error(['message' => __('Deposit ID, payment reference, and OTP are all required.', 'matrix-mlm')]);
+        }
+
+        $zebra  = new Matrix_MLM_Zebra();
+        $result = $zebra->complete_otp_payment($deposit_id, $user_id, $psp_reference, $otp);
+
+        if (!empty($result['success'])) {
             wp_send_json_success($result);
         } else {
             wp_send_json_error($result);
@@ -3397,6 +3482,33 @@ class Matrix_MLM_Core {
             'permission_callback' => [$this, 'check_payment_callback_permission'],
         ]);
 
+        // Zebra Wallet IPN with a per-install token segment.
+        //
+        // Bibimoney's IPN does not carry a signature header (spec
+        // section 5: "Your endpoint must return HTTP 200 + body
+        // 'accepted'", no auth scheme described). To compensate
+        // we let the operator generate a long random webhook_token
+        // in Admin -> Gateways -> Zebra Wallet, bake it into the
+        // IPN URL, and register that exact URL with developers@
+        // bibimoney.com as the destination. An attacker who
+        // doesn't know the token can't post to a guessable URL.
+        // The handler still re-validates VendorReference /
+        // PSPreference / amount / currency against our own deposit
+        // row before crediting, so even if the token leaks the
+        // worst-case is "platform retries an already-completed
+        // deposit" rather than "attacker credits arbitrary wallets".
+        //
+        // The (?P<token>...) regex is permissive on the token
+        // shape so future operator rotations don't have to match
+        // any particular character class — check_payment_callback_permission
+        // does the actual constant-time match against the stored
+        // value.
+        register_rest_route('matrix-mlm/v1', '/payment/callback/(?P<gateway>zebra)/(?P<token>[A-Za-z0-9_\-]+)', [
+            'methods' => 'POST',
+            'callback' => [$this, 'handle_payment_callback'],
+            'permission_callback' => [$this, 'check_payment_callback_permission'],
+        ]);
+
         // User-facing verify endpoint.
         //
         // This is the URL the gateway redirects the user's browser to
@@ -3443,6 +3555,28 @@ class Matrix_MLM_Core {
             case 'flutterwave':
                 $signature = $request->get_header('verif-hash');
                 break;
+            case 'zebra':
+                // Bibimoney's IPN has no signature header. The
+                // route's {token} segment IS the auth credential.
+                // Constant-time compare it against the configured
+                // webhook_token; reject any request whose token
+                // doesn't match. This is the same defense pattern
+                // the (header-based) Paystack/Flutterwave checks
+                // use, just bound to the URL path because that's
+                // where Bibimoney can authenticate us. Empty
+                // configured token -> refuse all calls (the
+                // operator hasn't finished setup).
+                $supplied   = (string) $request->get_param('token');
+                $zebra      = new Matrix_MLM_Zebra();
+                $configured = (string) $zebra->get_webhook_token();
+                if ($configured === '' || $supplied === '' || !hash_equals($configured, $supplied)) {
+                    return new WP_Error(
+                        'rest_forbidden',
+                        __('Webhook token is missing or invalid.', 'matrix-mlm'),
+                        ['status' => 401]
+                    );
+                }
+                return true;
             default:
                 return true;
         }
@@ -3465,6 +3599,9 @@ class Matrix_MLM_Core {
         } elseif ($gateway === 'flutterwave') {
             $flutterwave = new Matrix_MLM_Flutterwave();
             return $flutterwave->handle_webhook($request);
+        } elseif ($gateway === 'zebra') {
+            $zebra = new Matrix_MLM_Zebra();
+            return $zebra->handle_webhook($request);
         }
 
         return new WP_REST_Response(['status' => 'error'], 400);
@@ -3484,6 +3621,16 @@ class Matrix_MLM_Core {
         } elseif ($gateway === 'flutterwave') {
             $flutterwave = new Matrix_MLM_Flutterwave();
             return $flutterwave->verify_payment($reference);
+        } elseif ($gateway === 'zebra') {
+            // Zebra has no redirect-and-return flow, so this
+            // endpoint is a polling helper rather than a primary
+            // completion path. The verify_payment() implementation
+            // reads the local deposit row's status (which the IPN
+            // will have updated) rather than calling the platform,
+            // because Bibimoney does not expose a transaction
+            // lookup endpoint in the spec we have.
+            $zebra = new Matrix_MLM_Zebra();
+            return $zebra->verify_payment($reference);
         }
 
         return new WP_REST_Response(['status' => 'error', 'message' => 'Unsupported gateway'], 400);
