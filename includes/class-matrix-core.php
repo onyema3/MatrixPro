@@ -318,6 +318,37 @@ class Matrix_MLM_Core {
         }
 
         if ($is_dashboard_page) {
+            // Dashicons font (WordPress core handle). Every dashboard
+            // surface uses dashicon glyphs heavily — the genealogy
+            // toolbar's zoom +/-/fit/reset buttons, the notifications
+            // bell, the wallet/benefits/healthcare panels, etc. all
+            // render <span class="dashicons dashicons-..."></span>
+            // and rely on the dashicons stylesheet being loaded for
+            // the font + glyph mappings to resolve.
+            //
+            // On most installs dashicons is loaded transitively
+            // because WordPress's admin bar (visible to logged-in
+            // users on the front-end by default) registers
+            // dashicons as one of its dependencies. Themes that hide
+            // the admin bar — via show_admin_bar(false), or by
+            // setting the per-user "Show Toolbar when viewing site"
+            // preference to off, or by stripping it through a
+            // performance plugin — break that transitive load and
+            // every dashicon glyph in the dashboard becomes an
+            // empty 18x18 span. Symptom: zoom buttons render as
+            // empty 34x34 boxes, the notifications bell loses its
+            // icon, etc. The buttons stay clickable, just glyphless.
+            //
+            // Fix is to take ownership of the dependency: enqueue
+            // dashicons explicitly so the dashboard renders
+            // correctly regardless of whether the active theme or
+            // a perf plugin shows the admin bar. Cost is one
+            // ~30 KB CSS file (browser-cached aggressively) on
+            // dashboard pages only — non-dashboard pages are
+            // unaffected because this whole block is gated on
+            // $is_dashboard_page.
+            wp_enqueue_style('dashicons');
+
             wp_enqueue_style(
                 'matrix-mlm-notifications',
                 MATRIX_MLM_PLUGIN_URL . 'public/css/matrix-notifications.css',
