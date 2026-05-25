@@ -1381,6 +1381,9 @@ class Matrix_MLM_Database {
             'matrix_mlm_captcha_secret_key' => '',
             'matrix_mlm_livechat_enabled' => 0,
             'matrix_mlm_livechat_code' => '',
+            'matrix_mlm_whatsapp_enabled' => 0,
+            'matrix_mlm_whatsapp_number' => '',
+            'matrix_mlm_whatsapp_message' => '',
             'matrix_mlm_primary_color' => '#4f46e5',
             'matrix_mlm_secondary_color' => '#7c3aed',
         ];

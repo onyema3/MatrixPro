@@ -749,12 +749,29 @@ class Matrix_MLM_Admin_Settings {
     <?php }
 
     private function render_livechat_tab() { ?>
+        <h2 style="margin-top:0;"><?php _e('Livechat', 'matrix-mlm'); ?></h2>
+        <p class="description" style="margin-bottom:16px;"><?php _e('Two independent surfaces — enable either, both, or neither. Both render in the page footer when the master Livechat toggle is on AND the surface\'s own toggle is on.', 'matrix-mlm'); ?></p>
+
+        <h3><?php _e('Custom Embed Code', 'matrix-mlm'); ?></h3>
         <table class="form-table">
             <tr><th><?php _e('Enable Livechat', 'matrix-mlm'); ?></th>
-                <td><label><input type="checkbox" name="matrix_mlm_livechat_enabled" value="1" <?php checked(get_option('matrix_mlm_livechat_enabled', 0)); ?>> <?php _e('Enable livechat widget', 'matrix-mlm'); ?></label></td></tr>
+                <td><label><input type="checkbox" name="matrix_mlm_livechat_enabled" value="1" <?php checked(get_option('matrix_mlm_livechat_enabled', 0)); ?>> <?php _e('Master switch — must be on for any livechat surface (custom code OR WhatsApp button) to render.', 'matrix-mlm'); ?></label></td></tr>
             <tr><th><?php _e('Livechat Code', 'matrix-mlm'); ?></th>
-                <td><textarea name="matrix_mlm_livechat_code" rows="6" class="large-text code" placeholder="<?php _e('Paste your Tawk.to, Crisp, or other livechat embed code here', 'matrix-mlm'); ?>"><?php echo esc_textarea(get_option('matrix_mlm_livechat_code', '')); ?></textarea>
-                <p class="description"><?php _e('Supports Tawk.to, Crisp, LiveChat, Intercom, or any JavaScript widget code.', 'matrix-mlm'); ?></p></td></tr>
+                <td><textarea name="matrix_mlm_livechat_code" rows="6" class="large-text code" placeholder="<?php esc_attr_e('Paste your Tawk.to, Crisp, or other livechat embed code here', 'matrix-mlm'); ?>"><?php echo esc_textarea(get_option('matrix_mlm_livechat_code', '')); ?></textarea>
+                <p class="description"><?php _e('Supports Tawk.to, Crisp, LiveChat, Intercom, or any JavaScript widget code. Output is printed verbatim in the page footer with no escaping (the &lt;script&gt; tag from the third-party provider needs to execute as code).', 'matrix-mlm'); ?></p></td></tr>
+        </table>
+
+        <h3><?php _e('WhatsApp Button', 'matrix-mlm'); ?></h3>
+        <table class="form-table">
+            <tr><th><?php _e('Enable WhatsApp', 'matrix-mlm'); ?></th>
+                <td><label><input type="checkbox" name="matrix_mlm_whatsapp_enabled" value="1" <?php checked(get_option('matrix_mlm_whatsapp_enabled', 0)); ?>> <?php _e('Show a floating WhatsApp click-to-chat button on every front-end page.', 'matrix-mlm'); ?></label>
+                <p class="description"><?php _e('The button opens https://wa.me/&lt;number&gt; in a new tab — opens the WhatsApp app on mobile, web.whatsapp.com on desktop. Independent of the custom embed code above; both can run together.', 'matrix-mlm'); ?></p></td></tr>
+            <tr><th><?php _e('WhatsApp Number', 'matrix-mlm'); ?></th>
+                <td><input type="text" name="matrix_mlm_whatsapp_number" class="regular-text" placeholder="2348012345678" value="<?php echo esc_attr(get_option('matrix_mlm_whatsapp_number', '')); ?>">
+                <p class="description"><?php _e('Digits only, including country code, no +. Example: 2348012345678. The wa.me URL format requires the country code prefix and rejects + or spaces.', 'matrix-mlm'); ?></p></td></tr>
+            <tr><th><?php _e('Pre-filled Message', 'matrix-mlm'); ?></th>
+                <td><textarea name="matrix_mlm_whatsapp_message" rows="3" class="large-text" placeholder="<?php esc_attr_e('Hi! I have a question about...', 'matrix-mlm'); ?>"><?php echo esc_textarea(get_option('matrix_mlm_whatsapp_message', '')); ?></textarea>
+                <p class="description"><?php _e('Optional. WhatsApp pre-populates the message field with this text when the user opens the chat. Leave blank for a clean compose box.', 'matrix-mlm'); ?></p></td></tr>
         </table>
     <?php }
 
@@ -1177,7 +1194,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_default_language'];
                 break;
             case 'livechat':
-                $settings = ['matrix_mlm_livechat_enabled', 'matrix_mlm_livechat_code'];
+                $settings = ['matrix_mlm_livechat_enabled', 'matrix_mlm_livechat_code', 'matrix_mlm_whatsapp_enabled', 'matrix_mlm_whatsapp_number', 'matrix_mlm_whatsapp_message'];
                 break;
             case 'subscription':
                 $settings = ['matrix_mlm_subscription_enabled', 'matrix_mlm_subscription_amount', 'matrix_mlm_subscription_billing_day', 'matrix_mlm_subscription_grace_days'];
@@ -1292,10 +1309,16 @@ class Matrix_MLM_Admin_Settings {
 
         foreach ($settings as $setting) {
             $value = isset($_POST[$setting]) ? $_POST[$setting] : '';
-            if (in_array($setting, ['matrix_mlm_custom_css', 'matrix_mlm_livechat_code'])) {
+            if (in_array($setting, ['matrix_mlm_custom_css', 'matrix_mlm_livechat_code', 'matrix_mlm_whatsapp_message'])) {
                 $value = wp_unslash($value);
             } elseif (in_array($setting, ['matrix_mlm_login_logo_url'])) {
                 $value = esc_url_raw(wp_unslash($value));
+            } elseif ($setting === 'matrix_mlm_whatsapp_number') {
+                // Strip non-digits at save time so the wa.me URL the
+                // public renderer builds is always valid; wa.me wants
+                // bare digits with no +/space/dash. Operators routinely
+                // paste '+234 801 234 5678' from a contact card.
+                $value = preg_replace('/\D+/', '', wp_unslash((string) $value));
             } else {
                 $value = sanitize_text_field($value);
             }
@@ -1303,7 +1326,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_transaction_pin_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled', 'matrix_mlm_pin_required_for_transfers', 'matrix_mlm_pin_required_for_matrix_to_virtual', 'matrix_mlm_pin_required_for_bank', 'matrix_mlm_pin_required_for_bills', 'matrix_mlm_pin_required_for_subscription'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_transaction_pin_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_whatsapp_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled', 'matrix_mlm_pin_required_for_transfers', 'matrix_mlm_pin_required_for_matrix_to_virtual', 'matrix_mlm_pin_required_for_bank', 'matrix_mlm_pin_required_for_bills', 'matrix_mlm_pin_required_for_subscription'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

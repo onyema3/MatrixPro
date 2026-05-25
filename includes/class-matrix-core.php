@@ -82,6 +82,17 @@ class Matrix_MLM_Core {
         add_action('wp_enqueue_scripts', [$this, 'enqueue_public_assets']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
 
+        // Livechat surfaces (custom embed code + WhatsApp click-to-
+        // chat button). Both gated by the master livechat toggle on
+        // Settings -> Livechat AND each surface's own per-surface
+        // toggle. Pre-existing behaviour stored matrix_mlm_livechat_code
+        // but never actually rendered it on the public site (no hook
+        // was registered) — this single hook now wires the existing
+        // custom-code surface as a side effect of wiring the new
+        // WhatsApp surface, so installs that already had embed code
+        // saved start rendering it without any further admin action.
+        add_action('wp_footer', [$this, 'render_livechat_surfaces']);
+
         // Register shortcodes
         add_action('init', [$this, 'register_shortcodes']);
 
@@ -3392,5 +3403,106 @@ class Matrix_MLM_Core {
                 AND expires_at IS NOT NULL
                 AND expires_at < NOW()"
         );
+    }
+
+    /**
+     * Render the public-side livechat surfaces in wp_footer.
+     *
+     * Two independent surfaces, both gated by the master
+     * matrix_mlm_livechat_enabled toggle:
+     *
+     *   1. Custom embed code (matrix_mlm_livechat_code) — printed
+     *      verbatim as raw HTML so a third-party <script> tag from
+     *      Tawk.to / Crisp / LiveChat / Intercom / etc. executes.
+     *      No escaping at output time because the operator's intent
+     *      with this field is "execute this snippet"; the field is
+     *      already gated to admin-with-manage-options at save time
+     *      via the standard WP settings nonce + capability check.
+     *
+     *   2. WhatsApp click-to-chat button (matrix_mlm_whatsapp_enabled)
+     *      — emits a self-contained floating button that opens
+     *      https://wa.me/<digits>?text=<urlencoded message> in a
+     *      new tab. wa.me opens the WhatsApp app on mobile and
+     *      web.whatsapp.com on desktop, so a single href works for
+     *      both. The number is digit-stripped at save time so the
+     *      URL is always valid — wa.me rejects anything other than
+     *      bare digits.
+     *
+     * Both surfaces are skipped on wp-admin and on the wp-login
+     * page since they exist for end-user support, not for the
+     * authenticated admin who is configuring them.
+     *
+     * Output is also skipped entirely when nothing is configured —
+     * no empty <div> wrapper, no comment marker — so a default
+     * install with no livechat configured produces no footer
+     * pollution.
+     */
+    public function render_livechat_surfaces() {
+        if (is_admin()) {
+            return;
+        }
+        if (!(int) get_option('matrix_mlm_livechat_enabled', 0)) {
+            return;
+        }
+
+        // Surface 1: custom embed code. Operator-supplied HTML/JS,
+        // printed raw — see method docblock.
+        $code = (string) get_option('matrix_mlm_livechat_code', '');
+        if (trim($code) !== '') {
+            echo $code; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+        }
+
+        // Surface 2: WhatsApp button.
+        if ((int) get_option('matrix_mlm_whatsapp_enabled', 0)) {
+            $number  = preg_replace('/\D+/', '', (string) get_option('matrix_mlm_whatsapp_number', ''));
+            $message = (string) get_option('matrix_mlm_whatsapp_message', '');
+            if ($number !== '') {
+                $url = 'https://wa.me/' . $number;
+                if ($message !== '') {
+                    $url .= '?text=' . rawurlencode($message);
+                }
+                $aria = esc_attr__('Chat with us on WhatsApp', 'matrix-mlm');
+                ?>
+                <a href="<?php echo esc_url($url); ?>"
+                   class="matrix-whatsapp-btn"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   aria-label="<?php echo $aria; ?>"
+                   title="<?php echo $aria; ?>">
+                    <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+                        <path fill="#fff" d="M16 .5C7.44.5.5 7.44.5 16c0 2.83.74 5.49 2.04 7.79L.5 31.5l7.93-2.07A15.43 15.43 0 0 0 16 31.5c8.56 0 15.5-6.94 15.5-15.5S24.56.5 16 .5zm0 28a12.46 12.46 0 0 1-6.36-1.74l-.45-.27-4.71 1.23 1.26-4.59-.29-.47A12.46 12.46 0 1 1 16 28.5zm7.13-9.36c-.39-.2-2.32-1.14-2.68-1.27-.36-.13-.62-.2-.88.2-.26.39-1 1.27-1.23 1.53-.23.26-.45.29-.84.1-.39-.2-1.66-.61-3.16-1.95a11.86 11.86 0 0 1-2.18-2.71c-.23-.39-.02-.6.17-.79.18-.18.39-.45.59-.68.2-.23.26-.39.39-.65.13-.26.07-.49-.03-.68-.1-.2-.88-2.13-1.21-2.91-.32-.78-.65-.67-.88-.68l-.75-.01a1.44 1.44 0 0 0-1.05.49c-.36.39-1.39 1.36-1.39 3.31s1.42 3.84 1.62 4.1c.2.26 2.79 4.27 6.77 5.99 2.36 1.02 3.28 1.11 4.46.93.71-.11 2.32-.95 2.65-1.86.33-.91.33-1.69.23-1.86-.1-.16-.36-.26-.75-.46z"/>
+                    </svg>
+                </a>
+                <style>
+                    .matrix-whatsapp-btn {
+                        position: fixed;
+                        bottom: 24px;
+                        right: 24px;
+                        z-index: 99998; /* one below the level-toast stack (99999) */
+                        display: inline-flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 56px;
+                        height: 56px;
+                        border-radius: 50%;
+                        background: #25d366;
+                        box-shadow: 0 8px 20px -4px rgba(37, 211, 102, 0.45);
+                        text-decoration: none;
+                        transition: transform .18s ease, box-shadow .18s ease;
+                    }
+                    .matrix-whatsapp-btn:hover,
+                    .matrix-whatsapp-btn:focus {
+                        background: #1ebe5b;
+                        transform: scale(1.06);
+                        box-shadow: 0 12px 26px -4px rgba(37, 211, 102, 0.55);
+                    }
+                    .matrix-whatsapp-btn:focus { outline: 2px solid #128c7e; outline-offset: 3px; }
+                    @media (max-width: 600px) {
+                        .matrix-whatsapp-btn { bottom: 16px; right: 16px; width: 52px; height: 52px; }
+                    }
+                </style>
+                <?php
+            }
+        }
     }
 }
