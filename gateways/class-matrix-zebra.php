@@ -6,9 +6,18 @@
  * (PaymentAuth -> Payment with OTP), Instant Payment Notifications
  * (IPN) for asynchronous completion, customer / account / balance
  * lookups for diagnostics. Withdrawal (vendor -> customer "Dispense"
- * + "Remit") and the Capture/Release/Cancel state machine for
- * pre-auth flows are intentionally out of scope of this first cut
- * and reserved for a follow-up PR.
+ * + "Remit") is intentionally out of scope of this gateway and
+ * reserved for a follow-up that wires the platform into the
+ * existing matrix_withdrawals admin-approval flow.
+ *
+ * Pre-auth deposits (the Capture / Cancel state machine) ARE
+ * supported as of the /CaptureOrCancel follow-up: an operator
+ * who flips "Hold authorisation; capture later" in Admin ->
+ * Gateways -> Zebra Wallet sends step 2 of the OTP flow with
+ * EventType=PRE_AUTH instead of AUTO_CAPTURE, parking the
+ * deposit at status='pending_capture' until they click Capture
+ * or Cancel from the Deposits admin page. See the
+ * "/CaptureOrCancel" section below for the full state machine.
  *
  * Key design notes:
  *
@@ -81,6 +90,21 @@ class Matrix_MLM_Zebra {
      *  configured install fails to UAT, never to a guessed prod URL. */
     const LIVE_BASE_URL = '';
 
+    /* ====================================================================
+     * Bibimoney EventType vocabulary
+     *
+     * Centralised so the OTP-completion path (4.1.2), the IPN
+     * dispatcher (5.x), and the /CaptureOrCancel state machine
+     * (out-of-scope-of-#302 follow-up) all reference the same
+     * literal strings the spec uses. AUTO_CAPTURE is "charge
+     * immediately"; PRE_AUTH is "authorise and hold"; CAPTURE
+     * settles a held auth; CANCEL releases it without charging.
+     * ==================================================================== */
+    const EVENT_AUTO_CAPTURE = 'AUTO_CAPTURE';
+    const EVENT_PRE_AUTH     = 'PRE_AUTH';
+    const EVENT_CAPTURE      = 'CAPTURE';
+    const EVENT_CANCEL       = 'CANCEL';
+
     private $api_key;
     private $api_secret;
     private $vendor_id;
@@ -88,6 +112,7 @@ class Matrix_MLM_Zebra {
     private $environment;
     private $webhook_token;
     private $default_currency;
+    private $pre_auth_enabled;
 
     public function __construct() {
         $this->load_credentials();
@@ -118,6 +143,13 @@ class Matrix_MLM_Zebra {
         $this->environment      = strtolower((string) ($params['environment'] ?? 'qa'));
         $this->webhook_token    = (string) ($params['webhook_token'] ?? '');
         $this->default_currency = strtoupper((string) ($params['default_currency'] ?? get_option('matrix_mlm_currency', 'NGN')));
+        // Operator-controlled toggle. When true, step 2 of the
+        // deposit flow uses EventType=PRE_AUTH and parks the
+        // deposit at status='pending_capture' instead of
+        // crediting the wallet immediately. Defaults off so
+        // existing installs preserve the AUTO_CAPTURE behaviour
+        // shipped in PR #302.
+        $this->pre_auth_enabled = !empty($params['pre_auth_enabled']);
 
         $override = trim((string) ($params['base_url_override'] ?? ''));
         if ($override !== '') {
@@ -153,6 +185,26 @@ class Matrix_MLM_Zebra {
     }
 
     /**
+     * Whether the operator has enabled pre-auth deposits.
+     *
+     * The default is the gateway-row toggle (Admin -> Gateways ->
+     * Zebra Wallet -> "Hold authorisation; capture later"). The
+     * matrix_zebra_deposit_pre_auth filter lets ops switch a
+     * specific deposit to the alternate mode at runtime — useful
+     * when only a subset of plans / amounts / users should be
+     * gated on manual capture, without enabling pre-auth platform-
+     * wide. The filter receives the default boolean plus the
+     * deposit_id so callers can branch on context.
+     */
+    public function is_pre_auth_enabled($deposit_id = null) {
+        return (bool) apply_filters(
+            'matrix_zebra_deposit_pre_auth',
+            $this->pre_auth_enabled,
+            $deposit_id
+        );
+    }
+
+    /**
      * Compute the HMAC digest required by the platform's payment
      * endpoints (section 6.1.2 of the spec).
      *
@@ -177,6 +229,43 @@ class Matrix_MLM_Zebra {
                  . $this->vendor_id
                  . $vendor_reference
                  . $primary_account
+                 . (string) $amount_minor
+                 . strtoupper($currency);
+
+        $method = (string) apply_filters('matrix_zebra_hmac_method', 'hmac_sha256');
+        if ($method === 'sha256') {
+            return hash('sha256', $message);
+        }
+        return hash_hmac('sha256', $message, $this->api_secret);
+    }
+
+    /**
+     * HMAC for the /CaptureOrCancel endpoint.
+     *
+     * The /CaptureOrCancel request body is keyed on PSPreference
+     * (not VendorReference or PrimaryAccountNumber) so the 8-field
+     * concat from compute_hmac() doesn't fit cleanly. The spec
+     * doesn't separately publish the capture/cancel signature
+     * formula, so we use the same field-shape the request body
+     * carries: api_key + api_secret + EventType + VendorID +
+     * PSPreference + Amount + Currency.
+     *
+     * We deliberately omit PrimaryAccountNumber because (a) it's
+     * not in the capture request body, and (b) we mask it in the
+     * gateway_response audit stash for privacy — rebuilding the
+     * full PAN here would defeat the mask.
+     *
+     * Same matrix_zebra_hmac_method filter as compute_hmac() so
+     * operators whose Bibimoney env expects plain SHA-256 over
+     * the concat (vs. HMAC-SHA256 keyed by api_secret) flip one
+     * filter and both signing paths follow.
+     */
+    private function compute_capture_hmac($event_type, $psp_reference, $amount_minor, $currency) {
+        $message = $this->api_key
+                 . $this->api_secret
+                 . $event_type
+                 . $this->vendor_id
+                 . $psp_reference
                  . (string) $amount_minor
                  . strtoupper($currency);
 
@@ -501,18 +590,30 @@ class Matrix_MLM_Zebra {
             return ['success' => false, 'message' => __('Payment reference mismatch. Please start the deposit again.', 'matrix-mlm')];
         }
 
-        // EventType AUTO_CAPTURE: complete the transaction
-        // immediately. PRE_AUTH would let us hold and capture
-        // later; the Matrix deposits flow has no concept of a
-        // hold, so AUTO_CAPTURE is the right default. Spec 4.1.2
-        // confirms this is also the platform default when
-        // EventType is omitted; we set it explicitly so the wire
-        // log is unambiguous in support tickets.
+        // EventType branches:
+        //   AUTO_CAPTURE — charge the wallet immediately, single
+        //                  step settles the deposit.
+        //   PRE_AUTH     — authorise + hold; the customer's wallet
+        //                  is debited but the funds aren't yet
+        //                  released to the merchant. The deposit
+        //                  row sits at status='pending_capture'
+        //                  until an admin triggers
+        //                  /CaptureOrCancel.
+        //
+        // Selection is operator-driven (Admin -> Gateways -> Zebra
+        // Wallet -> "Hold authorisation; capture later") with a
+        // per-deposit override via matrix_zebra_deposit_pre_auth.
+        // Spec 4.1.2 confirms AUTO_CAPTURE is the platform default
+        // when EventType is omitted; we set it explicitly so the
+        // wire log is unambiguous in support tickets.
+        $use_pre_auth = $this->is_pre_auth_enabled((int) $deposit_id);
+        $event_type   = $use_pre_auth ? self::EVENT_PRE_AUTH : self::EVENT_AUTO_CAPTURE;
+
         $payload = [
             'api_key'      => $this->api_key,
             'api_secret'   => $this->api_secret,
             'VendorID'     => $this->vendor_id,
-            'EventType'    => 'AUTO_CAPTURE',
+            'EventType'    => $event_type,
             'PSPreference' => $psp_reference,
             'OTP'          => $otp,
             'UserData'     => [
@@ -539,23 +640,209 @@ class Matrix_MLM_Zebra {
             ];
         }
 
-        // Successful synchronous completion. We can credit the
-        // deposit right now from this code path — but we still
-        // expect an IPN, and complete_deposit() is idempotent
-        // (conditional update on status='pending'), so the
-        // duplicate IPN won't double-credit.
         $info = isset($response['Information']) && is_array($response['Information']) ? $response['Information'] : [];
         $payment_data = array_merge($info, [
             'StatusCode'   => $status_code,
+            'EventType'    => $event_type,
             'PSPreference' => $psp_reference,
             'amount_minor' => (int) ($info['Value'] ?? 0),
             'currency'     => (string) ($info['CurrencyISO'] ?? $deposit->currency),
         ]);
+
+        if ($use_pre_auth) {
+            // Successful synchronous AUTH-only. Park the deposit
+            // at 'pending_capture' (no wallet credit) and report
+            // a hold-confirmed message. The IPN may also fire
+            // PRE_AUTH; park_pending_capture() is idempotent
+            // (conditional UPDATE on status='pending') so the
+            // duplicate is a no-op.
+            $this->park_pending_capture($deposit->transaction_id, $payment_data, 'sync');
+            return [
+                'success'         => true,
+                'pending_capture' => true,
+                'message'         => __('Authorisation confirmed. Funds are on hold; the merchant will capture or release shortly.', 'matrix-mlm'),
+            ];
+        }
+
+        // AUTO_CAPTURE path: synchronous completion. We can
+        // credit the deposit right now from this code path —
+        // but we still expect an IPN, and complete_deposit() is
+        // idempotent (conditional update on status='pending'),
+        // so the duplicate IPN won't double-credit.
         $this->complete_deposit($deposit->transaction_id, $payment_data, 'sync');
 
         return [
             'success' => true,
             'message' => __('Payment confirmed. Your wallet has been credited.', 'matrix-mlm'),
+        ];
+    }
+
+    /* ====================================================================
+     * /CaptureOrCancel — pre-auth state machine (spec section 4.x)
+     *
+     * Lifecycle for a pre-auth deposit:
+     *
+     *   1. process_deposit() inserts a pending row.
+     *   2. /PaymentAuth (initialize_payment) -> OTP sent.
+     *   3. /Payment with EventType=PRE_AUTH (complete_otp_payment
+     *      when is_pre_auth_enabled() is true) -> deposit
+     *      transitions pending -> pending_capture. Customer's
+     *      wallet is debited but funds aren't released. NO Matrix
+     *      wallet credit yet.
+     *   4. Admin clicks Capture or Cancel on the deposits page.
+     *      capture_deposit() / cancel_deposit() POST to
+     *      /CaptureOrCancel and transition pending_capture ->
+     *      completed (credit) or pending_capture -> cancelled
+     *      (no credit, no refund — funds were never moved to
+     *      the merchant operating wallet).
+     *   5. Bibimoney also fires CAPTURE / CANCEL IPNs which
+     *      handle_webhook() routes to the same idempotent
+     *      finalisers, so a double-delivery is a no-op.
+     *
+     * Both methods enforce gateway='zebra' AND status='pending_capture'
+     * at the SQL layer (conditional UPDATE), so a stray click on a
+     * deposit row from a different gateway, or on a row that's
+     * already been captured/cancelled by an earlier admin / IPN,
+     * fails cleanly without side-effects.
+     * ==================================================================== */
+
+    /**
+     * Capture a held authorisation. Transitions a pending_capture
+     * deposit to completed and credits the Matrix wallet.
+     *
+     * Caller is the admin AJAX handler in class-matrix-admin.php
+     * (zebra_capture_deposit), which has already gated on
+     * manage_matrix_deposits + nonce. We re-verify the deposit's
+     * gateway='zebra' and current status here as defense in
+     * depth.
+     */
+    public function capture_deposit($deposit_id, $note = '') {
+        return $this->dispatch_capture_or_cancel((int) $deposit_id, self::EVENT_CAPTURE, (string) $note);
+    }
+
+    /**
+     * Cancel a held authorisation. Transitions a pending_capture
+     * deposit to cancelled. The customer is NOT refunded by the
+     * Matrix side because they were never credited — the funds
+     * Bibimoney debited from their wallet are released back by
+     * the platform when the cancel call succeeds (per spec).
+     */
+    public function cancel_deposit($deposit_id, $note = '') {
+        return $this->dispatch_capture_or_cancel((int) $deposit_id, self::EVENT_CANCEL, (string) $note);
+    }
+
+    /**
+     * Shared body for capture_deposit() and cancel_deposit().
+     * Reads the stashed PSPreference + amount + currency,
+     * computes the capture-shape HMAC, posts /CaptureOrCancel,
+     * and on success flips the deposit row through the matching
+     * idempotent finaliser. Returns a [success, message] envelope
+     * the AJAX handler can forward verbatim.
+     */
+    private function dispatch_capture_or_cancel($deposit_id, $event_type, $note) {
+        global $wpdb;
+
+        if (!$this->is_configured()) {
+            return [
+                'success' => false,
+                'message' => __('Zebra Wallet is not fully configured. Contact the administrator.', 'matrix-mlm'),
+            ];
+        }
+
+        if ($event_type !== self::EVENT_CAPTURE && $event_type !== self::EVENT_CANCEL) {
+            return ['success' => false, 'message' => __('Invalid capture action.', 'matrix-mlm')];
+        }
+
+        $deposit = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE id = %d AND gateway = 'zebra'",
+            $deposit_id
+        ));
+        if (!$deposit) {
+            return ['success' => false, 'message' => __('Zebra deposit not found.', 'matrix-mlm')];
+        }
+        if ($deposit->status !== 'pending_capture') {
+            // Already finalised — return a friendly message
+            // rather than calling the platform with a stale
+            // PSPreference.
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    /* translators: 1: deposit status, 2: action */
+                    __('This deposit is %1$s and cannot be %2$s.', 'matrix-mlm'),
+                    $deposit->status,
+                    $event_type === self::EVENT_CAPTURE ? __('captured', 'matrix-mlm') : __('cancelled', 'matrix-mlm')
+                ),
+            ];
+        }
+
+        $stash = json_decode((string) $deposit->gateway_response, true);
+        $psp_reference = is_array($stash) ? (string) ($stash['psp_reference'] ?? '') : '';
+        if ($psp_reference === '') {
+            // Belt-and-braces: a pending_capture row without a
+            // stashed PSPreference is a schema-drift bug, not a
+            // recoverable state. Surface it loudly.
+            error_log(sprintf(
+                '[Matrix Zebra] capture/cancel: missing PSPreference for deposit #%d (status=%s)',
+                $deposit_id,
+                $deposit->status
+            ));
+            return ['success' => false, 'message' => __('Missing payment reference for this deposit.', 'matrix-mlm')];
+        }
+
+        $currency     = strtoupper((string) ($deposit->currency ?? $this->default_currency));
+        $amount_minor = (int) round(((float) $deposit->amount) * 100);
+
+        $hmac = $this->compute_capture_hmac($event_type, $psp_reference, $amount_minor, $currency);
+
+        $payload = [
+            'api_key'      => $this->api_key,
+            'api_secret'   => $this->api_secret,
+            'VendorID'     => $this->vendor_id,
+            'EventType'    => $event_type,
+            'PSPreference' => $psp_reference,
+            'Amount'       => $amount_minor,
+            'Currency'     => $currency,
+            'HMACdigest'   => $hmac,
+            'UserData'     => [
+                'deposit_id' => (int) $deposit_id,
+                'plugin'     => 'matrix-mlm',
+                'note'       => $note,
+            ],
+        ];
+
+        $response = $this->post('CaptureOrCancel', $payload);
+
+        $status_code = (string) ($response['StatusCode'] ?? '');
+        if (!self::is_success_code($status_code)) {
+            return [
+                'success' => false,
+                'message' => (string) ($response['ErrorText'] ?? $response['Status'] ?? __('Capture/Cancel could not be completed.', 'matrix-mlm')),
+            ];
+        }
+
+        $info = isset($response['Information']) && is_array($response['Information']) ? $response['Information'] : [];
+        $payment_data = array_merge($info, [
+            'StatusCode'   => $status_code,
+            'EventType'    => $event_type,
+            'PSPreference' => $psp_reference,
+            'amount_minor' => (int) ($info['Value'] ?? $amount_minor),
+            'currency'     => (string) ($info['CurrencyISO'] ?? $currency),
+            'admin_note'   => $note,
+        ]);
+
+        if ($event_type === self::EVENT_CAPTURE) {
+            $this->finalize_capture($deposit->transaction_id, $payment_data, 'sync');
+            return [
+                'success' => true,
+                'message' => __('Authorisation captured. The wallet has been credited.', 'matrix-mlm'),
+            ];
+        }
+
+        // Cancel
+        $this->finalize_cancel($deposit->transaction_id, $payment_data, 'sync');
+        return [
+            'success' => true,
+            'message' => __('Authorisation released. The customer was not charged.', 'matrix-mlm'),
         ];
     }
 
@@ -594,30 +881,45 @@ class Matrix_MLM_Zebra {
         $status_code      = (string) ($event['StatusCode'] ?? '');
         $event_type       = (string) ($event['EventType'] ?? '');
 
-        // Bibimoney delivers IPNs for many event types: payment
-        // success, transfer success, refund, dispute, etc. We only
-        // act on the deposit-success path; everything else gets
-        // logged and accepted (so the platform stops retrying).
-        // The "transaction completed" predicate is a successful
-        // status code on a payment-shaped event. Future event
-        // types (e.g. CAPTURE for pre-auth flows) can hook here
-        // when we add those flows.
-        $is_payment_event = in_array($event_type, [
-            'AUTO_CAPTURE',
-            'PRE_AUTH',
-            'CAPTURE',
-        ], true);
+        // Dispatch by EventType. Each branch fans out to an
+        // idempotent finaliser that uses a conditional UPDATE
+        // keyed on the expected source status, so duplicate
+        // deliveries (sync + IPN, or two IPN retries) collapse
+        // to a single state transition. Non-actionable events
+        // (transfer success, refund, dispute, etc.) fall through
+        // to the "log and accept" branch so the platform stops
+        // retrying.
+        $payment_data = [
+            'StatusCode'   => $status_code,
+            'EventType'    => $event_type,
+            'PSPreference' => $psp_reference,
+            'amount_minor' => (int) ($event['Amount'] ?? 0),
+            'currency'     => strtoupper((string) ($event['Currency'] ?? '')),
+            'raw'          => $event,
+        ];
 
-        if ($is_payment_event && self::is_success_code($status_code) && $vendor_reference !== '') {
-            $payment_data = [
-                'StatusCode'   => $status_code,
-                'EventType'    => $event_type,
-                'PSPreference' => $psp_reference,
-                'amount_minor' => (int) ($event['Amount'] ?? 0),
-                'currency'     => strtoupper((string) ($event['Currency'] ?? '')),
-                'raw'          => $event,
-            ];
+        $is_success = self::is_success_code($status_code);
+        $has_ref    = $vendor_reference !== '';
+
+        if ($is_success && $has_ref && $event_type === self::EVENT_AUTO_CAPTURE) {
+            // Single-step settle. pending -> completed + credit.
             $this->complete_deposit($vendor_reference, $payment_data, 'ipn');
+        } elseif ($is_success && $has_ref && $event_type === self::EVENT_PRE_AUTH) {
+            // Hold confirmed. pending -> pending_capture, no credit.
+            $this->park_pending_capture($vendor_reference, $payment_data, 'ipn');
+        } elseif ($is_success && $has_ref && $event_type === self::EVENT_CAPTURE) {
+            // Held auth captured. pending_capture -> completed + credit.
+            $this->finalize_capture($vendor_reference, $payment_data, 'ipn');
+        } elseif ($is_success && $has_ref && (
+            $event_type === self::EVENT_CANCEL
+            || $event_type === 'RELEASE'
+            || $event_type === 'VOID'
+        )) {
+            // Held auth released. pending_capture -> cancelled.
+            // Bibimoney's spec section 4.x uses CANCEL; some env
+            // builds also emit RELEASE / VOID for the same
+            // semantic event, so we accept all three.
+            $this->finalize_cancel($vendor_reference, $payment_data, 'ipn');
         } else {
             error_log(sprintf(
                 '[Matrix Zebra IPN] non-actionable event type=%s status=%s vref=%s',
@@ -759,13 +1061,239 @@ class Matrix_MLM_Zebra {
             return;
         }
 
+        $this->credit_completed_deposit($deposit, $vendor_reference, __('Zebra Wallet deposit (Ref: %s)', 'matrix-mlm'));
+    }
+
+    /* ====================================================================
+     * Internal: park a pre-auth deposit at status='pending_capture'.
+     *
+     * Idempotent: conditional UPDATE on status='pending' means
+     * only the first delivery (sync from /Payment OR IPN with
+     * EventType=PRE_AUTH) makes the transition. The losing
+     * delivery is a no-op.
+     *
+     * Amount/currency mismatch defenses run identically to
+     * complete_deposit() — a forged or tampered IPN that claims
+     * a different amount than we initiated never advances the
+     * row past 'pending'.
+     * ==================================================================== */
+    private function park_pending_capture($vendor_reference, array $payment_data, $source) {
+        global $wpdb;
+
+        $deposit = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE transaction_id = %s AND status = 'pending'",
+            $vendor_reference
+        ));
+        if (!$deposit) {
+            // Either no such deposit, or already advanced past
+            // 'pending' by the other path (idempotent win).
+            return;
+        }
+
+        $paid_minor        = (int) ($payment_data['amount_minor'] ?? 0);
+        $expected_minor    = (int) round(((float) $deposit->amount) * 100);
+        $paid_currency     = strtoupper((string) ($payment_data['currency'] ?? ''));
+        $expected_currency = strtoupper((string) ($deposit->currency ?? get_option('matrix_mlm_currency', 'NGN')));
+
+        // Underpayment OR currency mismatch -> reject. Same
+        // defense as complete_deposit() — never advance the row
+        // on a payload we don't trust.
+        if ($paid_minor < $expected_minor
+            || ($paid_currency !== '' && $paid_currency !== $expected_currency)) {
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_deposits',
+                [
+                    'status'           => 'rejected',
+                    'gateway_response' => wp_json_encode([
+                        'reason'                => 'amount_or_currency_mismatch_pre_auth',
+                        'expected_amount_minor' => $expected_minor,
+                        'paid_amount_minor'     => $paid_minor,
+                        'expected_currency'     => $expected_currency,
+                        'paid_currency'         => $paid_currency,
+                        'source'                => $source,
+                        'payment_data'          => $payment_data,
+                    ]),
+                ],
+                ['id' => $deposit->id]
+            );
+            error_log(sprintf(
+                '[Matrix Zebra %s] Rejected pre-auth deposit #%d ref=%s: expected %d %s got %d %s',
+                strtoupper($source),
+                $deposit->id,
+                $vendor_reference,
+                $expected_minor,
+                $expected_currency,
+                $paid_minor,
+                $paid_currency
+            ));
+            if (class_exists('Matrix_MLM_Notifications')) {
+                Matrix_MLM_Notifications::send_admin_notification(
+                    'zebra_deposit_disputed',
+                    sprintf(__('Zebra Wallet pre-auth rejected (Ref: %s) - amount/currency mismatch', 'matrix-mlm'), $vendor_reference)
+                );
+            }
+            return;
+        }
+
+        // Preserve step-1's stash (psp_reference / vendor_reference
+        // / masked primary_account) by merging the new payment_data
+        // alongside it. capture_deposit() needs psp_reference at
+        // admin-action time so the merge keeps everything in one
+        // JSON blob.
+        $existing_stash = json_decode((string) $deposit->gateway_response, true);
+        if (!is_array($existing_stash)) {
+            $existing_stash = [];
+        }
+        $existing_stash['step']            = 'pre_auth_held';
+        $existing_stash['pre_auth_source'] = $source;
+        $existing_stash['pre_auth_data']   = $payment_data;
+
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_deposits',
+            [
+                'status'           => 'pending_capture',
+                'gateway_response' => wp_json_encode($existing_stash),
+            ],
+            ['id' => $deposit->id, 'status' => 'pending']
+        );
+        if ($updated !== 1) {
+            // Concurrent winner. Done.
+            return;
+        }
+
+        // Operator notification: a fresh hold has landed and
+        // needs an admin decision. We deliberately do NOT send
+        // the user the "deposit completed" email yet — that
+        // fires on capture.
+        if (class_exists('Matrix_MLM_Notifications')) {
+            Matrix_MLM_Notifications::send_admin_notification(
+                'zebra_deposit_pending_capture',
+                sprintf(
+                    __('Zebra Wallet pre-auth held (Ref: %s) - Capture or Cancel from the Deposits admin page.', 'matrix-mlm'),
+                    $vendor_reference
+                )
+            );
+        }
+    }
+
+    /* ====================================================================
+     * Internal: finalise a capture.
+     *
+     * Idempotent: conditional UPDATE on status='pending_capture'.
+     * Both the synchronous /CaptureOrCancel response and the
+     * matching CAPTURE IPN can fire; the second fires becomes a
+     * no-op. Mirrors complete_deposit() for the credit + notify
+     * path so user-facing messaging stays consistent across
+     * AUTO_CAPTURE and pre-auth-then-capture deposits.
+     * ==================================================================== */
+    private function finalize_capture($vendor_reference, array $payment_data, $source) {
+        global $wpdb;
+
+        $deposit = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE transaction_id = %s AND status = 'pending_capture'",
+            $vendor_reference
+        ));
+        if (!$deposit) {
+            // Either no such deposit, already captured/cancelled
+            // by the other path, or never reached pending_capture.
+            return;
+        }
+
+        // We don't re-run amount/currency defenses here: the
+        // amount was already validated at park_pending_capture()
+        // time, and /CaptureOrCancel doesn't accept a different
+        // amount than the original auth. If a future spec
+        // revision allows partial capture, this is where the
+        // delta check would land.
+
+        $existing_stash = json_decode((string) $deposit->gateway_response, true);
+        if (!is_array($existing_stash)) {
+            $existing_stash = [];
+        }
+        $existing_stash['step']           = 'captured';
+        $existing_stash['capture_source'] = $source;
+        $existing_stash['capture_data']   = $payment_data;
+
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_deposits',
+            [
+                'status'           => 'completed',
+                'gateway_response' => wp_json_encode($existing_stash),
+            ],
+            ['id' => $deposit->id, 'status' => 'pending_capture']
+        );
+        if ($updated !== 1) {
+            // Concurrent winner. Done.
+            return;
+        }
+
+        $this->credit_completed_deposit($deposit, $vendor_reference, __('Zebra Wallet captured deposit (Ref: %s)', 'matrix-mlm'));
+    }
+
+    /* ====================================================================
+     * Internal: finalise a cancel.
+     *
+     * Idempotent: conditional UPDATE on status='pending_capture'.
+     * No wallet credit and no refund — the customer was never
+     * credited Matrix-side, and the platform releases the held
+     * funds back to their Zebra wallet on the /CaptureOrCancel
+     * success path.
+     * ==================================================================== */
+    private function finalize_cancel($vendor_reference, array $payment_data, $source) {
+        global $wpdb;
+
+        $deposit = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE transaction_id = %s AND status = 'pending_capture'",
+            $vendor_reference
+        ));
+        if (!$deposit) {
+            return;
+        }
+
+        $existing_stash = json_decode((string) $deposit->gateway_response, true);
+        if (!is_array($existing_stash)) {
+            $existing_stash = [];
+        }
+        $existing_stash['step']          = 'cancelled';
+        $existing_stash['cancel_source'] = $source;
+        $existing_stash['cancel_data']   = $payment_data;
+
+        $updated = $wpdb->update(
+            $wpdb->prefix . 'matrix_deposits',
+            [
+                'status'           => 'cancelled',
+                'gateway_response' => wp_json_encode($existing_stash),
+            ],
+            ['id' => $deposit->id, 'status' => 'pending_capture']
+        );
+        if ($updated !== 1) {
+            // Concurrent winner. Done.
+            return;
+        }
+
+        // No user notification on cancel: the customer was never
+        // told "deposit completed" (that only fires on
+        // finalize_capture / complete_deposit), so a cancel from
+        // pending_capture is a silent no-op from the user's
+        // perspective. Admins see the state change in the
+        // Deposits page.
+    }
+
+    /**
+     * Shared credit + user-notification path used by both
+     * complete_deposit (AUTO_CAPTURE / single-step) and
+     * finalize_capture (pre-auth then capture). Centralised so
+     * "successful deposit" semantics stay identical regardless
+     * of which lifecycle the row took to reach 'completed'.
+     */
+    private function credit_completed_deposit($deposit, $vendor_reference, $description_format) {
         if (class_exists('Matrix_MLM_Wallet')) {
             $wallet = new Matrix_MLM_Wallet();
             $wallet->credit(
                 $deposit->user_id,
                 $deposit->net_amount,
                 'deposit',
-                sprintf(__('Zebra Wallet deposit (Ref: %s)', 'matrix-mlm'), $vendor_reference),
+                sprintf($description_format, $vendor_reference),
                 $vendor_reference
             );
         }

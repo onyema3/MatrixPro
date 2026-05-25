@@ -33,6 +33,7 @@ class Matrix_MLM_Admin_Deposits {
         $totals = [
             'all' => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits"),
             'pending' => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits WHERE status = 'pending'"),
+            'pending_capture' => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits WHERE status = 'pending_capture'"),
             'completed' => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits WHERE status = 'completed'"),
             'rejected' => $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits WHERE status = 'rejected'"),
         ];
@@ -43,6 +44,7 @@ class Matrix_MLM_Admin_Deposits {
             <ul class="subsubsub">
                 <li><a href="<?php echo admin_url('admin.php?page=matrix-mlm-deposits'); ?>" class="<?php echo empty($status_filter) ? 'current' : ''; ?>">All (<?php echo $totals['all']; ?>)</a> |</li>
                 <li><a href="<?php echo admin_url('admin.php?page=matrix-mlm-deposits&status=pending'); ?>" class="<?php echo $status_filter === 'pending' ? 'current' : ''; ?>">Pending (<?php echo $totals['pending']; ?>)</a> |</li>
+                <li><a href="<?php echo admin_url('admin.php?page=matrix-mlm-deposits&status=pending_capture'); ?>" class="<?php echo $status_filter === 'pending_capture' ? 'current' : ''; ?>"><?php _e('Pending Capture', 'matrix-mlm'); ?> (<?php echo $totals['pending_capture']; ?>)</a> |</li>
                 <li><a href="<?php echo admin_url('admin.php?page=matrix-mlm-deposits&status=completed'); ?>" class="<?php echo $status_filter === 'completed' ? 'current' : ''; ?>">Completed (<?php echo $totals['completed']; ?>)</a> |</li>
                 <li><a href="<?php echo admin_url('admin.php?page=matrix-mlm-deposits&status=rejected'); ?>" class="<?php echo $status_filter === 'rejected' ? 'current' : ''; ?>">Rejected (<?php echo $totals['rejected']; ?>)</a></li>
             </ul>
@@ -72,11 +74,14 @@ class Matrix_MLM_Admin_Deposits {
                         <td><?php echo $currency . number_format($deposit->charge, 2); ?></td>
                         <td><?php echo $currency . number_format($deposit->net_amount, 2); ?></td>
                         <td><code><?php echo esc_html($deposit->transaction_id ?? '-'); ?></code></td>
-                        <td><span class="matrix-badge matrix-badge-<?php echo $deposit->status; ?>"><?php echo ucfirst($deposit->status); ?></span></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo $deposit->status; ?>"><?php echo esc_html(ucwords(str_replace('_', ' ', $deposit->status))); ?></span></td>
                         <td><?php echo date('M d, Y H:i', strtotime($deposit->created_at)); ?></td>
                         <td>
                             <?php if ($deposit->status === 'pending'): ?>
                             <button class="button button-small button-primary" onclick="matrixAdminAction('approve_deposit', {id: <?php echo $deposit->id; ?>})"><?php _e('Approve', 'matrix-mlm'); ?></button>
+                            <?php elseif ($deposit->status === 'pending_capture' && $deposit->gateway === 'zebra'): ?>
+                            <button class="button button-small button-primary" onclick="matrixCaptureZebraDeposit(<?php echo $deposit->id; ?>)"><?php _e('Capture', 'matrix-mlm'); ?></button>
+                            <button class="button button-small" onclick="matrixCancelZebraDeposit(<?php echo $deposit->id; ?>)"><?php _e('Cancel', 'matrix-mlm'); ?></button>
                             <?php endif; ?>
                         </td>
                     </tr>

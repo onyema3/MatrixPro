@@ -66,6 +66,10 @@ class Matrix_MLM_Admin_Gateways {
                     'base_url_override' => '',
                     'webhook_token'     => '',
                     'default_currency'  => 'NGN',
+                    // Pre-auth toggle for the /CaptureOrCancel state
+                    // machine. Default off so existing installs preserve
+                    // the AUTO_CAPTURE behaviour shipped in PR #302.
+                    'pre_auth_enabled'  => 0,
                 ]),
                 'supported_currencies' => json_encode(['NGN', 'USD', 'GBP', 'EUR']),
                 'min_amount'    => 100.00,
@@ -154,6 +158,45 @@ class Matrix_MLM_Admin_Gateways {
                 );
             } else {
                 $result['inserted']++;
+            }
+        }
+
+        // Per-slug parameter backfill: when a new gateway parameter
+        // lands in default_gateways() (e.g. pre_auth_enabled in the
+        // /CaptureOrCancel follow-up), the seeded row on existing
+        // installs will be missing the key. Because save_gateway()
+        // is allow-listed against the stored gateway_parameters
+        // keys (audit fix C10), the new field would silently drop
+        // on save until it appears in the stored JSON. Walk each
+        // default and merge in any missing keys with the default
+        // value, leaving existing values untouched. Idempotent —
+        // installs already on the latest schema do nothing here.
+        foreach (self::default_gateways() as $gw) {
+            $row = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, gateway_parameters FROM $table WHERE slug = %s",
+                $gw['slug']
+            ));
+            if (!$row) {
+                continue;
+            }
+            $current  = json_decode($row->gateway_parameters ?? '', true);
+            if (!is_array($current)) {
+                $current = [];
+            }
+            $defaults = json_decode($gw['gateway_parameters'] ?? '', true);
+            if (!is_array($defaults)) {
+                $defaults = [];
+            }
+            $missing = array_diff_key($defaults, $current);
+            if (!empty($missing)) {
+                $merged = $current + $missing;
+                $wpdb->update(
+                    $table,
+                    ['gateway_parameters' => json_encode($merged)],
+                    ['id' => (int) $row->id],
+                    ['%s'],
+                    ['%d']
+                );
             }
         }
 
@@ -889,6 +932,19 @@ class Matrix_MLM_Admin_Gateways {
                         <p class="description">
                             <strong><?php _e('IPN URL:', 'matrix-mlm'); ?></strong>
                             <code><?php echo esc_html($zebra_ipn_url); ?></code>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><?php _e('Hold authorisation; capture later', 'matrix-mlm'); ?></th>
+                    <td>
+                        <label>
+                            <input type="hidden" name="params[pre_auth_enabled]" value="0">
+                            <input type="checkbox" name="params[pre_auth_enabled]" value="1" <?php checked(!empty($params['pre_auth_enabled']), true); ?>>
+                            <?php _e('Enable pre-auth deposits (operator captures or cancels manually)', 'matrix-mlm'); ?>
+                        </label>
+                        <p class="description">
+                            <?php _e('When ON, step 2 of the OTP flow uses EventType=PRE_AUTH instead of AUTO_CAPTURE. Funds are debited from the customer\'s Zebra Wallet but not credited to the Matrix wallet until an admin clicks Capture on the deposit row. Cancel releases the hold without charging. Default is OFF (single-step settle, today\'s behaviour).', 'matrix-mlm'); ?>
                         </p>
                     </td>
                 </tr>
