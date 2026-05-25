@@ -97,7 +97,24 @@ class Matrix_MLM_User_Billing {
         };
         // Update the .matrix-fee-preview block inside `formSelector`
         // based on the current value of its `[name=amount]` field
-        // and `dataType`. Hides the block entirely when fee = 0.
+        // and `dataType`. Always shows the breakdown when the user
+        // has entered a positive amount, even when the configured
+        // service fee is zero — the previous behaviour hid the
+        // whole preview when fee = 0, which left the user with no
+        // on-form confirmation that the wallet debit equals the
+        // bill amount with no extra fee added. That ambiguity led
+        // to the user-reported "service fees is 0 and yet on the
+        // form i see service fee being computed" complaint: the
+        // user couldn't see a definitive "Total to debit" line, so
+        // the absence of the preview was being read either as the
+        // form silently adding a fee (when reading the history
+        // table at the bottom of the page) or as the form being
+        // broken.
+        //
+        // When fee = 0 we hide just the "Service fee" row, leaving
+        // a clean two-line Amount / Total breakdown that makes the
+        // no-fee case unambiguous. When fee > 0 all three rows
+        // display.
         window.matrixBillingUpdatePreview = function(formSelector, dataType) {
             var $form = jQuery(formSelector);
             if (!$form.length) return;
@@ -109,13 +126,19 @@ class Matrix_MLM_User_Billing {
             }
             var fee = window.matrixBillingComputeFee(dataType, nominal);
             var total = Math.round((nominal + fee) * 100) / 100;
-            if (fee <= 0) {
-                preview.hide();
-                return;
-            }
             preview.find('.matrix-fee-nominal').text(window.matrixBillingFormatMoney(nominal));
             preview.find('.matrix-fee-amount').text(window.matrixBillingFormatMoney(fee));
             preview.find('.matrix-fee-total').text(window.matrixBillingFormatMoney(total));
+            // Toggle just the Service fee row on the fee value, not
+            // the entire preview. Targets the dedicated semantic
+            // class added in render_fee_preview_block() rather than
+            // an `.eq(1)` index so a future row reorder doesn't
+            // silently move the toggle to the wrong row.
+            if (fee > 0) {
+                preview.find('.matrix-fee-row-service-fee').show();
+            } else {
+                preview.find('.matrix-fee-row-service-fee').hide();
+            }
             preview.show();
         };
         // Defence-in-depth: every bill-payment AJAX handler used to
@@ -316,6 +339,14 @@ class Matrix_MLM_User_Billing {
         .matrix-fee-preview .matrix-fee-row { display:flex; justify-content:space-between; padding:2px 0; }
         .matrix-fee-preview .matrix-fee-row.matrix-fee-row-total { margin-top:6px; padding-top:8px; border-top:1px solid #e5e7eb; font-weight:600; color:#111827; }
         .matrix-fee-preview .matrix-fee-label { color:#6b7280; }
+        /* Static caption rendered below the amount/plan field on
+           each bill form. States in plain language what platform
+           service fee is currently configured for the category, so
+           the user can verify before typing an amount that no
+           hidden fee is being applied. Reads off the same markup
+           option the dynamic preview reads, so caption and preview
+           cannot disagree. */
+        .matrix-fee-caption { display:block; margin-top:6px; font-size:12px; color:#6b7280; }
         </style>
         <?php
     }
@@ -432,7 +463,7 @@ class Matrix_MLM_User_Billing {
                 <span class="matrix-fee-label"><?php _e('Amount', 'matrix-mlm'); ?></span>
                 <span class="matrix-fee-nominal">&mdash;</span>
             </div>
-            <div class="matrix-fee-row">
+            <div class="matrix-fee-row matrix-fee-row-service-fee">
                 <span class="matrix-fee-label"><?php _e('Service fee', 'matrix-mlm'); ?></span>
                 <span class="matrix-fee-amount">&mdash;</span>
             </div>
@@ -442,6 +473,78 @@ class Matrix_MLM_User_Billing {
             </div>
         </div>
     <?php }
+
+    /**
+     * Render a one-line caption that states, in plain language, what
+     * platform service fee is currently configured for `$category`.
+     * Sits below the amount field on each bill form so the user can
+     * verify exactly what they will be charged BEFORE typing a
+     * value, independent of the dynamic preview block (which only
+     * reacts once an amount is entered).
+     *
+     * Outputs are deliberately blunt:
+     *   - flat == 0 && percent == 0  -> "No service fee for this category."
+     *   - flat > 0  && percent == 0  -> "Service fee: ₦20.00 per transaction."
+     *   - flat == 0 && percent > 0   -> "Service fee: 1.50% of the amount."
+     *   - flat > 0  && percent > 0   -> "Service fee: ₦20.00 + 1.50% of the amount."
+     *
+     * The flat / percent values come from the same
+     * Matrix_MLM_Fintava_Billing::get_markup_config() the JS preview
+     * reads, so a discrepancy between this caption and the preview
+     * block is impossible — both render off the same option value
+     * in the same request. That makes this caption a faithful
+     * "what is currently saved" indicator: if the user reads "No
+     * service fee" here but the preview later adds a fee, the
+     * option is genuinely non-zero (i.e. the saved value is not
+     * what the admin thinks it is) and the caption + preview will
+     * agree on the truth, surfacing the misconfiguration.
+     *
+     * @param string $category One of Matrix_MLM_Fintava_Billing::BILL_CATEGORIES.
+     * @return string Safe-to-echo HTML (a single <small> with esc_html'd content).
+     */
+    private function format_markup_caption($category) {
+        // Fetch the full normalised config and pluck the requested
+        // category. get_markup_config() always returns an entry for
+        // every BILL_CATEGORIES slug with both fields populated, so
+        // the dereferences below cannot trip on a missing key.
+        $config   = Matrix_MLM_Fintava_Billing::get_markup_config();
+        $cfg      = isset($config[$category]) && is_array($config[$category])
+            ? $config[$category]
+            : ['flat' => 0.0, 'percent' => 0.0];
+        $flat     = (float) ($cfg['flat']    ?? 0);
+        $percent  = (float) ($cfg['percent'] ?? 0);
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+
+        // Derive the human caption first so the wrapper markup
+        // below stays a single esc_html'd echo. printf-style format
+        // strings are used so the translator sees the full sentence
+        // — concatenating fragments is a known WP-i18n footgun.
+        if ($flat <= 0 && $percent <= 0) {
+            $caption = __('No service fee for this category.', 'matrix-mlm');
+        } elseif ($percent <= 0) {
+            $caption = sprintf(
+                /* translators: %s: currency-formatted flat fee, e.g. "₦20.00" */
+                __('Service fee: %s per transaction.', 'matrix-mlm'),
+                $currency . number_format($flat, 2)
+            );
+        } elseif ($flat <= 0) {
+            $caption = sprintf(
+                /* translators: %s: percent figure formatted to 2dp, e.g. "1.50" */
+                __('Service fee: %s%% of the amount.', 'matrix-mlm'),
+                number_format($percent, 2)
+            );
+        } else {
+            $caption = sprintf(
+                /* translators: 1: currency-formatted flat fee, 2: percent figure 2dp */
+                __('Service fee: %1$s + %2$s%% of the amount.', 'matrix-mlm'),
+                $currency . number_format($flat, 2),
+                number_format($percent, 2)
+            );
+        }
+
+        return '<small class="matrix-fee-caption" data-bill-category="'
+             . esc_attr($category) . '">' . esc_html($caption) . '</small>';
+    }
 
     // =========================================================================
     // AIRTIME
@@ -467,6 +570,16 @@ class Matrix_MLM_User_Billing {
                 <label><?php _e('Amount (₦)', 'matrix-mlm'); ?></label>
                 <input type="number" name="amount" min="50" max="50000" required placeholder="100">
             </div>
+            <?php
+            // Static "what is currently configured" caption. The
+            // dynamic .matrix-fee-preview below only renders the
+            // breakdown after the user types an amount; this
+            // caption gives an upfront answer so a no-fee setup is
+            // unambiguously communicated. See format_markup_caption()
+            // for the full motivation and the user report that
+            // drove it.
+            echo $this->format_markup_caption('airtime');
+            ?>
             <?php $this->render_fee_preview_block(); ?>
             <?php
             // Transaction PIN field (PR 2). All four bill forms
@@ -533,6 +646,11 @@ class Matrix_MLM_User_Billing {
                 </select>
             </div>
             <input type="hidden" name="amount" id="data-amount" value="0">
+            <?php
+            // Static "what is currently configured" caption — see
+            // render_airtime() for the full rationale.
+            echo $this->format_markup_caption('data');
+            ?>
             <?php $this->render_fee_preview_block(); ?>
             <?php
             // Transaction PIN field (PR 2). See render_airtime() for
@@ -604,6 +722,11 @@ class Matrix_MLM_User_Billing {
                 </select>
             </div>
             <input type="hidden" name="amount" id="cable-amount" value="0">
+            <?php
+            // Static "what is currently configured" caption — see
+            // render_airtime() for the full rationale.
+            echo $this->format_markup_caption('cable');
+            ?>
             <?php $this->render_fee_preview_block(); ?>
             <?php
             // Transaction PIN field (PR 2). See render_airtime() for
@@ -689,6 +812,11 @@ class Matrix_MLM_User_Billing {
                 <label><?php _e('Amount (₦)', 'matrix-mlm'); ?></label>
                 <input type="number" name="amount" min="500" required placeholder="1000">
             </div>
+            <?php
+            // Static "what is currently configured" caption — see
+            // render_airtime() for the full rationale.
+            echo $this->format_markup_caption('electricity');
+            ?>
             <?php $this->render_fee_preview_block(); ?>
             <?php
             // Transaction PIN field (PR 2). See render_airtime() for
