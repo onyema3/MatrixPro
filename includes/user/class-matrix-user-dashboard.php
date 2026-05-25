@@ -471,7 +471,45 @@ class Matrix_MLM_User_Dashboard {
 
         <?php if ($can_pay): ?>
         <script>
-        (function($) {
+        // jQuery-footer-race guard. Without this, the inline IIFE
+        // throws ReferenceError at parse time on installs where
+        // jQuery is deferred to the footer, and the pay-subscription
+        // submit handler never binds. That matters here more than
+        // anywhere else on the dashboard: this is the recovery
+        // surface for inactive-subscription users — if the form
+        // can't submit, the user is stranded (their account is
+        // locked out of every other tab, and the only way back in
+        // is through this one form). Same polling pattern as
+        // class-matrix-user-wallet.php's render_scripts_no_wallet
+        // and the airtime form in class-matrix-user-billing.php —
+        // see that airtime <script> for the full historical context.
+        //
+        // The matrixMLM-undefined defensive check that was already
+        // here pre-empts a separate failure mode (matrix-public.js
+        // stripped by an asset optimizer); it is preserved INSIDE
+        // the polled callback because that's the only context where
+        // matrixMLM is meaningfully checkable. Pre-fix, that check
+        // never ran when jQuery itself was undefined because the
+        // IIFE threw before reaching it.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; pay-subscription handler not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             // Defensive guard against caching plugins / asset
             // optimizers that strip matrix-public.js — same idiom
             // used by the wallet and bank-payout surfaces. Without
@@ -530,7 +568,8 @@ class Matrix_MLM_User_Dashboard {
                         .text('<?php echo esc_js(__('Pay Subscription', 'matrix-mlm')); ?>');
                 });
             });
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php endif; ?>
         <?php

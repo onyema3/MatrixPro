@@ -809,7 +809,30 @@ class Matrix_MLM_User_Billing {
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Buy Data', 'matrix-mlm'); ?></button>
         </form>
         <script>
-        (function($){
+        // jQuery-footer-race guard. Same rationale as the airtime
+        // form earlier in this file. Without it, the network /
+        // plan-selection / submit handlers don't bind, so on
+        // installs where jQuery loads in the footer the user has
+        // to hard-refresh before the data form does anything.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; data-bundle form handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($){
             $('#data-network').on('change', function(){
                 var net=$(this).val(); if(!net) return;
                 var sel=$('#data-plan'); sel.html('<option>Loading...</option>').prop('disabled',true);
@@ -844,7 +867,8 @@ class Matrix_MLM_User_Billing {
                     b.prop('disabled',false).text('Buy Data');
                 });
             });
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
     <?php }
 
@@ -885,7 +909,27 @@ class Matrix_MLM_User_Billing {
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Subscribe', 'matrix-mlm'); ?></button>
         </form>
         <script>
-        (function($){
+        // jQuery-footer-race guard. See the airtime form earlier
+        // in this file for the full rationale.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; cable-tv form handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($){
             // Load providers
             $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_list_cable_providers',nonce:matrixMLM.nonce},function(r){
                 var sel=$('#cable-provider'); sel.empty().append('<option value="">-- Select Provider --</option>');
@@ -928,7 +972,8 @@ class Matrix_MLM_User_Billing {
                     b.prop('disabled',false).text('Subscribe');
                 });
             });
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
     <?php }
 
@@ -975,7 +1020,31 @@ class Matrix_MLM_User_Billing {
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Pay Electricity', 'matrix-mlm'); ?></button>
         </form>
         <script>
-        (function($){
+        // jQuery-footer-race guard. See the airtime form earlier
+        // in this file for the full rationale. Without this, the
+        // disco-list AJAX, the Verify-Meter button, the amount
+        // input, AND the submit handler all silently fail to bind,
+        // so on a footer-jQuery install the form does literally
+        // nothing until the user hard-refreshes.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; electricity form handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($){
             $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_list_discos',nonce:matrixMLM.nonce},function(r){
                 var sel=$('#elec-disco'); sel.empty().append('<option value="">-- Select Disco --</option>');
                 if(r.success && r.data.discos){
@@ -1019,7 +1088,8 @@ class Matrix_MLM_User_Billing {
                     b.prop('disabled',false).text('Pay Electricity');
                 });
             });
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
     <?php }
 }

@@ -331,7 +331,42 @@ class Matrix_MLM_User_Virtual_Wallet {
         <?php endif; ?>
 
         <script>
-        (function($) {
+        // jQuery-footer-race guard. Without this, the inline IIFE
+        // throws ReferenceError at parse time on installs where a
+        // theme or performance plugin defers jQuery to the footer
+        // (Astra, GeneratePress, OceanWP, WP Rocket, SG Optimizer,
+        // FlyingPress, Perfmatters, etc., AND this plugin's own
+        // matrix-mlm-public.js enqueue is $in_footer=true with
+        // jQuery as a dep). When the IIFE throws, none of the
+        // handlers below bind, and users see exactly the symptom
+        // that drove the audit: 'on some pages I have to do a
+        // manual refresh before things work'. Refresh / Verify-
+        // Wallet-ID / Calculate-Charge / Submit-Transfer all rely
+        // on these bindings. Same polling pattern as the OTHER
+        // <script> block lower down in this file, and as
+        // class-matrix-user-wallet.php's render_scripts_no_wallet,
+        // class-matrix-user-bank-payout.php, and the airtime form
+        // in class-matrix-user-billing.php — see that airtime
+        // <script> for the full historical context.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; Fintava virtual-wallet transfer handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             'use strict';
 
             // Live-refresh the Fintava wallet balance from the server without reloading.
@@ -492,7 +527,8 @@ class Matrix_MLM_User_Virtual_Wallet {
                 });
             });
 
-        })(jQuery);
+        }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
