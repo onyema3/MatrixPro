@@ -115,6 +115,19 @@
 .matrix-badge-active, .matrix-badge-completed, .matrix-badge-approved { background: #ecfdf5; color: #065f46; }
 .matrix-badge-pending, .matrix-badge-medium { background: #fffbeb; color: #92400e; }
 .matrix-badge-pending_capture { background: #eef2ff; color: #3730a3; }
+/* Mid-flight Zebra /Remit lock state introduced in 1.0.17.
+   Indigo-on-cyan to read distinct from amber 'pending' so an
+   operator scanning the Withdrawals list can spot rows that
+   are stuck mid-flight at a glance. */
+.matrix-badge-processing { background: #cffafe; color: #155e75; }
+/* Gateway-tag badge: the Withdrawals list shows which payment
+   provider settles each row when Approve is clicked. Zebra
+   gets the indigo treatment to match its Deposits-side
+   pending_capture badge; legacy NULL-gateway rows render with
+   neutral gray so they fade into the background while the
+   operator reviews active /Remit rows. */
+.matrix-badge-gateway-zebra { background: #eef2ff; color: #3730a3; }
+.matrix-badge-gateway-legacy { background: #f3f4f6; color: #4b5563; }
 .matrix-badge-inactive, .matrix-badge-rejected, .matrix-badge-banned { background: #fef2f2; color: #991b1b; }
 .matrix-badge-open, .matrix-badge-info, .matrix-badge-low, .matrix-badge-under_review { background: #eff6ff; color: #1e40af; }
 .matrix-badge-high, .matrix-badge-urgent, .matrix-badge-customer_reply { background: #fff1f2; color: #9f1239; }
