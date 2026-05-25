@@ -645,53 +645,126 @@ class Matrix_MLM_User_Billing {
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Buy Airtime', 'matrix-mlm'); ?></button>
         </form>
         <script>
-        (function($){
-            // Recompute the fee preview as the user types.
-            // matrixBillingUpdatePreview is defined once in render()
-            // and shared across all four bill forms.
-            $('#matrix-billing-airtime [name=amount]').on('input change', function(){
-                window.matrixBillingUpdatePreview('#matrix-billing-airtime', 'airtime');
-            });
-            $('#matrix-billing-airtime').on('submit', function(e){
-                e.preventDefault(); var f=$(this), b=f.find('button[type=submit]');
-                b.prop('disabled',true).text('Processing...');
-                $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')}, function(r){
-                    var msg = window.matrixBillingExtractMessage(r);
-                    if (r.success) {
-                        // Show success inline INSTEAD of alert() +
-                        // location.reload(). The reload looked like
-                        // a silent page refresh once airtime actually
-                        // started succeeding (post PR #276) — the
-                        // user's "page refreshes and loads again"
-                        // report. The new transaction WILL appear in
-                        // "Recent Bill Payments" the next time the
-                        // user refreshes the dashboard manually; the
-                        // inline notice contains all the per-purchase
-                        // details (amount + phone + fee disclosure)
-                        // so they don't NEED to refresh to confirm it
-                        // worked.
-                        window.matrixBillingShowNotice('#matrix-billing-airtime', 'success', msg);
-                        // Reset the form so a second purchase starts
-                        // from a clean slate. Leave network as the
-                        // user picked — they're likely to buy more
-                        // airtime on the same network — but clear
-                        // phone, amount, and PIN. Hide the fee
-                        // preview so it doesn't show stale numbers
-                        // for an empty amount.
-                        f.find('[name=phone]').val('');
-                        f.find('[name=amount]').val('');
-                        f.find('[name=transaction_pin]').val('');
-                        f.find('.matrix-fee-preview').hide();
-                    } else {
-                        window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', msg);
+        // Wait for jQuery before binding the airtime-form handlers.
+        //
+        // The previous revision did `(function($){...})(jQuery)`
+        // directly here, which throws ReferenceError at parse time
+        // on any install where a theme or performance plugin defers
+        // jQuery to the footer. Astra, GeneratePress, OceanWP,
+        // WP Rocket, SG Optimizer, FlyingPress, Perfmatters and
+        // most popular optimizers all do this — and on this plugin
+        // matrix-mlm-public.js is itself enqueued $in_footer=true
+        // with jQuery as a dep, so on a default install jQuery
+        // already loads in the footer.
+        //
+        // When the parse-time IIFE throws, neither the submit
+        // handler nor the input/change preview handler binds, so a
+        // user clicking "Buy Airtime" triggers a NATIVE HTML form
+        // submit (the form has no method/action so it POSTs to the
+        // current URL). The browser navigates away from the page,
+        // wp-admin/admin-ajax.php is never called, no purchase is
+        // recorded, and the user reads "page refreshed and nothing
+        // happened". A subsequent hard reload occasionally lets
+        // jQuery cache-load in time for the next parse, masking the
+        // issue intermittently — exactly the "either page refreshes
+        // or i have to do a refresh before it works" pattern.
+        //
+        // Same polling guard used by render_scripts_no_wallet() in
+        // class-matrix-user-wallet.php, by class-matrix-user-bank-
+        // payout.php, and by class-matrix-user-virtual-wallet.php.
+        // Polls every 50ms up to 10s, then logs an error and gives
+        // up so a permanently-broken jQuery doesn't hang anything.
+        //
+        // Handlers bind via DELEGATION on document (`$(document).on(
+        // 'submit', '#matrix-billing-airtime', ...)`) rather than
+        // direct .on() on the matched form. Direct binding requires
+        // the form to be in the DOM at the moment whenJQueryReady
+        // fires; document delegation lets the handler still fire
+        // even if the dashboard ever re-renders this tab via .html()
+        // (a real risk because WordPress dashboard tab systems
+        // sometimes do exactly that). $(this) inside a delegated
+        // handler still references the matched element (the form),
+        // so the handler body works unchanged.
+        //
+        // Scope: airtime form only. The data / cable / electricity
+        // forms have the SAME parse-time IIFE bug, but they still
+        // end every successful path in `location.reload()`, so a
+        // failed-bind native form submit looks identical to a
+        // successful AJAX + reload from the user's POV (page
+        // refreshes either way) — they don't *notice* the bug.
+        // When PR #277's inline-success-notice UX is ported to those
+        // three forms (the planned follow-up), each of them needs
+        // the same guard applied.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; airtime form handlers not bound.');
                     }
-                    b.prop('disabled',false).text('Buy Airtime');
-                }).fail(function(){
-                    window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', 'Network error. Please check your connection and try again.');
-                    b.prop('disabled',false).text('Buy Airtime');
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
+                'use strict';
+
+                // Recompute the fee preview as the user types.
+                // matrixBillingUpdatePreview is defined once in render()
+                // and shared across all four bill forms.
+                $(document).on('input change', '#matrix-billing-airtime [name=amount]', function() {
+                    window.matrixBillingUpdatePreview('#matrix-billing-airtime', 'airtime');
                 });
-            });
-        })(jQuery);
+
+                $(document).on('submit', '#matrix-billing-airtime', function(e) {
+                    e.preventDefault();
+                    var f = $(this), b = f.find('button[type=submit]');
+                    b.prop('disabled', true).text('Processing...');
+                    $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')}, function(r) {
+                        var msg = window.matrixBillingExtractMessage(r);
+                        if (r.success) {
+                            // Show success inline INSTEAD of alert() +
+                            // location.reload(). The reload looked like
+                            // a silent page refresh once airtime actually
+                            // started succeeding (post PR #276) — the
+                            // user's "page refreshes and loads again"
+                            // report. The new transaction WILL appear in
+                            // "Recent Bill Payments" the next time the
+                            // user refreshes the dashboard manually; the
+                            // inline notice contains all the per-purchase
+                            // details (amount + phone + fee disclosure)
+                            // so they don't NEED to refresh to confirm it
+                            // worked.
+                            window.matrixBillingShowNotice('#matrix-billing-airtime', 'success', msg);
+                            // Reset the form so a second purchase starts
+                            // from a clean slate. Leave network as the
+                            // user picked — they're likely to buy more
+                            // airtime on the same network — but clear
+                            // phone, amount, and PIN. Hide the fee
+                            // preview so it doesn't show stale numbers
+                            // for an empty amount.
+                            f.find('[name=phone]').val('');
+                            f.find('[name=amount]').val('');
+                            f.find('[name=transaction_pin]').val('');
+                            f.find('.matrix-fee-preview').hide();
+                        } else {
+                            window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', msg);
+                        }
+                        b.prop('disabled', false).text('Buy Airtime');
+                    }).fail(function() {
+                        window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', 'Network error. Please check your connection and try again.');
+                        b.prop('disabled', false).text('Buy Airtime');
+                    });
+                });
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
     <?php }
 
