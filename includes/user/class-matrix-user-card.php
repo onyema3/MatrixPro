@@ -139,19 +139,36 @@ class Matrix_MLM_User_Card {
            and admin bars but below WP's own toolbar. body.matrix-
            card-modal-open locks page scroll while the modal is up. */
         .matrix-card-modal {
+            /* Hidden by default. Visibility is driven by toggling
+               the .is-open class in JS. !important on .is-open
+               below ensures theme/optimizer CSS can't override.
+               Explicit top/right/bottom/left instead of `inset: 0`
+               for older mobile browsers that don't recognise the
+               shorthand. See the matching note on .matrix-wallet-
+               modal in class-matrix-user-wallet.php for the full
+               containing-block / specificity rationale. */
+            display: none;
             position: fixed;
-            inset: 0;
-            z-index: 9998;
-            display: flex;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 99999;
             align-items: flex-start;
             justify-content: center;
             padding: 60px 20px 20px;
             box-sizing: border-box;
             overflow: hidden;
         }
+        .matrix-card-modal.is-open {
+            display: flex !important;
+        }
         .matrix-card-modal-backdrop {
             position: absolute;
-            inset: 0;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
             background: rgba(15, 23, 42, 0.55);
             backdrop-filter: blur(2px);
             -webkit-backdrop-filter: blur(2px);
@@ -503,11 +520,33 @@ class Matrix_MLM_User_Card {
                 $('#matrix-card-pan-form-desc').text(cfg.desc);
                 $('#matrix-card-pan-form [name="card_action"]').val(cfg.action);
                 $('#matrix-card-pan-form [name="pan"]').val('');
-                // Surface the modal wrapper itself; the inner
-                // pan-form is no longer toggled directly. body
-                // class locks page scroll while the modal is open.
-                $('#matrix-card-modal').css('display', 'flex');
+
+                // First-open relocation. The verve-card page renders
+                // inside .matrix-dashboard-content > .matrix-dashboard
+                // (see class-matrix-user-dashboard.php), and that
+                // outer .matrix-dashboard wrapper has overflow:hidden
+                // plus an unpredictable mix of theme/optimizer-injected
+                // transform/filter rules that turn it into the
+                // containing block for fixed-position descendants.
+                // The symptom of getting trapped is "I click Activate
+                // Card and nothing happens" — the modal IS shown but
+                // pinned inside the dashboard column off-screen, or
+                // clipped to the column's overflow:hidden. Reparenting
+                // to <body> on first open sidesteps the trap. See the
+                // matching matrixWalletOpenModal in class-matrix-user-
+                // wallet.php for the full background.
+                var $modal = $('#matrix-card-modal');
+                if (!$modal.data('reparented')) {
+                    $modal.appendTo('body').data('reparented', true);
+                }
+
+                // Reveal via .is-open class (CSS uses !important to
+                // beat theme overrides). Clear inline display:none
+                // explicitly so the original style="display:none;"
+                // attribute on the wrapper doesn't fight the class.
+                $modal.addClass('is-open').css('display', '');
                 $('body').addClass('matrix-card-modal-open');
+
                 // Microtask delay so the slide-in animation has its
                 // first frame committed before focus moves — same
                 // rationale as matrixWalletOpenModal in the wallet
@@ -519,7 +558,7 @@ class Matrix_MLM_User_Card {
             };
 
             window.matrixHideCardPanForm = function() {
-                $('#matrix-card-modal').css('display', 'none');
+                $('#matrix-card-modal').removeClass('is-open').css('display', 'none');
                 $('body').removeClass('matrix-card-modal-open');
             };
 
@@ -541,7 +580,7 @@ class Matrix_MLM_User_Card {
             // without touching other keydown listeners on document.
             $(document).on('keydown.matrixCardModal', function(e) {
                 if (e.key !== 'Escape' && e.keyCode !== 27) return;
-                if ($('#matrix-card-modal').css('display') === 'none') return;
+                if (!$('#matrix-card-modal').hasClass('is-open')) return;
                 window.matrixHideCardPanForm();
             });
 
