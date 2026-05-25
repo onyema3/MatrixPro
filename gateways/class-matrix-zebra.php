@@ -158,6 +158,42 @@ class Matrix_MLM_Zebra {
      * ==================================================================== */
     const EVENT_DISPENSE = 'DISPENSE';
 
+    /* ====================================================================
+     * /Notify event vocabulary (dispute / fraud / chargeback
+     * feed). Bibimoney pushes these as IPN-style POSTs through
+     * the existing webhook URL — there's no separate /Notify
+     * endpoint we register; the platform decides at runtime
+     * which EventType to emit based on what's happening to a
+     * past transaction.
+     *
+     * The three constants below are the well-known strings the
+     * spec mentions; the dispatch path also accepts
+     * 'REVERSAL' and 'REFUND_NOTIFICATION' (legacy aliases that
+     * some env builds emit for the same semantic event) and is
+     * filterable via matrix_zebra_notify_event_types so an
+     * operator whose Bibimoney env emits e.g. 'CHARGEBACK_RECEIVED'
+     * or 'FRAUD_FLAGGED' can extend the recogniser without a
+     * code patch.
+     *
+     * No money moves automatically when a /Notify event arrives.
+     * The handler persists a row in matrix_zebra_notifications
+     * with state='received' for operator review. The matching
+     * admin page (Matrix MLM -> Zebra Notifications) surfaces
+     * actionable rows with three operator buttons:
+     *
+     *   - Acknowledge -> state='acknowledged' (just clears the
+     *     unread badge; no other side effect)
+     *   - Freeze withdrawal -> when the related row is a
+     *     pending/processing matrix_withdrawals, force it to
+     *     status='cancelled' and refund amount+charge to the
+     *     user's Matrix wallet via WD-FREEZE-{id}. Mark the
+     *     notification state='actioned'.
+     *   - Dismiss -> state='dismissed' (false positive)
+     * ==================================================================== */
+    const EVENT_DISPUTE     = 'DISPUTE';
+    const EVENT_FRAUD       = 'FRAUD';
+    const EVENT_CHARGEBACK  = 'CHARGEBACK';
+
     private $api_key;
     private $api_secret;
     private $vendor_id;
@@ -1782,6 +1818,14 @@ class Matrix_MLM_Zebra {
             // builds also emit RELEASE / VOID for the same
             // semantic event, so we accept all three.
             $this->finalize_cancel($vendor_reference, $payment_data, 'ipn');
+        } elseif (in_array($event_type, self::notify_event_types(), true)) {
+            // /Notify dispute / fraud / chargeback feed. No
+            // money moves automatically — persist the event
+            // for operator review and email the admin so the
+            // operator sees it without polling the admin page.
+            // See record_notify_event() and notify_admin_email()
+            // for the full lifecycle.
+            $this->record_notify_event($event_type, $vendor_reference, $psp_reference, $payment_data);
         } else {
             error_log(sprintf(
                 '[Matrix Zebra IPN] non-actionable event type=%s status=%s vref=%s',
@@ -2644,5 +2688,376 @@ class Matrix_MLM_Zebra {
             ),
             'withdrawal_id' => $withdrawal_id,
         ]);
+    }
+
+    /* ====================================================================
+     * /Notify dispute / fraud / chargeback feed.
+     *
+     * Bibimoney pushes /Notify events through the same IPN URL
+     * the deposit / capture / cancel events use; the EventType
+     * field is what tells us a row is a notification rather than
+     * a state-transition signal. Routing happens in
+     * handle_webhook(); the helpers below own the persistence
+     * and admin-alert side.
+     *
+     * Schema reference: matrix_zebra_notifications, added in
+     * 1.0.18. See class-matrix-database.php for the column
+     * layout and lifecycle states.
+     * ==================================================================== */
+
+    /**
+     * Filterable list of EventType strings the IPN dispatcher
+     * recognises as /Notify events.
+     *
+     * Defaults cover the three well-known spec tokens
+     * (DISPUTE / FRAUD / CHARGEBACK) plus two legacy aliases
+     * (REVERSAL / REFUND_NOTIFICATION) some env builds emit for
+     * semantically-equivalent events. Operators whose Bibimoney
+     * environment emits other tokens (e.g. CHARGEBACK_RECEIVED,
+     * FRAUD_FLAGGED) hook the matrix_zebra_notify_event_types
+     * filter to extend without forking. Defensive: forces the
+     * result back to a flat string array so a buggy filter that
+     * returns a non-array doesn't crash the in_array check on
+     * the caller side.
+     *
+     * @return string[]
+     */
+    public static function notify_event_types() {
+        $defaults = [
+            self::EVENT_DISPUTE,
+            self::EVENT_FRAUD,
+            self::EVENT_CHARGEBACK,
+            'REVERSAL',
+            'REFUND_NOTIFICATION',
+        ];
+        $list = apply_filters('matrix_zebra_notify_event_types', $defaults);
+        if (!is_array($list)) {
+            return $defaults;
+        }
+        $clean = [];
+        foreach ($list as $entry) {
+            if (is_string($entry) && $entry !== '') {
+                $clean[] = $entry;
+            }
+        }
+        return $clean === [] ? $defaults : $clean;
+    }
+
+    /**
+     * Map an EventType to a severity bucket used by the admin UI.
+     *
+     * Default mapping (operator-overridable via
+     * matrix_zebra_notify_severity_for_event filter):
+     *
+     *   FRAUD / CHARGEBACK / REVERSAL  -> 'critical' (immediate
+     *                                     action expected;
+     *                                     freeze the row before
+     *                                     /Remit / /Dispense
+     *                                     fires if it's still
+     *                                     pending)
+     *   DISPUTE                        -> 'warning'  (a
+     *                                     customer is contesting
+     *                                     a settled transaction;
+     *                                     operator should
+     *                                     respond but no
+     *                                     immediate freeze)
+     *   REFUND_NOTIFICATION / unknown  -> 'info'     (FYI /
+     *                                     reconciliation hint)
+     */
+    public static function notify_severity_for_event($event_type) {
+        $event_type = strtoupper((string) $event_type);
+        $default    = 'info';
+        if (in_array($event_type, ['FRAUD', 'CHARGEBACK', 'REVERSAL'], true)) {
+            $default = 'critical';
+        } elseif ($event_type === 'DISPUTE') {
+            $default = 'warning';
+        }
+        $sev = (string) apply_filters('matrix_zebra_notify_severity_for_event', $default, $event_type);
+        if (!in_array($sev, ['info', 'warning', 'critical'], true)) {
+            return $default;
+        }
+        return $sev;
+    }
+
+    /**
+     * Find the matrix_deposits or matrix_withdrawals row this
+     * /Notify event is talking about.
+     *
+     * Lookup order:
+     *   1. VendorReference against matrix_withdrawals.transaction_id
+     *      (vendor->customer payouts, set per /Remit / /Dispense
+     *      attempt)
+     *   2. VendorReference against matrix_deposits.transaction_id
+     *      (deposits)
+     *   3. PSPReference against matrix_deposits.gateway_response
+     *      (deposits, fallback for env builds that send only
+     *      PSPReference on /Notify)
+     *
+     * Returns shape ['type' => 'deposit'|'withdrawal'|'unknown',
+     *                'id' => int|null,
+     *                'user_id' => int|null,
+     *                'amount' => float|null,
+     *                'currency' => string|null].
+     *
+     * 'unknown' is a legitimate result — Bibimoney can /Notify
+     * about a transaction we never recorded (probe, stale event,
+     * cross-env contamination). The matrix_zebra_notifications
+     * row is still persisted for operator review with
+     * related_type='unknown' so support can investigate.
+     */
+    public static function find_related_record($vendor_reference, $psp_reference = '') {
+        global $wpdb;
+
+        $vendor_reference = (string) $vendor_reference;
+        $psp_reference    = (string) $psp_reference;
+
+        if ($vendor_reference !== '') {
+            // Withdrawals first — disputes/chargebacks/reversals
+            // most commonly attach to outbound payouts (the
+            // money has already left the platform; this is the
+            // signal that it's coming back).
+            $wd = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, user_id, amount, currency
+                   FROM {$wpdb->prefix}matrix_withdrawals
+                  WHERE transaction_id = %s
+                  LIMIT 1",
+                $vendor_reference
+            ));
+            if ($wd) {
+                return [
+                    'type'     => 'withdrawal',
+                    'id'       => (int) $wd->id,
+                    'user_id'  => (int) $wd->user_id,
+                    'amount'   => (float) $wd->amount,
+                    'currency' => (string) $wd->currency,
+                ];
+            }
+
+            $dep = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, user_id, amount, currency
+                   FROM {$wpdb->prefix}matrix_deposits
+                  WHERE transaction_id = %s
+                  LIMIT 1",
+                $vendor_reference
+            ));
+            if ($dep) {
+                return [
+                    'type'     => 'deposit',
+                    'id'       => (int) $dep->id,
+                    'user_id'  => (int) $dep->user_id,
+                    'amount'   => (float) $dep->amount,
+                    'currency' => (string) $dep->currency,
+                ];
+            }
+        }
+
+        if ($psp_reference !== '') {
+            // Best-effort PSPReference fallback — it's stashed
+            // inside gateway_response JSON, so this scan walks
+            // gateway='zebra' rows and matches on the JSON
+            // payload. LIMIT 1 plus the gateway filter keeps
+            // the scan bounded; in practice Zebra-gateway rows
+            // are a small slice of the total.
+            $needle = '%' . $wpdb->esc_like($psp_reference) . '%';
+            $dep = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, user_id, amount, currency
+                   FROM {$wpdb->prefix}matrix_deposits
+                  WHERE gateway = %s AND gateway_response LIKE %s
+                  ORDER BY id DESC
+                  LIMIT 1",
+                'zebra',
+                $needle
+            ));
+            if ($dep) {
+                return [
+                    'type'     => 'deposit',
+                    'id'       => (int) $dep->id,
+                    'user_id'  => (int) $dep->user_id,
+                    'amount'   => (float) $dep->amount,
+                    'currency' => (string) $dep->currency,
+                ];
+            }
+        }
+
+        return [
+            'type'     => 'unknown',
+            'id'       => null,
+            'user_id'  => null,
+            'amount'   => null,
+            'currency' => null,
+        ];
+    }
+
+    /**
+     * Persist a /Notify event in matrix_zebra_notifications and
+     * fire an admin alert email.
+     *
+     * Idempotency: not strictly idempotent because Bibimoney
+     * doesn't carry a stable per-event id we could dedupe on —
+     * the platform may resend the same dispute notification on
+     * retry, and we'd record two rows. That's deliberate: an
+     * operator-facing audit feed wants to see every delivery
+     * attempt rather than silently collapse them, so the
+     * matching admin UI shows duplicates but lets the operator
+     * dismiss the redundant rows. If/when Bibimoney exposes a
+     * NotificationId we can layer in a dedupe path on top of
+     * this without changing the storage shape.
+     *
+     * Returns the inserted row id, or null on failure.
+     */
+    private function record_notify_event($event_type, $vendor_reference, $psp_reference, array $payment_data) {
+        global $wpdb;
+
+        $related   = self::find_related_record($vendor_reference, $psp_reference);
+        $severity  = self::notify_severity_for_event($event_type);
+        $raw_event = $payment_data['raw'] ?? $payment_data;
+
+        // Best-effort pull of a human-readable message from the
+        // event payload. Different Bibimoney env builds use
+        // different field names, so we try several before
+        // falling back to the event type.
+        $message = '';
+        $candidates = ['Message', 'message', 'Description', 'description', 'StatusMessage', 'StatusDescription'];
+        foreach ($candidates as $key) {
+            if (isset($raw_event[$key]) && is_string($raw_event[$key]) && $raw_event[$key] !== '') {
+                $message = (string) $raw_event[$key];
+                break;
+            }
+        }
+        if ($message === '') {
+            $message = sprintf(
+                /* translators: %s = the EventType the platform sent */
+                __('Bibimoney %s event received.', 'matrix-mlm'),
+                $event_type
+            );
+        }
+
+        // amount is in minor units in the event; convert to
+        // major for display consistency with the rest of the
+        // platform.
+        $amount_minor = (int) ($payment_data['amount_minor'] ?? 0);
+        $amount       = $amount_minor > 0 ? ($amount_minor / 100.0) : null;
+        $currency     = strtoupper((string) ($payment_data['currency'] ?? ''));
+        if ($amount === null && isset($related['amount'])) {
+            // Fall back to the related row's amount when the
+            // event payload doesn't carry one — gives the
+            // operator something useful in the listing's
+            // amount column.
+            $amount   = $related['amount'];
+            $currency = $currency !== '' ? $currency : (string) ($related['currency'] ?? '');
+        }
+
+        $insert = $wpdb->insert(
+            $wpdb->prefix . 'matrix_zebra_notifications',
+            [
+                'event_type'       => (string) $event_type,
+                'status_code'      => (string) ($payment_data['StatusCode'] ?? ''),
+                'severity'         => $severity,
+                'vendor_reference' => $vendor_reference !== '' ? $vendor_reference : null,
+                'psp_reference'    => $psp_reference !== ''    ? $psp_reference    : null,
+                'related_type'     => $related['type'],
+                'related_id'       => $related['id'],
+                'amount'           => $amount,
+                'currency'         => $currency !== '' ? $currency : null,
+                'message'          => $message,
+                'raw_payload'      => wp_json_encode($raw_event),
+                'state'            => 'received',
+            ],
+            ['%s', '%s', '%s', '%s', '%s', '%s', '%d', '%f', '%s', '%s', '%s', '%s']
+        );
+
+        if ($insert === false || empty($wpdb->insert_id)) {
+            error_log(sprintf(
+                '[Matrix Zebra Notify] Could not persist event_type=%s vref=%s last_error=%s',
+                $event_type,
+                $vendor_reference,
+                $wpdb->last_error
+            ));
+            return null;
+        }
+
+        $notification_id = (int) $wpdb->insert_id;
+
+        // Fire the admin alert. wp_mail to the site admin_email
+        // is the lowest-complexity path that gets the operator
+        // an immediate signal without any UI changes — they can
+        // then click through to Matrix MLM -> Zebra Notifications
+        // for the full row + actions. We log+continue on send
+        // failure so a misconfigured SMTP doesn't break the IPN
+        // ack (the platform retries until it sees the literal
+        // "accepted" body, so any thrown exception here would
+        // strand the row in retry hell).
+        try {
+            self::notify_admin_email($notification_id, $event_type, $severity, $message, $related, $amount, $currency);
+        } catch (\Throwable $e) {
+            error_log(sprintf(
+                '[Matrix Zebra Notify] admin email dispatch failed for notif #%d: %s',
+                $notification_id,
+                $e->getMessage()
+            ));
+        }
+
+        return $notification_id;
+    }
+
+    /**
+     * Send the operator a heads-up email for a /Notify event.
+     *
+     * Plain-text wp_mail to the site admin_email; the email is
+     * intentionally minimal (subject line + 6-line body) so an
+     * inbox preview surfaces the gist without opening the
+     * message. The deep link points at the new admin page,
+     * scoped to the specific notification id so a click lands on
+     * the row that needs attention.
+     *
+     * Static so it can also be called from a future
+     * reconciliation worker (e.g. a daily cron that re-walks
+     * unhandled critical events) without instantiating the
+     * gateway.
+     */
+    public static function notify_admin_email($notification_id, $event_type, $severity, $message, array $related, $amount, $currency) {
+        $admin_email = get_option('admin_email');
+        if (empty($admin_email) || !is_email($admin_email)) {
+            return false;
+        }
+
+        $site_name = (string) get_bloginfo('name');
+        $deep_link = admin_url('admin.php?page=matrix-mlm-zebra-notifications&highlight=' . (int) $notification_id);
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: severity tag, 3: event type */
+            __('[%1$s] [%2$s] Zebra Wallet %3$s notification received', 'matrix-mlm'),
+            $site_name,
+            strtoupper($severity),
+            $event_type
+        );
+
+        $related_line = $related['type'] === 'unknown'
+            ? __('Could not match this event to a known deposit/withdrawal — review manually.', 'matrix-mlm')
+            : sprintf(
+                /* translators: 1: deposit/withdrawal, 2: id */
+                __('Related %1$s: #%2$d', 'matrix-mlm'),
+                $related['type'],
+                (int) ($related['id'] ?? 0)
+            );
+
+        $amount_line = $amount !== null
+            ? sprintf(
+                /* translators: 1: amount, 2: currency */
+                __('Amount: %1$s %2$s', 'matrix-mlm'),
+                number_format((float) $amount, 2),
+                $currency !== '' ? $currency : 'NGN'
+            )
+            : __('Amount: not specified by the platform', 'matrix-mlm');
+
+        $body  = __('A Zebra Wallet (Bibimoney) /Notify event has just been received and needs operator review.', 'matrix-mlm') . "\n\n";
+        $body .= sprintf(__('Event type: %s', 'matrix-mlm'), $event_type) . "\n";
+        $body .= sprintf(__('Severity:   %s', 'matrix-mlm'), strtoupper($severity)) . "\n";
+        $body .= $related_line . "\n";
+        $body .= $amount_line . "\n";
+        $body .= sprintf(__('Message:    %s', 'matrix-mlm'), $message) . "\n\n";
+        $body .= __('Open in admin:', 'matrix-mlm') . ' ' . $deep_link . "\n";
+
+        return (bool) wp_mail($admin_email, $subject, $body);
     }
 }

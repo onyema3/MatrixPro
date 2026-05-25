@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.17');
+define('MATRIX_MLM_DB_VERSION', '1.0.18');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -150,6 +150,7 @@ if (is_admin()) {
     // is fully form-driven), so the admin_menu registration
     // in class-matrix-admin.php is the only wiring required.
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-announcements.php';
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-zebra-notifications.php';
 }
 
 // User Dashboard

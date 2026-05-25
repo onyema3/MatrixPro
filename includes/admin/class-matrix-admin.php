@@ -81,6 +81,18 @@ class Matrix_MLM_Admin {
         // from the lower manage_matrix_tickets that staff need to
         // triage support, so a triage-only operator can't broadcast.
         add_submenu_page('matrix-mlm', __('Announcements', 'matrix-mlm'), __('Announcements', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-announcements', [new Matrix_MLM_Admin_Announcements(), 'render']);
+        // Zebra Notifications — inbound /Notify dispute / fraud /
+        // chargeback feed (1.0.18). Sits next to Withdrawals
+        // conceptually because the most common operator action
+        // (Freeze withdrawal) directly reaches into a
+        // matrix_withdrawals row, but it lives below Announcements
+        // in the menu so it doesn't crowd the top of the
+        // financial-ledger cluster. Capability is
+        // manage_matrix_withdrawals so an operator who can act on
+        // a withdrawal can also freeze one in response to a
+        // chargeback notification, while a support-tier operator
+        // who only reads ledgers can't freeze.
+        add_submenu_page('matrix-mlm', __('Zebra Notifications', 'matrix-mlm'), __('Zebra Notifications', 'matrix-mlm'), 'manage_matrix_withdrawals', 'matrix-mlm-zebra-notifications', [new Matrix_MLM_Admin_Zebra_Notifications(), 'render']);
         add_submenu_page('matrix-mlm', __('Reports', 'matrix-mlm'), __('Reports', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-reports', [new Matrix_MLM_Admin_Reports(), 'render']);
         add_submenu_page('matrix-mlm', __('Frontend Manager', 'matrix-mlm'), __('Frontend', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-frontend', [new Matrix_MLM_Admin_Frontend(), 'render']);
         add_submenu_page('matrix-mlm', __('Migration', 'matrix-mlm'), __('Migration', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-migration', [new Matrix_MLM_Admin_Migration(), 'render']);
@@ -591,6 +603,15 @@ class Matrix_MLM_Admin {
             case 'zebra_cancel_deposit':
                 $this->zebra_cancel_deposit();
                 break;
+            case 'zebra_acknowledge_notification':
+                $this->zebra_acknowledge_notification();
+                break;
+            case 'zebra_dismiss_notification':
+                $this->zebra_dismiss_notification();
+                break;
+            case 'zebra_freeze_withdrawal':
+                $this->zebra_freeze_withdrawal();
+                break;
             case 'ban_user':
                 $this->ban_user();
                 break;
@@ -908,6 +929,282 @@ class Matrix_MLM_Admin {
             wp_send_json_success(['message' => $result['message'] ?? __('Cancel completed.', 'matrix-mlm')]);
         }
         wp_send_json_error(['message' => $result['message'] ?? __('Cancel failed.', 'matrix-mlm')]);
+    }
+
+    /**
+     * Acknowledge a Zebra /Notify event (1.0.18).
+     *
+     * Operator says "I've seen this; no action needed." No money
+     * moves and the related deposit/withdrawal is untouched. The
+     * row's state advances received -> acknowledged via a
+     * conditional UPDATE keyed on the current state, so two
+     * operators racing on the same row collapse to one win and
+     * one no-op rather than both flipping it.
+     *
+     * The operator-supplied note (optional) is recorded for
+     * audit alongside handled_by_user_id and handled_at.
+     */
+    private function zebra_acknowledge_notification() {
+        if (!current_user_can('manage_matrix_withdrawals')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'matrix-mlm')]);
+        }
+        $id   = (int) ($_POST['id'] ?? 0);
+        $note = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid notification id', 'matrix-mlm')]);
+        }
+
+        global $wpdb;
+        $rows = $wpdb->update(
+            $wpdb->prefix . 'matrix_zebra_notifications',
+            [
+                'state'              => 'acknowledged',
+                'handled_by_user_id' => get_current_user_id(),
+                'handled_at'         => current_time('mysql'),
+                'handler_note'       => $note !== '' ? $note : null,
+            ],
+            ['id' => $id, 'state' => 'received']
+        );
+        if ($rows !== 1) {
+            wp_send_json_error([
+                'message' => __('This notification has already been handled.', 'matrix-mlm'),
+            ]);
+        }
+        wp_send_json_success(['message' => __('Notification acknowledged.', 'matrix-mlm')]);
+    }
+
+    /**
+     * Dismiss a Zebra /Notify event as a false positive or
+     * duplicate (1.0.18).
+     *
+     * Distinct from acknowledge: dismiss carries the semantic
+     * "this should not have been sent / does not apply" and the
+     * UI surfaces it differently (greyed out vs blue). No money
+     * moves either way. Reason note is REQUIRED on the JS side
+     * — we re-validate here so a programmatic call can't sneak
+     * an empty reason past the audit trail.
+     *
+     * Source state accepts both 'received' and 'acknowledged'
+     * so an operator who first acknowledged a row can later
+     * decide it was spurious and dismiss it without having to
+     * re-receive.
+     */
+    private function zebra_dismiss_notification() {
+        if (!current_user_can('manage_matrix_withdrawals')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'matrix-mlm')]);
+        }
+        $id   = (int) ($_POST['id'] ?? 0);
+        $note = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+        if ($id <= 0) {
+            wp_send_json_error(['message' => __('Invalid notification id', 'matrix-mlm')]);
+        }
+        if ($note === '') {
+            wp_send_json_error([
+                'message' => __('A reason is required when dismissing a notification.', 'matrix-mlm'),
+            ]);
+        }
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'matrix_zebra_notifications';
+        $current_state = (string) $wpdb->get_var($wpdb->prepare(
+            "SELECT state FROM $table WHERE id = %d",
+            $id
+        ));
+        if ($current_state === '') {
+            wp_send_json_error(['message' => __('Notification not found.', 'matrix-mlm')]);
+        }
+        if (!in_array($current_state, ['received', 'acknowledged'], true)) {
+            wp_send_json_error([
+                'message' => __('This notification has already been finalised.', 'matrix-mlm'),
+            ]);
+        }
+
+        $rows = $wpdb->update(
+            $table,
+            [
+                'state'              => 'dismissed',
+                'handled_by_user_id' => get_current_user_id(),
+                'handled_at'         => current_time('mysql'),
+                'handler_note'       => $note,
+            ],
+            ['id' => $id, 'state' => $current_state]
+        );
+        if ($rows !== 1) {
+            wp_send_json_error([
+                'message' => __('Could not dismiss this notification — another operator may have just handled it.', 'matrix-mlm'),
+            ]);
+        }
+        wp_send_json_success(['message' => __('Notification dismissed.', 'matrix-mlm')]);
+    }
+
+    /**
+     * Freeze the related withdrawal in response to a
+     * chargeback / fraud / dispute notification (1.0.18).
+     *
+     * Two-step state transition wrapped in conditional UPDATEs
+     * so operator races collapse safely:
+     *
+     *   1. matrix_withdrawals.status pending|processing -> cancelled
+     *      (only the operator who wins this transition gets to
+     *      proceed; a second click on the same row sees zero
+     *      affected rows and bails)
+     *   2. Refund amount+charge to the user's Matrix wallet via
+     *      WD-FREEZE-{id}. Distinct from the WD-REFUND-{id}
+     *      reference reject_withdrawal() uses, so the auditor
+     *      ledger trace makes the chargeback freeze visible as
+     *      a different lifecycle event from an operator-
+     *      initiated reject.
+     *   3. matrix_zebra_notifications.state -> 'actioned' with
+     *      the operator's reason captured in handler_note.
+     *
+     * The user is notified via send_withdrawal_notification with
+     * status='rejected' (the existing notification surface only
+     * has the four states that match send_withdrawal_notification's
+     * mapping table; 'rejected' is the closest fit for a
+     * chargeback freeze from the user's perspective —
+     * "the payout did not go through" — and the email body's
+     * reason text is the operator's freeze note so the user
+     * sees why).
+     *
+     * Note vs reject: reject_withdrawal is operator-initiated
+     * before the platform settles. Freeze is operator-initiated
+     * AFTER an inbound /Notify says the platform is reversing.
+     * Same wallet-refund effect, distinct audit trail, distinct
+     * status enum (cancelled vs rejected) so the listing badge
+     * can render them differently.
+     */
+    private function zebra_freeze_withdrawal() {
+        if (!current_user_can('manage_matrix_withdrawals')) {
+            wp_send_json_error(['message' => __('Insufficient permissions.', 'matrix-mlm')]);
+        }
+        $notification_id = (int) ($_POST['id'] ?? 0);
+        $withdrawal_id   = (int) ($_POST['withdrawal_id'] ?? 0);
+        $note            = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+        if ($notification_id <= 0 || $withdrawal_id <= 0) {
+            wp_send_json_error(['message' => __('Invalid notification or withdrawal id.', 'matrix-mlm')]);
+        }
+        if ($note === '') {
+            wp_send_json_error([
+                'message' => __('A reason is required when freezing a withdrawal.', 'matrix-mlm'),
+            ]);
+        }
+
+        global $wpdb;
+        $notif_table = $wpdb->prefix . 'matrix_zebra_notifications';
+        $wd_table    = $wpdb->prefix . 'matrix_withdrawals';
+
+        // Validate the notification is still actionable and
+        // really points at the withdrawal the form claims.
+        // Defends against a tampered POST that swaps the
+        // withdrawal_id mid-flight.
+        $notification = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, state, related_type, related_id FROM $notif_table WHERE id = %d",
+            $notification_id
+        ));
+        if (!$notification) {
+            wp_send_json_error(['message' => __('Notification not found.', 'matrix-mlm')]);
+        }
+        if (!in_array($notification->state, ['received', 'acknowledged'], true)) {
+            wp_send_json_error(['message' => __('This notification has already been finalised.', 'matrix-mlm')]);
+        }
+        if ($notification->related_type !== 'withdrawal' || (int) $notification->related_id !== $withdrawal_id) {
+            wp_send_json_error([
+                'message' => __('This notification is not linked to that withdrawal.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Read the withdrawal up front so we can validate AND
+        // capture user_id + amount + charge for the refund.
+        $withdrawal = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM $wd_table WHERE id = %d",
+            $withdrawal_id
+        ));
+        if (!$withdrawal) {
+            wp_send_json_error(['message' => __('Related withdrawal not found.', 'matrix-mlm')]);
+        }
+        if (!in_array($withdrawal->status, ['pending', 'processing'], true)) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: %s = current withdrawal status */
+                    __('This withdrawal is %s and cannot be frozen.', 'matrix-mlm'),
+                    $withdrawal->status
+                ),
+            ]);
+        }
+
+        // Step 1 — flip the withdrawal to cancelled. Conditional
+        // on the current status so a second operator click after
+        // the first one already won is a no-op.
+        $rows = $wpdb->update(
+            $wd_table,
+            [
+                'status'     => 'cancelled',
+                'admin_note' => sprintf(
+                    /* translators: 1: notification id, 2: operator note */
+                    __('Frozen via Zebra notification #%1$d: %2$s', 'matrix-mlm'),
+                    $notification_id,
+                    $note
+                ),
+            ],
+            ['id' => $withdrawal_id, 'status' => $withdrawal->status]
+        );
+        if ($rows !== 1) {
+            wp_send_json_error([
+                'message' => __('Could not freeze this withdrawal — its status changed in the meantime.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Step 2 — refund amount+charge to the Matrix wallet.
+        // Distinct reference scheme (WD-FREEZE-* vs the
+        // WD-REFUND-* reject path uses) so the auditor ledger
+        // trace the operator's reason for the credit.
+        $wallet = new Matrix_MLM_Wallet();
+        $wallet->credit(
+            (int) $withdrawal->user_id,
+            ((float) $withdrawal->amount) + ((float) $withdrawal->charge),
+            'withdrawal_refund',
+            __('Withdrawal frozen via Zebra notification - refund', 'matrix-mlm'),
+            'WD-FREEZE-' . (int) $withdrawal_id
+        );
+
+        // Step 3 — close out the notification. Conditional UPDATE
+        // keyed on the same source state we read above, so an
+        // operator race here also collapses safely.
+        $wpdb->update(
+            $notif_table,
+            [
+                'state'              => 'actioned',
+                'handled_by_user_id' => get_current_user_id(),
+                'handled_at'         => current_time('mysql'),
+                'handler_note'       => $note,
+            ],
+            ['id' => $notification_id, 'state' => $notification->state]
+        );
+
+        // Notify the user that the payout was reversed. The
+        // existing send_withdrawal_notification only has four
+        // status arms (pending / processing / approved /
+        // rejected); 'rejected' is the closest semantic fit
+        // for a chargeback freeze from the user's perspective
+        // ("the payout did not go through") and the email
+        // body already references admin_note for the reason,
+        // so the operator's freeze note rides through to the
+        // user.
+        if (class_exists('Matrix_MLM_Notifications')) {
+            Matrix_MLM_Notifications::send_withdrawal_notification(
+                (int) $withdrawal->user_id,
+                (float) $withdrawal->amount,
+                'rejected'
+            );
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: %d = withdrawal id */
+                __('Withdrawal #%d frozen and refunded to the user\'s Matrix wallet.', 'matrix-mlm'),
+                $withdrawal_id
+            ),
+        ]);
     }
 
     private function ban_user() {
