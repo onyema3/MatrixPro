@@ -370,7 +370,20 @@ class Matrix_MLM_User_Virtual_Wallet {
             'use strict';
 
             // Live-refresh the Fintava wallet balance from the server without reloading.
-            $('#matrix-fintava-refresh-balance').on('click', function() {
+            //
+            // Delegated on document (not direct .on against the matched
+            // element) for the same DOM-timing reason documented in
+            // class-matrix-user-wallet.php's render_scripts(): direct
+            // binding fires the moment whenJQueryReady resolves, but
+            // on stacks with deferred jQuery / Rocket Loader / WP
+            // Rocket / FlyingPress / Astra / GeneratePress the matched
+            // element may not be in the DOM yet. Delegation walks up
+            // from the click target each time so the handler always
+            // fires regardless of arrival order. A refresh shifts the
+            // parse/execute timing enough to mask the bug, which is
+            // why "doesn't work until I refresh" was the reported
+            // symptom on the legacy Virtual Wallet page.
+            $(document).on('click', '#matrix-fintava-refresh-balance', function() {
                 var btn = $(this);
                 var amountEl = $('#matrix-fintava-balance-amount');
                 var originalLabel = btn.text();
@@ -402,7 +415,8 @@ class Matrix_MLM_User_Virtual_Wallet {
             // Verify & save a missing Fintava Wallet ID inline. The server will only
             // accept the wallet_id if Fintava confirms it belongs to the same
             // account_number that's already stored on the local row.
-            $('#matrix-fintava-set-wallet-id-btn').on('click', function() {
+            // Delegated on document for the DOM-timing reason above.
+            $(document).on('click', '#matrix-fintava-set-wallet-id-btn', function() {
                 var btn = $(this);
                 var input = $('#matrix-fintava-wallet-id-input');
                 var statusEl = $('#matrix-fintava-set-wallet-id-status');
@@ -451,8 +465,8 @@ class Matrix_MLM_User_Virtual_Wallet {
             const accountName = '<?php echo esc_js($wallet->account_name); ?>';
             const bankCode = '<?php echo esc_js($wallet->bank_code ?? ''); ?>';
 
-            // Calculate charges on amount input
-            $('#fintava-transfer-amount').on('input', function() {
+            // Calculate charges on amount input. Delegated for the DOM-timing reason above.
+            $(document).on('input', '#fintava-transfer-amount', function() {
                 const amount = parseFloat($(this).val()) || 0;
                 if (amount > 0) {
                     let charge = chargeType === 'percent' ? (amount * chargeValue / 100) : chargeValue;
@@ -467,8 +481,8 @@ class Matrix_MLM_User_Virtual_Wallet {
                 }
             });
 
-            // Submit transfer
-            $('#matrix-transfer-to-fintava-form').on('submit', function(e) {
+            // Submit transfer. Delegated for the DOM-timing reason above.
+            $(document).on('submit', '#matrix-transfer-to-fintava-form', function(e) {
                 e.preventDefault();
 
                 const amount = parseFloat($('#fintava-transfer-amount').val());
@@ -649,7 +663,10 @@ class Matrix_MLM_User_Virtual_Wallet {
             whenJQueryReady(function($) {
             'use strict';
 
-            $('#matrix-create-virtual-wallet-form').on('submit', function(e) {
+            // Delegated on document so the handler always fires regardless
+            // of when this form arrives in the DOM relative to whenJQueryReady.
+            // Same rationale as the other bindings in this file.
+            $(document).on('submit', '#matrix-create-virtual-wallet-form', function(e) {
                 e.preventDefault();
 
                 const form = $(this);
