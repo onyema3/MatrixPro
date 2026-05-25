@@ -424,6 +424,19 @@ class Matrix_MLM_User_Billing {
                 <input type="number" name="amount" min="50" max="50000" required placeholder="100">
             </div>
             <?php $this->render_fee_preview_block(); ?>
+            <?php
+            // Transaction PIN field (PR 2). All four bill forms
+            // share the 'bills' path key (matrix_mlm_pin_required_
+            // for_bills admin toggle); the helper short-circuits to
+            // '' when the toggle is off or the user has no PIN, so
+            // installs that haven't opted in see no UI change. Use
+            // get_current_user_id() rather than threading $user_id
+            // through render_*() — these renderers run inside the
+            // user's authenticated session so the call is always
+            // consistent with the require_pin_for_request() gate
+            // in the matching ajax_buy_airtime handler.
+            echo Matrix_MLM_Transaction_Pin::render_field(get_current_user_id(), 'bills');
+            ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Buy Airtime', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -437,7 +450,7 @@ class Matrix_MLM_User_Billing {
             $('#matrix-billing-airtime').on('submit', function(e){
                 e.preventDefault(); var f=$(this), b=f.find('button');
                 b.prop('disabled',true).text('Processing...');
-                $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val()}, function(r){
+                $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')}, function(r){
                     alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Airtime');
                 });
             });
@@ -473,6 +486,11 @@ class Matrix_MLM_User_Billing {
             </div>
             <input type="hidden" name="amount" id="data-amount" value="0">
             <?php $this->render_fee_preview_block(); ?>
+            <?php
+            // Transaction PIN field (PR 2). See render_airtime() for
+            // the full rationale on the shared 'bills' path key.
+            echo Matrix_MLM_Transaction_Pin::render_field(get_current_user_id(), 'bills');
+            ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Buy Data', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -503,7 +521,7 @@ class Matrix_MLM_User_Billing {
             });
             $('#matrix-billing-data').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
-                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val()},function(r){
+                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Data');
                 });
             });
@@ -535,6 +553,11 @@ class Matrix_MLM_User_Billing {
             </div>
             <input type="hidden" name="amount" id="cable-amount" value="0">
             <?php $this->render_fee_preview_block(); ?>
+            <?php
+            // Transaction PIN field (PR 2). See render_airtime() for
+            // the full rationale on the shared 'bills' path key.
+            echo Matrix_MLM_Transaction_Pin::render_field(get_current_user_id(), 'bills');
+            ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" disabled><?php _e('Subscribe', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -573,7 +596,7 @@ class Matrix_MLM_User_Billing {
             });
             $('#matrix-billing-cable').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
-                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val()},function(r){
+                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Subscribe');
                 });
             });
@@ -611,6 +634,11 @@ class Matrix_MLM_User_Billing {
                 <input type="number" name="amount" min="500" required placeholder="1000">
             </div>
             <?php $this->render_fee_preview_block(); ?>
+            <?php
+            // Transaction PIN field (PR 2). See render_airtime() for
+            // the full rationale on the shared 'bills' path key.
+            echo Matrix_MLM_Transaction_Pin::render_field(get_current_user_id(), 'bills');
+            ?>
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Pay Electricity', 'matrix-mlm'); ?></button>
         </form>
         <script>
@@ -641,7 +669,7 @@ class Matrix_MLM_User_Billing {
             });
             $('#matrix-billing-electricity').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button[type=submit]'); b.prop('disabled',true).text('Processing...');
-                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_electricity',nonce:matrixMLM.nonce,meter_number:f.find('[name=meter_number]').val(),amount:f.find('[name=amount]').val(),disco:f.find('[name=disco]').val(),meter_type:f.find('[name=meter_type]').val()},function(r){
+                $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_electricity',nonce:matrixMLM.nonce,meter_number:f.find('[name=meter_number]').val(),amount:f.find('[name=amount]').val(),disco:f.find('[name=disco]').val(),meter_type:f.find('[name=meter_type]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     if(r.success){ alert(r.data.message); location.reload(); } else { alert(r.data.message); b.prop('disabled',false).text('Pay Electricity'); }
                 });
             });

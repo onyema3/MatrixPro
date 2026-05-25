@@ -845,11 +845,21 @@ class Matrix_MLM_User_Wallet {
                         url:  matrixMLM.ajaxUrl,
                         type: 'POST',
                         data: {
-                            action:        'matrix_mlm_action',
-                            nonce:         matrixMLM.nonce,
-                            matrix_action: 'transfer',
-                            recipient:     recipient,
-                            amount:        amount
+                            action:         'matrix_mlm_action',
+                            nonce:          matrixMLM.nonce,
+                            matrix_action:  'transfer',
+                            recipient:      recipient,
+                            amount:         amount,
+                            // Transaction PIN (PR 2). Read from the
+                            // form regardless of whether render_field()
+                            // emitted the input — when the gate is
+                            // off (admin toggle, no user PIN, etc)
+                            // the selector returns undefined and we
+                            // post '', which the server-side helper
+                            // treats as "PIN gate not active" and
+                            // ignores. No client-side gate logic
+                            // needed; the server is authoritative.
+                            transaction_pin: ($('#matrix-w2w-form [name=transaction_pin]').val() || '')
                         },
                         success: function(res) {
                             if (res && res.success) {
@@ -1014,6 +1024,17 @@ class Matrix_MLM_User_Wallet {
                     </div>
                 </div>
 
+                <?php
+                // Transaction PIN field (PR 2). Path key
+                // 'matrix_to_virtual' maps to the
+                // matrix_mlm_pin_required_for_matrix_to_virtual
+                // admin toggle. Helper returns '' when path is
+                // ungated or the user has no PIN — same predicate
+                // as the require_pin_for_request() server gate in
+                // Matrix_MLM_Fintava::ajax_transfer_matrix_to_virtual.
+                echo Matrix_MLM_Transaction_Pin::render_field($user_id, 'matrix_to_virtual');
+                ?>
+
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="matrix-own-wallet-submit-btn">
                     <?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?>
                 </button>
@@ -1146,6 +1167,19 @@ class Matrix_MLM_User_Wallet {
                         </small>
                     </div>
                 </div>
+
+                <?php
+                // Transaction PIN field — rendered ONLY when the
+                // admin requires PIN for path='transfers' AND the
+                // current user has one set. Helper returns '' on
+                // every other state, so users who never enrolled
+                // see an unchanged form. The matching require_pin_
+                // for_request() gate in Matrix_MLM_Core::process_
+                // transfer mirrors the same predicate, so the
+                // server never demands a PIN the form didn't ask
+                // for and vice versa.
+                echo Matrix_MLM_Transaction_Pin::render_field($user_id, 'transfers');
+                ?>
 
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="matrix-w2w-submit-btn">
                     <?php esc_html_e('Send Transfer', 'matrix-mlm'); ?>
@@ -1803,7 +1837,12 @@ class Matrix_MLM_User_Wallet {
                         action:         'matrix_transfer_matrix_to_virtual',
                         nonce:          matrixMLM.nonce,
                         amount:         amount,
-                        narration:      '<?php echo esc_js(__('Matrix to Virtual wallet transfer', 'matrix-mlm')); ?>'
+                        narration:      '<?php echo esc_js(__('Matrix to Virtual wallet transfer', 'matrix-mlm')); ?>',
+                        // Transaction PIN (PR 2). Posted unconditionally
+                        // (empty string when render_field() didn't
+                        // emit the input); the server-side gate is
+                        // authoritative on whether to enforce.
+                        transaction_pin: ($('#matrix-transfer-to-own-wallet-form [name=transaction_pin]').val() || '')
                     },
                     success: function(res) {
                         if (res && res.success) {
@@ -1899,11 +1938,15 @@ class Matrix_MLM_User_Wallet {
                     url:  matrixMLM.ajaxUrl,
                     type: 'POST',
                     data: {
-                        action:        'matrix_mlm_action',
-                        nonce:         matrixMLM.nonce,
-                        matrix_action: 'transfer',
-                        recipient:     recipient,
-                        amount:        amount
+                        action:         'matrix_mlm_action',
+                        nonce:          matrixMLM.nonce,
+                        matrix_action:  'transfer',
+                        recipient:      recipient,
+                        amount:         amount,
+                        // Transaction PIN (PR 2). See the matching
+                        // block above in render_wallet_to_wallet_form
+                        // for the rationale on always-post-empty.
+                        transaction_pin: ($('#matrix-w2w-form [name=transaction_pin]').val() || '')
                     },
                     success: function(res) {
                         if (res && res.success) {

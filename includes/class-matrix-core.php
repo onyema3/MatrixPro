@@ -1149,6 +1149,17 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => $eligibility['reason']]);
         }
 
+        // Transaction PIN gate (PR 2). Runs immediately after the
+        // can_move_funds eligibility check and BEFORE the START
+        // TRANSACTION below, so a wrong PIN can't dirty the wallet
+        // ledger or burn an audit-row insert. Path key 'transfers'
+        // maps to the matrix_mlm_pin_required_for_transfers admin
+        // toggle on Settings → Financial. The helper short-circuits
+        // (no-op return) when the path isn't gated or when the
+        // current user has no PIN configured, so this is inert
+        // until the admin opts in AND the user enrols.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'transfers');
+
         $amount = floatval($_POST['amount'] ?? 0);
         $recipient_username = sanitize_text_field($_POST['recipient'] ?? '');
 
@@ -3059,6 +3070,19 @@ class Matrix_MLM_Core {
 
     private function process_pay_subscription() {
         $user_id = get_current_user_id();
+
+        // Transaction PIN gate (PR 2). The manual subscription-pay
+        // surface debits the Matrix wallet without a separate
+        // can_move_funds preflight (the manual_pay() helper does
+        // its own balance + status checks under a per-user-month
+        // advisory lock). The PIN gate fires here, BEFORE
+        // manual_pay() acquires the lock or touches the wallet,
+        // so a wrong PIN can't dirty the subscription-payment
+        // history or contend with the cron-driven monthly job.
+        // Path key 'subscription' maps to the
+        // matrix_mlm_pin_required_for_subscription admin toggle.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'subscription');
+
         $subscription = new Matrix_MLM_Subscription();
         $result = $subscription->manual_pay($user_id);
 

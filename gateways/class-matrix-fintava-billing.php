@@ -695,6 +695,17 @@ class Matrix_MLM_Fintava_Billing {
         // a cheap probe of the visibility option.
         self::require_category_enabled_or_die('airtime');
 
+        // Transaction PIN gate (PR 2). All four bill handlers
+        // (airtime / data / cable / electricity) gate on the same
+        // 'bills' path key — admins toggle them as a single
+        // bucket on Settings → Financial. Runs AFTER the per-
+        // category kill switch above so disabled categories don't
+        // waste a PIN-verify slot on the user's throttle, and
+        // BEFORE process_purchase() debits the wallet or writes
+        // the pending-transaction row, so a wrong PIN here costs
+        // zero DB rows and zero outbound Fintava calls.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bills');
+
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);
         $network = sanitize_text_field($_POST['network'] ?? '');
@@ -765,6 +776,10 @@ class Matrix_MLM_Fintava_Billing {
 
         self::require_category_enabled_or_die('data');
 
+        // Transaction PIN gate (PR 2). Shared 'bills' path key —
+        // see ajax_buy_airtime for the full rationale.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bills');
+
         $phone = sanitize_text_field($_POST['phone'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
         $network = sanitize_text_field($_POST['network'] ?? '');
@@ -829,6 +844,10 @@ class Matrix_MLM_Fintava_Billing {
         }
 
         self::require_category_enabled_or_die('cable');
+
+        // Transaction PIN gate (PR 2). Shared 'bills' path key —
+        // see ajax_buy_airtime for the full rationale.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bills');
 
         $smartcard = sanitize_text_field($_POST['smartcard_number'] ?? '');
         $plan_id = sanitize_text_field($_POST['plan_id'] ?? '');
@@ -916,6 +935,10 @@ class Matrix_MLM_Fintava_Billing {
         }
 
         self::require_category_enabled_or_die('electricity');
+
+        // Transaction PIN gate (PR 2). Shared 'bills' path key —
+        // see ajax_buy_airtime for the full rationale.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bills');
 
         $meter_number = sanitize_text_field($_POST['meter_number'] ?? '');
         $amount = floatval($_POST['amount'] ?? 0);

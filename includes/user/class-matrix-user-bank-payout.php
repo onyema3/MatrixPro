@@ -296,6 +296,17 @@ class Matrix_MLM_User_Bank_Payout {
                 <!-- Hidden fields -->
                 <input type="hidden" name="bank_name" id="fintava-bank-name" value="">
 
+                <?php
+                // Transaction PIN field (PR 2). Path key 'bank' maps
+                // to the matrix_mlm_pin_required_for_bank admin
+                // toggle on Settings → Financial. Helper returns
+                // '' for ungated paths or users with no PIN, so
+                // installs that haven't opted in see no UI change.
+                // The matching require_pin_for_request() gate sits
+                // in Matrix_MLM_Fintava::ajax_initiate_transfer.
+                echo Matrix_MLM_Transaction_Pin::render_field($user_id, 'bank');
+                ?>
+
                 <!-- Submit -->
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="fintava-submit-btn" disabled>
                     <?php _e('Transfer to Bank', 'matrix-mlm'); ?>
@@ -848,7 +859,14 @@ class Matrix_MLM_User_Bank_Payout {
                         bank_code: $('#fintava-bank-select').val(),
                         bank_name: bankName,
                         account_name: accountName,
-                        narration: $('[name="narration"]').val()
+                        narration: $('[name="narration"]').val(),
+                        // Transaction PIN (PR 2). Always-post-empty
+                        // contract: when render_field() didn't emit
+                        // the input the selector returns undefined,
+                        // we send '', and the server-side gate
+                        // treats that as "PIN gate not active" and
+                        // proceeds. No client-side branching needed.
+                        transaction_pin: ($('#matrix-bank-payout-form [name=transaction_pin]').val() || '')
                     },
                     success: function(response) {
                         if (response.success) {

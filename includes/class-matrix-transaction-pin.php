@@ -310,6 +310,235 @@ class Matrix_MLM_Transaction_Pin {
     }
 
     /**
+     * Per-request gate: enforce a transaction PIN on the current AJAX
+     * call when the admin has flagged $path as PIN-required AND the
+     * caller has set one. This is THE entry point used by the eight
+     * fund-movement handlers wired up in PR 2 (peer transfer,
+     * subscription pay, bank transfer, matrix→virtual, plus the
+     * four bill handlers).
+     *
+     * Behaviour matrix:
+     *
+     *   path NOT required (admin toggle off)
+     *     → no-op return, transaction proceeds
+     *   path required, user has NO PIN set
+     *     → no-op return, transaction proceeds. Matches the design
+     *       call we made: turning a per-path toggle on doesn't
+     *       suddenly strand pre-existing users mid-flow. The
+     *       user-side Security tab still nudges them to set one,
+     *       but they're not gated until they opt in.
+     *   path required, user HAS a PIN, POST is missing/invalid/wrong
+     *     → wp_send_json_error with `pin_required: true` so the JS
+     *       layer can pop the PIN field on the form (or surface a
+     *       targeted message instead of a generic "transfer failed").
+     *   path required, user HAS a PIN, POST verifies
+     *     → no-op return, transaction proceeds. Rate-limit counter
+     *       gets reset so a real user who fat-fingered once isn't
+     *       penalised on subsequent legitimate transactions.
+     *
+     * Threat-model ordering — kept in lockstep with the docblock at
+     * the top of this class:
+     *
+     *   1. pin_required_for($path) — cheapest gate, runs first so
+     *      installs that haven't opted in pay zero overhead per
+     *      transaction (single get_option lookup, cached by WP).
+     *   2. is_set($user_id) — second-cheapest. Skipping when the
+     *      user has no PIN configured prevents the rate-limit
+     *      counter from being consumed by ungated callers, which
+     *      would otherwise let a single user with no PIN exhaust
+     *      their own throttle on perfectly legal transactions.
+     *   3. Rate limit (5 / 15 min, action 'transaction_pin_verify').
+     *      A SHARED counter across all eight handlers is on
+     *      purpose: the threat is brute-force PIN guessing, and a
+     *      determined attacker alternating between airtime / data
+     *      / transfer endpoints to dodge per-handler caps would be
+     *      defeated by per-endpoint counters. Same window length
+     *      and cap as the set/change/disable counters above for
+     *      consistency.
+     *   4. Empty-PIN check. After the rate-limit, NOT before — an
+     *      attacker spamming empty submissions still costs them
+     *      counter slots (cheap defence against probing whether a
+     *      path requires a PIN by watching the response shape).
+     *      Surfaces a distinct message ("enter your PIN") so a
+     *      legitimate user who forgot the field doesn't think
+     *      their PIN is wrong.
+     *   5. bcrypt verify. Returns false on every failure mode (no
+     *      hash stored, malformed PIN, mismatch); we don't branch
+     *      on the failure mode here because the user-visible
+     *      message is the same either way and we don't want to
+     *      surface state ("you have no PIN configured" vs "wrong
+     *      PIN") through this oracle. The threat-model docblock
+     *      already covers why the surrounding ordering matters.
+     *   6. Reset on success. Same convention as the set/change/
+     *      disable handlers in Matrix_MLM_Core — successful PIN
+     *      verification clears the counter so a subsequent
+     *      transaction in the same window starts from zero.
+     *
+     * Defensive contract: this method either returns silently or
+     * terminates the request via wp_send_json_error. Callers should
+     * treat a return as "PIN gate cleared" and proceed; they MUST
+     * NOT branch on the return value.
+     *
+     * @param int    $user_id Authenticated user id (typically
+     *                        get_current_user_id() in the caller).
+     * @param string $path    One of the keys in self::PATHS.
+     */
+    public static function require_pin_for_request($user_id, $path) {
+        // Path not gated — fast exit. No DB hits, no rate-limit
+        // bookkeeping. Installs that never opt in to PIN gating
+        // see this method as effectively free.
+        if (!self::pin_required_for($path)) {
+            return;
+        }
+
+        // No PIN on file — design contract: ungated transactions
+        // proceed. See top-of-class docblock and the disable()
+        // helper for why we deliberately don't force users into a
+        // mandatory-PIN posture from a per-path admin toggle.
+        if (!self::is_set($user_id)) {
+            return;
+        }
+
+        // Brute-force bound. Shared across all eight enforcement
+        // points (see docblock) so an attacker can't cycle handlers
+        // to reset the counter. 5 attempts / 15 minutes matches the
+        // set / change / disable handlers in Matrix_MLM_Core, so
+        // operators triaging a "PIN locked me out" complaint see
+        // the same idiom regardless of which surface the user hit.
+        $rl_action = 'transaction_pin_verify';
+        $rl_key    = Matrix_MLM_Rate_Limiter::key_for_request();
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            $rl_action,
+            $rl_key,
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many transaction PIN attempts. Please wait a few minutes and try again.', 'matrix-mlm'),
+                'pin_required' => true,
+            ]);
+        }
+
+        // Read the POST field. wp_unslash because WP's auto-magic
+        // quotes layer escapes the raw POST; the digit-only
+        // normaliser doesn't care about escaped backslashes but
+        // running unslash here keeps the bcrypt verify input
+        // identical to what the user originally typed, which
+        // matters if a future admin tool ever logs the rejected
+        // input for forensic debugging.
+        $raw = isset($_POST['transaction_pin']) ? wp_unslash($_POST['transaction_pin']) : '';
+
+        // Empty/missing PIN gets a distinct message so a real user
+        // who just forgot the field doesn't see "PIN is incorrect"
+        // and assume their stored PIN is wrong (which would push
+        // them into the disable→re-enrol loop unnecessarily).
+        // pin_required: true tells the front-end to surface the
+        // PIN field if it isn't already showing.
+        $normalised = self::normalise($raw);
+        if ($normalised === '') {
+            wp_send_json_error([
+                'message' => __('Enter your transaction PIN to confirm this action.', 'matrix-mlm'),
+                'pin_required' => true,
+            ]);
+        }
+
+        // bcrypt verify. False on every failure mode (no stored
+        // hash, format invalid post-normalisation, hash mismatch);
+        // surfaced uniformly as "incorrect" because branching on
+        // the cause would leak account state. The
+        // already-rate-limited path above caps the brute-force
+        // surface; bcrypt's cost factor caps per-attempt effort.
+        $pin = new self();
+        if (!$pin->verify($user_id, $raw)) {
+            wp_send_json_error([
+                'message' => __('Transaction PIN is incorrect.', 'matrix-mlm'),
+                'pin_required' => true,
+            ]);
+        }
+
+        // Success — clear the throttle so a legitimate user who
+        // mis-typed once doesn't burn budget on every subsequent
+        // legal transaction in the window. Same convention as
+        // process_set_transaction_pin / process_change_transaction_pin
+        // / process_disable_transaction_pin in Matrix_MLM_Core.
+        Matrix_MLM_Rate_Limiter::reset($rl_action, $rl_key);
+    }
+
+    /**
+     * Render the user-side PIN <input> for a fund-movement form, or
+     * the empty string when the gate isn't active for this user/path
+     * pair.
+     *
+     * Drop-in companion to require_pin_for_request(): the server-side
+     * gate and the form field share the SAME pin_required_for($path)
+     * && is_set($user_id) predicate, so a user who is ungated on the
+     * server side never sees the field, and a user who IS gated
+     * always sees it. No client-side decision logic needed; the JS
+     * always reads `[name=transaction_pin]` and POSTs whatever it
+     * finds (empty string if the field is absent, which the server
+     * gate then handles via the "PIN gate not active" no-op return).
+     *
+     * Field naming is fixed at `transaction_pin` so the four bill
+     * forms, both transfer forms, and the bank-payout form all
+     * share one POST contract — no per-form key juggling on the
+     * server.
+     *
+     * inputmode="numeric" + autocomplete="off" matches the existing
+     * recovery-code / 2FA-code field styling so the on-screen
+     * keyboard pops a digit pad on mobile and password managers
+     * don't try to autofill an unrelated value. type="password" is
+     * deliberate (not "tel" or "number"): we want the value masked
+     * the same way 2FA codes are, and "password" is what most
+     * accessibility tooling already expects for "sensitive numeric
+     * input you don't want over-the-shoulder visible". Browsers do
+     * NOT enforce maxlength on type="password" with non-Latin IMEs,
+     * so the server-side normaliser is the authority on length.
+     *
+     * @param int    $user_id Current user id (caller should pass
+     *                        get_current_user_id()).
+     * @param string $path    One of the keys in self::PATHS.
+     * @return string HTML fragment, or '' if the gate isn't active.
+     */
+    public static function render_field($user_id, $path) {
+        if (!self::pin_required_for($path)) {
+            return '';
+        }
+        if (!self::is_set((int) $user_id)) {
+            return '';
+        }
+
+        $label = __('Transaction PIN', 'matrix-mlm');
+        $hint  = __('Enter your transaction PIN to authorise this action.', 'matrix-mlm');
+        $ph    = sprintf(
+            /* translators: 1: minimum digits, 2: maximum digits */
+            __('%1$d–%2$d digits', 'matrix-mlm'),
+            self::MIN_LEN,
+            self::MAX_LEN
+        );
+
+        ob_start();
+        ?>
+        <div class="matrix-form-group matrix-pin-field">
+            <label for="matrix-pin-<?php echo esc_attr($path); ?>">
+                <?php echo esc_html($label); ?>
+            </label>
+            <input
+                type="password"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                autocomplete="off"
+                name="transaction_pin"
+                id="matrix-pin-<?php echo esc_attr($path); ?>"
+                minlength="<?php echo (int) self::MIN_LEN; ?>"
+                maxlength="<?php echo (int) self::MAX_LEN; ?>"
+                required
+                placeholder="<?php echo esc_attr($ph); ?>">
+            <small class="description"><?php echo esc_html($hint); ?></small>
+        </div>
+        <?php
+        return (string) ob_get_clean();
+    }
+
+    /**
      * Verify a plaintext PIN against the stored hash.
      *
      * Returns false on every failure mode (no PIN set, malformed
