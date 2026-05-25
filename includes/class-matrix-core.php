@@ -17,44 +17,27 @@ class Matrix_MLM_Core {
     }
 
     public function run() {
-        // One-time stale-cache purge after a plugin upgrade.
-        //
-        // Releases prior to this fix did not set DONOTCACHEPAGE,
-        // litespeed_control_set_nocache, or X-LiteSpeed-Cache-Control
-        // on dashboard pages — only the standard HTTP nocache_headers().
-        // Customer hosts running LiteSpeed (with "Cache Logged-in
-        // Users" enabled, which is the default on most LiteSpeed
-        // shared-hosting plans) accumulated full-page cached HTML
-        // snapshots of the wallet/dashboard that outlived balance
-        // changes, presenting users with stale balances after deposits,
-        // withdrawals, transfers, and commission payouts. The fix
-        // (above, in nocache_dashboard_pages) prevents new cache
-        // entries — but existing entries on every customer site at
-        // the moment of upgrade are still poisoned and would keep
-        // serving stale HTML until they naturally expired.
-        //
-        // Compare the version stamp we last purged at against the
-        // current MATRIX_MLM_VERSION; on any forward movement, fire
-        // each major page-cache plugin's purge_all action exactly
-        // once and record the new stamp. The check is cheap in the
-        // steady state (one get_option() + one version_compare()),
-        // and the purge fan-out only runs when the version genuinely
-        // moved forward — so this isn't a per-request cost beyond
-        // first-load-after-upgrade. Each do_action() / function_exists()
-        // is a no-op on hosts where that cache plugin is not present,
-        // so the fan-out is safe to fire unconditionally.
-        $last_purged = (string) get_option('matrix_mlm_last_purged_version', '0.0.0');
-        if (version_compare($last_purged, MATRIX_MLM_VERSION, '<')) {
-            do_action('litespeed_purge_all');
-            do_action('rocket_purge_cache');
-            if (function_exists('w3tc_pgcache_flush')) {
-                w3tc_pgcache_flush();
-            }
-            if (function_exists('wp_cache_clear_cache')) {
-                wp_cache_clear_cache();
-            }
-            update_option('matrix_mlm_last_purged_version', MATRIX_MLM_VERSION, false);
-        }
+        // The post-upgrade page-cache purge that used to live here was
+        // moved to maybe_purge_caches_after_upgrade(), hooked on
+        // `init` priority 99 — see define_hooks() below. Firing it
+        // from run() (which executes on plugins_loaded priority 10)
+        // was too early: LiteSpeed Cache's litespeed_purge_all
+        // handler internally calls __('...', 'litespeed-cache'),
+        // which forces the LiteSpeed textdomain to load before
+        // WordPress's standard init-priority-1 textdomain bootstrap.
+        // WP 6.7 raises a _doing_it_wrong notice for "translation
+        // loading triggered too early"; that notice echoes into the
+        // response stream, which then makes every subsequent
+        // header() call fail with "headers already sent" — including
+        // the wp-admin/admin-header.php redirects that fire on the
+        // very first page load after upgrade. End-user symptom: a
+        // wall of PHP notices on top of every admin page, and the
+        // login redirect chain broken until the textdomain notice
+        // stops emitting. Deferring to init priority 99 lets every
+        // page-cache plugin's textdomain load normally on init
+        // priority 1 first, so the purge handler can translate
+        // its own strings without triggering the early-load
+        // detector.
 
         // Self-healing schema upgrade: run any pending migrations on load
         // so admins don't have to deactivate/reactivate after a plugin update.
@@ -222,6 +205,31 @@ class Matrix_MLM_Core {
         // — `wp` fires after the main query is set up, so $post
         // and has_shortcode() are usable at that point.
         add_action('wp', [$this, 'nocache_dashboard_pages']);
+
+        // One-time stale-cache purge after a plugin upgrade.
+        //
+        // Hooked on `init` priority 99 (rather than firing inline
+        // during plugins_loaded, where it lived in the original
+        // PR #327) for one specific reason: LiteSpeed Cache's
+        // `litespeed_purge_all` handler internally translates a few
+        // of its own status strings via __('…', 'litespeed-cache').
+        // WordPress 6.7 raises a `_doing_it_wrong` notice if a
+        // textdomain loads before `init`, and the notice text
+        // emits into the response stream — which then breaks the
+        // first header() call with "headers already sent",
+        // including the wp-admin/admin-header.php redirects that
+        // fire on the first page load after upgrade. Deferring
+        // until after init priority 1 (where WP loads textdomains
+        // by default) means LiteSpeed's translation lookups
+        // happen at a moment WP considers safe.
+        //
+        // Priority 99 (rather than 1, 5, or 10) is deliberate so
+        // that any other plugin hooked on init that might want to
+        // be running before our purge fires has already run — the
+        // purge action handlers in LSCWP / WP Rocket / W3TC walk
+        // their own state machines and we want those settled before
+        // we fan out.
+        add_action('init', [$this, 'maybe_purge_caches_after_upgrade'], 99);
     }
 
     public function enqueue_public_assets() {
@@ -473,6 +481,75 @@ class Matrix_MLM_Core {
         // covers that gap.
         if (!headers_sent()) {
             header('X-LiteSpeed-Cache-Control: no-cache');
+        }
+    }
+
+    /**
+     * One-time stale-cache purge fan-out after a plugin upgrade.
+     *
+     * Hooked on `init` priority 99 (see define_hooks). Runs once per
+     * forward version change, no-op on every subsequent request.
+     *
+     * Why this exists at all: releases prior to the LiteSpeed
+     * cache-control fix did not set DONOTCACHEPAGE,
+     * litespeed_control_set_nocache, or X-LiteSpeed-Cache-Control on
+     * dashboard pages — only the standard nocache_headers(). Customer
+     * hosts running LiteSpeed (with "Cache Logged-in Users" enabled,
+     * which is the default on most LiteSpeed shared-hosting plans)
+     * accumulated full-page cached HTML snapshots of the dashboard
+     * that survived past balance changes. nocache_dashboard_pages()
+     * prevents NEW poisoned entries from being created, but pre-
+     * existing snapshots on every customer site at the moment of
+     * upgrade keep serving stale HTML until they naturally expire
+     * (typically several hours, sometimes longer). Firing each
+     * cache plugin's purge_all hook exactly once on the first
+     * post-upgrade load evicts those legacy entries so members
+     * see correct balances immediately after the version flip.
+     *
+     * Why init priority 99, not plugins_loaded:
+     *
+     * The previous revision called this from Matrix_MLM_Core::run()
+     * (which is bound to plugins_loaded priority 10). LiteSpeed's
+     * litespeed_purge_all handler translates a few of its own status
+     * strings through __('…', 'litespeed-cache'). WordPress 6.7
+     * raises a `_doing_it_wrong` notice when a textdomain loads
+     * before `init`, and that notice text emits straight into the
+     * response stream. The first subsequent header() call — including
+     * the wp-admin/admin-header.php redirects — then fails with
+     * "headers already sent (output started at functions.php:6170)",
+     * which on the affected site presented as a wall of PHP notices
+     * across every admin page load right after upgrade. Deferring
+     * to init priority 99 lets every textdomain load through the
+     * standard init priority 1 bootstrap before we trigger any
+     * translation-bearing handlers.
+     *
+     * Each do_action() / function_exists() check below is a no-op
+     * on hosts where that particular cache plugin isn't installed,
+     * so the fan-out is safe to fire unconditionally.
+     */
+    public function maybe_purge_caches_after_upgrade() {
+        $last_purged = (string) get_option('matrix_mlm_last_purged_version', '0.0.0');
+        if (!version_compare($last_purged, MATRIX_MLM_VERSION, '<')) {
+            return;
+        }
+
+        // Update the stamp BEFORE firing the purge handlers. If a
+        // handler exits the request (an error, an exit() call deep
+        // in someone else's code, a fatal in a translation lookup),
+        // we still want the stamp to record that we attempted the
+        // purge — better to skip a purge than to retry it on every
+        // subsequent request and re-trigger whatever the failure was.
+        // The autoload=false flag keeps this option out of the
+        // alloptions cache.
+        update_option('matrix_mlm_last_purged_version', MATRIX_MLM_VERSION, false);
+
+        do_action('litespeed_purge_all');             // LiteSpeed Cache
+        do_action('rocket_purge_cache');              // WP Rocket
+        if (function_exists('w3tc_pgcache_flush')) {
+            w3tc_pgcache_flush();                     // W3 Total Cache
+        }
+        if (function_exists('wp_cache_clear_cache')) {
+            wp_cache_clear_cache();                   // WP Super Cache
         }
     }
 
