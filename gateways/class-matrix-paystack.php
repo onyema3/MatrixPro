@@ -253,4 +253,266 @@ class Matrix_MLM_Paystack {
     public function get_public_key() {
         return $this->public_key;
     }
+
+    /**
+     * GET /bank — fetch Paystack's Nigerian bank list. Cached in a 24h
+     * transient because the list is stable (the CBN doesn't add Nigerian
+     * banks daily) and we hit it on every name-enquiry race.
+     *
+     * Returns an array of `[ ['name' => ..., 'code' => ..., 'longcode' => ...], ...]`.
+     * Returns `[]` on any failure mode (no key configured, network error,
+     * non-success response) so callers can treat "list empty" as "Paystack
+     * resolver unavailable" without a separate error type.
+     */
+    public function get_banks() {
+        $cache_key = 'matrix_paystack_banks_v1';
+        $cached    = get_transient($cache_key);
+        if (is_array($cached)) {
+            return $cached;
+        }
+
+        if (empty($this->secret_key)) {
+            return [];
+        }
+
+        $response = wp_remote_get($this->base_url . '/bank?country=nigeria&perPage=200', [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $this->secret_key,
+                'Accept'        => 'application/json',
+            ],
+            'timeout' => 8,
+        ]);
+
+        if (is_wp_error($response)) {
+            return [];
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (!is_array($body) || empty($body['status']) || empty($body['data']) || !is_array($body['data'])) {
+            return [];
+        }
+
+        $banks = [];
+        foreach ($body['data'] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $banks[] = [
+                'name'     => (string) ($row['name'] ?? ''),
+                'code'     => (string) ($row['code'] ?? ''),
+                'longcode' => (string) ($row['longcode'] ?? ''),
+            ];
+        }
+        set_transient($cache_key, $banks, DAY_IN_SECONDS);
+        return $banks;
+    }
+
+    /**
+     * Translate a Fintava-style 6-digit NIBSS sortCode (e.g. "000014")
+     * into the matching Paystack CBN code (e.g. "044") so the
+     * /bank/resolve endpoint can be called with input the form already
+     * collected via the Fintava-shaped bank dropdown.
+     *
+     * Strategy:
+     *   1. Hard-coded fast path for the ~25 Nigerian banks where the
+     *      sortCode <-> CBN mapping is stable and well-known. Avoids
+     *      a Paystack /bank round-trip on the hot path.
+     *   2. Fallback to dynamic name-matching against the cached
+     *      Paystack /bank list. This is how new / fintech banks
+     *      keep working without code changes — they get added to
+     *      Paystack's list before they get added to ours.
+     *   3. Returns '' when the bank can't be resolved on either
+     *      path. Caller drops the Paystack leg of the race and
+     *      runs Fintava-only, same behaviour as today.
+     *
+     * @param string $sortcode    NIBSS sortCode from Fintava /banks.
+     * @param string $bank_name   Optional bank display name from the
+     *                            same /banks row, used by step 2 above.
+     * @return string CBN code (3-digit), or '' if no match.
+     */
+    public function nibss_sortcode_to_cbn_code($sortcode, $bank_name = '') {
+        $sortcode = trim((string) $sortcode);
+        if ($sortcode === '') {
+            return '';
+        }
+
+        // Static map - the well-known Nigerian commercial and merchant
+        // banks. Source: NIBSS sortCode publication + CBN code list.
+        // Edit this map when a new bank's sortCode <-> CBN code pair
+        // becomes stable; until then the dynamic name-match fallback
+        // below picks up new banks Paystack adds.
+        $map = [
+            // Commercial banks
+            '000014' => '044', // Access Bank
+            '000005' => '063', // Access (Diamond)
+            '000009' => '023', // Citibank
+            '000010' => '050', // Ecobank Nigeria
+            '000007' => '070', // Fidelity Bank
+            '000016' => '011', // First Bank of Nigeria
+            '000003' => '214', // First City Monument Bank (FCMB)
+            '000013' => '058', // Guaranty Trust Bank (GTBank)
+            '000020' => '030', // Heritage Bank
+            '000006' => '301', // Jaiz Bank
+            '000002' => '082', // Keystone Bank
+            '000008' => '076', // Polaris Bank
+            '000023' => '101', // Providus Bank
+            '000012' => '221', // Stanbic IBTC Bank
+            '000021' => '068', // Standard Chartered Bank
+            '000001' => '232', // Sterling Bank
+            '000022' => '100', // SunTrust Bank
+            '000025' => '102', // TitanTrust Bank (Taj Bank)
+            '000004' => '033', // United Bank for Africa (UBA)
+            '000018' => '032', // Union Bank of Nigeria
+            '000011' => '215', // Unity Bank
+            '000017' => '035', // Wema Bank
+            '000015' => '057', // Zenith Bank
+            '000027' => '103', // Globus Bank
+            '000030' => '104', // Parallex Bank
+            '000031' => '105', // PremiumTrust Bank
+            // Merchant banks
+            '060001' => '559', // Coronation Merchant Bank
+            '060002' => '401', // FBNQuest Merchant Bank
+            '060003' => '060', // Nova Merchant Bank
+        ];
+        if (isset($map[$sortcode])) {
+            return $map[$sortcode];
+        }
+
+        // Dynamic fallback. If the operator gave us a bank name from
+        // Fintava's /banks row, look for a Paystack bank whose name
+        // matches by normalised compare (case + whitespace + "bank"
+        // suffix tolerance). This keeps fintech banks (OPay, Kuda,
+        // PalmPay, Moniepoint, etc.) working without us shipping a
+        // new map every time Paystack onboards one.
+        if ($bank_name !== '') {
+            $needle = self::normalize_bank_name_for_match($bank_name);
+            if ($needle !== '') {
+                foreach ($this->get_banks() as $bank) {
+                    if (self::normalize_bank_name_for_match($bank['name']) === $needle) {
+                        return $bank['code'];
+                    }
+                }
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Normalise a bank name for fuzzy matching. Lowercase, strip
+     * surrounding whitespace, collapse internal whitespace, strip
+     * common-noise tokens ("plc", "limited", "ltd", trailing "bank"
+     * with no further qualifier). Symmetric on both sides so e.g.
+     * "Access Bank Plc" / "Access Bank" / "Access" all collide on
+     * the same key.
+     */
+    public static function normalize_bank_name_for_match($name) {
+        $n = strtolower((string) $name);
+        $n = preg_replace('/\b(plc|limited|ltd|nigeria|nig)\b/u', ' ', $n);
+        $n = preg_replace('/\s+/', ' ', $n);
+        $n = trim($n);
+        $n = preg_replace('/\s+bank$/u', '', $n);
+        return trim($n);
+    }
+
+    /**
+     * GET /bank/resolve - verify a Nigerian bank account via NIBSS
+     * Name Enquiry, resold by Paystack.
+     *
+     * Used as one of two parallel resolvers in
+     * Matrix_MLM_Fintava::ajax_resolve_account - see the race_resolve_account
+     * docblock there for the full design. Paystack's resolver is free,
+     * NIBSS-backed, and tends to have wider coverage than Fintava's
+     * basic-tier /name/enquiry, especially for fintech banks (OPay,
+     * Kuda, PalmPay, Moniepoint).
+     *
+     * Bank-code shape: 3-digit CBN code (e.g. "044" for Access).
+     * Callers translating from Fintava's 6-digit NIBSS sortCode must
+     * use nibss_sortcode_to_cbn_code() first.
+     *
+     * Returns a normalized array on success, or WP_Error on any
+     * failure mode (network, non-success response, empty name).
+     */
+    public function resolve_account($account_number, $cbn_bank_code) {
+        if (empty($this->secret_key)) {
+            return new WP_Error(
+                'paystack_not_configured',
+                __('Paystack secret key not configured', 'matrix-mlm')
+            );
+        }
+
+        $url = $this->base_url . '/bank/resolve?' . http_build_query([
+            'account_number' => $account_number,
+            'bank_code'      => $cbn_bank_code,
+        ]);
+
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $this->secret_key,
+                'Accept'        => 'application/json',
+            ],
+            'timeout' => 8,
+        ]);
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (!is_array($body) || empty($body['status']) || !$body['status']) {
+            return new WP_Error(
+                'paystack_resolve_error',
+                (string) ($body['message'] ?? __('Could not resolve account via Paystack', 'matrix-mlm'))
+            );
+        }
+
+        $data = isset($body['data']) && is_array($body['data']) ? $body['data'] : [];
+        $name = trim((string) ($data['account_name'] ?? ''));
+        if ($name === '') {
+            return new WP_Error(
+                'paystack_resolve_empty',
+                __('Paystack returned no account name', 'matrix-mlm')
+            );
+        }
+
+        return [
+            'account_name'   => $name,
+            'account_number' => (string) ($data['account_number'] ?? $account_number),
+            'bank_id'        => (string) ($data['bank_id'] ?? ''),
+        ];
+    }
+
+    /**
+     * Parse a raw Paystack /bank/resolve JSON body (already decoded to
+     * array) into the same normalized shape as resolve_account().
+     * Used by the parallel-race code path which doesn't go through
+     * resolve_account because it builds the HTTP request itself for
+     * Requests::request_multiple. Returns null when the body has no
+     * usable name.
+     */
+    public static function parse_resolve_body($body) {
+        if (!is_array($body) || empty($body['status']) || !$body['status']) {
+            return null;
+        }
+        $data = isset($body['data']) && is_array($body['data']) ? $body['data'] : [];
+        $name = trim((string) ($data['account_name'] ?? ''));
+        if ($name === '') {
+            return null;
+        }
+        return [
+            'account_name'   => $name,
+            'account_number' => (string) ($data['account_number'] ?? ''),
+        ];
+    }
+
+    /**
+     * Return the secret key for read-only resolvers (bank-resolve).
+     * Used by the parallel-race code path so it can build the
+     * Authorization header for Requests::request_multiple without
+     * reaching into the private property. Returns '' when Paystack
+     * isn't configured - caller drops the Paystack leg of the race.
+     */
+    public function get_secret_key_for_resolver() {
+        return (string) $this->secret_key;
+    }
 }
