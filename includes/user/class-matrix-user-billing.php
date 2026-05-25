@@ -686,15 +686,17 @@ class Matrix_MLM_User_Billing {
         // handler still references the matched element (the form),
         // so the handler body works unchanged.
         //
-        // Scope: airtime form only. The data / cable / electricity
-        // forms have the SAME parse-time IIFE bug, but they still
-        // end every successful path in `location.reload()`, so a
-        // failed-bind native form submit looks identical to a
-        // successful AJAX + reload from the user's POV (page
-        // refreshes either way) — they don't *notice* the bug.
-        // When PR #277's inline-success-notice UX is ported to those
-        // three forms (the planned follow-up), each of them needs
-        // the same guard applied.
+        // Scope: applies to all four bill forms. Each form has its
+        // own copy of this guard inline because they each ship
+        // their own <script> block. The data / cable / electricity
+        // forms used to end every successful path in
+        // `location.reload()`, so a failed-bind native form submit
+        // looked identical to a successful AJAX + reload from the
+        // user's POV (page refreshes either way) — they didn't
+        // *notice* the bug. The follow-up PR that ports this
+        // form's inline-success-notice UX to those three forms
+        // also needs the guard, which is why all four copies live
+        // here.
         (function() {
             var attempts = 0;
             var maxAttempts = 200; // 200 * 50ms = 10s ceiling
@@ -908,11 +910,42 @@ class Matrix_MLM_User_Billing {
             $(document).on('submit', '#matrix-billing-data', function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
-                    alert(window.matrixBillingExtractMessage(r));
-                    if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Data');
+                    var msg = window.matrixBillingExtractMessage(r);
+                    if(r.success){
+                        // Show success inline INSTEAD of alert() +
+                        // location.reload(). Same rationale as the
+                        // airtime form earlier in this file: once
+                        // bill payments started succeeding reliably,
+                        // the full-page reload looked to users like a
+                        // silent page refresh that "ate" their form.
+                        // The new transaction will appear in "Recent
+                        // Bill Payments" on the next manual refresh;
+                        // the inline notice contains the per-purchase
+                        // confirmation so they don't NEED to refresh
+                        // to know it worked.
+                        window.matrixBillingShowNotice('#matrix-billing-data', 'success', msg);
+                        // Reset for a second purchase. Keep network
+                        // (user is likely buying more data on the same
+                        // line); clear phone + PIN; reset plan to its
+                        // initial "select network first" state and
+                        // re-disable the submit button until a plan
+                        // is picked again. Hide fee preview so it
+                        // doesn't show stale numbers for amount=0.
+                        f.find('[name=phone]').val('');
+                        f.find('[name=transaction_pin]').val('');
+                        $('#data-plan').empty()
+                            .append('<option value="">' + '<?php echo esc_js(__('Select network first', 'matrix-mlm')); ?>' + '</option>')
+                            .prop('disabled', true);
+                        f.find('[name=amount]').val('0');
+                        f.find('.matrix-fee-preview').hide();
+                        b.prop('disabled', true).text('Buy Data');
+                    } else {
+                        window.matrixBillingShowNotice('#matrix-billing-data', 'error', msg);
+                        b.prop('disabled', false).text('Buy Data');
+                    }
                 }).fail(function(){
-                    alert('Network error. Please check your connection and try again.');
-                    b.prop('disabled',false).text('Buy Data');
+                    window.matrixBillingShowNotice('#matrix-billing-data', 'error', 'Network error. Please check your connection and try again.');
+                    b.prop('disabled', false).text('Buy Data');
                 });
             });
             }); // whenJQueryReady
@@ -1035,11 +1068,37 @@ class Matrix_MLM_User_Billing {
             $(document).on('submit', '#matrix-billing-cable', function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
-                    alert(window.matrixBillingExtractMessage(r));
-                    if(r.success) location.reload(); else b.prop('disabled',false).text('Subscribe');
+                    var msg = window.matrixBillingExtractMessage(r);
+                    if(r.success){
+                        // Show success inline — same rationale as the
+                        // airtime form earlier in this file. See that
+                        // handler for the full motivation behind
+                        // dropping location.reload().
+                        window.matrixBillingShowNotice('#matrix-billing-cable', 'success', msg);
+                        // Reset for a second subscription. Keep the
+                        // provider selection (the user is likely
+                        // managing multiple smartcards on the same
+                        // provider — DSTV/GoTV bouquets, say); clear
+                        // smartcard + PIN; reset plan to its initial
+                        // "select provider first" state and re-disable
+                        // the submit button until a plan is picked
+                        // again. Hide fee preview so it doesn't show
+                        // stale numbers for amount=0.
+                        f.find('[name=smartcard_number]').val('');
+                        f.find('[name=transaction_pin]').val('');
+                        $('#cable-plan').empty()
+                            .append('<option value="">' + '<?php echo esc_js(__('Select provider first', 'matrix-mlm')); ?>' + '</option>')
+                            .prop('disabled', true);
+                        f.find('[name=amount]').val('0');
+                        f.find('.matrix-fee-preview').hide();
+                        b.prop('disabled', true).text('Subscribe');
+                    } else {
+                        window.matrixBillingShowNotice('#matrix-billing-cable', 'error', msg);
+                        b.prop('disabled', false).text('Subscribe');
+                    }
                 }).fail(function(){
-                    alert('Network error. Please check your connection and try again.');
-                    b.prop('disabled',false).text('Subscribe');
+                    window.matrixBillingShowNotice('#matrix-billing-cable', 'error', 'Network error. Please check your connection and try again.');
+                    b.prop('disabled', false).text('Subscribe');
                 });
             });
             }); // whenJQueryReady
@@ -1160,10 +1219,17 @@ class Matrix_MLM_User_Billing {
                         var info = window.matrixBillingFormatMeterInfo(r.data && r.data.meter);
                         if (info) { $('#meter-info').text(info).show(); }
                         else { $('#meter-info').text('Meter verified.').show(); }
-                    } else { alert(window.matrixBillingExtractMessage(r, 'Could not verify meter. Please try again.')); }
+                    } else {
+                        // Surface verify failures via the same inline
+                        // notice the submit handler uses, rather than
+                        // alert() — keeps a single feedback channel
+                        // for the form so the user isn't bouncing
+                        // between modal alerts and inline banners.
+                        window.matrixBillingShowNotice('#matrix-billing-electricity', 'error', window.matrixBillingExtractMessage(r, 'Could not verify meter. Please try again.'));
+                    }
                 }).fail(function(){
                     btn.prop('disabled',false).text('Verify Meter');
-                    alert('Network error verifying meter. Please check your connection and try again.');
+                    window.matrixBillingShowNotice('#matrix-billing-electricity', 'error', 'Network error verifying meter. Please check your connection and try again.');
                 });
             });
             // Recompute the fee preview as the user types the amount.
@@ -1174,10 +1240,37 @@ class Matrix_MLM_User_Billing {
                 e.preventDefault(); var f=$(this),b=f.find('button[type=submit]'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_electricity',nonce:matrixMLM.nonce,meter_number:f.find('[name=meter_number]').val(),amount:f.find('[name=amount]').val(),disco:f.find('[name=disco]').val(),meter_type:f.find('[name=meter_type]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     var msg = window.matrixBillingExtractMessage(r);
-                    if(r.success){ alert(msg); location.reload(); } else { alert(msg); b.prop('disabled',false).text('Pay Electricity'); }
+                    if(r.success){
+                        // Show success inline — same rationale as the
+                        // airtime form earlier in this file. See that
+                        // handler for the full motivation behind
+                        // dropping location.reload(). For electricity
+                        // the success message also typically carries
+                        // the prepaid token (server-side), so showing
+                        // it inline (instead of in an alert dialog
+                        // that disappears on dismissal) means the
+                        // token stays visible on the page until the
+                        // user explicitly navigates away.
+                        window.matrixBillingShowNotice('#matrix-billing-electricity', 'success', msg);
+                        // Reset for a second purchase. Keep disco +
+                        // meter_type (user is likely paying for the
+                        // same meter again later, or topping up a
+                        // different meter on the same disco); clear
+                        // meter_number, amount, PIN; hide the
+                        // verified-meter info card and fee preview
+                        // so a stale meter readout doesn't linger.
+                        f.find('[name=meter_number]').val('');
+                        f.find('[name=amount]').val('');
+                        f.find('[name=transaction_pin]').val('');
+                        $('#meter-info').hide().text('');
+                        f.find('.matrix-fee-preview').hide();
+                    } else {
+                        window.matrixBillingShowNotice('#matrix-billing-electricity', 'error', msg);
+                    }
+                    b.prop('disabled', false).text('Pay Electricity');
                 }).fail(function(){
-                    alert('Network error. Please check your connection and try again.');
-                    b.prop('disabled',false).text('Pay Electricity');
+                    window.matrixBillingShowNotice('#matrix-billing-electricity', 'error', 'Network error. Please check your connection and try again.');
+                    b.prop('disabled', false).text('Pay Electricity');
                 });
             });
             }); // whenJQueryReady
