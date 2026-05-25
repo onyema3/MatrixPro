@@ -400,31 +400,152 @@ class Matrix_MLM_Wallet {
      * SELECT would emit a "table doesn't exist" warning into the
      * wallet page render).
      */
-    public function get_unified_transactions($user_id, $limit = 50) {
+    public function get_unified_transactions($user_id, $limit = 50, $offset = 0) {
         global $wpdb;
 
-        $rows = [];
+        $offset = max(0, (int) $offset);
+        $limit  = max(1, (int) $limit);
 
-        // Source 1: the canonical Matrix wallet ledger. Already
-        // covers every credit/debit that touches the Matrix
-        // balance.
-        $wallet_rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT created_at, type, amount, post_balance, description, status, transaction_type, reference
-             FROM {$wpdb->prefix}matrix_wallet
-             WHERE user_id = %d
-             ORDER BY created_at DESC
-             LIMIT %d",
-            $user_id, $limit
+        // matrix_fintava_payouts is created lazily by the Fintava
+        // gateway. Probe its existence so a Fintava-disabled install
+        // doesn't blow up the SELECT with a "table doesn't exist"
+        // warning.
+        $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
+        $table_exists = (bool) $wpdb->get_var($wpdb->prepare(
+            "SELECT 1 FROM information_schema.tables
+             WHERE table_schema = %s AND table_name = %s LIMIT 1",
+            DB_NAME, $payouts_table
         ));
-        foreach ($wallet_rows as $r) {
-            $r->source = 'matrix';
-            $rows[] = $r;
+
+        if (!$table_exists) {
+            // Single-source fallback. Page directly off matrix_wallet.
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT created_at, type, amount, post_balance, description,
+                        status, transaction_type, reference,
+                        NULL AS bank_name, NULL AS account_number,
+                        NULL AS narration, NULL AS failure_reason
+                 FROM {$wpdb->prefix}matrix_wallet
+                 WHERE user_id = %d
+                 ORDER BY created_at DESC
+                 LIMIT %d OFFSET %d",
+                $user_id, $limit, $offset
+            ));
+            foreach ($rows as $r) {
+                $r->source = 'matrix';
+            }
+            return $rows;
         }
 
-        // Source 2: Fintava bank payouts. These never touch
-        // matrix_wallet, so we have to merge them in here. Probe
-        // for the table first (Fintava-disabled installs won't
-        // have it).
+        // Both sources present. UNION ALL into a single derived
+        // table, then ORDER + LIMIT/OFFSET on the union — this is
+        // the correct strategy for paginating across two
+        // heterogeneous sources. A naive per-source LIMIT+OFFSET
+        // followed by a PHP merge gets pages 2+ wrong: the global
+        // top-N rows aren't the top-N from each source, so paging
+        // would skip arbitrary rows whenever one source had a
+        // dense run of timestamps.
+        //
+        // Each branch projects the same column list; bank-payout
+        // rows fill the matrix-only slots (post_balance,
+        // description, transaction_type) with NULL/sentinels and
+        // carry the bank-only metadata (bank_name, account_number,
+        // narration, failure_reason) so the renderer can build the
+        // masked "Transfer to Bank — Bank ****1234" description
+        // from the row data without a follow-up query.
+        $sql = "
+            SELECT * FROM (
+                (SELECT
+                    created_at,
+                    type,
+                    amount,
+                    post_balance,
+                    description,
+                    status,
+                    transaction_type,
+                    reference,
+                    NULL AS bank_name,
+                    NULL AS account_number,
+                    NULL AS narration,
+                    NULL AS failure_reason,
+                    'matrix' AS source
+                 FROM {$wpdb->prefix}matrix_wallet
+                 WHERE user_id = %d)
+                UNION ALL
+                (SELECT
+                    created_at,
+                    'debit' AS type,
+                    total_debit AS amount,
+                    NULL AS post_balance,
+                    NULL AS description,
+                    status,
+                    'bank_transfer' AS transaction_type,
+                    reference,
+                    bank_name,
+                    account_number,
+                    narration,
+                    failure_reason,
+                    'bank' AS source
+                 FROM $payouts_table
+                 WHERE user_id = %d)
+            ) AS unified
+            ORDER BY created_at DESC
+            LIMIT %d OFFSET %d
+        ";
+        $rows = $wpdb->get_results($wpdb->prepare(
+            $sql, $user_id, $user_id, $limit, $offset
+        ));
+
+        // Build the human-readable description for bank-payout
+        // rows from the per-row metadata. Account numbers are
+        // masked to last-4 because the unified history lives
+        // behind a single-factor session and we don't want the
+        // full NUBAN appearing in plain text alongside arbitrary
+        // wallet activity.
+        foreach ($rows as $r) {
+            if ($r->source === 'bank') {
+                $acct = (string) $r->account_number;
+                $masked = strlen($acct) >= 4
+                    ? '****' . substr($acct, -4)
+                    : $acct;
+                $desc = sprintf(
+                    /* translators: 1: bank name, 2: masked account number */
+                    __('Transfer to Bank — %1$s %2$s', 'matrix-mlm'),
+                    $r->bank_name,
+                    $masked
+                );
+                if (!empty($r->narration)) {
+                    $desc .= ' — ' . $r->narration;
+                }
+                if ($r->status === 'failed' && !empty($r->failure_reason)) {
+                    $desc .= ' (' . $r->failure_reason . ')';
+                }
+                $r->description = $desc;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Total count across the same two sources get_unified_transactions()
+     * pages over (matrix_wallet + matrix_fintava_payouts). The wallet
+     * page's pagination chrome reads this to compute total_pages =
+     * ceil(count / per_page).
+     *
+     * Two cheap COUNT(*) calls — both keyed on indexed user_id — are
+     * simpler and faster than a SELECT COUNT(*) over the unified
+     * derived table. Fintava-disabled installs gracefully return just
+     * the matrix_wallet count via the same INFORMATION_SCHEMA probe
+     * get_unified_transactions() uses.
+     */
+    public function get_unified_transactions_count($user_id) {
+        global $wpdb;
+
+        $count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_wallet WHERE user_id = %d",
+            $user_id
+        ));
+
         $payouts_table = $wpdb->prefix . 'matrix_fintava_payouts';
         $table_exists = (bool) $wpdb->get_var($wpdb->prepare(
             "SELECT 1 FROM information_schema.tables
@@ -432,61 +553,13 @@ class Matrix_MLM_Wallet {
             DB_NAME, $payouts_table
         ));
         if ($table_exists) {
-            $payout_rows = $wpdb->get_results($wpdb->prepare(
-                "SELECT created_at, total_debit, bank_name, account_number, narration, status, reference, failure_reason
-                 FROM $payouts_table
-                 WHERE user_id = %d
-                 ORDER BY created_at DESC
-                 LIMIT %d",
-                $user_id, $limit
+            $count += (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $payouts_table WHERE user_id = %d",
+                $user_id
             ));
-            foreach ($payout_rows as $p) {
-                // Mask the destination account in the description
-                // so the unified history doesn't print full bank
-                // account numbers in plain text on a page that
-                // sits behind a single-factor session. The full
-                // number is still on the dedicated Bank Payout
-                // history page.
-                $acct = (string) $p->account_number;
-                $masked = strlen($acct) >= 4
-                    ? '****' . substr($acct, -4)
-                    : $acct;
-                $desc = sprintf(
-                    /* translators: 1: bank name, 2: masked account number */
-                    __('Transfer to Bank — %1$s %2$s', 'matrix-mlm'),
-                    $p->bank_name,
-                    $masked
-                );
-                if (!empty($p->narration)) {
-                    $desc .= ' — ' . $p->narration;
-                }
-                if ($p->status === 'failed' && !empty($p->failure_reason)) {
-                    $desc .= ' (' . $p->failure_reason . ')';
-                }
-
-                $rows[] = (object) [
-                    'created_at'       => $p->created_at,
-                    'type'             => 'debit',
-                    'amount'           => $p->total_debit,
-                    'post_balance'     => null,
-                    'description'      => $desc,
-                    'status'           => $p->status,
-                    'transaction_type' => 'bank_transfer',
-                    'reference'        => $p->reference,
-                    'source'           => 'bank',
-                ];
-            }
         }
 
-        // Merge-sort and trim. created_at is a MySQL DATETIME
-        // string ('YYYY-MM-DD HH:MM:SS') so a lexicographic
-        // strcmp gives us correct chronological ordering without
-        // a strtotime() round-trip per row.
-        usort($rows, function ($a, $b) {
-            return strcmp((string) $b->created_at, (string) $a->created_at);
-        });
-
-        return array_slice($rows, 0, $limit);
+        return $count;
     }
 
     /**

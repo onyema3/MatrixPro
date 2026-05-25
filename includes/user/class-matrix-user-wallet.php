@@ -1102,10 +1102,27 @@ class Matrix_MLM_User_Wallet {
      * at the top of the page).
      */
     private function render_transaction_history($user_id, $currency) {
-        $wallet       = new Matrix_MLM_Wallet();
-        $transactions = $wallet->get_unified_transactions($user_id, 50);
+        $wallet         = new Matrix_MLM_Wallet();
+        $per_page       = 10;
+        $total_count    = (int) $wallet->get_unified_transactions_count($user_id);
+        $total_pages    = $total_count > 0 ? (int) ceil($total_count / $per_page) : 1;
+
+        // Page comes in via ?wallet_tx_page=N. The param name is
+        // namespaced (not just "page" / "p") so it doesn't collide
+        // with WordPress's own `page` query var on the dashboard
+        // tab router or with any other paginated table on the same
+        // page. Clamp to [1, total_pages] so a hand-crafted URL
+        // can't push the OFFSET past the last row (would render an
+        // empty table with no way to navigate back without editing
+        // the URL).
+        $current_page = isset($_GET['wallet_tx_page']) ? (int) $_GET['wallet_tx_page'] : 1;
+        if ($current_page < 1)            { $current_page = 1; }
+        if ($current_page > $total_pages) { $current_page = $total_pages; }
+        $offset = ($current_page - 1) * $per_page;
+
+        $transactions = $wallet->get_unified_transactions($user_id, $per_page, $offset);
         ?>
-        <section class="matrix-wallet-tx-history">
+        <section class="matrix-wallet-tx-history" id="matrix-wallet-tx-history">
             <h2><?php esc_html_e('Transaction History', 'matrix-mlm'); ?></h2>
             <p class="matrix-subtitle">
                 <?php esc_html_e('Every credit and debit across your Matrix wallet and bank transfers, in one timeline.', 'matrix-mlm'); ?>
@@ -1162,8 +1179,100 @@ class Matrix_MLM_User_Wallet {
                         <?php endforeach; ?>
                     </tbody>
                 </table>
+
+                <?php
+                // Pagination chrome. Rendered only when there's more
+                // than one page so a small ledger doesn't carry
+                // visual noise. Anchored to #matrix-wallet-tx-history
+                // so clicking Previous/Next jumps the viewport back
+                // to the table heading instead of leaving the user
+                // at the top of the page after the action panes.
+                $this->render_pagination_nav(
+                    $current_page,
+                    $total_pages,
+                    'wallet_tx_page',
+                    'matrix-wallet-tx-history'
+                );
+                ?>
             <?php endif; ?>
         </section>
+        <?php
+    }
+
+    /**
+     * Render Previous / Next pagination links plus a "Page X of Y"
+     * indicator. Centralised here so every paginated table on this
+     * page (currently just the unified Transaction History; future
+     * paginated panes can reuse the same chrome) renders an
+     * identical control without duplicating the link-building
+     * boilerplate.
+     *
+     * URL-building strategy: add_query_arg on the current request
+     * URI preserves any other query params already on the page
+     * (the dashboard tab router relies on those, so a click on
+     * Next must NOT drop them — otherwise the user lands back on
+     * the overview tab without their wallet selection). The page
+     * param name is supplied by the caller because each paginated
+     * table on the page must use a unique name to avoid collisions
+     * — this method has no opinion on the namespace.
+     *
+     * The fragment ($section_id) is appended manually because
+     * add_query_arg() doesn't take fragments. Anchoring back to
+     * the table means the user lands at the heading they were
+     * looking at, not at the page top — small detail, but the
+     * difference between "feels paginated" and "feels broken" on
+     * a long page.
+     *
+     * Disabled "Previous" on page 1 and "Next" on the last page
+     * are rendered as a span (not <a>) so they're visually muted
+     * and not clickable; this avoids the "click does nothing"
+     * dead-end while keeping the layout stable across pages.
+     *
+     * @param int    $current_page  1-indexed.
+     * @param int    $total_pages   >= 1.
+     * @param string $param_name    URL query var to read/write.
+     * @param string $section_id    HTML id (no leading #) to anchor
+     *                              the prev/next links to.
+     */
+    private function render_pagination_nav($current_page, $total_pages, $param_name, $section_id = '') {
+        if ($total_pages <= 1) {
+            return;
+        }
+
+        $base_url = remove_query_arg($param_name);
+        $fragment = $section_id !== '' ? '#' . $section_id : '';
+
+        $prev_url = $current_page > 1
+            ? esc_url(add_query_arg($param_name, $current_page - 1, $base_url) . $fragment)
+            : '';
+        $next_url = $current_page < $total_pages
+            ? esc_url(add_query_arg($param_name, $current_page + 1, $base_url) . $fragment)
+            : '';
+        ?>
+        <nav class="matrix-pagination" aria-label="<?php esc_attr_e('Transaction history pagination', 'matrix-mlm'); ?>">
+            <?php if ($prev_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $prev_url; ?>" rel="prev">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></span>
+            <?php endif; ?>
+
+            <span class="matrix-page-info">
+                <?php
+                printf(
+                    /* translators: 1: current page number, 2: total page count */
+                    esc_html__('Page %1$d of %2$d', 'matrix-mlm'),
+                    (int) $current_page,
+                    (int) $total_pages
+                );
+                ?>
+            </span>
+
+            <?php if ($next_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $next_url; ?>" rel="next"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</span>
+            <?php endif; ?>
+        </nav>
         <?php
     }
 
@@ -1954,6 +2063,54 @@ class Matrix_MLM_User_Wallet {
             color: #1f2937;
         }
         .matrix-wallet-tx-history .matrix-table { margin-top: 0; }
+
+        /* Pagination chrome — used by the Transaction History
+           below the action panes (and by any future paginated
+           table on this page; see render_pagination_nav). The
+           layout is a three-column row: prev button on the left,
+           "Page X of Y" indicator centred, next button on the
+           right. Disabled prev/next on the first/last page render
+           as muted spans (not <a>) so they're visually distinct
+           from clickable buttons and don't lead to a dead-end
+           click. */
+        .matrix-pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-top: 16px;
+            padding: 12px 0 4px;
+            font-size: 14px;
+            color: #4b5563;
+        }
+        .matrix-page-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            color: #1f2937;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background .15s ease, border-color .15s ease;
+        }
+        .matrix-page-btn:hover {
+            background: #eef2ff;
+            border-color: #4f46e5;
+            color: #4f46e5;
+        }
+        .matrix-page-btn-disabled,
+        .matrix-page-btn-disabled:hover {
+            color: #9ca3af;
+            background: #f9fafb;
+            border-color: #e5e7eb;
+            cursor: not-allowed;
+        }
+        .matrix-page-info {
+            font-variant-numeric: tabular-nums;
+            color: #6b7280;
+        }
 
         .matrix-wallet-history-heading { margin-top: 24px; }
 
