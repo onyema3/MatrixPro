@@ -11,8 +11,6 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_User_Billing {
 
     public function render($user_id) {
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $billing = new Matrix_MLM_Fintava_Billing();
         $history = $billing->get_user_history($user_id, null, 10);
@@ -44,12 +42,68 @@ class Matrix_MLM_User_Billing {
         if (!isset($enabled_categories[$sub_tab])) {
             $sub_tab = $all_disabled ? '' : array_key_first($enabled_categories);
         }
+
+        // PR #294 — bill payments are sourced from the user's
+        // Fintava virtual wallet (the same wallet that funds bank
+        // payouts). Resolve the wallet up-front so the page can
+        // render either the balance + low-balance warning OR the
+        // create-wallet CTA, instead of the form. The submit-time
+        // /transaction/wallet-to-wallet call is the authoritative
+        // gate; this page-time read is a UX hint.
+        //
+        // Two distinct failure modes intentionally surfaced
+        // separately because they have different recovery paths:
+        //   - no_wallet  → user-recoverable via the Wallet tab's
+        //                  "Create Fintava virtual wallet" form
+        //                  (full KYC flow). The form below is
+        //                  hidden; we render a CTA pointing at
+        //                  Wallet instead so the user can't
+        //                  submit a purchase that's guaranteed
+        //                  to fail.
+        //   - api_error  → transient Fintava balance-endpoint
+        //                  failure; not a hard block. We let the
+        //                  form render with a stale-balance hint
+        //                  and rely on the submit-time check to
+        //                  enforce funding.
+        $fintava        = new Matrix_MLM_Fintava();
+        $virtual_wallet = $fintava->get_user_wallet($user_id);
+        $balance        = null;   // available_balance on success, null on failure
+        $balance_error  = '';     // human-readable failure message
+        $balance_reason = '';     // 'no_wallet' | 'api_error' | ''
+        if (!$virtual_wallet) {
+            $balance_reason = 'no_wallet';
+            $balance_error  = __('You need a Fintava virtual wallet to pay bills.', 'matrix-mlm');
+        } else {
+            $balance_result = $fintava->get_virtual_wallet_balance(
+                $virtual_wallet->wallet_id ?? '',
+                $virtual_wallet->account_number ?? null,
+                $virtual_wallet->customer_id ?? null
+            );
+            if (is_wp_error($balance_result)) {
+                $balance_reason = 'api_error';
+                $balance_error  = Matrix_MLM_Fintava::normalize_api_message(
+                    $balance_result->get_error_message(),
+                    __('Balance is unavailable.', 'matrix-mlm')
+                );
+            } elseif (isset($balance_result['available_balance']) && is_numeric($balance_result['available_balance'])) {
+                $balance = (float) $balance_result['available_balance'];
+            } else {
+                $balance_reason = 'api_error';
+                $balance_error  = __('Balance is unavailable.', 'matrix-mlm');
+            }
+        }
+
         // Matrix_MLM_Fintava_Billing::MIN_AMOUNT is the floor every
         // upstream call enforces (see validate_amount), so use it as
         // the threshold for the "your balance is too low" inline
         // warning rather than a magic number that could drift.
         $min_amount = Matrix_MLM_Fintava_Billing::MIN_AMOUNT;
-        $low_balance = ($balance < $min_amount);
+        // low_balance only triggers when we have a definitive
+        // numeric balance below the floor. A failed balance lookup
+        // (api_error) leaves $balance NULL — we don't know whether
+        // the wallet is low, so we don't warn; the submit-time
+        // pre-flight is the source of truth.
+        $low_balance = ($balance !== null && $balance < $min_amount);
 
         // Service fee config (item C). Inlined as a JSON blob on the
         // page so each form can render a client-side fee preview
@@ -63,7 +117,7 @@ class Matrix_MLM_User_Billing {
         $markup_config = Matrix_MLM_Fintava_Billing::get_markup_config();
         ?>
         <h2><?php _e('Bill Payments', 'matrix-mlm'); ?></h2>
-        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Matrix wallet.', 'matrix-mlm'); ?></p>
+        <p class="matrix-subtitle"><?php _e('Buy airtime, data bundles, cable TV subscriptions, and pay electricity bills. All payments are debited from your Fintava virtual wallet.', 'matrix-mlm'); ?></p>
 
         <script>
         // Exposed once for all four bill forms on this page. Each
@@ -241,23 +295,39 @@ class Matrix_MLM_User_Billing {
         ?>
 
         <div class="matrix-info-box" style="margin-bottom:16px;">
-            <p style="margin:0;"><strong><?php _e('Payment Source:', 'matrix-mlm'); ?></strong> <?php _e('Matrix Wallet', 'matrix-mlm'); ?></p>
-            <p style="margin:6px 0 0;font-size:13px;color:#374151;">
-                <?php _e('Available balance:', 'matrix-mlm'); ?>
-                <strong><?php echo esc_html($currency . number_format($balance, 2)); ?></strong>
-                <a href="<?php echo esc_url(Matrix_MLM_User_Dashboard::tab_url('deposits')); ?>" style="margin-left:10px;font-size:12px;"><?php _e('Add funds &rarr;', 'matrix-mlm'); ?></a>
-            </p>
-            <?php if ($low_balance): ?>
-            <p style="margin:6px 0 0;font-size:12px;color:#b91c1c;">
-                <?php
-                printf(
-                    /* translators: %1$s: currency symbol, %2$s: minimum amount, formatted */
-                    esc_html__('Your balance is below the minimum bill amount of %1$s%2$s. Please fund your wallet before submitting a purchase.', 'matrix-mlm'),
-                    esc_html($currency),
-                    esc_html(number_format($min_amount, 2))
-                );
-                ?>
-            </p>
+            <p style="margin:0;"><strong><?php _e('Payment Source:', 'matrix-mlm'); ?></strong> <?php _e('Fintava Virtual Wallet', 'matrix-mlm'); ?></p>
+            <?php if ($balance_reason === 'no_wallet'): ?>
+                <p style="margin:6px 0 0;font-size:13px;color:#b91c1c;">
+                    <?php esc_html_e('You don\'t have a Fintava virtual wallet yet. Set one up before paying bills.', 'matrix-mlm'); ?>
+                    <a href="<?php echo esc_url(Matrix_MLM_User_Dashboard::tab_url('wallet')); ?>" style="margin-left:10px;font-size:12px;"><?php esc_html_e('Open Wallet &rarr;', 'matrix-mlm'); ?></a>
+                </p>
+            <?php elseif ($balance_reason === 'api_error'): ?>
+                <p style="margin:6px 0 0;font-size:13px;color:#374151;">
+                    <?php esc_html_e('Available balance:', 'matrix-mlm'); ?>
+                    <strong title="<?php echo esc_attr($balance_error); ?>">&mdash;</strong>
+                    <a href="<?php echo esc_url(Matrix_MLM_User_Dashboard::tab_url('wallet')); ?>" style="margin-left:10px;font-size:12px;"><?php esc_html_e('Refresh in Wallet &rarr;', 'matrix-mlm'); ?></a>
+                </p>
+                <p style="margin:6px 0 0;font-size:12px;color:#92400e;">
+                    <?php esc_html_e('We couldn\'t fetch your virtual wallet balance from Fintava just now. Your purchase will still go through if your virtual wallet is funded — we re-check at submit time.', 'matrix-mlm'); ?>
+                </p>
+            <?php else: ?>
+                <p style="margin:6px 0 0;font-size:13px;color:#374151;">
+                    <?php esc_html_e('Available balance:', 'matrix-mlm'); ?>
+                    <strong><?php echo esc_html($currency . number_format((float) $balance, 2)); ?></strong>
+                    <a href="<?php echo esc_url(Matrix_MLM_User_Dashboard::tab_url('wallet')); ?>" style="margin-left:10px;font-size:12px;"><?php esc_html_e('Fund wallet &rarr;', 'matrix-mlm'); ?></a>
+                </p>
+                <?php if ($low_balance): ?>
+                <p style="margin:6px 0 0;font-size:12px;color:#b91c1c;">
+                    <?php
+                    printf(
+                        /* translators: %1$s: currency symbol, %2$s: minimum amount, formatted */
+                        esc_html__('Your Fintava virtual wallet balance is below the minimum bill amount of %1$s%2$s. Please fund your virtual wallet before submitting a purchase.', 'matrix-mlm'),
+                        esc_html($currency),
+                        esc_html(number_format($min_amount, 2))
+                    );
+                    ?>
+                </p>
+                <?php endif; ?>
             <?php endif; ?>
         </div>
 

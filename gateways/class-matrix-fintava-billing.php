@@ -15,14 +15,41 @@
  *
  * Funds flow:
  *   The Fintava billing API debits the merchant's master Fintava
- *   account when these endpoints are called. To make the user pay
- *   for what they actually consume, every bill-purchase handler in
- *   this class debits the user's MatrixPro internal wallet
- *   (matrix_user_meta.balance) BEFORE calling the upstream API.
- *   On API failure the wallet is refunded; on API success the
- *   debit stands and the merchant has been reimbursed by the user.
+ *   wallet when these endpoints are called (the wallet whose NUBAN
+ *   is configured as the "operating account" admin-side — Fintava
+ *   identifies it via the merchant ID in the request header).
+ *   To make the user pay for what they actually consume, every
+ *   bill-purchase handler in this class moves the bill total from
+ *   the user's Fintava virtual wallet into the merchant's
+ *   master/operating wallet via POST /transaction/wallet-to-wallet
+ *   BEFORE calling the upstream billing endpoint. On billing-API
+ *   failure the wallet-to-wallet is reversed (merchant -> user's
+ *   virtual wallet) so the user is made whole; on billing-API
+ *   success the move stands and the merchant has been reimbursed
+ *   by the user with the service fee accruing on the merchant
+ *   wallet as the difference between the wallet-to-wallet `total`
+ *   and the billing endpoint's `nominal` debit.
  *
- *   Previously these handlers ran the API call without ever
+ *   This is a deliberate change from the pre-PR-#294 architecture
+ *   where the user's MatrixPro internal wallet (matrix_user_meta.
+ *   balance) was the source. The internal-wallet path required
+ *   users to pre-fund the Matrix wallet (typically by transferring
+ *   from their Fintava virtual wallet first), which created a
+ *   confusing two-step "fund Fintava → transfer to Matrix → buy
+ *   bill" experience for what is conceptually one purchase. The
+ *   virtual-wallet-as-source model collapses that into one step
+ *   and aligns bill payments with the bank-payout flow, which has
+ *   always sourced from the user's virtual wallet.
+ *
+ *   For migration safety, every matrix_billing_transactions row
+ *   carries a `source_wallet` column ('matrix' or 'virtual') that
+ *   records which wallet was actually debited. Pre-PR-#294 rows
+ *   are stamped 'matrix' (the column DEFAULT) so an admin-initiated
+ *   refund or a future reconciliation worker can route the credit
+ *   back to the correct wallet without having to infer it from
+ *   row age. Post-PR-#294 rows are stamped 'virtual'.
+ *
+ *   Before C1, these handlers ran the API call without ever
  *   debiting the user, so any logged-in member could buy unlimited
  *   airtime / data / cable / electricity at the merchant's expense.
  *   See security audit C1.
@@ -1067,19 +1094,25 @@ class Matrix_MLM_Fintava_Billing {
         $fee   = self::compute_service_fee($type, $nominal);
         $total = round($nominal + $fee, 2);
 
-        // 1. Debit the user's wallet for the full total.
-        $debit = self::debit_for_purchase($user_id, $total, $type, $debit_description);
+        // 1. Move the full total from the user's Fintava virtual wallet
+        //    into the merchant master/operating wallet. The /billing/<type>
+        //    call below debits the merchant master wallet, so funding it
+        //    from the user's virtual wallet first is what makes the user
+        //    the actual payer. The fee accrues on the merchant wallet as
+        //    the gap between this `total` debit and the `nominal` upstream
+        //    debit.
+        $debit = self::debit_via_virtual_wallet($user_id, $total, $type, $debit_description);
         if (is_wp_error($debit)) {
             // Special-case the insufficient-balance error: rebuild
             // it with a fee-aware message that surfaces the
             // breakdown (nominal / fee / total / balance / shortfall).
-            // The default "Insufficient wallet balance. Please fund
-            // your wallet first." is correct but misleading when the
-            // user can plainly see their wallet has more than the
-            // bill amount but is being told it's not enough — that's
-            // the symptom of a too-large flat-fee config, and a
-            // breakdown lets the user (and ops) diagnose it
-            // immediately rather than guess.
+            // The default "Insufficient Fintava virtual wallet
+            // balance." is correct but misleading when the user can
+            // plainly see their wallet has more than the bill amount
+            // but is being told it's not enough — that's the symptom
+            // of a too-large flat-fee config, and a breakdown lets
+            // the user (and ops) diagnose it immediately rather than
+            // guess.
             if ($debit->get_error_code() === 'insufficient_balance') {
                 $err_data = $debit->get_error_data();
                 $balance  = is_array($err_data) && isset($err_data['balance'])
@@ -1100,7 +1133,8 @@ class Matrix_MLM_Fintava_Billing {
             ];
         }
         $debit_reference = $debit;
-        $details['debit_ref'] = $debit_reference;
+        $details['debit_ref']     = $debit_reference;
+        $details['source_wallet'] = 'virtual';
 
         // 2. Generate the idempotency reference and INSERT a
         //    `pending` row BEFORE the upstream call. The unique
@@ -1118,7 +1152,8 @@ class Matrix_MLM_Fintava_Billing {
             $type,
             ['nominal' => $nominal, 'fee' => $fee, 'total' => $total],
             $details,
-            $client_reference
+            $client_reference,
+            'virtual'
         );
         if ($tx_id === 0) {
             // Row insert failed (DB error or, vanishingly, UNIQUE
@@ -1135,7 +1170,7 @@ class Matrix_MLM_Fintava_Billing {
             // wallet-side noise.
             $support_ref = $this->last_begin_support_ref;
             self::refund_failed_purchase(
-                $user_id, $total, $type, $debit_reference,
+                $user_id, $total, $type, $debit_reference, 'virtual',
                 __('Internal error: could not record transaction.', 'matrix-mlm')
             );
             // The token is null only on the defensive code path
@@ -1182,7 +1217,7 @@ class Matrix_MLM_Fintava_Billing {
             }
             $this->fail_transaction($tx_id, $result);
             self::refund_failed_purchase(
-                $user_id, $total, $type, $debit_reference, $result->get_error_message()
+                $user_id, $total, $type, $debit_reference, 'virtual', $result->get_error_message()
             );
             return [
                 'kind'           => 'http_error',
@@ -1255,13 +1290,13 @@ class Matrix_MLM_Fintava_Billing {
 
             case 'transport_error':
                 // The user's wallet IS still debited — make sure the
-                // surfaced message reflects that. The "your wallet
-                // will be refunded if it didn't go through" wording
-                // sets the right expectation: reconciliation may
-                // refund, but it also may finalize the purchase as
-                // completed.
+                // surfaced message reflects that. The "your Fintava
+                // virtual wallet will be refunded if it didn't go
+                // through" wording sets the right expectation:
+                // reconciliation may refund, but it also may finalize
+                // the purchase as completed.
                 wp_send_json_success([
-                    'message' => __('Your purchase is being verified. Please check Bill Payments History in a few minutes — your wallet will be refunded if the purchase did not go through.', 'matrix-mlm'),
+                    'message' => __('Your purchase is being verified. Please check Bill Payments History in a few minutes — your Fintava virtual wallet will be refunded if the purchase did not go through.', 'matrix-mlm'),
                     'pending' => true,
                     'transaction_id'   => $outcome['transaction_id'],
                     'client_reference' => $outcome['client_reference'],
@@ -1276,12 +1311,12 @@ class Matrix_MLM_Fintava_Billing {
                 if ($amounts['fee'] > 0) {
                     $message .= ' ' . sprintf(
                         /* translators: %1$s: currency symbol + total, %2$s: currency symbol + fee */
-                        __('Wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
+                        __('Fintava virtual wallet debited %1$s (includes %2$s service fee).', 'matrix-mlm'),
                         $currency . number_format($amounts['total'], 2),
                         $currency . number_format($amounts['fee'], 2)
                     );
                 } else {
-                    $message .= ' ' . __('(debited from your wallet)', 'matrix-mlm');
+                    $message .= ' ' . __('(debited from your Fintava virtual wallet)', 'matrix-mlm');
                 }
 
                 $payload = [
@@ -1391,14 +1426,30 @@ class Matrix_MLM_Fintava_Billing {
      * @param array  $details Per-category map serialised to the
      *                       details JSON column.
      * @param string $client_reference Generated by build_client_reference.
+     * @param string $source_wallet    Which wallet was debited.
+     *                                 'virtual' (default for the
+     *                                 post-PR-#294 path) or
+     *                                 'matrix' (legacy / kept so a
+     *                                 future caller restoring the
+     *                                 internal-wallet path doesn't
+     *                                 silently mis-tag rows).
      * @return int row id or 0 on failure
      */
-    private function begin_transaction($user_id, $type, array $amounts, array $details, $client_reference) {
+    private function begin_transaction($user_id, $type, array $amounts, array $details, $client_reference, $source_wallet = 'virtual') {
         global $wpdb;
 
         $nominal = round((float) ($amounts['nominal'] ?? 0), 2);
         $fee     = round((float) ($amounts['fee']     ?? 0), 2);
         $total   = round((float) ($amounts['total']   ?? ($nominal + $fee)), 2);
+
+        // Normalise: only the two known values are accepted; anything
+        // else falls back to the post-PR-#294 default. Defensive
+        // against a typo in a future caller (e.g. 'fintava' instead
+        // of 'virtual') that would otherwise sneak past the column's
+        // ENUM constraint and land as the empty string.
+        if (!in_array($source_wallet, ['matrix', 'virtual'], true)) {
+            $source_wallet = 'virtual';
+        }
 
         $table   = $wpdb->prefix . 'matrix_billing_transactions';
         $payload = [
@@ -1415,6 +1466,7 @@ class Matrix_MLM_Fintava_Billing {
             'api_response'     => null,
             'status'           => 'pending',
             'client_reference' => (string) $client_reference,
+            'source_wallet'    => (string) $source_wallet,
             'created_at'       => current_time('mysql'),
         ];
 
@@ -1671,6 +1723,12 @@ class Matrix_MLM_Fintava_Billing {
      * (small shortfall) or symptomatic of a misconfigured fee
      * (huge fee, e.g. flat=14000 typo on airtime).
      *
+     * Wording references the user's Fintava virtual wallet (the
+     * post-PR-#294 source of funds) so a user who reads "your
+     * wallet" doesn't conflate it with the Matrix internal wallet
+     * — the two were kept conceptually distinct precisely to make
+     * "fund Fintava → buy bill" a one-step flow.
+     *
      * Branches on the relationship between fee, nominal, and balance:
      *
      *   - fee == 0      : pre-C single-amount message — same shape
@@ -1705,7 +1763,7 @@ class Matrix_MLM_Fintava_Billing {
         if ($fee <= 0) {
             return sprintf(
                 /* translators: 1: balance, 2: bill amount, 3: shortfall */
-                __('Your wallet has %1$s but this purchase requires %2$s. Add %3$s to continue.', 'matrix-mlm'),
+                __('Your Fintava virtual wallet has %1$s but this purchase requires %2$s. Add %3$s to continue.', 'matrix-mlm'),
                 $fmt($balance), $fmt($nominal), $fmt($shortfall)
             );
         }
@@ -1713,65 +1771,280 @@ class Matrix_MLM_Fintava_Billing {
         if ($fee > $nominal) {
             return sprintf(
                 /* translators: 1: balance, 2: total to debit, 3: bill amount, 4: service fee, 5: shortfall */
-                __('Your wallet has %1$s but this purchase costs %2$s — that\'s %3$s for the bill plus a %4$s service fee. The service fee looks unusually high; please contact support if this is unexpected. Otherwise, add %5$s to continue.', 'matrix-mlm'),
+                __('Your Fintava virtual wallet has %1$s but this purchase costs %2$s — that\'s %3$s for the bill plus a %4$s service fee. The service fee looks unusually high; please contact support if this is unexpected. Otherwise, add %5$s to continue.', 'matrix-mlm'),
                 $fmt($balance), $fmt($total), $fmt($nominal), $fmt($fee), $fmt($shortfall)
             );
         }
 
         return sprintf(
             /* translators: 1: balance, 2: total to debit, 3: bill amount, 4: service fee, 5: shortfall */
-            __('Your wallet has %1$s but this purchase costs %2$s (%3$s bill + %4$s service fee). Add %5$s to continue.', 'matrix-mlm'),
+            __('Your Fintava virtual wallet has %1$s but this purchase costs %2$s (%3$s bill + %4$s service fee). Add %5$s to continue.', 'matrix-mlm'),
             $fmt($balance), $fmt($total), $fmt($nominal), $fmt($fee), $fmt($shortfall)
         );
     }
 
     /**
-     * Debit the user's MatrixPro wallet for a bill purchase.
+     * Move the bill total from the user's Fintava virtual wallet
+     * into the merchant's master/operating wallet via
+     * /transaction/wallet-to-wallet, so the upstream /billing/<type>
+     * call (which debits the merchant master wallet server-side)
+     * is reimbursed by the user before it runs.
      *
      * Returns a unique reference string on success, or WP_Error on
-     * failure (insufficient funds is the most common case — surfaced
-     * to the user with a helpful message).
+     * failure. The most common failure modes:
+     *
+     *   - no_virtual_wallet     : user hasn't generated a Fintava
+     *                             virtual wallet yet. The UI gates
+     *                             this with a CTA before the form
+     *                             renders, but the AJAX handler
+     *                             must also defend against direct
+     *                             calls.
+     *   - missing_operating_account : the merchant operating
+     *                             account NUBAN admin setting is
+     *                             unset. Configuration error.
+     *   - insufficient_balance  : user's virtual wallet balance is
+     *                             below `total`. Carries balance +
+     *                             requested amount on the WP_Error
+     *                             data slot so process_purchase()
+     *                             can rebuild a fee-aware message.
+     *   - virtual_wallet_debit_failed : Fintava rejected the
+     *                             wallet-to-wallet for any other
+     *                             reason. The upstream message is
+     *                             surfaced verbatim so the user
+     *                             (and ops) can see what Fintava
+     *                             said.
+     *
+     * The pre-flight balance check is best-effort: if Fintava's
+     * balance endpoint is transiently unavailable on this tier we
+     * skip the check and let the wallet-to-wallet itself be the
+     * source of truth (its "insufficient balance on source wallet"
+     * response is normalised back to insufficient_balance below).
+     * The bank-payout flow follows the same pattern for the same
+     * reason — a flaky balance endpoint shouldn't strand a working
+     * payment flow.
+     *
+     * Wallet-to-wallet narration carries the same description the
+     * caller would have used as the wallet auditor row description
+     * pre-PR-#294 ("Airtime purchase to 0801…"), so the user's
+     * Fintava transaction history reads naturally without us having
+     * to build a separate naming convention.
      *
      * @return string|WP_Error reference identifier
      */
-    private static function debit_for_purchase($user_id, $amount, $type, $description) {
-        $wallet = new Matrix_MLM_Wallet();
-        $balance = $wallet->get_balance($user_id);
-        if ($balance < $amount) {
-            // Carry the balance + requested-amount through the
-            // WP_Error data slot so process_purchase() can rebuild
-            // a fee-aware message ("you have ₦X but this costs ₦Y
-            // including a ₦Z service fee, add ₦W"). The default
-            // message is kept generic so legacy callers that don't
-            // re-examine error_data still surface something sensible.
+    private static function debit_via_virtual_wallet($user_id, $amount, $type, $description) {
+        $fintava = new Matrix_MLM_Fintava();
+        $wallet_row = $fintava->get_user_wallet($user_id);
+        if (!$wallet_row) {
             return new WP_Error(
-                'insufficient_balance',
-                __('Insufficient wallet balance. Please fund your wallet first.', 'matrix-mlm'),
-                ['balance' => $balance, 'requested' => (float) $amount]
+                'no_virtual_wallet',
+                __('You need a Fintava virtual wallet to pay bills. Open the Wallet tab to set one up.', 'matrix-mlm')
             );
         }
 
-        $reference = 'BILL-' . $type . '-' . $user_id . '-' . wp_generate_uuid4();
-        $result = $wallet->debit(
-            $user_id,
-            $amount,
-            'bill_payment',
-            $description,
-            $reference
-        );
-        if ($result === false) {
-            // debit() already logged; surface the same insufficient/locked message.
-            return new WP_Error('debit_failed', __('Could not debit wallet. Please try again or contact support.', 'matrix-mlm'));
+        $sender_account = preg_replace('/\s+/', '', (string) ($wallet_row->account_number ?? ''));
+        if ($sender_account === '') {
+            return new WP_Error(
+                'no_virtual_wallet',
+                __('Your Fintava virtual wallet is missing its account number. Refresh it from the Wallet tab and try again.', 'matrix-mlm')
+            );
         }
+
+        $receiver_account = preg_replace('/\s+/', '', (string) get_option('matrix_mlm_fintava_operating_account', ''));
+        if ($receiver_account === '') {
+            // The /transaction/wallet-to-wallet endpoint requires
+            // a senderAccount AND a receiverAccount. The wallet-to-
+            // wallet helper would surface this same error code, but
+            // we surface it here too so a misconfigured install
+            // fails before opening a PIN-gated request and burning
+            // a counter slot on the rate limiter.
+            return new WP_Error(
+                'missing_operating_account',
+                __('Bill payments are not configured: the merchant operating account is missing. Please contact support.', 'matrix-mlm')
+            );
+        }
+
+        // Pre-flight balance check. Fail-open if the balance endpoint
+        // is unavailable on this tier — the wallet-to-wallet call
+        // itself will refuse with an upstream "insufficient balance
+        // on source wallet" error which we normalise below. Same
+        // pattern as the bank-payout flow.
+        $balance_info = $fintava->get_virtual_wallet_balance(
+            $wallet_row->wallet_id ?? '',
+            $sender_account,
+            $wallet_row->customer_id ?? null
+        );
+        if (!is_wp_error($balance_info) && isset($balance_info['available_balance']) && is_numeric($balance_info['available_balance'])) {
+            $available = (float) $balance_info['available_balance'];
+            if ($available < $amount) {
+                return new WP_Error(
+                    'insufficient_balance',
+                    __('Insufficient Fintava virtual wallet balance.', 'matrix-mlm'),
+                    ['balance' => $available, 'requested' => (float) $amount]
+                );
+            }
+        }
+
+        $reference = 'BILL-' . $type . '-' . $user_id . '-' . wp_generate_uuid4();
+        $transfer = $fintava->wallet_to_wallet_transfer([
+            'amount'             => floatval($amount),
+            'sender_account'     => $sender_account,
+            'receiver_account'   => $receiver_account,
+            'narration'          => (string) $description,
+            'customer_reference' => $reference,
+        ]);
+
+        if (is_wp_error($transfer)) {
+            $msg = (string) $transfer->get_error_message();
+            // Fintava's /transaction/wallet-to-wallet returns
+            // "insufficient balance on source wallet to complete
+            // transfer" when the user's virtual wallet doesn't
+            // cover the requested amount. Normalise it to our
+            // insufficient_balance shape so process_purchase()
+            // formats the same fee-aware breakdown the pre-flight
+            // path produces. Match on the substring "insufficient"
+            // so a future tier-specific rewording (e.g.
+            // "Insufficient funds on source wallet") still hits.
+            // Carry balance=0 so format_insufficient_balance_message
+            // produces a "shortfall = total" message — we don't
+            // have a definitive balance here (the pre-flight either
+            // didn't run or saw a stale value), and 0 is the safe
+            // floor.
+            if (stripos($msg, 'insufficient') !== false) {
+                return new WP_Error(
+                    'insufficient_balance',
+                    __('Insufficient Fintava virtual wallet balance.', 'matrix-mlm'),
+                    ['balance' => 0.0, 'requested' => (float) $amount, 'upstream' => $msg]
+                );
+            }
+            return new WP_Error(
+                'virtual_wallet_debit_failed',
+                sprintf(
+                    /* translators: %s: upstream Fintava error message */
+                    __('Could not debit your Fintava virtual wallet: %s', 'matrix-mlm'),
+                    $msg
+                )
+            );
+        }
+
         return $reference;
     }
 
     /**
-     * Refund a failed bill purchase by crediting the user's wallet
-     * back. Records the refund as a wallet transaction tied to the
-     * original debit reference so reconciliation is straightforward.
+     * Reverse a virtual-wallet debit by transferring the same
+     * amount from the merchant operating wallet back to the user's
+     * Fintava virtual wallet. Used by refund_failed_purchase() on
+     * the post-PR-#294 path.
+     *
+     * Returns TRUE on success, FALSE on any failure. Failures are
+     * logged and surfaced via send_admin_notification() because a
+     * failed reversal means the user has been debited but not
+     * refunded — manual intervention required.
+     *
+     * The customer_reference is REFUND-{original} so the Fintava
+     * audit trail links the refund back to the failing purchase
+     * one-to-one.
      */
-    private static function refund_failed_purchase($user_id, $amount, $type, $debit_reference, $reason) {
+    private static function reverse_virtual_wallet_debit($user_id, $amount, $type, $original_reference, $reason) {
+        $fintava = new Matrix_MLM_Fintava();
+        $wallet_row = $fintava->get_user_wallet($user_id);
+        if (!$wallet_row) {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] CRITICAL: cannot reverse virtual-wallet debit, user has no wallet. user_id=%d amount=%.2f ref=%s reason=%s',
+                $user_id, $amount, $original_reference, $reason
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_bill_refund_failed',
+                sprintf(
+                    /* translators: 1: user id, 2: amount, 3: debit ref */
+                    __('Bill purchase virtual-wallet reversal FAILED for user #%1$d, amount %2$.2f, ref %3$s — user has no Fintava virtual wallet on file. Manual intervention required.', 'matrix-mlm'),
+                    $user_id, $amount, $original_reference
+                )
+            );
+            return false;
+        }
+
+        $sender_account   = preg_replace('/\s+/', '', (string) get_option('matrix_mlm_fintava_operating_account', ''));
+        $receiver_account = preg_replace('/\s+/', '', (string) ($wallet_row->account_number ?? ''));
+
+        if ($sender_account === '' || $receiver_account === '') {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] CRITICAL: cannot reverse virtual-wallet debit, missing NUBAN. user_id=%d amount=%.2f ref=%s sender=%s receiver=%s',
+                $user_id, $amount, $original_reference, $sender_account, $receiver_account
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_bill_refund_failed',
+                sprintf(
+                    __('Bill purchase virtual-wallet reversal FAILED for user #%1$d, amount %2$.2f, ref %3$s — operating account or user wallet NUBAN missing. Manual intervention required.', 'matrix-mlm'),
+                    $user_id, $amount, $original_reference
+                )
+            );
+            return false;
+        }
+
+        $refund_ref = 'REFUND-' . $original_reference;
+        $description = sprintf(
+            /* translators: %1$s: bill type, %2$s: failure reason */
+            __('Refund: %1$s purchase failed (%2$s)', 'matrix-mlm'),
+            $type,
+            $reason
+        );
+
+        $transfer = $fintava->wallet_to_wallet_transfer([
+            'amount'             => floatval($amount),
+            'sender_account'     => $sender_account,
+            'receiver_account'   => $receiver_account,
+            'narration'          => $description,
+            'customer_reference' => $refund_ref,
+        ]);
+
+        if (is_wp_error($transfer)) {
+            error_log(sprintf(
+                '[Matrix Fintava Billing] CRITICAL: virtual-wallet reverse-transfer failed user_id=%d amount=%.2f ref=%s reason=%s upstream=%s',
+                $user_id, $amount, $original_reference, $reason, $transfer->get_error_message()
+            ));
+            Matrix_MLM_Notifications::send_admin_notification(
+                'fintava_bill_refund_failed',
+                sprintf(
+                    /* translators: 1: user id, 2: amount, 3: debit ref, 4: upstream error */
+                    __('Bill purchase virtual-wallet reversal FAILED for user #%1$d, amount %2$.2f, ref %3$s. Upstream error: %4$s. Manual intervention required.', 'matrix-mlm'),
+                    $user_id, $amount, $original_reference, $transfer->get_error_message()
+                )
+            );
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Refund a failed bill purchase. Dispatches on the
+     * `source_wallet` parameter:
+     *
+     *   - 'matrix'  : credit the user's Matrix internal wallet
+     *                 (legacy path; kept so admin-initiated
+     *                 refunds and any future reconciliation
+     *                 worker can correctly process pre-PR-#294
+     *                 rows whose original debit landed there).
+     *   - 'virtual' : reverse the wallet-to-wallet transfer back
+     *                 to the user's Fintava virtual wallet (the
+     *                 post-PR-#294 path).
+     *
+     * Catastrophic failures (debited-but-cannot-refund) are logged
+     * loudly and an admin notification is dispatched so manual
+     * reconciliation can happen before the user notices.
+     */
+    private static function refund_failed_purchase($user_id, $amount, $type, $debit_reference, $source_wallet, $reason) {
+        if ($source_wallet === 'virtual') {
+            self::reverse_virtual_wallet_debit($user_id, $amount, $type, $debit_reference, $reason);
+            return;
+        }
+
+        // Legacy path — Matrix internal wallet. Reached only by
+        // refund flows operating on rows that were debited before
+        // PR #294 flipped the source wallet. Kept verbatim so any
+        // reconciliation worker that finalises a stale pending
+        // pre-PR-#294 row settles to the wallet that was actually
+        // debited.
         $wallet = new Matrix_MLM_Wallet();
         $refund_ref = 'REFUND-' . $debit_reference;
         $description = sprintf(
@@ -2029,6 +2302,7 @@ class Matrix_MLM_Fintava_Billing {
             nominal_amount decimal(12,2) NOT NULL DEFAULT 0.00,
             service_fee decimal(12,2) NOT NULL DEFAULT 0.00,
             total_charged decimal(12,2) NOT NULL DEFAULT 0.00,
+            source_wallet enum('matrix','virtual') NOT NULL DEFAULT 'matrix',
             refunded_amount decimal(12,2) NOT NULL DEFAULT 0.00,
             client_reference varchar(64) DEFAULT NULL,
             details text,
@@ -2179,6 +2453,39 @@ class Matrix_MLM_Fintava_Billing {
                 "ALTER TABLE {$table}
                    MODIFY status ENUM('pending','completed','failed','refunded','partial_refund')
                           NOT NULL DEFAULT 'pending'"
+            );
+        }
+
+        // PR #294 migration: add the source_wallet column that
+        // records which wallet was actually debited for each bill
+        // purchase. The post-PR-#294 code path debits the user's
+        // Fintava virtual wallet ('virtual'); pre-PR-#294 rows
+        // debited the Matrix internal wallet ('matrix'). Refund
+        // dispatch (both in-flow and admin-initiated) reads this
+        // column so a refund of a stale pending row debits the
+        // correct wallet — this is the migration-safety guarantee
+        // that lets the source-wallet flip ship without stranding
+        // existing pending rows on the wrong refund path.
+        //
+        // Default 'matrix' so any row that existed before this
+        // ALTER ran is correctly tagged as the legacy path. New
+        // rows inserted by the post-PR-#294 begin_transaction()
+        // explicitly set 'virtual', so the DEFAULT only ever
+        // applies to historical rows. Future-proofs against a
+        // direct INSERT via wp-cli or third-party tooling that
+        // doesn't know about the column.
+        $source_wallet_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+               AND COLUMN_NAME = 'source_wallet'",
+            DB_NAME, $table
+        ));
+        if ($source_wallet_exists === 0) {
+            $wpdb->query(
+                "ALTER TABLE {$table}
+                   ADD COLUMN source_wallet ENUM('matrix','virtual')
+                       NOT NULL DEFAULT 'matrix'
+                       AFTER total_charged"
             );
         }
     }
