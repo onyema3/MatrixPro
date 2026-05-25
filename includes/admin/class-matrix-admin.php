@@ -667,25 +667,53 @@ class Matrix_MLM_Admin {
         $note    = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
 
         if ($gateway === 'zebra') {
-            // Vendor -> customer payout via Bibimoney /Remit. The
-            // gateway class owns the full pending -> processing
-            // -> approved (or pending) state machine, including
-            // the conditional-UPDATE lock that prevents two
-            // simultaneous Approve clicks from double-firing
-            // /Remit. We just forward the result envelope.
+            // Vendor -> customer payout via Bibimoney. The
+            // Zebra gateway exposes two destination rails:
+            //
+            //   /Remit    — destination is the customer's Zebra
+            //               Wallet (IWAN / MSISDN). method='zebra'.
+            //   /Dispense — destination is the customer's bank
+            //               account (account number + sortCode).
+            //               method='zebra_bank' AND
+            //               account_details is a JSON envelope
+            //               with the bank routing fields.
+            //
+            // Both flows share the same pending -> processing ->
+            // approved (or pending) lock state machine. The
+            // gateway class owns the conditional-UPDATE locks
+            // that prevent two simultaneous Approve clicks from
+            // double-firing the platform call. We just forward
+            // the result envelope.
             if (!class_exists('Matrix_MLM_Zebra')) {
                 wp_send_json_error(['message' => __('Zebra gateway not available.', 'matrix-mlm')]);
             }
             $zebra  = new Matrix_MLM_Zebra();
-            $result = $zebra->remit_to_account($id, $note);
+            $method = strtolower((string) ($withdrawal->method ?? ''));
+            if ($method === 'zebra_bank') {
+                $result = $zebra->dispense_to_account($id, $note);
+                $rail_label = __('Dispense', 'matrix-mlm');
+            } else {
+                $result = $zebra->remit_to_account($id, $note);
+                $rail_label = __('Remit', 'matrix-mlm');
+            }
             if (!empty($result['success'])) {
                 wp_send_json_success([
-                    'message'        => $result['message'] ?? __('Remit completed.', 'matrix-mlm'),
+                    'message'        => $result['message'] ?? sprintf(
+                        /* translators: %s = "Remit" or "Dispense" depending on the rail */
+                        __('%s completed.', 'matrix-mlm'),
+                        $rail_label
+                    ),
                     'transaction_id' => $result['transaction_id'] ?? '',
                     'psp_reference'  => $result['psp_reference'] ?? '',
                 ]);
             }
-            wp_send_json_error(['message' => $result['message'] ?? __('Remit failed.', 'matrix-mlm')]);
+            wp_send_json_error([
+                'message' => $result['message'] ?? sprintf(
+                    /* translators: %s = "Remit" or "Dispense" depending on the rail */
+                    __('%s failed.', 'matrix-mlm'),
+                    $rail_label
+                ),
+            ]);
         }
 
         // Legacy Fintava-credit branch (gateway IS NULL or any
