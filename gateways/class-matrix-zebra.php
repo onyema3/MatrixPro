@@ -2183,4 +2183,466 @@ class Matrix_MLM_Zebra {
         }
         return str_repeat('*', $len - 4) . substr($value, -4);
     }
+
+    /* ====================================================================
+     * User-facing payout AJAX surface.
+     *
+     * Wired separately from the deposit / OTP flow because the
+     * gateway is constructed lazily for those (only inside the
+     * matrix_action=deposit / matrix_action=zebra_complete_otp
+     * dispatch branches in Matrix_MLM_Core), and we need the
+     * AJAX hook reachable on every pageload regardless of whether
+     * the OTP flow has been touched. The static
+     * register_user_payout_hooks() lets Matrix_MLM_Core::__construct
+     * wire the endpoint at boot without paying the cost of
+     * constructing the gateway just to register a hook.
+     *
+     * The single endpoint matrix_zebra_initiate_payout handles
+     * both the /Remit and /Dispense rails — the rail is picked by
+     * the form's radio button and validated server-side before
+     * any state changes. Same nonce / can_move_funds /
+     * transaction-PIN / rate-limit gates as the existing Fintava
+     * bank-payout path so admin policy applies uniformly across
+     * external rails.
+     * ==================================================================== */
+
+    /**
+     * Register the user-facing payout AJAX endpoint.
+     *
+     * Static so the bootloader can call it without constructing
+     * the gateway — credentials only matter at AJAX dispatch
+     * time (we re-construct the instance inside the handler),
+     * not at hook registration time.
+     */
+    public static function register_user_payout_hooks() {
+        add_action('wp_ajax_matrix_zebra_initiate_payout', [__CLASS__, 'ajax_initiate_payout_static']);
+        // No nopriv twin — only logged-in members can submit
+        // payouts (the get_current_user_id() check inside the
+        // handler enforces this anyway, but the missing
+        // wp_ajax_nopriv hook means the unauthenticated AJAX
+        // path 0-bytes immediately rather than hitting our
+        // handler at all).
+    }
+
+    /**
+     * Static AJAX entry point — constructs the gateway and
+     * forwards to the instance handler. Splits the static-vs-
+     * instance contract so the configuration-loading happens
+     * inside the request rather than at hook-registration time.
+     */
+    public static function ajax_initiate_payout_static() {
+        (new self())->ajax_initiate_payout();
+    }
+
+    /**
+     * Whether the operator has enabled this gateway end-to-end.
+     *
+     * Pattern mirrors Matrix_MLM_Fintava::is_active(): credentials
+     * must be present AND the matrix_gateways row's status
+     * column must be set to 1. is_configured() above checks only
+     * credentials, so this is the stricter gate the user-facing
+     * payout flow needs (we don't want to take a Matrix-wallet
+     * debit on a row that the admin disabled mid-session).
+     */
+    public function is_active() {
+        if (!$this->is_configured()) {
+            return false;
+        }
+        global $wpdb;
+        $status = $wpdb->get_var(
+            "SELECT status FROM {$wpdb->prefix}matrix_gateways WHERE slug = 'zebra'"
+        );
+        return ((int) $status) === 1;
+    }
+
+    /**
+     * Handle a user-submitted Zebra payout.
+     *
+     * Two rails behind a single endpoint:
+     *
+     *   rail='zebra'      -> /Remit. account_details = the raw
+     *                        wallet identifier (IWAN, MSISDN, or
+     *                        local reference). 3-64 chars.
+     *
+     *   rail='zebra_bank' -> /Dispense. account_details = a
+     *                        structured JSON envelope
+     *                        {type, bank_code, bank_name,
+     *                        account_number, account_name}
+     *                        that dispense_to_account() decodes
+     *                        back out at Approve time.
+     *
+     * Order of checks (intentionally cheap-first so a wrong
+     * input or a disabled gateway can never advance to the wallet
+     * debit):
+     *
+     *   1. nonce
+     *   2. logged in
+     *   3. rate limit (per user, 30 / 15min)
+     *   4. can_move_funds (5-toggle admin policy + active-account
+     *      + plan-tier — same policy as the Fintava bank flow,
+     *      because semantically both are "user is sending money
+     *      out via an external rail")
+     *   5. transaction PIN gate (path='bank' — same as Fintava
+     *      bank-payout so admin gating applies uniformly)
+     *   6. gateway is_active (credentials + matrix_gateways
+     *      status column)
+     *   7. amount within min/max payout
+     *   8. rail-specific destination validation
+     *   9. Matrix wallet debit (atomic, fails on insufficient or
+     *      missing meta row)
+     *   10. INSERT matrix_withdrawals row. On INSERT failure,
+     *       FAILSAFE re-credit so we don't trap funds in limbo.
+     *   11. Notification fan-out (in-app + email + SMS via
+     *       Matrix_MLM_Notifications::send_withdrawal_notification).
+     *
+     * State machine after this method returns success:
+     *
+     *   matrix_withdrawals row at status='pending', gateway='zebra',
+     *   method=$rail, amount=$amount, charge=$charge,
+     *   net_amount=$amount, account_details=<raw or JSON envelope>.
+     *
+     *   Approve from Withdrawals admin -> dispatch /Remit or
+     *   /Dispense per method (PR #304/#305 wiring), processing
+     *   -> approved on platform success.
+     *
+     *   Reject from Withdrawals admin -> refund amount+charge to
+     *   Matrix wallet via WD-REFUND-{id} (existing behaviour in
+     *   reject_withdrawal()).
+     */
+    public function ajax_initiate_payout() {
+        check_ajax_referer('matrix_mlm_nonce', 'nonce');
+
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            wp_send_json_error(['message' => __('Authentication required', 'matrix-mlm')]);
+        }
+
+        // Rate limit. Same shape as the Fintava
+        // ajax_initiate_transfer cap — bound abuse from a
+        // compromised session without false-positiving a user
+        // who's just iterating on a typo'd account number.
+        if (class_exists('Matrix_MLM_Rate_Limiter')) {
+            if (Matrix_MLM_Rate_Limiter::throttle(
+                'zebra_initiate_payout',
+                Matrix_MLM_Rate_Limiter::key_for_request(),
+                ['max_attempts' => 30, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+            )) {
+                wp_send_json_error([
+                    'message' => __('Too many payout attempts. Please wait a few minutes and try again.', 'matrix-mlm'),
+                ]);
+            }
+        }
+
+        // Withdrawal policy. Path 'bank_transfer' folds in:
+        //   - master kill switch (matrix_mlm_withdrawals_enabled)
+        //   - active-account requirement
+        //   - plan-tier restriction
+        //   - the Bank Transfers toggle on Settings -> Financial
+        // Same policy gate the Fintava bank-payout flow applies,
+        // because semantically these are external-platform
+        // transfers and should be governed by one admin lever
+        // rather than two parallel ones.
+        if (class_exists('Matrix_MLM_User')) {
+            $eligibility = Matrix_MLM_User::can_move_funds($user_id, 'bank_transfer');
+            if (!$eligibility['allowed']) {
+                wp_send_json_error(['message' => $eligibility['reason']]);
+            }
+        }
+
+        // Transaction PIN. Path 'bank' is shared with the
+        // Fintava bank-payout flow so an admin who already
+        // gated their install on Settings -> Financial doesn't
+        // have to flip a second toggle. Returns 401 / pin_*
+        // shapes via wp_send_json_error directly when the gate
+        // fails.
+        if (class_exists('Matrix_MLM_Transaction_Pin')) {
+            Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bank');
+        }
+
+        if (!$this->is_active()) {
+            wp_send_json_error([
+                'message' => __('Zebra Wallet payouts are not available at the moment.', 'matrix-mlm'),
+            ]);
+        }
+
+        $rail = strtolower((string) ($_POST['rail'] ?? 'zebra'));
+        if (!in_array($rail, ['zebra', 'zebra_bank'], true)) {
+            wp_send_json_error(['message' => __('Unknown payout rail.', 'matrix-mlm')]);
+        }
+
+        $amount = (float) ($_POST['amount'] ?? 0);
+        if ($amount <= 0) {
+            wp_send_json_error(['message' => __('Enter a valid amount.', 'matrix-mlm')]);
+        }
+
+        $currency_symbol = (string) get_option('matrix_mlm_currency_symbol', '₦');
+        $min_payout = (float) apply_filters(
+            'matrix_mlm_zebra_min_payout',
+            (float) get_option('matrix_mlm_fintava_min_payout', 1000)
+        );
+        $max_payout = (float) apply_filters(
+            'matrix_mlm_zebra_max_payout',
+            (float) get_option('matrix_mlm_fintava_max_payout', 5000000)
+        );
+        if ($amount < $min_payout) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: 1: currency symbol, 2: minimum amount */
+                    __('Minimum payout is %1$s%2$s.', 'matrix-mlm'),
+                    $currency_symbol,
+                    number_format($min_payout, 2)
+                ),
+            ]);
+        }
+        if ($amount > $max_payout) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: 1: currency symbol, 2: maximum amount */
+                    __('Maximum payout is %1$s%2$s.', 'matrix-mlm'),
+                    $currency_symbol,
+                    number_format($max_payout, 2)
+                ),
+            ]);
+        }
+
+        // Plugin-side service charge. Defaults to 0; the
+        // matrix_zebra_payout_charge filter receives both the
+        // amount and the rail so an operator can express either
+        // a flat per-transfer fee or a percentage. We coerce to
+        // float and floor at 0 so a buggy filter can't credit
+        // the user free money via a negative charge.
+        $charge = (float) apply_filters(
+            'matrix_zebra_payout_charge',
+            0.0,
+            $amount,
+            $rail
+        );
+        if ($charge < 0) { $charge = 0.0; }
+
+        // Rail-specific destination validation. We reject
+        // structurally-invalid inputs up front so the wallet
+        // debit never lands on a row that's guaranteed to fail
+        // at Approve time.
+        $account_details = '';
+        $human_destination = '';
+        $narration = isset($_POST['narration']) ? sanitize_text_field((string) $_POST['narration']) : '';
+
+        if ($rail === 'zebra') {
+            $identifier = isset($_POST['wallet_identifier'])
+                ? sanitize_text_field((string) $_POST['wallet_identifier'])
+                : '';
+            $identifier = trim($identifier);
+            $len = function_exists('mb_strlen') ? mb_strlen($identifier) : strlen($identifier);
+            if ($len < 3 || $len > 64) {
+                wp_send_json_error([
+                    'message' => __('Enter the destination Zebra wallet identifier (IWAN, MSISDN, or local reference, 3-64 chars).', 'matrix-mlm'),
+                ]);
+            }
+            $account_details   = $identifier;
+            $human_destination = $identifier;
+        } else {
+            // zebra_bank rail.
+            $bank_code      = isset($_POST['bank_code']) ? sanitize_text_field((string) $_POST['bank_code']) : '';
+            $bank_name      = isset($_POST['bank_name']) ? sanitize_text_field((string) $_POST['bank_name']) : '';
+            $account_number = isset($_POST['account_number']) ? sanitize_text_field((string) $_POST['account_number']) : '';
+            $account_name   = isset($_POST['account_name']) ? sanitize_text_field((string) $_POST['account_name']) : '';
+
+            if (!preg_match('/^\d{3,6}$/', $bank_code)) {
+                wp_send_json_error([
+                    'message' => __('Bank code must be 3-6 numeric digits (CBN/NIBSS sortCode).', 'matrix-mlm'),
+                ]);
+            }
+            if (!preg_match('/^\d{6,20}$/', $account_number)) {
+                wp_send_json_error([
+                    'message' => __('Account number must be 6-20 digits.', 'matrix-mlm'),
+                ]);
+            }
+            if ($bank_name === '') {
+                wp_send_json_error([
+                    'message' => __('Select a bank from the dropdown before submitting.', 'matrix-mlm'),
+                ]);
+            }
+            // Account name: client-side gates submit on a
+            // non-empty name field (verified or manually-
+            // entered), but a programmatic resubmit could
+            // bypass the form. Try a server-side resolve as a
+            // best-effort recovery before failing — saves the
+            // user a round-trip when their original
+            // verification just timed out.
+            if ($account_name === '' && class_exists('Matrix_MLM_Fintava')) {
+                $fintava  = new Matrix_MLM_Fintava();
+                $resolved = $fintava->resolve_account($account_number, $bank_code);
+                if (!is_wp_error($resolved)) {
+                    $maybe_name = '';
+                    if (is_array($resolved)) {
+                        if (method_exists('Matrix_MLM_Fintava', 'extract_account_name')) {
+                            $maybe_name = (string) Matrix_MLM_Fintava::extract_account_name($resolved);
+                        }
+                        if ($maybe_name === '' && isset($resolved['account_name'])) {
+                            $maybe_name = (string) $resolved['account_name'];
+                        }
+                    }
+                    if ($maybe_name !== '') {
+                        $account_name = sanitize_text_field($maybe_name);
+                    }
+                }
+            }
+            if ($account_name === '') {
+                wp_send_json_error([
+                    'message' => __('Account name is required. Verify the destination account or type the holder name before submitting.', 'matrix-mlm'),
+                ]);
+            }
+
+            // Structured envelope — same shape dispense_to_account()
+            // decodes (see PR #305).
+            $account_details = wp_json_encode([
+                'type'           => 'bank',
+                'bank_code'      => $bank_code,
+                'bank_name'      => $bank_name,
+                'account_number' => $account_number,
+                'account_name'   => $account_name,
+            ]);
+            if (!is_string($account_details) || $account_details === '') {
+                wp_send_json_error([
+                    'message' => __('Could not encode bank account details. Please try again.', 'matrix-mlm'),
+                ]);
+            }
+            $human_destination = sprintf('%s · %s · %s', $bank_name, $account_number, $account_name);
+        }
+
+        // Optional operator-visible narration goes into
+        // admin_note so the Withdrawals listing can render it
+        // without parsing account_details. We deliberately don't
+        // round-trip it to /Remit / /Dispense because Bibimoney's
+        // request body has its own Note field that the gateway
+        // class fills from the operator note at Approve time;
+        // this field is purely a "why I'm sending this" hint
+        // for the admin reviewing the row.
+        $admin_note = $narration !== ''
+            ? sprintf('User narration: %s', $narration)
+            : null;
+
+        // Atomic Matrix wallet debit. By the time the row
+        // INSERT runs below, the user's matrix_user_meta.balance
+        // has already moved by amount+charge. That's the
+        // contract reject_withdrawal() depends on (it credits
+        // amount+charge back via WD-REFUND-{id} on reject) and
+        // approve_withdrawal() implicitly relies on (Approve
+        // dispatches /Remit / /Dispense to release the funds
+        // off-platform — it does not double-debit).
+        $wallet = new Matrix_MLM_Wallet();
+        $balance = $wallet->get_balance($user_id);
+        $required = $amount + $charge;
+        if ($balance < $required) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: 1: currency symbol, 2: required amount, 3: current balance */
+                    __('Insufficient Matrix wallet balance. You need %1$s%2$s but you have %1$s%3$s.', 'matrix-mlm'),
+                    $currency_symbol,
+                    number_format($required, 2),
+                    number_format($balance, 2)
+                ),
+            ]);
+        }
+
+        // Mint a unique reference per attempt so a retry doesn't
+        // collide with the previous debit's auditor row.
+        $debit_ref = sprintf('WD-ZEBRA-%d-%d', $user_id, (int) (microtime(true) * 1000));
+        $debit_result = $wallet->debit(
+            $user_id,
+            $required,
+            'withdrawal_request',
+            sprintf(
+                /* translators: 1: amount, 2: rail label */
+                __('Zebra payout request via %2$s', 'matrix-mlm'),
+                number_format($required, 2),
+                $rail === 'zebra_bank' ? __('Bank Account', 'matrix-mlm') : __('Zebra Wallet', 'matrix-mlm')
+            ),
+            $debit_ref
+        );
+        if ($debit_result === false) {
+            // debit() already logs the underlying reason. The
+            // only realistic causes here (we already pre-flighted
+            // balance >= required above) are a concurrent debit
+            // on the same user that landed between get_balance()
+            // and debit(), or a missing matrix_user_meta row.
+            wp_send_json_error([
+                'message' => __('Could not debit your Matrix wallet — please try again or contact support.', 'matrix-mlm'),
+            ]);
+        }
+
+        global $wpdb;
+        $row_currency = strtoupper((string) get_option('matrix_mlm_currency', 'NGN'));
+
+        $insert_result = $wpdb->insert(
+            $wpdb->prefix . 'matrix_withdrawals',
+            [
+                'user_id'         => $user_id,
+                'method'          => $rail,
+                'gateway'         => 'zebra',
+                'amount'          => $amount,
+                'charge'          => $charge,
+                'net_amount'      => $amount,
+                'currency'        => $row_currency,
+                'account_details' => $account_details,
+                'admin_note'      => $admin_note,
+                'status'          => 'pending',
+            ],
+            ['%d', '%s', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s']
+        );
+
+        if ($insert_result === false || empty($wpdb->insert_id)) {
+            // FAILSAFE: the debit landed but the row didn't, so
+            // we'd be holding the user's funds without any
+            // record of why. Refund immediately under a distinct
+            // reference so support can correlate the credit
+            // back to the specific failed attempt.
+            $failsafe_ref = sprintf('WD-ZEBRA-FAILSAFE-%d', (int) (microtime(true) * 1000));
+            $wallet->credit(
+                $user_id,
+                $required,
+                'withdrawal_refund',
+                __('Zebra payout request failed to record — automatic refund', 'matrix-mlm'),
+                $failsafe_ref
+            );
+            error_log(sprintf(
+                '[Matrix Zebra] Payout INSERT failed for user_id=%d rail=%s amount=%s last_error=%s — auto-refunded via %s',
+                $user_id,
+                $rail,
+                $amount,
+                $wpdb->last_error,
+                $failsafe_ref
+            ));
+            wp_send_json_error([
+                'message' => __('Could not save your payout request. Your wallet has been refunded; please try again or contact support.', 'matrix-mlm'),
+            ]);
+        }
+
+        $withdrawal_id = (int) $wpdb->insert_id;
+
+        // Notify (in-app + email + SMS pair). Status='pending'
+        // so the user knows the request landed; they get a
+        // second notification when an operator approves or
+        // rejects (existing wiring in approve_withdrawal /
+        // reject_withdrawal).
+        if (class_exists('Matrix_MLM_Notifications')) {
+            Matrix_MLM_Notifications::send_withdrawal_notification(
+                $user_id,
+                $amount,
+                'pending'
+            );
+        }
+
+        wp_send_json_success([
+            'message' => sprintf(
+                /* translators: 1: currency symbol, 2: amount, 3: rail label, 4: withdrawal id */
+                __('Payout request submitted: %1$s%2$s to %3$s. Withdrawal #%4$d is now pending operator approval.', 'matrix-mlm'),
+                $currency_symbol,
+                number_format($amount, 2),
+                $human_destination,
+                $withdrawal_id
+            ),
+            'withdrawal_id' => $withdrawal_id,
+        ]);
+    }
 }

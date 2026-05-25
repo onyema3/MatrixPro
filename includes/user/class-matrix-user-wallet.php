@@ -159,8 +159,22 @@ class Matrix_MLM_User_Wallet {
         }
 
         $this->render_header($wallet, $user_id, $matrix_balance, $currency, $fintava);
-        $this->render_action_buttons($payouts_enabled);
-        $this->render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled);
+        // Resolve Zebra Wallet eligibility once and pass it
+        // through to both the action-button row and the pane
+        // renderer. Zebra and Fintava are independent gateways
+        // — Zebra is shown whenever the gateway is configured
+        // AND the same Bank Transfers policy toggle is on
+        // ($payouts_enabled). The Bank Transfers toggle gates
+        // both rails uniformly because semantically both move
+        // funds off the platform; an admin who wants to disable
+        // just one rail flips the gateway-row status on the
+        // Gateways admin page (Zebra) or unsets the Fintava
+        // credentials.
+        $zebra_enabled = $payouts_enabled
+            && class_exists('Matrix_MLM_Zebra')
+            && (new Matrix_MLM_Zebra())->is_active();
+        $this->render_action_buttons($payouts_enabled, $zebra_enabled);
+        $this->render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled, $zebra_enabled);
         // Transaction History is rendered as an always-visible table at
         // the bottom of the page rather than as a fourth toggleable
         // action pane: it's a read-only ledger, not an action, so
@@ -371,8 +385,15 @@ class Matrix_MLM_User_Wallet {
      *                              toggle is on (and Fintava is active).
      *                              When false, the Transfer to Bank
      *                              button is suppressed.
+     * @param bool $zebra_enabled   Whether the Zebra Wallet gateway is
+     *                              configured + active AND the Bank
+     *                              Transfers policy toggle allows
+     *                              external transfers. When false, the
+     *                              "Transfer via Zebra Wallet" button
+     *                              is suppressed and its pane is not
+     *                              rendered (see render_panes()).
      */
-    private function render_action_buttons($payouts_enabled = true) {
+    private function render_action_buttons($payouts_enabled = true, $zebra_enabled = false) {
         ?>
         <div class="matrix-wallet-action-group">
             <div class="matrix-wallet-action-group-header">
@@ -397,13 +418,14 @@ class Matrix_MLM_User_Wallet {
             </div>
         </div>
 
-        <?php if ($payouts_enabled): ?>
+        <?php if ($payouts_enabled || $zebra_enabled): ?>
         <div class="matrix-wallet-action-group matrix-wallet-action-group-external">
             <div class="matrix-wallet-action-group-header">
                 <h3><?php esc_html_e('External Transfers', 'matrix-mlm'); ?></h3>
-                <p><?php esc_html_e('Send funds out of the platform to a Nigerian bank account.', 'matrix-mlm'); ?></p>
+                <p><?php esc_html_e('Send funds out of the platform to a Nigerian bank account or a Zebra wallet.', 'matrix-mlm'); ?></p>
             </div>
             <div class="matrix-wallet-actions">
+                <?php if ($payouts_enabled): ?>
                 <button type="button" class="matrix-wallet-action-btn" data-target="bank">
                     <span class="matrix-wallet-action-icon dashicons dashicons-bank"></span>
                     <span class="matrix-wallet-action-text">
@@ -411,6 +433,16 @@ class Matrix_MLM_User_Wallet {
                         <small><?php esc_html_e('Instant — debited from your Fintava virtual wallet', 'matrix-mlm'); ?></small>
                     </span>
                 </button>
+                <?php endif; ?>
+                <?php if ($zebra_enabled): ?>
+                <button type="button" class="matrix-wallet-action-btn" data-target="zebra">
+                    <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
+                    <span class="matrix-wallet-action-text">
+                        <strong><?php esc_html_e('Transfer via Zebra Wallet', 'matrix-mlm'); ?></strong>
+                        <small><?php esc_html_e('Send to a Zebra wallet or a Nigerian bank — debited from your Matrix wallet, released on operator approval', 'matrix-mlm'); ?></small>
+                    </span>
+                </button>
+                <?php endif; ?>
             </div>
         </div>
         <?php endif; ?>
@@ -421,18 +453,24 @@ class Matrix_MLM_User_Wallet {
      * Render the action panes (hidden by default; one is shown when
      * its matching action button is clicked).
      *
-     * Three panes total in the wallet-exists state:
+     * Up to four panes total in the wallet-exists state:
      *   - own-wallet      → render_transfer_to_own_wallet_form()
      *   - user-wallet     → render_wallet_to_wallet_form()
      *   - bank            → embedded Matrix_MLM_User_Bank_Payout::render()
      *                       (Fintava → external bank, instant)
+     *   - zebra           → embedded Matrix_MLM_User_Zebra_Payout::render()
+     *                       (Matrix wallet → Zebra wallet OR bank, via
+     *                       Bibimoney's /Remit / /Dispense rails;
+     *                       admin-approval flow)
      *
      * The bank pane is only rendered when $payouts_enabled is true;
      * otherwise the Transfer to Bank action button is also hidden in
      * render_action_buttons() so the [data-pane="bank"] target never
-     * gets clicked.
+     * gets clicked. The zebra pane is rendered only when
+     * $zebra_enabled is true (gateway configured + active + the
+     * same Bank Transfers policy toggle).
      */
-    private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true) {
+    private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true, $zebra_enabled = false) {
         ?>
         <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
             <?php $this->render_transfer_to_own_wallet_form($wallet, $user_id, $matrix_balance, $currency); ?>
@@ -459,6 +497,21 @@ class Matrix_MLM_User_Wallet {
             // render_scripts() — it removes [hidden] from the matching
             // pane and adds .is-active to the matching button).
             (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
+            ?>
+        </section>
+        <?php endif; ?>
+
+        <?php if ($zebra_enabled): ?>
+        <section class="matrix-wallet-pane" data-pane="zebra" hidden>
+            <?php
+            // Embed the Zebra Wallet payout flow (rail picker +
+            // form + history + its own JS). Self-contained:
+            // owns its bank dropdown, account resolver
+            // (delegated to the existing 3-leg
+            // matrix_fintava_resolve_account AJAX endpoint),
+            // PIN field render, submit-state gate, history
+            // table.
+            (new Matrix_MLM_User_Zebra_Payout())->render($user_id);
             ?>
         </section>
         <?php endif; ?>
