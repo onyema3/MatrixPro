@@ -179,13 +179,13 @@ class Matrix_MLM_Admin_Users {
                         <td><strong><?php echo esc_html($user->user_login); ?></strong></td>
                         <td><?php echo esc_html($user->user_email); ?></td>
                         <td><?php echo esc_html($user->phone ?? '-'); ?></td>
-                        <td><?php echo $currency . number_format($user->balance, 2); ?></td>
+                        <td><?php echo esc_html($currency . number_format($user->balance, 2)); ?></td>
                         <td><code><?php echo esc_html($user->referral_code); ?></code></td>
-                        <td><?php echo $referral_count; ?></td>
-                        <td><span class="matrix-badge matrix-badge-<?php echo $user->status; ?>"><?php echo ucfirst($user->status); ?></span></td>
-                        <td><?php echo date('M d, Y', strtotime($user->user_registered)); ?></td>
+                        <td><?php echo (int) $referral_count; ?></td>
+                        <td><span class="matrix-badge matrix-badge-<?php echo esc_attr($user->status); ?>"><?php echo esc_html(ucfirst($user->status)); ?></span></td>
+                        <td><?php echo esc_html(date('M d, Y', strtotime($user->user_registered))); ?></td>
                         <td>
-                            <a href="<?php echo admin_url('admin.php?page=matrix-mlm-users&action=view&id=' . $user->user_id); ?>" class="button button-small"><?php _e('View', 'matrix-mlm'); ?></a>
+                            <a href="<?php echo esc_url(admin_url('admin.php?page=matrix-mlm-users&action=view&id=' . $user->user_id)); ?>" class="button button-small"><?php _e('View', 'matrix-mlm'); ?></a>
                         </td>
                     </tr>
                     <?php endforeach; ?>
@@ -199,7 +199,7 @@ class Matrix_MLM_Admin_Users {
             <div class="tablenav bottom">
                 <div class="tablenav-pages">
                     <?php for ($i = 1; $i <= $total_pages; $i++): ?>
-                    <a href="<?php echo admin_url('admin.php?page=matrix-mlm-users&paged=' . $i); ?>" class="<?php echo $i === $page_num ? 'current' : ''; ?>"><?php echo $i; ?></a>
+                    <a href="<?php echo esc_url(admin_url('admin.php?page=matrix-mlm-users&paged=' . $i)); ?>" class="<?php echo $i === $page_num ? 'current' : ''; ?>"><?php echo (int) $i; ?></a>
                     <?php endfor; ?>
                 </div>
             </div>
