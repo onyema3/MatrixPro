@@ -72,6 +72,15 @@ class Matrix_MLM_Admin {
         // manage_options because issuing a refund moves money.
         add_submenu_page('matrix-mlm', __('Bill Payments History', 'matrix-mlm'), __('Bill Payments', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-billing-history', [new Matrix_MLM_Admin_Billing_History(), 'render']);
         add_submenu_page('matrix-mlm', __('Support Tickets', 'matrix-mlm'), __('Tickets', 'matrix-mlm'), 'manage_matrix_tickets', 'matrix-mlm-tickets', [new Matrix_MLM_Admin_Tickets(), 'render']);
+        // Announcements — broadcast composer for in-app notifications
+        // pushed to every member. Sits next to Tickets because the
+        // two are the platform's outbound + inbound member-comms
+        // surfaces (announcements are 1:N from staff, tickets are
+        // 1:1 to staff). Capability is manage_matrix_settings —
+        // sending a platform-wide blast is settings-grade, distinct
+        // from the lower manage_matrix_tickets that staff need to
+        // triage support, so a triage-only operator can't broadcast.
+        add_submenu_page('matrix-mlm', __('Announcements', 'matrix-mlm'), __('Announcements', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-announcements', [new Matrix_MLM_Admin_Announcements(), 'render']);
         add_submenu_page('matrix-mlm', __('Reports', 'matrix-mlm'), __('Reports', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-reports', [new Matrix_MLM_Admin_Reports(), 'render']);
         add_submenu_page('matrix-mlm', __('Frontend Manager', 'matrix-mlm'), __('Frontend', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-frontend', [new Matrix_MLM_Admin_Frontend(), 'render']);
         add_submenu_page('matrix-mlm', __('Migration', 'matrix-mlm'), __('Migration', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-migration', [new Matrix_MLM_Admin_Migration(), 'render']);
