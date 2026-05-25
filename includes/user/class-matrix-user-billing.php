@@ -162,6 +162,47 @@ class Matrix_MLM_User_Billing {
             }
             return parts.join(' | ');
         };
+        // Inline status banner shown above the bill form on submit
+        // outcome. Replaces the previous "alert() + location.reload()"
+        // pattern, which — once PR #276 made airtime actually
+        // succeed — caused the form to disappear in a full-page
+        // refresh on every successful purchase. Users described it as
+        // "page refreshes and loads again" and read it as the form
+        // silently resetting without confirmation, when in fact the
+        // purchase had completed.
+        //
+        // The notice <div> is created on first call and reused on
+        // subsequent calls (kind / message are reset each time), so
+        // the form HTML stays untouched until first interaction.
+        // Placement: prepended to the form so it sits above the first
+        // field, visible without scrolling. .text() (not .html())
+        // avoids any XSS risk if a future caller passes a non-
+        // sanitised PHP message through.
+        //
+        // kind: 'success' | 'error'   (anything else falls back to
+        //                              'error' styling — fail visible
+        //                              rather than silent).
+        window.matrixBillingShowNotice = function(formSelector, kind, message) {
+            var $form = jQuery(formSelector);
+            if (!$form.length) return;
+            if (kind !== 'success') { kind = 'error'; }
+            var $notice = $form.find('.matrix-billing-notice').first();
+            if (!$notice.length) {
+                $notice = jQuery('<div class="matrix-billing-notice" role="status" aria-live="polite" tabindex="-1"></div>');
+                $form.prepend($notice);
+            }
+            $notice
+                .removeClass('matrix-billing-notice-success matrix-billing-notice-error')
+                .addClass('matrix-billing-notice-' + kind)
+                .text(typeof message === 'string' && message.length ? message : '')
+                .show();
+            // Bring the notice into view and focus it so screen-reader
+            // users hear the announcement and sighted users on small
+            // screens (where the notice may be above the fold of the
+            // form scroll position) actually see it.
+            try { $notice[0].scrollIntoView({behavior: 'smooth', block: 'nearest'}); } catch (e) {}
+            try { $notice.focus(); } catch (e) {}
+        };
         </script>
 
         <?php
@@ -316,6 +357,13 @@ class Matrix_MLM_User_Billing {
         .matrix-fee-preview .matrix-fee-row { display:flex; justify-content:space-between; padding:2px 0; }
         .matrix-fee-preview .matrix-fee-row.matrix-fee-row-total { margin-top:6px; padding-top:8px; border-top:1px solid #e5e7eb; font-weight:600; color:#111827; }
         .matrix-fee-preview .matrix-fee-label { color:#6b7280; }
+        /* Inline status banner injected by matrixBillingShowNotice
+           above the first form field on submit outcome. Replaces the
+           old alert()+location.reload() pattern that disappeared the
+           form on success and looked like a silent page refresh. */
+        .matrix-billing-notice { padding:10px 14px; border-radius:6px; margin-bottom:14px; font-size:13px; line-height:1.45; outline:none; }
+        .matrix-billing-notice-success { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+        .matrix-billing-notice-error { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
         </style>
         <?php
     }
@@ -492,13 +540,41 @@ class Matrix_MLM_User_Billing {
                 window.matrixBillingUpdatePreview('#matrix-billing-airtime', 'airtime');
             });
             $('#matrix-billing-airtime').on('submit', function(e){
-                e.preventDefault(); var f=$(this), b=f.find('button');
+                e.preventDefault(); var f=$(this), b=f.find('button[type=submit]');
                 b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')}, function(r){
-                    alert(window.matrixBillingExtractMessage(r));
-                    if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Airtime');
+                    var msg = window.matrixBillingExtractMessage(r);
+                    if (r.success) {
+                        // Show success inline INSTEAD of alert() +
+                        // location.reload(). The reload looked like
+                        // a silent page refresh once airtime actually
+                        // started succeeding (post PR #276) — the
+                        // user's "page refreshes and loads again"
+                        // report. The new transaction WILL appear in
+                        // "Recent Bill Payments" the next time the
+                        // user refreshes the dashboard manually; the
+                        // inline notice contains all the per-purchase
+                        // details (amount + phone + fee disclosure)
+                        // so they don't NEED to refresh to confirm it
+                        // worked.
+                        window.matrixBillingShowNotice('#matrix-billing-airtime', 'success', msg);
+                        // Reset the form so a second purchase starts
+                        // from a clean slate. Leave network as the
+                        // user picked — they're likely to buy more
+                        // airtime on the same network — but clear
+                        // phone, amount, and PIN. Hide the fee
+                        // preview so it doesn't show stale numbers
+                        // for an empty amount.
+                        f.find('[name=phone]').val('');
+                        f.find('[name=amount]').val('');
+                        f.find('[name=transaction_pin]').val('');
+                        f.find('.matrix-fee-preview').hide();
+                    } else {
+                        window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', msg);
+                    }
+                    b.prop('disabled',false).text('Buy Airtime');
                 }).fail(function(){
-                    alert('Network error. Please check your connection and try again.');
+                    window.matrixBillingShowNotice('#matrix-billing-airtime', 'error', 'Network error. Please check your connection and try again.');
                     b.prop('disabled',false).text('Buy Airtime');
                 });
             });
