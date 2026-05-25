@@ -336,23 +336,19 @@ class Matrix_MLM_User_Wallet {
     /**
      * Render the top-level action buttons.
      *
-     * The buttons are split into two visually-separated groups so the
-     * external cash-out paths read as a distinct concern from the
-     * internal transfers — the page should make it obvious which
-     * actions move money around inside the platform vs which actions
-     * send it off to a real bank account.
+     * All transfer actions render in a single responsive row so the
+     * user sees every available transfer option at a glance, without
+     * the previous Internal/External visual split. The underlying
+     * .matrix-wallet-actions grid is auto-fit so up to four buttons
+     * sit on one line on wide viewports and gracefully wrap to two
+     * (and then one) columns on narrower screens.
      *
-     *   Internal (Matrix-side) group:
-     *     - Transfer to Own Wallet  (Matrix → user's own Fintava virtual)
-     *     - Wallet to Wallet        (Matrix → another user's Matrix wallet)
+     * Buttons rendered (left → right, in order of appearance):
      *
-     *   External (Bank) group:
-     *     - Transfer to Bank        (Fintava virtual → external Nigerian bank, instant)
-     *
-     * Each group has its own heading + caption row; the underlying
-     * .matrix-wallet-actions grid styling is unchanged so the buttons
-     * still flow into a 1/2/3-column responsive layout within their
-     * group.
+     *   - Transfer to Own Wallet   (Matrix → user's own Fintava virtual)
+     *   - Wallet to Wallet         (Matrix → another user's Matrix wallet)
+     *   - Transfer to Bank         (Fintava virtual → external Nigerian bank, instant)
+     *   - Transfer via Zebra Wallet (Matrix → Zebra wallet / bank, admin-approval)
      *
      * Buttons toggle the matching pane below (data-target → data-pane).
      * All panes are rendered server-side so the forms work even if
@@ -367,15 +363,18 @@ class Matrix_MLM_User_Wallet {
      *     ($is_active=false in render()). Both states are folded into
      *     the $payouts_enabled flag the caller passes in.
      *
+     *   - "Transfer via Zebra Wallet" is hidden when $zebra_enabled
+     *     is false (gateway not configured/active OR the Bank
+     *     Transfers policy toggle is off).
+     *
      * History note: a fourth "Matrix Transfers" button used to live
-     * in the External group, claiming to debit the Matrix wallet
+     * alongside Transfer to Bank, claiming to debit the Matrix wallet
      * straight to a bank. It was retired in
      * refactor/withdrawal-controls-five-toggles — the code path
      * never actually reached a payment rail (the operator settled
      * bank-side off-platform), so the button was a misleading
      * shortcut. Users who want money in a bank now go Matrix →
-     * Fintava virtual (Internal group) and then Fintava → Bank
-     * (External group) as two real flows.
+     * Fintava virtual and then Fintava → Bank as two real flows.
      *
      * No button starts in the .is-active state and all panes (see
      * render_panes()) are rendered with the [hidden] attribute, so
@@ -395,57 +394,40 @@ class Matrix_MLM_User_Wallet {
      */
     private function render_action_buttons($payouts_enabled = true, $zebra_enabled = false) {
         ?>
-        <div class="matrix-wallet-action-group">
-            <div class="matrix-wallet-action-group-header">
-                <h3><?php esc_html_e('Internal Transfers', 'matrix-mlm'); ?></h3>
-                <p><?php esc_html_e('Move funds between your own wallets or send to another platform user — funds stay inside the platform.', 'matrix-mlm'); ?></p>
-            </div>
-            <div class="matrix-wallet-actions">
-                <button type="button" class="matrix-wallet-action-btn" data-target="own-wallet">
-                    <span class="matrix-wallet-action-icon dashicons dashicons-randomize"></span>
-                    <span class="matrix-wallet-action-text">
-                        <strong><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></strong>
-                        <small><?php esc_html_e('Move funds from your Matrix wallet to your Virtual account', 'matrix-mlm'); ?></small>
-                    </span>
-                </button>
-                <button type="button" class="matrix-wallet-action-btn" data-target="user-wallet">
-                    <span class="matrix-wallet-action-icon dashicons dashicons-share"></span>
-                    <span class="matrix-wallet-action-text">
-                        <strong><?php esc_html_e('Wallet to Wallet', 'matrix-mlm'); ?></strong>
-                        <small><?php esc_html_e('Send funds to another user\'s Matrix wallet (internal transfer)', 'matrix-mlm'); ?></small>
-                    </span>
-                </button>
-            </div>
+        <div class="matrix-wallet-actions">
+            <button type="button" class="matrix-wallet-action-btn" data-target="own-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-randomize"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Move funds from your Matrix wallet to your Virtual account', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <button type="button" class="matrix-wallet-action-btn" data-target="user-wallet">
+                <span class="matrix-wallet-action-icon dashicons dashicons-share"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Wallet to Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Send funds to another user\'s Matrix wallet (internal transfer)', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <?php if ($payouts_enabled): ?>
+            <button type="button" class="matrix-wallet-action-btn" data-target="bank">
+                <span class="matrix-wallet-action-icon dashicons dashicons-bank"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Transfer to Bank', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Instant — debited from your Fintava virtual wallet', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <?php endif; ?>
+            <?php if ($zebra_enabled): ?>
+            <button type="button" class="matrix-wallet-action-btn" data-target="zebra">
+                <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
+                <span class="matrix-wallet-action-text">
+                    <strong><?php esc_html_e('Transfer via Zebra Wallet', 'matrix-mlm'); ?></strong>
+                    <small><?php esc_html_e('Send to a Zebra wallet or a Nigerian bank — debited from your Matrix wallet, released on operator approval', 'matrix-mlm'); ?></small>
+                </span>
+            </button>
+            <?php endif; ?>
         </div>
-
-        <?php if ($payouts_enabled || $zebra_enabled): ?>
-        <div class="matrix-wallet-action-group matrix-wallet-action-group-external">
-            <div class="matrix-wallet-action-group-header">
-                <h3><?php esc_html_e('External Transfers', 'matrix-mlm'); ?></h3>
-                <p><?php esc_html_e('Send funds out of the platform to a Nigerian bank account or a Zebra wallet.', 'matrix-mlm'); ?></p>
-            </div>
-            <div class="matrix-wallet-actions">
-                <?php if ($payouts_enabled): ?>
-                <button type="button" class="matrix-wallet-action-btn" data-target="bank">
-                    <span class="matrix-wallet-action-icon dashicons dashicons-bank"></span>
-                    <span class="matrix-wallet-action-text">
-                        <strong><?php esc_html_e('Transfer to Bank', 'matrix-mlm'); ?></strong>
-                        <small><?php esc_html_e('Instant — debited from your Fintava virtual wallet', 'matrix-mlm'); ?></small>
-                    </span>
-                </button>
-                <?php endif; ?>
-                <?php if ($zebra_enabled): ?>
-                <button type="button" class="matrix-wallet-action-btn" data-target="zebra">
-                    <span class="matrix-wallet-action-icon dashicons dashicons-money-alt"></span>
-                    <span class="matrix-wallet-action-text">
-                        <strong><?php esc_html_e('Transfer via Zebra Wallet', 'matrix-mlm'); ?></strong>
-                        <small><?php esc_html_e('Send to a Zebra wallet or a Nigerian bank — debited from your Matrix wallet, released on operator approval', 'matrix-mlm'); ?></small>
-                    </span>
-                </button>
-                <?php endif; ?>
-            </div>
-        </div>
-        <?php endif; ?>
         <?php
     }
 
@@ -1821,7 +1803,12 @@ class Matrix_MLM_User_Wallet {
 
         .matrix-wallet-actions {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            /* auto-fit so up to four action buttons sit on one line on
+               wide viewports and gracefully wrap to 2 (and then 1)
+               columns as the viewport narrows. The min-track of
+               220px keeps each button readable without forcing a
+               hard column count. */
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }
@@ -1829,36 +1816,6 @@ class Matrix_MLM_User_Wallet {
             .matrix-wallet-actions { grid-template-columns: 1fr; }
         }
 
-        /* Two-group split: Internal vs External Transfers.
-           The .matrix-wallet-action-group wrapper gives each group
-           its own heading + caption row above its .matrix-wallet-actions
-           grid, with an extra .matrix-wallet-action-group-external
-           modifier on the external group so it visually reads as a
-           distinct concern (top border + extra spacing) without
-           introducing a separate column layout — the underlying
-           grid still flows responsively the same way as before. */
-        .matrix-wallet-action-group { margin-bottom: 16px; }
-        .matrix-wallet-action-group-external {
-            margin-top: 16px;
-            padding-top: 20px;
-            border-top: 2px dashed #e5e7eb;
-        }
-        .matrix-wallet-action-group-header {
-            margin-bottom: 12px;
-        }
-        .matrix-wallet-action-group-header h3 {
-            margin: 0 0 4px;
-            font-size: 14px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #6b7280;
-        }
-        .matrix-wallet-action-group-header p {
-            margin: 0;
-            font-size: 12px;
-            color: #9ca3af;
-        }
         .matrix-wallet-action-btn {
             display: flex;
             align-items: center;
