@@ -3664,7 +3664,16 @@ class Matrix_MLM_Core {
         $stored_token = get_user_meta($user_id, 'matrix_email_verify_token', true);
         $expiry = get_user_meta($user_id, 'matrix_email_verify_expiry', true);
 
-        if ($stored_token !== $token) {
+        // Constant-time comparison. Every other security-sensitive
+        // string compare in this plugin (webhook signatures, TOTP,
+        // attachment HMAC, Zebra IPN URL token) uses hash_equals();
+        // the email-verify path was the lone outlier on plain !==,
+        // which leaks via timing on a long-lived per-user token.
+        // The is_string guard keeps hash_equals() from emitting a
+        // type warning when get_user_meta() returns '' for a user
+        // who has no pending verification — empty($token) above
+        // already short-circuits the corresponding empty-input case.
+        if (!is_string($stored_token) || !hash_equals($stored_token, $token)) {
             wp_die(__('Invalid or expired verification link.', 'matrix-mlm'));
         }
 
