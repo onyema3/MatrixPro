@@ -833,7 +833,13 @@ class Matrix_MLM_User_Billing {
             }
 
             whenJQueryReady(function($){
-            $('#data-network').on('change', function(){
+            // Direct \$(selector).on(...) bindings on inline scripts
+            // race against the matched element's DOM arrival on stacks
+            // with deferred jQuery / Rocket Loader / WP Rocket / etc.
+            // Delegated on document so handlers always fire regardless
+            // of arrival order. See class-matrix-user-wallet.php's
+            // render_scripts() for the canonical explanation.
+            $(document).on('change', '#data-network', function(){
                 var net=$(this).val(); if(!net) return;
                 var sel=$('#data-plan'); sel.html('<option>Loading...</option>').prop('disabled',true);
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_list_data_bundles',nonce:matrixMLM.nonce,network:net},function(r){
@@ -846,7 +852,7 @@ class Matrix_MLM_User_Billing {
                     sel.prop('disabled',false);
                 });
             });
-            $('#data-plan').on('change',function(){
+            $(document).on('change', '#data-plan', function(){
                 var a=$(this).find(':selected').data('amount')||0;
                 $('#data-amount').val(a);
                 $('button[type=submit]').prop('disabled',!a);
@@ -857,7 +863,7 @@ class Matrix_MLM_User_Billing {
                 // bind here because the amount field is hidden.
                 window.matrixBillingUpdatePreview('#matrix-billing-data', 'data');
             });
-            $('#matrix-billing-data').on('submit',function(e){
+            $(document).on('submit', '#matrix-billing-data', function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     alert(window.matrixBillingExtractMessage(r));
@@ -941,7 +947,8 @@ class Matrix_MLM_User_Billing {
                     });
                 }
             });
-            $('#cable-provider').on('change',function(){
+            // Delegated on document — same DOM-timing rationale as render_data().
+            $(document).on('change', '#cable-provider', function(){
                 var prov=$(this).val(); if(!prov) return;
                 var sel=$('#cable-plan'); sel.html('<option>Loading...</option>').prop('disabled',true);
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_list_cable_plans',nonce:matrixMLM.nonce,provider:prov},function(r){
@@ -954,7 +961,7 @@ class Matrix_MLM_User_Billing {
                     sel.prop('disabled',false);
                 });
             });
-            $('#cable-plan').on('change',function(){
+            $(document).on('change', '#cable-plan', function(){
                 var a=$(this).find(':selected').data('amount')||0;
                 $('#cable-amount').val(a);
                 $('button[type=submit]').prop('disabled',!a);
@@ -962,7 +969,7 @@ class Matrix_MLM_User_Billing {
                 // see render_data() for the rationale.
                 window.matrixBillingUpdatePreview('#matrix-billing-cable', 'cable');
             });
-            $('#matrix-billing-cable').on('submit',function(e){
+            $(document).on('submit', '#matrix-billing-cable', function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     alert(window.matrixBillingExtractMessage(r));
@@ -1055,7 +1062,8 @@ class Matrix_MLM_User_Billing {
                     });
                 }
             });
-            $('#verify-meter-btn').on('click',function(){
+            // Delegated on document — same DOM-timing rationale as render_data().
+            $(document).on('click', '#verify-meter-btn', function(){
                 var btn=$(this); btn.prop('disabled',true).text('Verifying...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_verify_meter',nonce:matrixMLM.nonce,meter_number:$('#elec-meter').val(),disco:$('#elec-disco').val(),meter_type:$('[name=meter_type]').val()},function(r){
                     btn.prop('disabled',false).text('Verify Meter');
@@ -1075,10 +1083,10 @@ class Matrix_MLM_User_Billing {
                 });
             });
             // Recompute the fee preview as the user types the amount.
-            $('#matrix-billing-electricity [name=amount]').on('input change', function(){
+            $(document).on('input change', '#matrix-billing-electricity [name=amount]', function(){
                 window.matrixBillingUpdatePreview('#matrix-billing-electricity', 'electricity');
             });
-            $('#matrix-billing-electricity').on('submit',function(e){
+            $(document).on('submit', '#matrix-billing-electricity', function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button[type=submit]'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_electricity',nonce:matrixMLM.nonce,meter_number:f.find('[name=meter_number]').val(),amount:f.find('[name=amount]').val(),disco:f.find('[name=disco]').val(),meter_type:f.find('[name=meter_type]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
                     var msg = window.matrixBillingExtractMessage(r);
