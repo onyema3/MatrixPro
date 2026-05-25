@@ -142,6 +142,48 @@ class Matrix_MLM_Flutterwave {
      * - Uses hash_equals() to avoid timing-attack leaks.
      * - complete_deposit() validates that the verified gateway amount and
      *   currency match the server-stored deposit row before crediting.
+     *
+     * Operator security model (audit L9 — vendor protocol limitation):
+     *
+     *   Flutterwave's "verif-hash" is a STATIC shared secret that the
+     *   platform echoes back verbatim on every webhook call. It is
+     *   NOT an HMAC over the request body. That means:
+     *
+     *     - Any leak of webhook_hash (a backup, a log file, the
+     *       wp_options table dumped during a migration, an operator
+     *       pasting it into a chat) lets an attacker forge arbitrary
+     *       deposit-completion events without ever touching
+     *       Flutterwave.
+     *     - There is no replay protection at the protocol layer; the
+     *       same {hash, body} pair is valid forever.
+     *
+     *   This is a Flutterwave protocol limitation, not a bug in this
+     *   plugin's verification logic. The remaining defence is the
+     *   server-side amount / currency cross-check in
+     *   complete_deposit() below — even a forged webhook can only
+     *   credit amounts that match a deposit row this plugin already
+     *   wrote at initiation time. So a successful forgery requires
+     *   ALSO knowing the (tx_ref, amount, currency) tuple of a
+     *   pending deposit, narrowing the impact significantly.
+     *
+     *   Operator handling guidance:
+     *
+     *     1. Treat webhook_hash as a high-sensitivity secret on par
+     *        with the API secret key. Rotate quarterly via the
+     *        Flutterwave dashboard and update the plugin gateway
+     *        settings in the same change window.
+     *     2. Never log webhook_hash. Audit log emitters in this file
+     *        already redact it; future additions must do the same.
+     *     3. If a webhook_hash leak is suspected, rotate immediately
+     *        AND audit the matrix_deposits table for any 'completed'
+     *        rows in the suspected window whose audit trail does not
+     *        match a real Flutterwave dashboard entry.
+     *     4. Prefer Paystack or Fintava for new merchant integrations
+     *        when both options exist — both use HMAC-of-body which
+     *        does not have this protocol shape.
+     *
+     *   See .kiro/steering/operator-security-notes.md for the
+     *   plugin-wide secret-rotation expectations.
      */
     public function handle_webhook($request) {
         $payload = $request->get_body();
