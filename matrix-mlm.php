@@ -26,6 +26,66 @@ define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
 define('MATRIX_MLM_DB_VERSION', '1.0.18');
 
+/**
+ * GitHub-driven auto-updates.
+ *
+ * The plugin is not hosted on the WordPress.org plugin directory, so WP
+ * core's update check (which polls api.wordpress.org) will never find us.
+ * Instead we use the YahnisElsts/plugin-update-checker library (vendored
+ * in vendor/plugin-update-checker/, MIT licensed) to poll GitHub Releases
+ * on the source repo and surface the standard "Update available" banner
+ * + one-click upgrade flow inside Plugins -> Installed Plugins.
+ *
+ * Operational contract:
+ *   1. PUC checks the configured repo every 12 hours by default (WP
+ *      transient cadence). It compares the latest GitHub Release tag
+ *      against the Version: header in this file (the value above).
+ *   2. To ship an update, cut a GitHub Release on onyema3/MatrixPro
+ *      whose tag matches the new version (e.g. `v2.0.1` or `2.0.1`).
+ *      PUC accepts both `v`-prefixed and plain semver tags.
+ *   3. PUC will use the Release's auto-generated source ZIP. The library
+ *      already handles WordPress's quirk of installing the unpacked
+ *      directory under the wrapper folder name from the tarball -- it
+ *      renames it back to `matrix-mlm` so the upgrade lands in the
+ *      same plugin slot and re-activates cleanly.
+ *
+ * Filter `matrix_mlm_update_checker_repo` lets resellers point a fork
+ * at a different upstream without editing this file. Returning false
+ * disables update checks entirely (useful for white-labelled installs
+ * that ship updates through their own pipeline).
+ */
+$matrix_mlm_update_repo = apply_filters(
+    'matrix_mlm_update_checker_repo',
+    'https://github.com/onyema3/MatrixPro/'
+);
+
+if ($matrix_mlm_update_repo && file_exists(MATRIX_MLM_PLUGIN_DIR . 'vendor/plugin-update-checker/plugin-update-checker.php')) {
+    require_once MATRIX_MLM_PLUGIN_DIR . 'vendor/plugin-update-checker/plugin-update-checker.php';
+
+    // The third argument ('matrix-mlm') MUST match the plugin's text-domain
+    // and the directory name WordPress installs this plugin into. PUC uses
+    // it to identify which row in the update transient belongs to us; if
+    // it drifts away from the actual install dir, WP will believe the
+    // update applies to a different plugin and either skip the upgrade or
+    // overwrite the wrong directory.
+    $matrix_mlm_update_checker = YahnisElsts\PluginUpdateChecker\v5\PucFactory::buildUpdateChecker(
+        $matrix_mlm_update_repo,
+        __FILE__,
+        'matrix-mlm'
+    );
+
+    // GitHub exposes every tag as a "release" candidate. Constrain to tags
+    // that look like semver (with or without a leading `v`) so that any
+    // ad-hoc tags an operator might push (e.g. `staging`, `hotfix-temp`)
+    // never get offered to customers as an update.
+    if (method_exists($matrix_mlm_update_checker, 'getVcsApi')) {
+        $vcs_api = $matrix_mlm_update_checker->getVcsApi();
+        if ($vcs_api && method_exists($vcs_api, 'setReleaseVersionFilter')) {
+            $vcs_api->setReleaseVersionFilter('/^v?\d+\.\d+(?:\.\d+)?(?:[.\-]\w+)?$/');
+        }
+    }
+}
+
 // Autoloader
 spl_autoload_register(function ($class) {
     $prefix = 'Matrix_MLM_';
