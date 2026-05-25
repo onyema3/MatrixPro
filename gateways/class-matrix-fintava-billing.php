@@ -2590,16 +2590,49 @@ class Matrix_MLM_Fintava_Billing {
     }
 
     /**
-     * Get user billing history
+     * Get user billing history.
+     *
+     * Paginatable: passes $limit + $offset through to the SQL.
+     * The user-facing Bill Payments page reads $offset off a
+     * `bill_page` URL param via Matrix_MLM_User_Billing::render(),
+     * so this helper has to honour offset alongside limit. Default
+     * offset is 0 so existing callers (e.g. legacy non-paginated
+     * call sites) keep working unchanged.
      */
-    public function get_user_history($user_id, $type = null, $limit = 20) {
+    public function get_user_history($user_id, $type = null, $limit = 20, $offset = 0) {
         global $wpdb;
         $where = "WHERE user_id = %d";
         $params = [$user_id];
         if ($type) { $where .= " AND type = %s"; $params[] = $type; }
-        $params[] = $limit;
+        $params[] = max(1, (int) $limit);
+        $params[] = max(0, (int) $offset);
         return $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_billing_transactions $where ORDER BY created_at DESC LIMIT %d", $params
+            "SELECT * FROM {$wpdb->prefix}matrix_billing_transactions $where ORDER BY created_at DESC LIMIT %d OFFSET %d", $params
+        ));
+    }
+
+    /**
+     * Total count of bill payments for this user. Used by the
+     * Bill Payments page to compute total_pages =
+     * ceil(count / per_page) before rendering the prev/next
+     * pagination chrome.
+     *
+     * Optional $type narrows to a single category (airtime / data /
+     * cable / electricity) — matches the same filter $type takes on
+     * get_user_history(), so a future per-tab paginated history can
+     * reuse this without a separate count helper.
+     */
+    public function get_user_history_count($user_id, $type = null) {
+        global $wpdb;
+        if ($type) {
+            return (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_billing_transactions WHERE user_id = %d AND type = %s",
+                $user_id, $type
+            ));
+        }
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_billing_transactions WHERE user_id = %d",
+            $user_id
         ));
     }
 }

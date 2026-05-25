@@ -279,12 +279,36 @@ class Matrix_MLM_User_Deposits {
     public function render_history($user_id) {
         global $wpdb;
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
-        $deposits = $wpdb->get_results($wpdb->prepare(
-            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE user_id = %d ORDER BY created_at DESC LIMIT 50",
+
+        // Pagination chrome — 10 rows per page across all paginated
+        // transaction tables on the dashboard for consistency. The
+        // page param is namespaced (`dep_page` rather than `page` /
+        // `p`) so it doesn't collide with WordPress's own `page`
+        // query var on the dashboard tab router or with any other
+        // paginated table elsewhere on the site.
+        $per_page = 10;
+        $total_count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_deposits WHERE user_id = %d",
             $user_id
         ));
+        $total_pages = $total_count > 0 ? (int) ceil($total_count / $per_page) : 1;
+
+        $current_page = isset($_GET['dep_page']) ? (int) $_GET['dep_page'] : 1;
+        if ($current_page < 1)            { $current_page = 1; }
+        if ($current_page > $total_pages) { $current_page = $total_pages; }
+        $offset = ($current_page - 1) * $per_page;
+
+        $deposits = $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_deposits WHERE user_id = %d ORDER BY created_at DESC LIMIT %d OFFSET %d",
+            $user_id, $per_page, $offset
+        ));
         ?>
-        <h2><?php _e('Deposit History', 'matrix-mlm'); ?></h2>
+        <h2 id="matrix-deposit-history"><?php _e('Deposit History', 'matrix-mlm'); ?></h2>
+        <?php if (empty($deposits)): ?>
+            <div class="matrix-info-box">
+                <p><?php esc_html_e('No deposits yet.', 'matrix-mlm'); ?></p>
+            </div>
+        <?php else: ?>
         <table class="matrix-table">
             <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Gateway', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Charge', 'matrix-mlm'); ?></th><th><?php _e('Net', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th></tr></thead>
             <tbody>
@@ -300,6 +324,116 @@ class Matrix_MLM_User_Deposits {
                 <?php endforeach; ?>
             </tbody>
         </table>
+        <?php
+        // Pagination chrome — only when there's more than one
+        // page, so a small ledger doesn't carry visual noise.
+        // Anchored to #matrix-deposit-history so prev/next jumps
+        // back to the heading rather than the page top.
+        $this->render_pagination_nav($current_page, $total_pages, 'dep_page', 'matrix-deposit-history');
+        ?>
+        <?php endif; ?>
+
+        <style>
+        /* Pagination chrome — same visual contract as the Wallet
+           page's Transaction History. Defined inline rather than
+           in a shared stylesheet so each transaction page stays
+           self-contained and editable without a CSS rebuild. */
+        .matrix-pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-top: 16px;
+            padding: 12px 0 4px;
+            font-size: 14px;
+            color: #4b5563;
+        }
+        .matrix-page-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            color: #1f2937;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background .15s ease, border-color .15s ease;
+        }
+        .matrix-page-btn:hover {
+            background: #eef2ff;
+            border-color: #4f46e5;
+            color: #4f46e5;
+        }
+        .matrix-page-btn-disabled,
+        .matrix-page-btn-disabled:hover {
+            color: #9ca3af;
+            background: #f9fafb;
+            border-color: #e5e7eb;
+            cursor: not-allowed;
+        }
+        .matrix-page-info {
+            font-variant-numeric: tabular-nums;
+            color: #6b7280;
+        }
+        </style>
+        <?php
+    }
+
+    /**
+     * Render Previous / Next pagination links plus a "Page X of Y"
+     * indicator. Same contract as the helper on Matrix_MLM_User_Wallet
+     * — see that class's render_pagination_nav() for the full
+     * rationale. The implementation is duplicated here (rather than
+     * extracted to a shared trait) because each user-facing page
+     * class is self-contained, and a 25-line helper isn't worth
+     * threading through a separate file.
+     *
+     * @param int    $current_page  1-indexed.
+     * @param int    $total_pages   >= 1.
+     * @param string $param_name    URL query var to read/write.
+     * @param string $section_id    HTML id (no leading #) to anchor
+     *                              the prev/next links to.
+     */
+    private function render_pagination_nav($current_page, $total_pages, $param_name, $section_id = '') {
+        if ($total_pages <= 1) {
+            return;
+        }
+
+        $base_url = remove_query_arg($param_name);
+        $fragment = $section_id !== '' ? '#' . $section_id : '';
+
+        $prev_url = $current_page > 1
+            ? esc_url(add_query_arg($param_name, $current_page - 1, $base_url) . $fragment)
+            : '';
+        $next_url = $current_page < $total_pages
+            ? esc_url(add_query_arg($param_name, $current_page + 1, $base_url) . $fragment)
+            : '';
+        ?>
+        <nav class="matrix-pagination" aria-label="<?php esc_attr_e('Deposit history pagination', 'matrix-mlm'); ?>">
+            <?php if ($prev_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $prev_url; ?>" rel="prev">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></span>
+            <?php endif; ?>
+
+            <span class="matrix-page-info">
+                <?php
+                printf(
+                    /* translators: 1: current page number, 2: total page count */
+                    esc_html__('Page %1$d of %2$d', 'matrix-mlm'),
+                    (int) $current_page,
+                    (int) $total_pages
+                );
+                ?>
+            </span>
+
+            <?php if ($next_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $next_url; ?>" rel="next"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</span>
+            <?php endif; ?>
+        </nav>
         <?php
     }
 }

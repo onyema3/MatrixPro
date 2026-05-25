@@ -13,7 +13,23 @@ class Matrix_MLM_User_Billing {
     public function render($user_id) {
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $billing = new Matrix_MLM_Fintava_Billing();
-        $history = $billing->get_user_history($user_id, null, 10);
+
+        // Pagination chrome — 10 rows per page across all paginated
+        // transaction tables on the dashboard for consistency. The
+        // page param is namespaced (`bill_page` rather than `page`)
+        // so it doesn't collide with the dashboard tab router or
+        // any other paginated table on the site. We compute total
+        // pages from a count query rather than infering from the
+        // returned row count so the prev/next chrome is correct
+        // even on the last (partial) page.
+        $per_page         = 10;
+        $bill_total_count = $billing->get_user_history_count($user_id);
+        $bill_total_pages = $bill_total_count > 0 ? (int) ceil($bill_total_count / $per_page) : 1;
+        $bill_current_page = isset($_GET['bill_page']) ? (int) $_GET['bill_page'] : 1;
+        if ($bill_current_page < 1)                  { $bill_current_page = 1; }
+        if ($bill_current_page > $bill_total_pages)  { $bill_current_page = $bill_total_pages; }
+        $bill_offset = ($bill_current_page - 1) * $per_page;
+        $history = $billing->get_user_history($user_id, null, $per_page, $bill_offset);
         $sub_tab = sanitize_text_field($_GET['service'] ?? 'airtime');
 
         // Per-category visibility — admins can disable individual
@@ -360,7 +376,7 @@ class Matrix_MLM_User_Billing {
 
         <!-- Transaction History -->
         <?php if (!empty($history)): ?>
-        <h3 style="margin-top:24px;"><?php _e('Recent Bill Payments', 'matrix-mlm'); ?></h3>
+        <h3 id="matrix-bill-history" style="margin-top:24px;"><?php _e('Recent Bill Payments', 'matrix-mlm'); ?></h3>
         <table class="matrix-table">
             <thead><tr><th><?php _e('Date', 'matrix-mlm'); ?></th><th><?php _e('Type', 'matrix-mlm'); ?></th><th><?php _e('Amount', 'matrix-mlm'); ?></th><th><?php _e('Details', 'matrix-mlm'); ?></th></tr></thead>
             <tbody>
@@ -433,10 +449,89 @@ class Matrix_MLM_User_Billing {
                 <?php endforeach; ?>
             </tbody>
         </table>
+        <?php
+        // Pagination chrome. Inline conditional: only render when
+        // there's more than one page so a small ledger doesn't
+        // carry visual noise. URL-builds via add_query_arg() so
+        // the dashboard's tab + service params survive the click.
+        if ($bill_total_pages > 1):
+            $base_url = remove_query_arg('bill_page');
+            $prev_url = $bill_current_page > 1
+                ? esc_url(add_query_arg('bill_page', $bill_current_page - 1, $base_url) . '#matrix-bill-history')
+                : '';
+            $next_url = $bill_current_page < $bill_total_pages
+                ? esc_url(add_query_arg('bill_page', $bill_current_page + 1, $base_url) . '#matrix-bill-history')
+                : '';
+        ?>
+        <nav class="matrix-pagination" aria-label="<?php esc_attr_e('Bill payments pagination', 'matrix-mlm'); ?>">
+            <?php if ($prev_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $prev_url; ?>" rel="prev">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true">&laquo; <?php esc_html_e('Previous', 'matrix-mlm'); ?></span>
+            <?php endif; ?>
+            <span class="matrix-page-info">
+                <?php
+                printf(
+                    /* translators: 1: current page number, 2: total page count */
+                    esc_html__('Page %1$d of %2$d', 'matrix-mlm'),
+                    (int) $bill_current_page,
+                    (int) $bill_total_pages
+                );
+                ?>
+            </span>
+            <?php if ($next_url !== ''): ?>
+                <a class="matrix-page-btn" href="<?php echo $next_url; ?>" rel="next"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</a>
+            <?php else: ?>
+                <span class="matrix-page-btn matrix-page-btn-disabled" aria-disabled="true"><?php esc_html_e('Next', 'matrix-mlm'); ?> &raquo;</span>
+            <?php endif; ?>
+        </nav>
+        <?php endif; ?>
         <?php endif; ?>
 
         <style>
         .matrix-subtitle { color: #6b7280; margin: -10px 0 20px; font-size: 14px; }
+        /* Pagination chrome — same visual contract as the Wallet
+           page's Transaction History. Inline rather than in a
+           shared stylesheet so each transaction page stays
+           self-contained. */
+        .matrix-pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-top: 16px;
+            padding: 12px 0 4px;
+            font-size: 14px;
+            color: #4b5563;
+        }
+        .matrix-page-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            color: #1f2937;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background .15s ease, border-color .15s ease;
+        }
+        .matrix-page-btn:hover {
+            background: #eef2ff;
+            border-color: #4f46e5;
+            color: #4f46e5;
+        }
+        .matrix-page-btn-disabled,
+        .matrix-page-btn-disabled:hover {
+            color: #9ca3af;
+            background: #f9fafb;
+            border-color: #e5e7eb;
+            cursor: not-allowed;
+        }
+        .matrix-page-info {
+            font-variant-numeric: tabular-nums;
+            color: #6b7280;
+        }
         .matrix-billing-tabs { display: flex; gap: 0; margin-bottom: 0; border-bottom: 2px solid #e5e7eb; }
         .matrix-billing-tabs a { padding: 10px 20px; text-decoration: none; color: #6b7280; font-weight: 500; font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all .2s; }
         .matrix-billing-tabs a.active { color: #4f46e5; border-bottom-color: #4f46e5; }
