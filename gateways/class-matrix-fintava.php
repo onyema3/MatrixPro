@@ -1870,10 +1870,28 @@ class Matrix_MLM_Fintava {
             // functional. Manual entry shifts the responsibility for the
             // account name to the operator and lets the actual transfer
             // arbitrate correctness.
-            wp_send_json_error([
+            $payload = [
                 'message'              => $resolved->get_error_message(),
                 'allow_manual_override' => true,
-            ]);
+            ];
+
+            // When WP_DEBUG is on, attach the per-leg diagnostic the
+            // race resolver stashed on the WP_Error data so the
+            // operator can see in DevTools exactly what each resolver
+            // returned. Single most useful piece of info for triaging
+            // "still failing for OPay/Kuda/etc." — tells us in one
+            // shot whether Paystack rejected the bank code, returned
+            // an empty name, timed out, or whether Fintava's
+            // /name/enquiry is the only one that ran. Gated on
+            // WP_DEBUG so we don't leak upstream error wording to
+            // end users on production installs.
+            if (defined('WP_DEBUG') && WP_DEBUG) {
+                $err_data = $resolved->get_error_data();
+                if (is_array($err_data)) {
+                    $payload['debug'] = $err_data;
+                }
+            }
+            wp_send_json_error($payload);
         }
 
         wp_send_json_success([
@@ -2058,6 +2076,15 @@ class Matrix_MLM_Fintava {
         // per-leg cause for diagnostic purposes; surface a single
         // friendly message to the user so they know to fall through
         // to the manual-entry path.
+        //
+        // Attach the per-leg breakdown to the WP_Error data so
+        // ajax_resolve_account can echo it back to the client when
+        // WP_DEBUG is on (server-side toggle, not a client header).
+        // Without this, every "Could not auto-verify" failure looks
+        // identical to the operator regardless of which resolver
+        // actually failed and how — useful for triaging tier
+        // limitations like "Paystack rejects this fintech's code"
+        // or "Fintava's name-enquiry endpoint is down".
         error_log(sprintf(
             '[Matrix MLM] resolve_account: all resolvers failed. sortCode=%s cbn=%s legs=%s',
             $bank_code,
@@ -2066,7 +2093,12 @@ class Matrix_MLM_Fintava {
         ));
         return new WP_Error(
             'all_resolvers_failed',
-            __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm')
+            __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm'),
+            [
+                'sortCode'    => $bank_code,
+                'paystack_cbn' => $paystack_cbn !== '' ? $paystack_cbn : null,
+                'legs'        => $leg_errors,
+            ]
         );
     }
 
