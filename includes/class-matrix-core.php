@@ -167,12 +167,43 @@ class Matrix_MLM_Core {
             MATRIX_MLM_VERSION
         );
 
+        // Enqueue in the HEAD (not the footer). Pre-fix this used
+        // $in_footer=true, which — combined with the 'jquery' dep —
+        // caused WordPress to push jQuery into the footer too. The
+        // dashboard then emits inline <script> blocks in the body
+        // (wallet, verve card, bills payment, benefits, virtual
+        // wallet, bank payout, pay-subscription) that reference
+        // jQuery synchronously at parse time. On a fresh pageload
+        // jQuery hadn't downloaded yet when those bodies parsed,
+        // so the inline IIFEs threw ReferenceError, none of the
+        // click/submit handlers bound, and clicks silently did
+        // nothing. A manual refresh masked it: jQuery was now in
+        // browser cache, arrived in time on the second parse, and
+        // every handler bound — exactly the user-reported
+        // "buttons don't work until I refresh" symptom across
+        // Wallet, Verve Card, Bill Payments, and Benefits.
+        //
+        // Loading in the head pushes jQuery into the head as well
+        // (because of the dep), so every inline body <script> now
+        // has jQuery available at parse time. The existing
+        // whenJQueryReady polling guards in those inline scripts
+        // stay as defence-in-depth for installs whose theme or
+        // performance plugin (Astra, GeneratePress, OceanWP,
+        // WP Rocket, SG Optimizer, FlyingPress, Perfmatters,
+        // Cloudflare Rocket Loader, etc.) re-defers jQuery to
+        // the footer despite this enqueue.
+        //
+        // Cost: jQuery (~33 KB gzipped) and matrix-public.js move
+        // from the footer to the head, which adds a few hundred
+        // milliseconds to first paint on cold loads. Acceptable
+        // tradeoff for correctness — the dashboard pages weren't
+        // functional without it.
         wp_enqueue_script(
             'matrix-mlm-public',
             MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-public.js',
             ['jquery'],
             MATRIX_MLM_VERSION,
-            true
+            false
         );
 
         wp_localize_script('matrix-mlm-public', 'matrixMLM', [
