@@ -490,6 +490,144 @@
     window.matrixEnable2FA  = function() { matrixToggle2FAForm('enable'); };
     window.matrixDisable2FA = function() { matrixToggle2FAForm('disable'); };
 
+    // Transaction PIN form. Same shape and rationale as the 2FA form
+    // above — server-rendered hidden form, JS swaps the visible
+    // input rows and dispatches the right AJAX action based on mode.
+    //
+    // matrixTogglePinForm(mode) where mode is 'set' | 'change' | 'disable'.
+    var matrixPinState = { mode: null };
+
+    window.matrixTogglePinForm = function(mode) {
+        matrixPinState.mode = mode;
+        var $form        = $('#matrix-pin-form');
+        var $title       = $('#matrix-pin-form-title');
+        var $help        = $('#matrix-pin-form-help');
+        var $currentRow  = $('#matrix-pin-current-row');
+        var $newRow      = $('#matrix-pin-new-row');
+        var $confirmRow  = $('#matrix-pin-confirm-row');
+        var $submit      = $('#matrix-pin-submit');
+
+        // Reset every input on each open so a previous half-finished
+        // attempt doesn't leak into the next one.
+        $('#matrix-pin-password').val('');
+        $('#matrix-pin-current').val('');
+        $('#matrix-pin-new').val('');
+        $('#matrix-pin-confirm').val('');
+
+        if (mode === 'set') {
+            $title.text('Set transaction PIN');
+            $help.text('Confirm your password and choose a 4–6 digit numeric PIN.');
+            $currentRow.hide();
+            $newRow.show();
+            $confirmRow.show();
+            $submit.text('Set PIN');
+        } else if (mode === 'change') {
+            $title.text('Change transaction PIN');
+            $help.text('Confirm your password, your current PIN, and choose a new 4–6 digit numeric PIN.');
+            $currentRow.show();
+            $newRow.show();
+            $confirmRow.show();
+            $submit.text('Change PIN');
+        } else if (mode === 'disable') {
+            $title.text('Disable transaction PIN');
+            $help.text('Confirm your password and your current PIN to remove the PIN gate.');
+            $currentRow.show();
+            $newRow.hide();
+            $confirmRow.hide();
+            $submit.text('Disable PIN');
+        }
+
+        $form.show();
+        $('#matrix-pin-password').trigger('focus');
+    };
+
+    window.matrixCancelPinForm = function() {
+        matrixPinState.mode = null;
+        $('#matrix-pin-form').hide();
+        $('#matrix-pin-password').val('');
+        $('#matrix-pin-current').val('');
+        $('#matrix-pin-new').val('');
+        $('#matrix-pin-confirm').val('');
+    };
+
+    // Single submit button — dispatches based on state. Client-side
+    // checks here are UX hints (catch the obvious typo before the
+    // round-trip); the server normaliser is the security gate, so a
+    // client that bypasses these checks still hits the same 4–6
+    // digit + bcrypt verify on the back end.
+    $(document).on('click', '#matrix-pin-submit', function(e) {
+        e.preventDefault();
+        var password    = $('#matrix-pin-password').val();
+        var currentPin  = $('#matrix-pin-current').val();
+        var newPin      = $('#matrix-pin-new').val();
+        var confirmPin  = $('#matrix-pin-confirm').val();
+
+        if (!password) {
+            showNotification('Enter your current password.', 'error');
+            return;
+        }
+
+        var mode = matrixPinState.mode;
+        var pinPattern = /^[0-9]{4,6}$/;
+
+        if (mode === 'set') {
+            if (!pinPattern.test(newPin)) {
+                showNotification('PIN must be 4 to 6 digits.', 'error');
+                return;
+            }
+            if (newPin !== confirmPin) {
+                showNotification('PIN and confirmation do not match.', 'error');
+                return;
+            }
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'set_transaction_pin',
+                current_password: password,
+                pin: newPin
+            }, function(data) {
+                showNotification(data.message || 'PIN set.', 'success');
+                setTimeout(function() { matrixMLMReload(); }, 1200);
+            });
+        } else if (mode === 'change') {
+            if (!pinPattern.test(currentPin)) {
+                showNotification('Enter your current PIN.', 'error');
+                return;
+            }
+            if (!pinPattern.test(newPin)) {
+                showNotification('New PIN must be 4 to 6 digits.', 'error');
+                return;
+            }
+            if (newPin !== confirmPin) {
+                showNotification('PIN and confirmation do not match.', 'error');
+                return;
+            }
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'change_transaction_pin',
+                current_password: password,
+                current_pin: currentPin,
+                new_pin: newPin
+            }, function(data) {
+                showNotification(data.message || 'PIN updated.', 'success');
+                setTimeout(function() { matrixMLMReload(); }, 1200);
+            });
+        } else if (mode === 'disable') {
+            if (!pinPattern.test(currentPin)) {
+                showNotification('Enter your current PIN.', 'error');
+                return;
+            }
+            matrixAjax({
+                action: 'matrix_mlm_action',
+                matrix_action: 'disable_transaction_pin',
+                current_password: password,
+                current_pin: currentPin
+            }, function(data) {
+                showNotification(data.message || 'PIN disabled.', 'success');
+                setTimeout(function() { matrixMLMReload(); }, 1200);
+            });
+        }
+    });
+
     // Notification styles
     $('<style>')
         .text('.matrix-notification{position:fixed;top:20px;right:20px;padding:14px 24px;border-radius:8px;font-size:14px;font-weight:500;z-index:99999;transform:translateX(120%);transition:transform 0.3s ease;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);}.matrix-notification.show{transform:translateX(0);}.matrix-notification-success{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;}.matrix-notification-error{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;}.matrix-notification-info{background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe;}')

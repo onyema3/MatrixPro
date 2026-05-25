@@ -57,6 +57,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-notifications.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-crypto.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-qr-svg.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-two-factor.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-transaction-pin.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-gdpr.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-language.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-seo.php';
