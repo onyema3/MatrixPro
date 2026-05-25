@@ -17,6 +17,45 @@ class Matrix_MLM_Core {
     }
 
     public function run() {
+        // One-time stale-cache purge after a plugin upgrade.
+        //
+        // Releases prior to this fix did not set DONOTCACHEPAGE,
+        // litespeed_control_set_nocache, or X-LiteSpeed-Cache-Control
+        // on dashboard pages — only the standard HTTP nocache_headers().
+        // Customer hosts running LiteSpeed (with "Cache Logged-in
+        // Users" enabled, which is the default on most LiteSpeed
+        // shared-hosting plans) accumulated full-page cached HTML
+        // snapshots of the wallet/dashboard that outlived balance
+        // changes, presenting users with stale balances after deposits,
+        // withdrawals, transfers, and commission payouts. The fix
+        // (above, in nocache_dashboard_pages) prevents new cache
+        // entries — but existing entries on every customer site at
+        // the moment of upgrade are still poisoned and would keep
+        // serving stale HTML until they naturally expired.
+        //
+        // Compare the version stamp we last purged at against the
+        // current MATRIX_MLM_VERSION; on any forward movement, fire
+        // each major page-cache plugin's purge_all action exactly
+        // once and record the new stamp. The check is cheap in the
+        // steady state (one get_option() + one version_compare()),
+        // and the purge fan-out only runs when the version genuinely
+        // moved forward — so this isn't a per-request cost beyond
+        // first-load-after-upgrade. Each do_action() / function_exists()
+        // is a no-op on hosts where that cache plugin is not present,
+        // so the fan-out is safe to fire unconditionally.
+        $last_purged = (string) get_option('matrix_mlm_last_purged_version', '0.0.0');
+        if (version_compare($last_purged, MATRIX_MLM_VERSION, '<')) {
+            do_action('litespeed_purge_all');
+            do_action('rocket_purge_cache');
+            if (function_exists('w3tc_pgcache_flush')) {
+                w3tc_pgcache_flush();
+            }
+            if (function_exists('wp_cache_clear_cache')) {
+                wp_cache_clear_cache();
+            }
+            update_option('matrix_mlm_last_purged_version', MATRIX_MLM_VERSION, false);
+        }
+
         // Self-healing schema upgrade: run any pending migrations on load
         // so admins don't have to deactivate/reactivate after a plugin update.
         if (class_exists('Matrix_MLM_Database')) {
@@ -388,7 +427,53 @@ class Matrix_MLM_Core {
         if (!has_shortcode($post->post_content, 'matrix_dashboard')) {
             return;
         }
+
+        // Layer 1: standard HTTP Cache-Control + Expires headers.
+        // Honoured by the browser and by RFC-compliant intermediate
+        // caches. Was the only layer this method covered before —
+        // sufficient for browser cache, but ignored by every
+        // server-side full-page cache plugin/module on the market,
+        // which is why logged-in users were seeing stale wallet
+        // balances after transfers when LiteSpeed was in front.
         nocache_headers();
+
+        // Layer 2: the DONOTCACHE* constants. Honoured by WP Rocket,
+        // W3 Total Cache, WP Super Cache, WP Fastest Cache, Comet
+        // Cache, and WP Engine's built-in page cache. LiteSpeed Cache
+        // also reads DONOTCACHEPAGE — but only when its "Cache
+        // Logged-in Users" toggle is OFF, which is NOT the default on
+        // most cPanel/CloudLinux LiteSpeed hosting plans. Layer 3
+        // covers the on-by-default case.
+        if (!defined('DONOTCACHEPAGE')) {
+            define('DONOTCACHEPAGE', true);
+        }
+        if (!defined('DONOTCACHEDB')) {
+            define('DONOTCACHEDB', true);
+        }
+        if (!defined('DONOTCACHEOBJECT')) {
+            define('DONOTCACHEOBJECT', true);
+        }
+
+        // Layer 3: LiteSpeed Cache plugin (the WordPress-side half
+        // of the LiteSpeed stack). LSCWP exposes this action so
+        // plugins can opt the current request out of caching even
+        // when "Cache Logged-in Users" is on. No-op when LiteSpeed
+        // is not installed, so it's safe to fire unconditionally.
+        do_action('litespeed_control_set_nocache', 'matrix-mlm dashboard renders per-user wallet state');
+
+        // Layer 4: LSCache web-server module (Apache mod_lsapi or
+        // OpenLiteSpeed). The web-server reads
+        // X-LiteSpeed-Cache-Control directly and makes its caching
+        // decision before PHP returns to the request pool, so it
+        // doesn't observe the litespeed_control_set_nocache hook
+        // when the LSCWP plugin is not also installed (a real
+        // configuration on shared LiteSpeed hosting where the host
+        // runs LSCache at the server level but customers haven't
+        // installed the WP plugin). Sending the header explicitly
+        // covers that gap.
+        if (!headers_sent()) {
+            header('X-LiteSpeed-Cache-Control: no-cache');
+        }
     }
 
     /**
