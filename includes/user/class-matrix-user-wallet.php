@@ -792,7 +792,7 @@ class Matrix_MLM_User_Wallet {
                 var w2wChargeValue = <?php echo floatval(get_option('matrix_mlm_transfer_charge', 100)); ?>;
                 var w2wBalance     = <?php echo floatval($matrix_balance); ?>;
 
-                $('#matrix-w2w-amount').on('input', function() {
+                $(document).on('input', '#matrix-w2w-amount', function() {
                     var amount = parseFloat($(this).val()) || 0;
                     if (amount > 0) {
                         var charge = w2wChargeType === 'percent'
@@ -809,7 +809,7 @@ class Matrix_MLM_User_Wallet {
                     }
                 });
 
-                $('#matrix-w2w-form').on('submit', function(e) {
+                $(document).on('submit', '#matrix-w2w-form', function(e) {
                     e.preventDefault();
 
                     var recipient = ($('#matrix-w2w-recipient').val() || '').trim();
@@ -1622,19 +1622,48 @@ class Matrix_MLM_User_Wallet {
             // Click toggles the corresponding pane. Clicking the active
             // button collapses its pane (so the user can return to the
             // overview state). Clicking the other button switches panes.
+            //
+            // IMPORTANT: handlers are bound via event delegation on
+            // document (.on with selector argument) rather than direct
+            // .on on matched elements. The previous revision used
+            // direct binding, which assumes the buttons exist in the
+            // DOM the moment whenJQueryReady fires. That assumption
+            // holds for first-time pageviews but breaks subtly if any
+            // of: a parent script throws and nudges the parser, the
+            // document-ready fires before our buttons get to the DOM,
+            // or jQuery's .data() gets cached against an earlier
+            // attribute state. Document delegation sidesteps all
+            // three — jQuery walks up from the click target each
+            // time and re-reads data-target fresh.
+            //
+            // Symptom this fixes: "click Wallet → click any Transfer
+            // card → nothing happens until I refresh." A refresh
+            // shifts the parse/network timing enough that the buttons
+            // happen to be in the DOM when the direct bind fired,
+            // which is why a refresh hid the bug. Same fix is already
+            // applied in render_scripts_no_wallet() above.
             // -----------------------------------------------------------
-            $('.matrix-wallet-action-btn').on('click', function() {
+            $(document).on('click', '.matrix-wallet-action-btn', function() {
                 var $btn    = $(this);
-                var target  = $btn.data('target');
+                // Use attr('data-target') (NOT .data('target')) so a
+                // cached value from an earlier render — e.g. when
+                // a theme/optimizer reuses the same DOM nodes after
+                // a navigation swap — never wins over the current
+                // attribute on the clicked element.
+                var target  = $btn.attr('data-target');
                 var $pane   = $('.matrix-wallet-pane[data-pane="' + target + '"]');
                 var wasOpen = $btn.hasClass('is-active');
 
                 $('.matrix-wallet-action-btn').removeClass('is-active');
-                $('.matrix-wallet-pane').attr('hidden', true);
+                // Belt-and-braces: set both [hidden] AND inline
+                // display:none so themes that ship a competing
+                // `section { display: block !important }` rule can't
+                // leave the pane visible. Mirrors render_scripts_no_wallet().
+                $('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
 
                 if (!wasOpen) {
                     $btn.addClass('is-active');
-                    $pane.removeAttr('hidden');
+                    $pane.removeAttr('hidden').css('display', '');
                     // Smooth-scroll the pane into view on small screens
                     // where the form might otherwise sit below the fold.
                     if (window.innerWidth < 900) {
@@ -1646,8 +1675,9 @@ class Matrix_MLM_User_Wallet {
 
             // -----------------------------------------------------------
             // Copy account number to clipboard.
+            // Delegated for the same DOM-timing reason as above.
             // -----------------------------------------------------------
-            $('.matrix-wallet-copy-btn').on('click', function() {
+            $(document).on('click', '.matrix-wallet-copy-btn', function() {
                 var $btn = $(this);
                 var text = $btn.data('clipboard');
                 if (!text) { return; }
@@ -1692,8 +1722,10 @@ class Matrix_MLM_User_Wallet {
             // -----------------------------------------------------------
             // Refresh Fintava balance without reloading.
             // Reuses the existing matrix_fintava_wallet_balance handler.
+            // Delegated so the button keeps working even if its row is
+            // re-rendered or arrives in the DOM after this script.
             // -----------------------------------------------------------
-            $('#matrix-fintava-refresh-balance').on('click', function() {
+            $(document).on('click', '#matrix-fintava-refresh-balance', function() {
                 var $btn = $(this);
                 var $amt = $('#matrix-fintava-balance-amount');
                 var orig = $btn.text();
@@ -1727,7 +1759,7 @@ class Matrix_MLM_User_Wallet {
             // confirms the wallet_id maps to the same account_number we
             // already have stored — so this is safe to expose to users.
             // -----------------------------------------------------------
-            $('#matrix-fintava-set-wallet-id-btn').on('click', function() {
+            $(document).on('click', '#matrix-fintava-set-wallet-id-btn', function() {
                 var $btn    = $(this);
                 var $input  = $('#matrix-fintava-wallet-id-input');
                 var $status = $('#matrix-fintava-set-wallet-id-status');
@@ -1782,7 +1814,7 @@ class Matrix_MLM_User_Wallet {
             var ownAccountName = '<?php echo esc_js($wallet->account_name); ?>';
             var ownBankCode    = '<?php echo esc_js($wallet->bank_code ?? ''); ?>';
 
-            $('#matrix-own-wallet-amount').on('input', function() {
+            $(document).on('input', '#matrix-own-wallet-amount', function() {
                 var amount = parseFloat($(this).val()) || 0;
                 if (amount > 0) {
                     var charge = ownChargeType === 'percent'
@@ -1799,7 +1831,7 @@ class Matrix_MLM_User_Wallet {
                 }
             });
 
-            $('#matrix-transfer-to-own-wallet-form').on('submit', function(e) {
+            $(document).on('submit', '#matrix-transfer-to-own-wallet-form', function(e) {
                 e.preventDefault();
 
                 var amount = parseFloat($('#matrix-own-wallet-amount').val());
@@ -1885,7 +1917,7 @@ class Matrix_MLM_User_Wallet {
             // Live charge preview as the user types the amount. Same
             // visual contract as the other two transfer forms on this
             // page — Charge | Total Debit | Recipient Receives.
-            $('#matrix-w2w-amount').on('input', function() {
+            $(document).on('input', '#matrix-w2w-amount', function() {
                 var amount = parseFloat($(this).val()) || 0;
                 if (amount > 0) {
                     var charge = w2wChargeType === 'percent'
@@ -1902,7 +1934,7 @@ class Matrix_MLM_User_Wallet {
                 }
             });
 
-            $('#matrix-w2w-form').on('submit', function(e) {
+            $(document).on('submit', '#matrix-w2w-form', function(e) {
                 e.preventDefault();
 
                 var recipient = ($('#matrix-w2w-recipient').val() || '').trim();

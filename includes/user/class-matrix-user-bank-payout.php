@@ -580,8 +580,8 @@ class Matrix_MLM_User_Bank_Payout {
                 }
             }
 
-            $('#fintava-account-number').on('input', tryResolveAccount);
-            $('#fintava-bank-select').on('change', function() {
+            $(document).on('input', '#fintava-account-number', tryResolveAccount);
+            $(document).on('change', '#fintava-bank-select', function() {
                 $('#fintava-bank-name').val($(this).find(':selected').data('name') || '');
                 tryResolveAccount();
             });
@@ -711,7 +711,7 @@ class Matrix_MLM_User_Bank_Payout {
             // shifts the responsibility for the displayed name — it can't
             // route money to a wrong account just because the user typed
             // the wrong name into the box.
-            $('#fintava-manual-override').on('click', function() {
+            $(document).on('click', '#fintava-manual-override', function() {
                 $('#fintava-verify-failed').hide();
 
                 const nameField = $('#fintava-account-name');
@@ -742,7 +742,7 @@ class Matrix_MLM_User_Bank_Payout {
             // Re-disable submit on every keystroke until the manual-entry
             // field actually has a non-empty name, so an empty box can't
             // sneak through with manualOverride=true set.
-            $('#fintava-account-name').on('input', function() {
+            $(document).on('input', '#fintava-account-name', function() {
                 if (manualOverride) {
                     accountVerified = $(this).val().trim().length > 0;
                     updateSubmitButton();
@@ -756,7 +756,7 @@ class Matrix_MLM_User_Bank_Payout {
             // to re-evaluate the submit-state gate so the "amount +
             // gateway fee buffer exceeds Fintava balance" reason can
             // appear/disappear as the user types.
-            $('#fintava-amount').on('input', function() {
+            $(document).on('input', '#fintava-amount', function() {
                 updateSubmitButton();
             });
 
@@ -829,7 +829,7 @@ class Matrix_MLM_User_Bank_Payout {
             }
 
             // Submit transfer
-            $('#matrix-bank-payout-form').on('submit', function(e) {
+            $(document).on('submit', '#matrix-bank-payout-form', function(e) {
                 e.preventDefault();
 
                 if (!accountVerified) {
@@ -892,9 +892,14 @@ class Matrix_MLM_User_Bank_Payout {
             //
             // The button is only rendered server-side when there is at
             // least one failed row, but the click handler is registered
-            // unconditionally — `.on('click', ...)` on a non-existent
-            // element is a harmless no-op and keeps the JS branchless.
-            $('#fintava-clear-failed-btn').on('click', function() {
+            // unconditionally — document delegation on a non-existent
+            // element is a harmless no-op and keeps the JS branchless,
+            // and (importantly) lets the handler still fire if the
+            // pane is re-rendered or the button arrives in the DOM
+            // after this script runs (the same DOM-timing race that
+            // affected the wallet action buttons before they were
+            // converted to delegation).
+            $(document).on('click', '#fintava-clear-failed-btn', function() {
                 var btn = $(this);
                 var count = btn.data('failedCount') || 0;
                 var prompt = count === 1
