@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.14');
+define('MATRIX_MLM_DB_VERSION', '1.0.15');
 
 // Autoloader
 spl_autoload_register(function ($class) {
@@ -54,6 +54,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-epin.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-support.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-notifications.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-in-app-notifications.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-crypto.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-qr-svg.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-two-factor.php';

@@ -85,6 +85,29 @@ class Matrix_MLM_Notifications {
                 ));
             }
         }
+
+        // In-app notification (1.0.15). Surfaces in the dashboard
+        // sidebar bell so a user logging in to a deactivated account
+        // sees the same "you're inactive — pay now" prompt without
+        // having to check their email. The link goes straight to
+        // the recovery view rendered by Matrix_MLM_User_Dashboard::
+        // render_inactive_account_view(), which is the only path
+        // that can self-heal a subscription-driven deactivation.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'subscription_deactivation',
+                __('Account deactivated — subscription unpaid', 'matrix-mlm'),
+                sprintf(
+                    /* translators: 1: amount, 2: period */
+                    __('Your %1$s subscription for %2$s is unpaid. Pay from your wallet to reactivate.', 'matrix-mlm'),
+                    $amount_str,
+                    $period_label
+                ),
+                '/matrix-dashboard/',
+                ['amount' => (float) $amount, 'period' => $billing_month]
+            );
+        }
     }
 
     /**
@@ -187,6 +210,39 @@ class Matrix_MLM_Notifications {
                 self::send_sms($phone, $sms);
             }
         }
+
+        // In-app notification (1.0.15). Surfaces the same milestone
+        // in the bell dropdown alongside the email — durable beyond
+        // the 8s level-completion toast in
+        // Matrix_MLM_User_Dashboard::build_level_completion_toasts(),
+        // which only catches the user once.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'level_completion',
+                sprintf(
+                    /* translators: 1: level number, 2: plan name */
+                    __('Level %1$d completed — %2$s', 'matrix-mlm'),
+                    $level,
+                    $plan_name
+                ),
+                $positions > 0
+                    ? sprintf(
+                        /* translators: 1: position count, 2: plan name */
+                        __('All %1$s positions at this depth of your %2$s matrix are filled.', 'matrix-mlm'),
+                        number_format($positions),
+                        $plan_name
+                    )
+                    : sprintf(
+                        /* translators: 1: level number, 2: plan name */
+                        __('Level %1$d of your %2$s matrix is complete.', 'matrix-mlm'),
+                        $level,
+                        $plan_name
+                    ),
+                '/matrix-dashboard/genealogy/',
+                ['level' => $level, 'plan_id' => isset($plan->id) ? (int) $plan->id : 0, 'positions' => $positions]
+            );
+        }
     }
 
     /**
@@ -219,6 +275,33 @@ class Matrix_MLM_Notifications {
                 ));
             }
         }
+
+        // In-app notification (1.0.15). Surfaces the credit in the
+        // bell dropdown so a member sees the unread badge bump the
+        // moment a commission lands, without having to refresh into
+        // the Commissions tab. Type slug differentiates referral /
+        // level / matrix_completion in the JS-side icon registry.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $amount_str = $currency . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'commission_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $type)),
+                sprintf(
+                    /* translators: 1: commission amount, 2: commission type label */
+                    __('Commission received: %1$s (%2$s)', 'matrix-mlm'),
+                    $amount_str,
+                    $type_label
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: type */
+                    __('Your wallet has been credited with %1$s as a %2$s commission.', 'matrix-mlm'),
+                    $amount_str,
+                    $type_label
+                ),
+                '/matrix-dashboard/commissions/',
+                ['amount' => (float) $amount, 'type' => (string) $type]
+            );
+        }
     }
 
     /**
@@ -238,6 +321,29 @@ class Matrix_MLM_Notifications {
         ]);
 
         self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15).
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $amount_str = $currency . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'deposit',
+                sprintf(
+                    /* translators: 1: amount, 2: status */
+                    __('Deposit %2$s: %1$s', 'matrix-mlm'),
+                    $amount_str,
+                    ucfirst((string) $status)
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: status */
+                    __('Your deposit of %1$s is %2$s.', 'matrix-mlm'),
+                    $amount_str,
+                    strtolower((string) $status)
+                ),
+                '/matrix-dashboard/deposit-history/',
+                ['amount' => (float) $amount, 'status' => (string) $status]
+            );
+        }
     }
 
     /**
@@ -257,6 +363,29 @@ class Matrix_MLM_Notifications {
         ]);
 
         self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15).
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $amount_str = $currency . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'withdrawal_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $status)),
+                sprintf(
+                    /* translators: 1: amount, 2: status */
+                    __('Withdrawal %2$s: %1$s', 'matrix-mlm'),
+                    $amount_str,
+                    ucfirst((string) $status)
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: status */
+                    __('Your withdrawal request of %1$s has been %2$s.', 'matrix-mlm'),
+                    $amount_str,
+                    strtolower((string) $status)
+                ),
+                '/matrix-dashboard/wallet/',
+                ['amount' => (float) $amount, 'status' => (string) $status]
+            );
+        }
     }
 
     /**
@@ -287,6 +416,28 @@ class Matrix_MLM_Notifications {
         ]);
 
         self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15).
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $amount_str = $currency . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'loan_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $status)),
+                sprintf(
+                    /* translators: 1: status label */
+                    __('Loan application %s', 'matrix-mlm'),
+                    $status_label
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: status */
+                    __('Your loan application for %1$s has been %2$s.', 'matrix-mlm'),
+                    $amount_str,
+                    strtolower($status_label)
+                ),
+                '/matrix-dashboard/benefits/',
+                ['amount' => (float) $amount, 'status' => (string) $status]
+            );
+        }
     }
 
     /**
@@ -317,6 +468,34 @@ class Matrix_MLM_Notifications {
         ]);
 
         self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15).
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $body = sprintf(
+                /* translators: %s: status label */
+                __('Your healthcare application has been %s.', 'matrix-mlm'),
+                strtolower($status_label)
+            );
+            if (!empty($policy_number)) {
+                $body .= ' ' . sprintf(
+                    /* translators: %s: policy number */
+                    __('Policy number: %s.', 'matrix-mlm'),
+                    (string) $policy_number
+                );
+            }
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'healthcare_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $status)),
+                sprintf(
+                    /* translators: %s: status label */
+                    __('Healthcare application %s', 'matrix-mlm'),
+                    $status_label
+                ),
+                $body,
+                '/matrix-dashboard/benefits/',
+                ['status' => (string) $status, 'policy_number' => (string) $policy_number]
+            );
+        }
     }
 
     /**
@@ -596,6 +775,19 @@ class Matrix_MLM_Notifications {
         ]);
 
         self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15). Security event — surface
+        // it prominently so a user who didn't initiate the change
+        // sees the alert on their next visit and can react quickly.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'password_changed',
+                __('Password changed', 'matrix-mlm'),
+                __('Your account password was just changed. If this was not you, contact support immediately and reset your password.', 'matrix-mlm'),
+                '/matrix-dashboard/security/'
+            );
+        }
     }
 
     /**
@@ -688,6 +880,33 @@ class Matrix_MLM_Notifications {
                 ));
             }
         }
+
+        // In-app notification (1.0.15) for the recipient. The
+        // sender gets their own confirmation toast at the action
+        // site (Matrix_MLM_Core::process_transfer / wallet AJAX
+        // handler), so we don't duplicate that here — this method
+        // is the recipient-only path.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $amount_str = $currency . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $recipient_id,
+                'transfer_received',
+                sprintf(
+                    /* translators: 1: amount, 2: sender username */
+                    __('Received %1$s from %2$s', 'matrix-mlm'),
+                    $amount_str,
+                    $sender->user_login
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: sender */
+                    __('Your wallet was credited with %1$s from %2$s.', 'matrix-mlm'),
+                    $amount_str,
+                    $sender->user_login
+                ),
+                '/matrix-dashboard/wallet/',
+                ['amount' => (float) $amount, 'sender_id' => (int) $sender_id, 'sender_login' => (string) $sender->user_login]
+            );
+        }
     }
 
     /**
@@ -778,6 +997,29 @@ class Matrix_MLM_Notifications {
                     strtolower($type_label)
                 ));
             }
+        }
+
+        // In-app notification (1.0.15).
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'bill_refund',
+                sprintf(
+                    /* translators: 1: amount, 2: bill type */
+                    __('%2$s refund: %1$s', 'matrix-mlm'),
+                    $amount_str,
+                    $type_label
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: type, 3: transaction id */
+                    __('Your wallet was credited with %1$s as a refund for %2$s purchase #%3$d.', 'matrix-mlm'),
+                    $amount_str,
+                    $type_label,
+                    (int) $transaction_id
+                ),
+                '/matrix-dashboard/billing/',
+                ['amount' => (float) $amount, 'type' => (string) $type, 'transaction_id' => (int) $transaction_id, 'reason' => (string) $reason]
+            );
         }
     }
 

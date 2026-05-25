@@ -79,6 +79,18 @@ class Matrix_MLM_Database {
         // Matrix_MLM_Plan_Engine::build_tree_at_snapshot();
         // written by Matrix_MLM_Position_History::record_event().
         'matrix_position_history',
+        // In-app notifications (1.0.15). One row per per-user
+        // notification surfaced via the dashboard sidebar bell
+        // icon. Pairs with — does not replace — the email/SMS
+        // path in Matrix_MLM_Notifications: the notifications
+        // class enqueue()s a row here at every email-send site,
+        // so the two channels stay locked to the same trigger.
+        // Read rows are pruned by the daily cron after 90 days
+        // (READ_RETENTION_DAYS in Matrix_MLM_In_App_Notifications);
+        // unread rows are kept indefinitely so a user who hasn't
+        // logged in for months still sees every commission they
+        // earned while away.
+        'matrix_notifications',
     ];
 
     /**
@@ -1177,6 +1189,53 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_position_history);
 
+        // In-app notifications (1.0.15) — one row per per-user
+        // notification surfaced via the dashboard sidebar bell.
+        // Matrix_MLM_In_App_Notifications::enqueue() writes here
+        // from every site that today fires a Matrix_MLM_Notifications
+        // email send, so the email and in-app channels stay locked
+        // to the same trigger.
+        //
+        // Index choice:
+        //   - (user_id, read_at): primary workhorse for the unread
+        //     badge query (`WHERE user_id = %d AND read_at IS NULL`)
+        //     that runs on every dashboard pageload and on every
+        //     60-second poll. read_at being nullable means MySQL's
+        //     index covers both "unread" (NULL) and "read" lookups;
+        //     the index is also useful for the cleanup cron's
+        //     `read_at IS NOT NULL AND read_at < cutoff` predicate.
+        //   - (user_id, created_at): drives the dropdown's
+        //     "newest 20" ordering and the Notifications-tab
+        //     pagination. Composite with user_id rather than just
+        //     created_at because every read is user-scoped.
+        //
+        // No UNIQUE constraint: a user can legitimately receive two
+        // notifications of the same type within the same second
+        // (two simultaneous commissions from a level wave for
+        // example), and dedup is not desired here — each event is
+        // its own surfaceable signal.
+        //
+        // meta is JSON; the renderer parses it client-side and
+        // tolerates unknown keys, so future trigger sites can attach
+        // additional context (counterpart_user_id, amount, etc.) in
+        // the same column without a schema migration.
+        $table_notifications = $wpdb->prefix . 'matrix_notifications';
+        $sql_notifications = "CREATE TABLE $table_notifications (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            type varchar(50) NOT NULL DEFAULT 'generic',
+            title varchar(255) NOT NULL,
+            body text,
+            link_url varchar(500) DEFAULT NULL,
+            meta longtext,
+            read_at datetime DEFAULT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY user_unread (user_id, read_at),
+            KEY user_created (user_id, created_at)
+        ) $charset_collate;";
+        dbDelta($sql_notifications);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -1199,6 +1258,7 @@ class Matrix_MLM_Database {
             'matrix_level_completions',
             'matrix_share_tokens',
             'matrix_position_history',
+            'matrix_notifications',
         ];
 
         foreach ($tables as $table) {

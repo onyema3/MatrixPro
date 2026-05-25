@@ -70,6 +70,14 @@ class Matrix_MLM_Core {
         // Benefits-tab healthcare card application form posts to.
         new Matrix_MLM_User_Healthcare();
 
+        // Register in-app notification hooks (1.0.15). Wires the
+        // three AJAX endpoints (fetch, mark_read, mark_all_read)
+        // that drive the dashboard sidebar bell, plus the daily
+        // cron cleanup of read rows older than 90 days. Idempotent
+        // — safe to call once per pageload alongside the other
+        // run-time bootstraps above.
+        Matrix_MLM_In_App_Notifications::register_hooks();
+
         // Initialize monthly subscription
         new Matrix_MLM_Subscription();
 
@@ -217,6 +225,63 @@ class Matrix_MLM_Core {
             'userEmail' => is_user_logged_in() ? wp_get_current_user()->user_email : '',
             'userName' => is_user_logged_in() ? wp_get_current_user()->display_name : '',
         ]);
+
+        // In-app notifications stylesheet + script (1.0.15). The
+        // script is loaded only on the dashboard route — there's no
+        // bell icon anywhere else on the site, so on landing pages
+        // and other shortcode hosts we skip both. Detection mirrors
+        // the nocache_dashboard_pages() gate: a singular page whose
+        // post body carries the [matrix_dashboard] shortcode. On
+        // those pages it loads in the head with jQuery as a no-op
+        // dependency (the bell file is jQuery-free for CSP-safety
+        // but we declare jquery as a dep so the script tag's load
+        // order matches the rest of the dashboard's head-loaded
+        // scripts).
+        $is_dashboard_page = false;
+        if (is_singular()) {
+            global $post;
+            if ($post && is_a($post, 'WP_Post') && has_shortcode($post->post_content, 'matrix_dashboard')) {
+                $is_dashboard_page = true;
+            }
+        }
+
+        if ($is_dashboard_page) {
+            wp_enqueue_style(
+                'matrix-mlm-notifications',
+                MATRIX_MLM_PLUGIN_URL . 'public/css/matrix-notifications.css',
+                ['matrix-mlm-dashboard'],
+                MATRIX_MLM_VERSION
+            );
+
+            wp_enqueue_script(
+                'matrix-mlm-notifications',
+                MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-notifications.js',
+                [], // No deps — the bell is intentionally jQuery-free
+                    // and only reads matrixMLM via window lookup, so
+                    // strict-CSP installs that block inline scripts
+                    // (which prevents matrix-public.js's IIFE from
+                    // running) still get a working notification
+                    // bell from this file alone.
+                MATRIX_MLM_VERSION,
+                false  // head-load so the bell is interactive as
+                       // soon as the user can see it.
+            );
+
+            wp_localize_script('matrix-mlm-notifications', 'matrixNotifConfig', [
+                'ajaxUrl' => admin_url('admin-ajax.php'),
+                'nonce'   => wp_create_nonce('matrix_mlm_nonce'),
+                // Polling cadence — 60s per the design doc. Capped
+                // server-side at >=15s by the JS bootstrap to
+                // prevent a misconfigured filter from hammering the
+                // server.
+                'pollMs'  => (int) apply_filters('matrix_mlm_notifications_poll_ms', 60000),
+                'seeAllUrl' => Matrix_MLM_User_Dashboard::tab_url('notifications'),
+                'l10n' => [
+                    'empty'  => __("No notifications yet. We'll let you know here when something happens.", 'matrix-mlm'),
+                    'unread' => __('Unread', 'matrix-mlm'),
+                ],
+            ]);
+        }
 
         // Register (but don't enqueue) the D3.js genealogy view scripts.
         //
@@ -1351,6 +1416,36 @@ class Matrix_MLM_Core {
         // the user has already been debited and credited, the
         // transfer is real.
         Matrix_MLM_Notifications::send_transfer_notification($recipient->ID, $user_id, $amount);
+
+        // Sender-side in-app notification (1.0.15). The recipient
+        // gets theirs via send_transfer_notification above; this
+        // pair gives the sender a durable record in their bell
+        // dropdown that survives past the on-form success toast.
+        // Useful for "did that ₦5,000 actually go through?" — the
+        // notification sits in their history with the recipient
+        // username and amount baked into both the title and meta.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            $currency_sym = get_option('matrix_mlm_currency_symbol', '₦');
+            $amount_fmt   = $currency_sym . number_format((float) $amount, 2);
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'transfer_sent',
+                sprintf(
+                    /* translators: 1: amount, 2: recipient username */
+                    __('Sent %1$s to %2$s', 'matrix-mlm'),
+                    $amount_fmt,
+                    (string) $recipient->user_login
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: recipient */
+                    __('Your transfer of %1$s to %2$s was completed.', 'matrix-mlm'),
+                    $amount_fmt,
+                    (string) $recipient->user_login
+                ),
+                '/matrix-dashboard/wallet/',
+                ['amount' => (float) $amount, 'recipient_id' => (int) $recipient->ID, 'recipient_login' => (string) $recipient->user_login]
+            );
+        }
 
         wp_send_json_success(['message' => __('Transfer completed successfully', 'matrix-mlm')]);
     }

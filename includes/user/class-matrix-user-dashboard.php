@@ -72,6 +72,14 @@ class Matrix_MLM_User_Dashboard {
         'profile',
         'security',
         'benefits',
+        // 1.0.15: full-page notifications tab. Reachable from the
+        // bell dropdown's "See all" footer link, paginates the
+        // user's complete notification history. The bell icon
+        // itself is rendered inline in render_dashboard() — see
+        // build_notification_bell() — and is independent of this
+        // tab; users can read and dismiss notifications without
+        // ever leaving their current tab.
+        'notifications',
     ];
 
     /**
@@ -303,6 +311,7 @@ class Matrix_MLM_User_Dashboard {
                     <h4><?php echo esc_html(wp_get_current_user()->display_name); ?></h4>
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
                 </div>
+                <?php echo $this->build_notification_bell($user_id); ?>
                 <nav class="matrix-dashboard-nav">
                     <?php
                     // Render only menu items the admin hasn't explicitly
@@ -968,6 +977,9 @@ class Matrix_MLM_User_Dashboard {
             case 'security':
                 $this->render_security($user_id);
                 break;
+            case 'notifications':
+                $this->render_notifications_tab($user_id);
+                break;
             default:
                 $this->render_overview($user_id);
         }
@@ -1375,4 +1387,293 @@ class Matrix_MLM_User_Dashboard {
         </div>
         <?php
     }
+
+    /**
+     * Build the notification bell + dropdown shell rendered in the
+     * sidebar, just below the user info block. Self-contained
+     * markup; the live behaviour (open/close, fetch, mark-read,
+     * polling) is bound by the external `matrix-mlm-notifications`
+     * JS file. No inline scripts on this file — strict CSP
+     * compatible.
+     *
+     * Server-side, we render the unread count once (so the badge
+     * appears immediately without waiting for the first poll) and
+     * pre-render up to 20 of the most recent notifications inside
+     * the dropdown so the panel content is visible the moment the
+     * user clicks the bell, even on a slow first AJAX round-trip.
+     *
+     * The dropdown is hidden by default (display:none) and toggled
+     * by a click handler on the bell button. We do not pre-fetch a
+     * fresh list on render — the inline copy is good enough to
+     * unblock first interaction and the polling cycle in
+     * matrix-mlm-notifications.js refreshes both the badge and the
+     * list on a 60-second cadence.
+     *
+     * @param int $user_id Current user.
+     * @return string HTML to inline in the sidebar.
+     */
+    private function build_notification_bell($user_id) {
+        if (!class_exists('Matrix_MLM_In_App_Notifications')) {
+            return '';
+        }
+        $unread = Matrix_MLM_In_App_Notifications::unread_count($user_id);
+        $rows   = Matrix_MLM_In_App_Notifications::get_for_user($user_id, 20);
+        $see_all_url = self::tab_url('notifications');
+
+        ob_start();
+        ?>
+        <div class="matrix-notif-bell-wrapper" data-matrix-notif-bell>
+            <button type="button"
+                    class="matrix-notif-bell-btn"
+                    aria-label="<?php esc_attr_e('Notifications', 'matrix-mlm'); ?>"
+                    aria-expanded="false"
+                    aria-haspopup="true"
+                    data-matrix-notif-trigger>
+                <span class="dashicons dashicons-bell" aria-hidden="true"></span>
+                <span class="matrix-notif-bell-label"><?php esc_html_e('Notifications', 'matrix-mlm'); ?></span>
+                <span class="matrix-notif-bell-badge<?php echo $unread > 0 ? ' is-visible' : ''; ?>"
+                      data-matrix-notif-badge
+                      aria-hidden="<?php echo $unread > 0 ? 'false' : 'true'; ?>"><?php
+                    echo $unread > 99 ? '99+' : (int) $unread;
+                ?></span>
+            </button>
+
+            <div class="matrix-notif-dropdown"
+                 hidden
+                 role="dialog"
+                 aria-label="<?php esc_attr_e('Recent notifications', 'matrix-mlm'); ?>"
+                 data-matrix-notif-dropdown>
+                <div class="matrix-notif-dropdown-header">
+                    <h4><?php esc_html_e('Notifications', 'matrix-mlm'); ?></h4>
+                    <button type="button"
+                            class="matrix-notif-mark-all"
+                            data-matrix-notif-mark-all
+                            <?php echo $unread > 0 ? '' : 'disabled'; ?>>
+                        <?php esc_html_e('Mark all as read', 'matrix-mlm'); ?>
+                    </button>
+                </div>
+                <ul class="matrix-notif-list" data-matrix-notif-list>
+                    <?php if (empty($rows)): ?>
+                        <li class="matrix-notif-empty" data-matrix-notif-empty>
+                            <?php esc_html_e('No notifications yet. We\'ll let you know here when something happens.', 'matrix-mlm'); ?>
+                        </li>
+                    <?php else: foreach ($rows as $row):
+                        $is_read = !empty($row->read_at);
+                        $href    = !empty($row->link_url) ? $row->link_url : '#';
+                        $created = strtotime($row->created_at . ' UTC');
+                        $time_ago = $created
+                            ? sprintf(
+                                /* translators: %s: e.g. "3 minutes" */
+                                __('%s ago', 'matrix-mlm'),
+                                human_time_diff($created, time())
+                            )
+                            : '';
+                    ?>
+                        <li class="matrix-notif-item<?php echo $is_read ? ' is-read' : ' is-unread'; ?>"
+                            data-matrix-notif-item
+                            data-id="<?php echo (int) $row->id; ?>"
+                            data-link="<?php echo esc_attr($href); ?>">
+                            <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true"></span>
+                            <div class="matrix-notif-body">
+                                <div class="matrix-notif-title"><?php echo esc_html($row->title); ?></div>
+                                <?php if (!empty($row->body)): ?>
+                                    <div class="matrix-notif-text"><?php echo esc_html(wp_trim_words((string) $row->body, 24)); ?></div>
+                                <?php endif; ?>
+                                <div class="matrix-notif-time"><?php echo esc_html($time_ago); ?></div>
+                            </div>
+                            <?php if (!$is_read): ?>
+                                <span class="matrix-notif-dot" aria-label="<?php esc_attr_e('Unread', 'matrix-mlm'); ?>"></span>
+                            <?php endif; ?>
+                        </li>
+                    <?php endforeach; endif; ?>
+                </ul>
+                <div class="matrix-notif-dropdown-footer">
+                    <a href="<?php echo esc_url($see_all_url); ?>"><?php esc_html_e('See all notifications', 'matrix-mlm'); ?></a>
+                </div>
+            </div>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Map a notification type slug to the dashicons class the
+     * bell dropdown should render. Unknown slugs fall through to
+     * a generic info icon. Mirrored verbatim by the JS-side
+     * iconClassFor() in matrix-mlm-notifications.js so server
+     * render and client polled updates stay aligned.
+     */
+    private function notification_icon_class($type) {
+        $map = [
+            'transfer_received'           => 'dashicons-money-alt',
+            'transfer_sent'               => 'dashicons-share',
+            'commission_referral'         => 'dashicons-groups',
+            'commission_level'            => 'dashicons-chart-area',
+            'commission_matrix_completion' => 'dashicons-awards',
+            'commission'                  => 'dashicons-chart-area',
+            'level_completion'            => 'dashicons-awards',
+            'deposit'                     => 'dashicons-download',
+            'withdrawal_approved'         => 'dashicons-yes-alt',
+            'withdrawal_rejected'         => 'dashicons-no-alt',
+            'withdrawal_completed'        => 'dashicons-yes-alt',
+            'withdrawal'                  => 'dashicons-bank',
+            'bank_payout'                 => 'dashicons-bank',
+            'bank_payout_failed'          => 'dashicons-warning',
+            'bill_payment'                => 'dashicons-smartphone',
+            'bill_payment_airtime'        => 'dashicons-smartphone',
+            'bill_payment_data'           => 'dashicons-smartphone',
+            'bill_payment_cable'          => 'dashicons-format-video',
+            'bill_payment_electricity'    => 'dashicons-lightbulb',
+            'bill_refund'                 => 'dashicons-image-rotate',
+            'card_status'                 => 'dashicons-id-alt',
+            'epin_redeemed'               => 'dashicons-tickets-alt',
+            'subscription'                => 'dashicons-calendar-alt',
+            'subscription_deactivation'   => 'dashicons-warning',
+            'password_changed'            => 'dashicons-shield',
+            'loan_approved'               => 'dashicons-yes-alt',
+            'loan_rejected'               => 'dashicons-no-alt',
+            'loan'                        => 'dashicons-money-alt',
+            'healthcare_approved'         => 'dashicons-heart',
+            'healthcare_rejected'         => 'dashicons-no-alt',
+            'healthcare'                  => 'dashicons-heart',
+            'admin_announcement'          => 'dashicons-megaphone',
+        ];
+        return $map[$type] ?? 'dashicons-info-outline';
+    }
+
+    /**
+     * Render the full Notifications dashboard tab. Paginated server
+     * side at 20 per page; the bell dropdown is for the most recent
+     * 20, this surface is for the complete history.
+     *
+     * Uses ?notif_page=N for paging — different query var from the
+     * dashboard's ?tab= so the two don't collide. Mark-as-read and
+     * mark-all-read on this view share the same AJAX endpoints the
+     * bell dropdown uses (matrix_in_app_mark_read /
+     * matrix_in_app_mark_all_read), so a user can act on
+     * notifications from either surface and the read state stays
+     * consistent across both.
+     */
+    private function render_notifications_tab($user_id) {
+        if (!class_exists('Matrix_MLM_In_App_Notifications')) {
+            echo '<div class="matrix-alert matrix-alert-info">'
+               . esc_html__('Notifications are not available on this install.', 'matrix-mlm')
+               . '</div>';
+            return;
+        }
+        $per_page = 20;
+        $page     = isset($_GET['notif_page']) ? max(1, (int) $_GET['notif_page']) : 1;
+        $offset   = ($page - 1) * $per_page;
+        $total    = Matrix_MLM_In_App_Notifications::total_count($user_id);
+        $pages    = max(1, (int) ceil($total / $per_page));
+        $rows     = Matrix_MLM_In_App_Notifications::get_for_user($user_id, $per_page, $offset);
+        $unread   = Matrix_MLM_In_App_Notifications::unread_count($user_id);
+        $base_url = self::tab_url('notifications');
+        ?>
+        <h2><?php esc_html_e('Notifications', 'matrix-mlm'); ?></h2>
+        <p class="matrix-subtitle">
+            <?php
+            if ($total > 0) {
+                printf(
+                    /* translators: 1: unread, 2: total */
+                    esc_html__('%1$d unread of %2$d total. Older read notifications are removed automatically after 90 days.', 'matrix-mlm'),
+                    (int) $unread,
+                    (int) $total
+                );
+            } else {
+                esc_html_e('You have no notifications yet.', 'matrix-mlm');
+            }
+            ?>
+        </p>
+
+        <?php if ($unread > 0): ?>
+            <div class="matrix-notif-page-toolbar">
+                <button type="button"
+                        class="matrix-btn matrix-btn-secondary matrix-btn-sm"
+                        data-matrix-notif-mark-all-page>
+                    <?php esc_html_e('Mark all as read', 'matrix-mlm'); ?>
+                </button>
+            </div>
+        <?php endif; ?>
+
+        <?php if (empty($rows)): ?>
+            <div class="matrix-info-box">
+                <p><?php esc_html_e('Nothing here yet. As soon as you receive a transfer, earn a commission, or pay a bill, it\'ll show up on this page.', 'matrix-mlm'); ?></p>
+            </div>
+        <?php else: ?>
+            <ul class="matrix-notif-page-list">
+                <?php foreach ($rows as $row):
+                    $is_read = !empty($row->read_at);
+                    $created = strtotime($row->created_at . ' UTC');
+                    $human_time = $created
+                        ? sprintf(
+                            /* translators: %s: human-readable diff */
+                            __('%s ago', 'matrix-mlm'),
+                            human_time_diff($created, time())
+                        )
+                        : '';
+                    $exact_time = $created ? date_i18n('M j, Y g:i a', $created) : '';
+                ?>
+                    <li class="matrix-notif-page-item<?php echo $is_read ? ' is-read' : ' is-unread'; ?>"
+                        data-matrix-notif-page-item
+                        data-id="<?php echo (int) $row->id; ?>">
+                        <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true"></span>
+                        <div class="matrix-notif-page-body">
+                            <div class="matrix-notif-page-title">
+                                <?php if (!empty($row->link_url)): ?>
+                                    <a href="<?php echo esc_url($row->link_url); ?>"
+                                       data-matrix-notif-page-link
+                                       data-id="<?php echo (int) $row->id; ?>"><?php echo esc_html($row->title); ?></a>
+                                <?php else: ?>
+                                    <?php echo esc_html($row->title); ?>
+                                <?php endif; ?>
+                            </div>
+                            <?php if (!empty($row->body)): ?>
+                                <div class="matrix-notif-page-text"><?php echo esc_html($row->body); ?></div>
+                            <?php endif; ?>
+                            <div class="matrix-notif-page-time" title="<?php echo esc_attr($exact_time); ?>"><?php echo esc_html($human_time . ' · ' . $exact_time); ?></div>
+                        </div>
+                        <?php if (!$is_read): ?>
+                            <button type="button"
+                                    class="matrix-notif-page-mark-read"
+                                    data-matrix-notif-page-mark-read
+                                    data-id="<?php echo (int) $row->id; ?>"
+                                    aria-label="<?php esc_attr_e('Mark as read', 'matrix-mlm'); ?>">
+                                <?php esc_html_e('Mark as read', 'matrix-mlm'); ?>
+                            </button>
+                        <?php endif; ?>
+                    </li>
+                <?php endforeach; ?>
+            </ul>
+
+            <?php if ($pages > 1): ?>
+                <nav class="matrix-notif-pagination" aria-label="<?php esc_attr_e('Notifications pagination', 'matrix-mlm'); ?>">
+                    <?php if ($page > 1): ?>
+                        <a class="matrix-btn matrix-btn-secondary matrix-btn-sm"
+                           href="<?php echo esc_url(add_query_arg('notif_page', $page - 1, $base_url)); ?>">
+                            &larr; <?php esc_html_e('Previous', 'matrix-mlm'); ?>
+                        </a>
+                    <?php endif; ?>
+                    <span class="matrix-notif-page-indicator">
+                        <?php
+                        printf(
+                            /* translators: 1: current page, 2: total pages */
+                            esc_html__('Page %1$d of %2$d', 'matrix-mlm'),
+                            (int) $page,
+                            (int) $pages
+                        );
+                        ?>
+                    </span>
+                    <?php if ($page < $pages): ?>
+                        <a class="matrix-btn matrix-btn-secondary matrix-btn-sm"
+                           href="<?php echo esc_url(add_query_arg('notif_page', $page + 1, $base_url)); ?>">
+                            <?php esc_html_e('Next', 'matrix-mlm'); ?> &rarr;
+                        </a>
+                    <?php endif; ?>
+                </nav>
+            <?php endif; ?>
+        <?php endif; ?>
+        <?php
+    }
 }
+

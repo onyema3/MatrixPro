@@ -1301,6 +1301,38 @@ class Matrix_MLM_Fintava_Billing {
                         $payload = array_merge($payload, $extra);
                     }
                 }
+
+                // In-app notification (1.0.15) — sender-side. Bills
+                // payment is a one-sided action (no receiver to
+                // notify; the merchant is paid out-of-band by the
+                // gateway), so this is the only notification this
+                // path emits. Surfaces in the dashboard bell so a
+                // user can prove from their notification history
+                // that the airtime/data/cable/electricity purchase
+                // succeeded, even after the on-form toast disappears.
+                if (class_exists('Matrix_MLM_In_App_Notifications')) {
+                    $type_label = ucfirst(strtolower((string) $type));
+                    $amount_str = $currency . number_format((float) $amounts['total'], 2);
+                    Matrix_MLM_In_App_Notifications::enqueue(
+                        get_current_user_id(),
+                        'bill_payment_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $type)),
+                        sprintf(
+                            /* translators: 1: bill type, 2: total amount */
+                            __('%1$s purchase: %2$s', 'matrix-mlm'),
+                            $type_label,
+                            $amount_str
+                        ),
+                        $message,
+                        '/matrix-dashboard/billing/',
+                        [
+                            'type'           => (string) $type,
+                            'transaction_id' => isset($outcome['transaction_id']) ? (int) $outcome['transaction_id'] : 0,
+                            'nominal'        => (float) $amounts['nominal'],
+                            'fee'            => (float) $amounts['fee'],
+                            'total'          => (float) $amounts['total'],
+                        ]
+                    );
+                }
                 wp_send_json_success($payload);
                 return;
         }
