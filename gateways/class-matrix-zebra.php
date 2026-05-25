@@ -131,6 +131,33 @@ class Matrix_MLM_Zebra {
      * ==================================================================== */
     const EVENT_REMIT = 'REMIT';
 
+    /* ====================================================================
+     * /Dispense — the second vendor->customer payout in the
+     * Bibimoney pair. Where /Remit settles to the customer's
+     * Zebra Wallet (keyed on PrimaryAccountNumber — IWAN /
+     * MSISDN / local reference), /Dispense settles to a bank
+     * account (keyed on AccountNumber + BankCode) and is the
+     * rail to use when the customer wants the funds in a
+     * traditional NUBAN-style account rather than back on their
+     * mobile wallet.
+     *
+     * Architecturally this is the asymmetric mirror of the
+     * Fintava bank-payout flow: same matrix_withdrawals admin-
+     * approval flow we just wired /Remit into, same pending ->
+     * processing -> approved state machine, same per-row lock
+     * to prevent double-fire, but the destination payload
+     * carries bank routing instead of a wallet identifier and
+     * the row is tagged method='zebra_bank' so the dispatcher
+     * in approve_withdrawal() can branch.
+     *
+     * Same operator-facing filter knobs as /Remit
+     * (matrix_zebra_dispense_endpoint /
+     *  matrix_zebra_dispense_event_type) for the same reason —
+     * the public spec is ambiguous about which exact tokens
+     * each Bibimoney environment expects.
+     * ==================================================================== */
+    const EVENT_DISPENSE = 'DISPENSE';
+
     private $api_key;
     private $api_secret;
     private $vendor_id;
@@ -325,6 +352,55 @@ class Matrix_MLM_Zebra {
                  . $this->vendor_id
                  . $vendor_reference
                  . $primary_account
+                 . (string) $amount_minor
+                 . strtoupper($currency);
+
+        $method = (string) apply_filters('matrix_zebra_hmac_method', 'hmac_sha256');
+        if ($method === 'sha256') {
+            return hash('sha256', $message);
+        }
+        return hash_hmac('sha256', $message, $this->api_secret);
+    }
+
+    /**
+     * HMAC for the /Dispense endpoint (vendor -> customer bank
+     * payout).
+     *
+     * Distinct from compute_remit_hmac() because the destination
+     * shape differs: /Dispense routes to a bank account, not a
+     * wallet identifier, so the concat carries AccountNumber and
+     * BankCode where /Remit carries PrimaryAccountNumber. Concat
+     * order:
+     *
+     *   api_key + api_secret + EventType + VendorID +
+     *   VendorReference + AccountNumber + BankCode + Amount +
+     *   Currency
+     *
+     * AccountNumber is the destination NUBAN (10-digit Nigerian
+     * standard, but we don't enforce length — Bibimoney's
+     * partner banks sometimes accept regional formats).
+     *
+     * BankCode is the CBN sortCode for the destination institution
+     * (3 to 6 digit numeric, depending on whether it's a
+     * commercial bank or fintech). The form-side validator
+     * reuses the existing Fintava bank-payout sortCode shape
+     * check so a single typo doesn't ride all the way to
+     * Bibimoney.
+     *
+     * Same matrix_zebra_hmac_method filter as the deposit and
+     * remit signing paths, so an operator whose Bibimoney env
+     * expects plain SHA-256 over the concat (vs. HMAC-SHA256
+     * keyed by api_secret) flips one filter and all four
+     * signing paths follow.
+     */
+    private function compute_dispense_hmac($event_type, $vendor_reference, $account_number, $bank_code, $amount_minor, $currency) {
+        $message = $this->api_key
+                 . $this->api_secret
+                 . $event_type
+                 . $this->vendor_id
+                 . $vendor_reference
+                 . $account_number
+                 . $bank_code
                  . (string) $amount_minor
                  . strtoupper($currency);
 
@@ -1238,6 +1314,383 @@ class Matrix_MLM_Zebra {
             'event_type'       => $event_type,
             'endpoint'         => $endpoint,
             'primary_account'  => self::mask_account($primary_account),
+            'amount_minor'     => $amount_minor,
+            'currency'         => $currency,
+            'source'           => 'sync',
+            'error_text'       => $error_text,
+            'response'         => $response,
+        ];
+
+        $wpdb->update(
+            $table,
+            [
+                'status'           => $target_status,
+                'gateway_response' => wp_json_encode($stash),
+            ],
+            ['id' => $withdrawal_id, 'status' => 'processing']
+        );
+    }
+
+    /* ====================================================================
+     * /Dispense — vendor -> customer bank payout
+     *
+     * Plugs Zebra (Bibimoney) /Dispense into the same
+     * matrix_withdrawals admin-approval flow that /Remit lives
+     * in. Architecturally this method mirrors remit_to_account()
+     * one-for-one — same lock acquisition, same per-attempt
+     * VendorReference, same processing -> approved/pending
+     * transitions, same audit stash shape, same customer
+     * notification on success — but the destination payload
+     * carries bank routing instead of a wallet identifier:
+     *
+     *   1. matrix_withdrawals row exists with gateway='zebra'
+     *      AND method='zebra_bank'. The dispatcher in
+     *      Matrix_MLM_Admin::approve_withdrawal() branches on
+     *      method when gateway='zebra' so /Remit and /Dispense
+     *      route to the right handler.
+     *
+     *   2. account_details on the row holds a JSON envelope:
+     *
+     *        {
+     *          "type"          : "bank",
+     *          "bank_code"     : "058",            // CBN sortCode
+     *          "bank_name"     : "GTBank",         // display only
+     *          "account_number": "0123456789",
+     *          "account_name"  : "Jane Doe"        // display only
+     *        }
+     *
+     *      JSON shape rather than free-form text because
+     *      /Dispense needs structured fields at API call time
+     *      and parsing four-line operator notes is fragile. The
+     *      schema column stays TEXT so legacy rows that pre-
+     *      date this convention still render in the admin
+     *      Withdrawals page (the table cell shows the raw blob
+     *      and the operator can still triage).
+     *
+     *   3. Same pending -> processing lock as /Remit. Two
+     *      Approve clicks within the same second see exactly
+     *      one winner; the loser bails before /Dispense fires.
+     *
+     *   4. compute_dispense_hmac() builds the 9-field concat
+     *      shape (the bank rail adds AccountNumber + BankCode
+     *      vs Remit's single PrimaryAccountNumber). HMAC method
+     *      is filterable through the same matrix_zebra_hmac_method
+     *      hook so an operator only ever flips one switch
+     *      between SHA-256 and HMAC-SHA256.
+     *
+     *   5. On success: processing -> approved with the audit
+     *      stash. Customer notification fires once.
+     *
+     *   6. On non-success: processing -> pending (release the
+     *      lock so the operator can retry). gateway_response
+     *      stashes the failure detail so the operator can see
+     *      why; admin_note is left untouched.
+     *
+     * Idempotence and double-credit defenses are identical to
+     * /Remit's, see remit_to_account() for the rationale. The
+     * only operationally meaningful difference is the
+     * destination payload — and the fact that the payload
+     * fields live behind a JSON parse rather than a single
+     * column read.
+     * ==================================================================== */
+
+    /**
+     * Public dispatch from class-matrix-admin.php's
+     * approve_withdrawal handler when method='zebra_bank'.
+     * Returns the standard [success, message] envelope the
+     * AJAX layer forwards verbatim.
+     */
+    public function dispense_to_account($withdrawal_id, $note = '') {
+        global $wpdb;
+
+        $withdrawal_id = (int) $withdrawal_id;
+        if ($withdrawal_id <= 0) {
+            return ['success' => false, 'message' => __('Invalid withdrawal id.', 'matrix-mlm')];
+        }
+
+        if (!$this->is_configured()) {
+            return [
+                'success' => false,
+                'message' => __('Zebra Wallet is not fully configured. Contact the administrator.', 'matrix-mlm'),
+            ];
+        }
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        $withdrawal = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$table} WHERE id = %d",
+            $withdrawal_id
+        ));
+        if (!$withdrawal) {
+            return ['success' => false, 'message' => __('Withdrawal not found.', 'matrix-mlm')];
+        }
+        if (strtolower((string) ($withdrawal->gateway ?? '')) !== 'zebra') {
+            return ['success' => false, 'message' => __('This withdrawal is not configured for Zebra Wallet.', 'matrix-mlm')];
+        }
+        if ($withdrawal->status !== 'pending') {
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    /* translators: %s = current withdrawal status */
+                    __('This withdrawal is %s and cannot be dispensed.', 'matrix-mlm'),
+                    $withdrawal->status
+                ),
+            ];
+        }
+
+        // Parse the structured destination envelope. Reject
+        // anything that's not the expected JSON shape rather
+        // than guessing — we'd rather an operator see a clear
+        // "missing destination details" error and fix the row
+        // than have a garbled payload land at Bibimoney.
+        $details_raw = trim((string) ($withdrawal->account_details ?? ''));
+        $details     = json_decode($details_raw, true);
+        if (!is_array($details) || ($details['type'] ?? '') !== 'bank') {
+            return [
+                'success' => false,
+                'message' => __('Withdrawal is missing structured bank account details (expected JSON with type=bank).', 'matrix-mlm'),
+            ];
+        }
+
+        $account_number = trim((string) ($details['account_number'] ?? ''));
+        $bank_code      = trim((string) ($details['bank_code'] ?? ''));
+        $bank_name      = trim((string) ($details['bank_name'] ?? ''));
+        $account_name   = trim((string) ($details['account_name'] ?? ''));
+
+        if ($account_number === '' || $bank_code === '') {
+            return [
+                'success' => false,
+                'message' => __('Bank account number and bank code are both required for /Dispense.', 'matrix-mlm'),
+            ];
+        }
+        // Same shape check the Fintava bank-payout flow uses on
+        // the /bank/credit/merchant validator: 3-digit CBN codes
+        // for commercial banks, 5-6 digit NIBSS-issued codes for
+        // fintechs. Anything else would be rejected by Bibimoney
+        // anyway.
+        if (!preg_match('/^\d{3,6}$/', $bank_code)) {
+            return [
+                'success' => false,
+                'message' => __('Bank code must be 3-6 numeric digits (CBN or NIBSS sortCode).', 'matrix-mlm'),
+            ];
+        }
+        if (!preg_match('/^\d{6,20}$/', $account_number)) {
+            return [
+                'success' => false,
+                'message' => __('Bank account number must be 6-20 digits.', 'matrix-mlm'),
+            ];
+        }
+
+        // Acquire the lock. Same conditional-UPDATE pattern as
+        // /Remit — only the first request that flips pending ->
+        // processing gets to call /Dispense.
+        $rows = $wpdb->update(
+            $table,
+            ['status' => 'processing'],
+            ['id' => $withdrawal_id, 'status' => 'pending']
+        );
+        if ($rows !== 1) {
+            return ['success' => false, 'message' => __('This withdrawal is already being processed.', 'matrix-mlm')];
+        }
+
+        $currency     = strtoupper((string) ($withdrawal->currency ?? $this->default_currency));
+        $amount_minor = (int) round(((float) $withdrawal->net_amount) * 100);
+
+        // Fresh VendorReference per attempt (same retry
+        // rationale as /Remit — Bibimoney's spec requires
+        // VendorReference uniqueness).
+        $vendor_reference = sprintf(
+            'MTX-DSP-%d-%d-%s',
+            $withdrawal_id,
+            time(),
+            substr(str_replace('.', '', (string) microtime(true)), -4)
+        );
+
+        $event_type = (string) apply_filters('matrix_zebra_dispense_event_type', self::EVENT_DISPENSE);
+        $endpoint   = (string) apply_filters('matrix_zebra_dispense_endpoint', 'Dispense');
+
+        $hmac = $this->compute_dispense_hmac(
+            $event_type,
+            $vendor_reference,
+            $account_number,
+            $bank_code,
+            $amount_minor,
+            $currency
+        );
+
+        $payload = [
+            'api_key'         => $this->api_key,
+            'api_secret'      => $this->api_secret,
+            'VendorID'        => $this->vendor_id,
+            'EventType'       => $event_type,
+            'VendorReference' => $vendor_reference,
+            'AccountNumber'   => $account_number,
+            'BankCode'        => $bank_code,
+            'BankName'        => $bank_name,
+            'AccountName'     => $account_name,
+            'Amount'          => $amount_minor,
+            'Currency'        => $currency,
+            'HMACdigest'      => $hmac,
+            'UserData'        => [
+                'withdrawal_id' => $withdrawal_id,
+                'user_id'       => (int) $withdrawal->user_id,
+                'plugin'        => 'matrix-mlm',
+                'note'          => (string) $note,
+            ],
+        ];
+
+        // Stash the in-flight reference + masked account on the
+        // row before the network call so a crashed PHP worker
+        // still leaves an audit trail.
+        $wpdb->update(
+            $table,
+            [
+                'transaction_id'   => $vendor_reference,
+                'gateway_response' => wp_json_encode([
+                    'step'             => 'dispense_in_flight',
+                    'vendor_reference' => $vendor_reference,
+                    'event_type'       => $event_type,
+                    'endpoint'         => $endpoint,
+                    'account_number'   => self::mask_account($account_number),
+                    'bank_code'        => $bank_code,
+                    'bank_name'        => $bank_name,
+                    'amount_minor'     => $amount_minor,
+                    'currency'         => $currency,
+                    'note'             => (string) $note,
+                ]),
+            ],
+            ['id' => $withdrawal_id]
+        );
+
+        $response = $this->post($endpoint, $payload);
+
+        $status_code = (string) ($response['StatusCode'] ?? '');
+        if (!self::is_success_code($status_code)) {
+            $error_text = (string) ($response['ErrorText'] ?? $response['Status'] ?? __('Dispense failed.', 'matrix-mlm'));
+            $this->release_dispense_lock(
+                $withdrawal_id,
+                $vendor_reference,
+                $event_type,
+                $endpoint,
+                $account_number,
+                $bank_code,
+                $bank_name,
+                $amount_minor,
+                $currency,
+                $response,
+                'pending',
+                $error_text
+            );
+            return [
+                'success' => false,
+                'message' => $error_text,
+            ];
+        }
+
+        $info = isset($response['Information']) && is_array($response['Information']) ? $response['Information'] : [];
+        $psp_reference = (string) ($response['PSPreference'] ?? $info['PSPreference'] ?? '');
+
+        $this->finalize_dispense(
+            $withdrawal_id,
+            $vendor_reference,
+            $event_type,
+            $endpoint,
+            $account_number,
+            $bank_code,
+            $bank_name,
+            $amount_minor,
+            $currency,
+            $response,
+            $psp_reference,
+            (string) $note
+        );
+
+        return [
+            'success'        => true,
+            'message'        => __('Dispense completed. The customer\'s bank account has been credited.', 'matrix-mlm'),
+            'transaction_id' => $vendor_reference,
+            'psp_reference'  => $psp_reference,
+        ];
+    }
+
+    /**
+     * Internal: success transition for /Dispense. processing ->
+     * approved with audit stash. Conditional UPDATE keyed on
+     * the lock state so a duplicate sync delivery (which the
+     * platform shouldn't generate, but defense in depth)
+     * collapses to a no-op.
+     *
+     * Customer notification fires inside the conditional so a
+     * row that was already finalised by another process doesn't
+     * generate a duplicate "withdrawal approved" email.
+     */
+    private function finalize_dispense($withdrawal_id, $vendor_reference, $event_type, $endpoint, $account_number, $bank_code, $bank_name, $amount_minor, $currency, $response, $psp_reference, $note) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        $stash = [
+            'step'             => 'dispense_completed',
+            'vendor_reference' => $vendor_reference,
+            'psp_reference'    => $psp_reference,
+            'event_type'       => $event_type,
+            'endpoint'         => $endpoint,
+            'account_number'   => self::mask_account($account_number),
+            'bank_code'        => $bank_code,
+            'bank_name'        => $bank_name,
+            'amount_minor'     => $amount_minor,
+            'currency'         => $currency,
+            'source'           => 'sync',
+            'note'             => $note,
+            'response'         => $response,
+        ];
+
+        $updated = $wpdb->update(
+            $table,
+            [
+                'status'           => 'approved',
+                'gateway_response' => wp_json_encode($stash),
+            ],
+            ['id' => $withdrawal_id, 'status' => 'processing']
+        );
+
+        if ($updated === 1) {
+            $withdrawal = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table} WHERE id = %d",
+                $withdrawal_id
+            ));
+            if ($withdrawal && class_exists('Matrix_MLM_Notifications')) {
+                Matrix_MLM_Notifications::send_withdrawal_notification(
+                    $withdrawal->user_id,
+                    $withdrawal->amount,
+                    'approved'
+                );
+            }
+        }
+    }
+
+    /**
+     * Internal: failure transition for /Dispense. processing ->
+     * $target_status with the failure envelope on
+     * gateway_response for diagnosis. No customer notification
+     * on this path — same rationale as release_remit_lock(): a
+     * transient failure that the operator retries should not
+     * emit a "withdrawal rejected" email and then a confusing
+     * "withdrawal approved" email moments later.
+     */
+    private function release_dispense_lock($withdrawal_id, $vendor_reference, $event_type, $endpoint, $account_number, $bank_code, $bank_name, $amount_minor, $currency, $response, $target_status, $error_text) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        $stash = [
+            'step'             => 'dispense_failed',
+            'vendor_reference' => $vendor_reference,
+            'event_type'       => $event_type,
+            'endpoint'         => $endpoint,
+            'account_number'   => self::mask_account($account_number),
+            'bank_code'        => $bank_code,
+            'bank_name'        => $bank_name,
             'amount_minor'     => $amount_minor,
             'currency'         => $currency,
             'source'           => 'sync',

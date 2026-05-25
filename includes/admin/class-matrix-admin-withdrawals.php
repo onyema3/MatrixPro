@@ -18,6 +18,7 @@ class Matrix_MLM_Admin_Withdrawals {
         // capability that gates the page registration); we re-
         // verify here as defense in depth.
         $this->maybe_handle_create_test_remit();
+        $this->maybe_handle_create_test_dispense();
 
         $currency = get_option('matrix_mlm_currency_symbol', '₦');
         $status_filter = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
@@ -69,6 +70,7 @@ class Matrix_MLM_Admin_Withdrawals {
             </ul>
 
             <?php $this->render_create_test_remit_panel($zebra_configured); ?>
+            <?php $this->render_create_test_dispense_panel($zebra_configured); ?>
 
             <table class="wp-list-table widefat fixed striped" style="margin-top: 30px;">
                 <thead>
@@ -110,7 +112,7 @@ class Matrix_MLM_Admin_Withdrawals {
                         <td><?php echo $currency . number_format($w->amount, 2); ?></td>
                         <td><?php echo $currency . number_format($w->charge, 2); ?></td>
                         <td><?php echo $currency . number_format($w->net_amount, 2); ?></td>
-                        <td><small><?php echo esc_html($w->account_details); ?></small></td>
+                        <td><small><?php echo esc_html(self::format_account_details($w)); ?></small></td>
                         <td>
                             <?php if (!empty($w->transaction_id)): ?>
                                 <code style="font-size:11px;"><?php echo esc_html($w->transaction_id); ?></code>
@@ -283,6 +285,171 @@ class Matrix_MLM_Admin_Withdrawals {
     }
 
     /**
+     * Render the "Test Zebra Wallet /Dispense" admin tool.
+     *
+     * Sibling to render_create_test_remit_panel(). Inserts a
+     * pending matrix_withdrawals row tagged with method='zebra_bank'
+     * AND a structured account_details JSON envelope so the
+     * Approve dispatcher routes to dispense_to_account() instead
+     * of remit_to_account(). Same caveat: this is a staging tool,
+     * not the user-facing payout form, so no wallet debit and
+     * no PIN gate. Production rows will land via the user-facing
+     * payout form in a follow-up release.
+     */
+    private function render_create_test_dispense_panel($zebra_configured) {
+        if (!current_user_can('manage_matrix_withdrawals')) {
+            return;
+        }
+        $currency = get_option('matrix_mlm_currency_symbol', '₦');
+        ?>
+        <div class="matrix-admin-card" style="margin-top:20px;padding:14px;border:1px solid #c3c4c7;background:#fff;">
+            <h2 style="margin-top:0;"><?php _e('Test Zebra Wallet /Dispense (Bank Payout)', 'matrix-mlm'); ?></h2>
+            <p>
+                <?php _e('Create a pending matrix_withdrawals row tagged for the Zebra Wallet (Bibimoney) /Dispense endpoint. Approving the row dispatches the vendor->customer bank payout. This tool does not debit any wallet — production rows will be created from the user-facing payout form in a follow-up release.', 'matrix-mlm'); ?>
+            </p>
+            <form method="post" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                <?php wp_nonce_field('matrix_create_test_dispense', 'matrix_create_test_dispense_nonce'); ?>
+                <input type="hidden" name="matrix_action" value="create_test_dispense">
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('User ID', 'matrix-mlm'); ?></label>
+                    <input type="number" name="user_id" min="1" step="1" required style="width:90px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('Net amount', 'matrix-mlm'); ?> (<?php echo esc_html($currency); ?>)</label>
+                    <input type="number" name="amount" min="0.01" step="0.01" required style="width:120px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('Bank name', 'matrix-mlm'); ?></label>
+                    <input type="text" name="bank_name" placeholder="GTBank" required style="width:160px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('Bank code (sortCode)', 'matrix-mlm'); ?></label>
+                    <input type="text" name="bank_code" placeholder="058 / 100004" pattern="\d{3,6}" required style="width:120px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('Account number', 'matrix-mlm'); ?></label>
+                    <input type="text" name="account_number" placeholder="0123456789" pattern="\d{6,20}" required style="width:140px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;"><?php _e('Account name', 'matrix-mlm'); ?></label>
+                    <input type="text" name="account_name" placeholder="Jane Doe" style="width:180px;">
+                </div>
+                <div>
+                    <button type="submit" class="button button-primary" <?php echo $zebra_configured ? '' : 'disabled'; ?>><?php _e('Create Pending Row', 'matrix-mlm'); ?></button>
+                </div>
+            </form>
+        </div>
+        <?php
+    }
+
+    /**
+     * Handle the "Create Test Dispense" form post. Inserts a
+     * single pending row with gateway='zebra' AND method='zebra_bank',
+     * with account_details serialised as the JSON envelope the
+     * dispense_to_account() handler decodes back out. No wallet
+     * debit — see render_create_test_dispense_panel() for
+     * rationale.
+     */
+    private function maybe_handle_create_test_dispense() {
+        if (empty($_POST['matrix_action']) || $_POST['matrix_action'] !== 'create_test_dispense') {
+            return;
+        }
+        if (!current_user_can('manage_matrix_withdrawals')) {
+            wp_die(__('Insufficient permissions.', 'matrix-mlm'));
+        }
+        check_admin_referer('matrix_create_test_dispense', 'matrix_create_test_dispense_nonce');
+
+        $user_id        = (int) ($_POST['user_id'] ?? 0);
+        $amount         = (float) ($_POST['amount'] ?? 0);
+        $bank_name      = isset($_POST['bank_name']) ? sanitize_text_field((string) $_POST['bank_name']) : '';
+        $bank_code      = isset($_POST['bank_code']) ? sanitize_text_field((string) $_POST['bank_code']) : '';
+        $account_number = isset($_POST['account_number']) ? sanitize_text_field((string) $_POST['account_number']) : '';
+        $account_name   = isset($_POST['account_name']) ? sanitize_text_field((string) $_POST['account_name']) : '';
+
+        // Repeat the gateway-side validation up front so an
+        // operator typo doesn't pollute matrix_withdrawals with
+        // a row that's guaranteed to fail at Approve time.
+        if ($user_id <= 0 || $amount <= 0 || $bank_name === '' || $bank_code === '' || $account_number === '') {
+            add_settings_error(
+                'matrix_mlm_withdrawals',
+                'invalid_test_dispense',
+                __('User ID, amount, bank name, bank code, and account number are all required.', 'matrix-mlm'),
+                'error'
+            );
+            return;
+        }
+        if (!preg_match('/^\d{3,6}$/', $bank_code)) {
+            add_settings_error(
+                'matrix_mlm_withdrawals',
+                'invalid_test_dispense_bank_code',
+                __('Bank code must be 3-6 numeric digits (CBN or NIBSS sortCode).', 'matrix-mlm'),
+                'error'
+            );
+            return;
+        }
+        if (!preg_match('/^\d{6,20}$/', $account_number)) {
+            add_settings_error(
+                'matrix_mlm_withdrawals',
+                'invalid_test_dispense_account_number',
+                __('Bank account number must be 6-20 digits.', 'matrix-mlm'),
+                'error'
+            );
+            return;
+        }
+
+        global $wpdb;
+        $currency = strtoupper((string) get_option('matrix_mlm_currency', 'NGN'));
+
+        // account_details carries the structured destination
+        // envelope dispense_to_account() will decode. Schema
+        // column is TEXT so the JSON fits comfortably.
+        $account_details = wp_json_encode([
+            'type'           => 'bank',
+            'bank_code'      => $bank_code,
+            'bank_name'      => $bank_name,
+            'account_number' => $account_number,
+            'account_name'   => $account_name,
+        ]);
+
+        $wpdb->insert(
+            $wpdb->prefix . 'matrix_withdrawals',
+            [
+                'user_id'         => $user_id,
+                'method'          => 'zebra_bank',
+                'gateway'         => 'zebra',
+                'amount'          => $amount,
+                'charge'          => 0,
+                'net_amount'      => $amount,
+                'currency'        => $currency,
+                'account_details' => $account_details,
+                'status'          => 'pending',
+            ],
+            ['%d', '%s', '%s', '%f', '%f', '%f', '%s', '%s', '%s']
+        );
+
+        if ($wpdb->insert_id) {
+            add_settings_error(
+                'matrix_mlm_withdrawals',
+                'test_dispense_created',
+                sprintf(
+                    /* translators: %d = withdrawal id */
+                    __('Test Dispense row created (id #%d). Click Approve below to dispatch /Dispense.', 'matrix-mlm'),
+                    (int) $wpdb->insert_id
+                ),
+                'success'
+            );
+        } else {
+            add_settings_error(
+                'matrix_mlm_withdrawals',
+                'test_dispense_failed',
+                __('Could not create the test row. Check error_log for the underlying DB message.', 'matrix-mlm'),
+                'error'
+            );
+        }
+        settings_errors('matrix_mlm_withdrawals');
+    }
+
+    /**
      * Pretty-print a gateway_response JSON envelope for the audit
      * <pre> block. Falls back to the raw value if the column
      * happens to hold a non-JSON string (legacy import data,
@@ -297,5 +464,44 @@ class Matrix_MLM_Admin_Withdrawals {
             return wp_json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
         return (string) $raw;
+    }
+
+    /**
+     * Render account_details for the listing's table cell.
+     *
+     * Zebra bank-payout rows (method='zebra_bank') store the
+     * destination as a structured JSON envelope so the
+     * /Dispense dispatcher can pull bank_code + account_number
+     * out as discrete fields. Decoding here lets the listing
+     * show "GTBank · 0123456789" instead of a 100-char JSON
+     * string the operator has to mentally parse. Non-JSON
+     * legacy values (free-form bank notes, Zebra Wallet IWANs,
+     * etc.) fall through to the raw blob unchanged.
+     */
+    private static function format_account_details($w) {
+        $raw = (string) ($w->account_details ?? '');
+        if ($raw === '') {
+            return '';
+        }
+        // Only decode when the row is structurally a Zebra bank
+        // payout — other gateways and free-form notes shouldn't
+        // be coerced into the bank shape just because they
+        // happen to be valid JSON.
+        $method = strtolower((string) ($w->method ?? ''));
+        if ($method !== 'zebra_bank' || $raw[0] !== '{') {
+            return $raw;
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || ($decoded['type'] ?? '') !== 'bank') {
+            return $raw;
+        }
+        $bank_name      = (string) ($decoded['bank_name'] ?? '');
+        $account_number = (string) ($decoded['account_number'] ?? '');
+        $account_name   = (string) ($decoded['account_name'] ?? '');
+        $parts = [];
+        if ($bank_name !== '')      { $parts[] = $bank_name; }
+        if ($account_number !== '') { $parts[] = $account_number; }
+        if ($account_name !== '')   { $parts[] = $account_name; }
+        return $parts ? implode(' · ', $parts) : $raw;
     }
 }
