@@ -1,0 +1,353 @@
+/**
+ * Matrix MLM — In-App Notifications styles
+ *
+ * Styles the sidebar bell (.matrix-notif-bell-*) and the dedicated
+ * Notifications dashboard tab (.matrix-notif-page-*). Loaded on
+ * every page where the dashboard shortcode renders, via the
+ * matrix-mlm-notifications stylesheet handle (see
+ * Matrix_MLM_Core::enqueue_public_assets).
+ *
+ * Color tokens are the same indigo/grey palette used elsewhere on
+ * the dashboard for visual consistency. The unread state uses a
+ * red badge (consistent with industry-wide convention for "new"
+ * counters) and a small left-side accent bar so unread rows are
+ * scannable at a glance even when the dot is missed.
+ */
+
+/* ------------------------------------------------------------------
+ * Sidebar bell
+ * -----------------------------------------------------------------*/
+
+.matrix-notif-bell-wrapper {
+    position: relative;
+    margin: 8px 12px 4px;
+}
+
+.matrix-notif-bell-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    background: transparent;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    color: #374151;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 14px;
+    text-align: left;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.matrix-notif-bell-btn:hover,
+.matrix-notif-bell-btn:focus {
+    background: #eef2ff;
+    border-color: #c7d2fe;
+    color: #4f46e5;
+    outline: none;
+}
+.matrix-notif-bell-btn .dashicons {
+    font-size: 20px;
+    width: 20px;
+    height: 20px;
+    color: inherit;
+}
+.matrix-notif-bell-label {
+    flex: 1 1 auto;
+    font-weight: 500;
+}
+.matrix-notif-bell-badge {
+    display: none;
+    min-width: 22px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: #ef4444;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.4;
+    text-align: center;
+}
+.matrix-notif-bell-badge.is-visible {
+    display: inline-block;
+}
+
+/* ------------------------------------------------------------------
+ * Dropdown
+ * -----------------------------------------------------------------*/
+
+.matrix-notif-dropdown {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    z-index: 9999;
+    width: 360px;
+    max-width: calc(100vw - 32px);
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    box-shadow: 0 18px 36px -10px rgba(15, 23, 42, 0.25);
+    overflow: hidden;
+}
+.matrix-notif-dropdown[hidden] {
+    display: none;
+}
+
+.matrix-notif-dropdown-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #f3f4f6;
+}
+.matrix-notif-dropdown-header h4 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #111827;
+}
+.matrix-notif-mark-all {
+    background: transparent;
+    border: 0;
+    padding: 4px 6px;
+    color: #4f46e5;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+.matrix-notif-mark-all:hover:not(:disabled) {
+    color: #4338ca;
+    text-decoration: underline;
+}
+.matrix-notif-mark-all:disabled {
+    color: #9ca3af;
+    cursor: not-allowed;
+}
+
+.matrix-notif-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 420px;
+    overflow-y: auto;
+}
+.matrix-notif-empty {
+    padding: 24px 16px;
+    text-align: center;
+    color: #6b7280;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.matrix-notif-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid #f3f4f6;
+    cursor: pointer;
+    transition: background 0.12s ease;
+    position: relative;
+}
+.matrix-notif-item:last-child {
+    border-bottom: 0;
+}
+.matrix-notif-item:hover {
+    background: #f9fafb;
+}
+.matrix-notif-item.is-unread {
+    background: #fafbff;
+}
+.matrix-notif-item.is-unread::before {
+    content: '';
+    position: absolute;
+    top: 12px;
+    bottom: 12px;
+    left: 0;
+    width: 3px;
+    background: #4f46e5;
+    border-radius: 0 3px 3px 0;
+}
+
+.matrix-notif-icon {
+    flex: 0 0 32px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #eef2ff;
+    color: #4f46e5;
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px !important;
+}
+.matrix-notif-item.is-read .matrix-notif-icon {
+    background: #f3f4f6;
+    color: #6b7280;
+}
+
+.matrix-notif-body {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.matrix-notif-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #111827;
+    line-height: 1.35;
+    margin-bottom: 2px;
+    word-break: break-word;
+}
+.matrix-notif-item.is-read .matrix-notif-title {
+    color: #4b5563;
+    font-weight: 500;
+}
+.matrix-notif-text {
+    font-size: 12.5px;
+    color: #6b7280;
+    line-height: 1.45;
+    margin-bottom: 4px;
+    word-break: break-word;
+}
+.matrix-notif-time {
+    font-size: 11px;
+    color: #9ca3af;
+}
+
+.matrix-notif-dot {
+    flex: 0 0 8px;
+    width: 8px;
+    height: 8px;
+    margin-top: 8px;
+    border-radius: 50%;
+    background: #4f46e5;
+}
+
+.matrix-notif-dropdown-footer {
+    padding: 10px 16px;
+    border-top: 1px solid #f3f4f6;
+    text-align: center;
+    background: #f9fafb;
+}
+.matrix-notif-dropdown-footer a {
+    color: #4f46e5;
+    font-size: 12.5px;
+    font-weight: 500;
+    text-decoration: none;
+}
+.matrix-notif-dropdown-footer a:hover {
+    color: #4338ca;
+    text-decoration: underline;
+}
+
+/* On narrow screens, anchor the dropdown to the right edge of the
+ * viewport so it doesn't overflow off-screen on small phones. */
+@media (max-width: 480px) {
+    .matrix-notif-dropdown {
+        width: calc(100vw - 24px);
+        left: auto;
+        right: -8px;
+    }
+}
+
+/* ------------------------------------------------------------------
+ * Notifications dashboard tab (full-page list)
+ * -----------------------------------------------------------------*/
+
+.matrix-notif-page-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin: 0 0 16px;
+}
+
+.matrix-notif-page-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid #e5e7eb;
+}
+
+.matrix-notif-page-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 4px;
+    border-bottom: 1px solid #f3f4f6;
+    position: relative;
+}
+.matrix-notif-page-item.is-unread::before {
+    content: '';
+    position: absolute;
+    top: 16px;
+    bottom: 16px;
+    left: -8px;
+    width: 3px;
+    background: #4f46e5;
+    border-radius: 0 3px 3px 0;
+}
+
+.matrix-notif-page-body {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.matrix-notif-page-title {
+    font-size: 14.5px;
+    font-weight: 600;
+    color: #111827;
+    line-height: 1.4;
+    margin-bottom: 4px;
+}
+.matrix-notif-page-item.is-read .matrix-notif-page-title {
+    color: #4b5563;
+    font-weight: 500;
+}
+.matrix-notif-page-title a {
+    color: inherit;
+    text-decoration: none;
+}
+.matrix-notif-page-title a:hover {
+    color: #4f46e5;
+    text-decoration: underline;
+}
+.matrix-notif-page-text {
+    font-size: 13px;
+    color: #4b5563;
+    line-height: 1.5;
+    margin-bottom: 4px;
+    word-break: break-word;
+}
+.matrix-notif-page-time {
+    font-size: 11.5px;
+    color: #9ca3af;
+}
+
+.matrix-notif-page-mark-read {
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid #c7d2fe;
+    color: #4f46e5;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    align-self: center;
+}
+.matrix-notif-page-mark-read:hover {
+    background: #eef2ff;
+}
+
+.matrix-notif-pagination {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 24px;
+    gap: 12px;
+}
+.matrix-notif-page-indicator {
+    font-size: 13px;
+    color: #6b7280;
+}
