@@ -838,7 +838,14 @@ class Matrix_MLM_User_Card {
 
             whenJQueryReady(function($) {
             'use strict';
-            $('#matrix-request-card-form').on('submit', function(e) {
+            // Delegated on document for the same DOM-timing reason
+            // documented in class-matrix-user-wallet.php's render_scripts():
+            // direct binding races the matched form's DOM arrival on
+            // stacks with deferred jQuery / Rocket Loader / WP Rocket /
+            // FlyingPress / Astra / GeneratePress / OceanWP, etc., and
+            // silently no-op's. Symptom: 'Create Verve Card form
+            // doesn't work until I refresh.'
+            $(document).on('submit', '#matrix-request-card-form', function(e) {
                 e.preventDefault();
                 var form = $(this), btn = $('#request-card-btn');
                 if (!confirm('<?php echo esc_js(__('Create your Verve card record now? You will activate it with the PAN on your physical card in the next step.', 'matrix-mlm')); ?>')) return;
