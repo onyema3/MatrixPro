@@ -474,6 +474,28 @@ class Matrix_MLM_Fintava_Billing {
      * Buy Airtime
      * POST /billing/airtime
      *
+     * Fintava's /billing/airtime endpoint expects VTU-convention
+     * field names (Virtual Top-Up — the standard Nigerian fintech
+     * naming for telco airtime/data top-ups), NOT the descriptive
+     * names the rest of this class uses internally. Without these
+     * keys the endpoint rejects the call with HTTP 400 and the
+     * message:
+     *   "vtu_network must be a string;
+     *    vtu_amount must be a number conforming to the specified constraints;
+     *    vtu_number must be a string"
+     *
+     * Mapping (internal name -> Fintava wire name):
+     *   $phone   -> vtu_number   (the recipient phone, as a string)
+     *   $amount  -> vtu_amount   (numeric, in major units / NGN)
+     *   $network -> vtu_network  (MTN / GLO / AIRTEL / 9MOBILE)
+     *
+     * The legacy `phone` / `amount` / `network` keys are NOT sent
+     * — Fintava rejects the request when only those are present,
+     * which was the user-visible "bills payment error … vtu_network
+     * must be a string; …" report. The PHP method signature keeps
+     * the descriptive names so the four ajax_buy_<type> handlers
+     * (and any non-AJAX caller) don't have to know the wire convention.
+     *
      * @param string      $phone
      * @param float       $amount
      * @param string      $network
@@ -488,9 +510,9 @@ class Matrix_MLM_Fintava_Billing {
      */
     public function buy_airtime($phone, $amount, $network, $client_reference = null) {
         return $this->make_request('POST', '/billing/airtime', $this->with_client_reference([
-            'phone' => $phone,
-            'amount' => floatval($amount),
-            'network' => $network,
+            'vtu_number'  => (string) $phone,
+            'vtu_amount'  => floatval($amount),
+            'vtu_network' => (string) $network,
         ], $client_reference));
     }
 
