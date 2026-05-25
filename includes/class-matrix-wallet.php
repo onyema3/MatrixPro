@@ -227,6 +227,112 @@ class Matrix_MLM_Wallet {
     }
 
     /**
+     * Append a ledger row to matrix_wallet WITHOUT touching the
+     * matrix_user_meta balance.
+     *
+     * Use this for movements that happen on a wallet OTHER than the
+     * Matrix internal wallet — the user's Fintava virtual wallet,
+     * external bank payouts sourced from that virtual wallet, bill
+     * purchases / refunds whose actual cash leg is a Fintava
+     * wallet-to-wallet transfer, etc. These movements never touch
+     * matrix_user_meta.balance, so calling credit()/debit() on them
+     * would mis-mutate the Matrix wallet AND mis-stamp post_balance
+     * against the wrong wallet. record_ledger() is the inverse of
+     * that mistake: write the audit row, leave the Matrix balance
+     * alone.
+     *
+     * The existing render_transaction_history() pane on the user
+     * Wallet page reads from matrix_wallet only, so every call
+     * site that wants its movement to appear in the user's unified
+     * Transaction History must either go through credit()/debit()
+     * (Matrix-wallet movement) or through record_ledger()
+     * (non-Matrix-wallet movement). Both produce a row of the same
+     * shape, so the UI render code stays unchanged.
+     *
+     * post_balance is REQUIRED and reflects the post-operation
+     * balance of WHICHEVER wallet was affected. The caller is the
+     * authoritative source for that value (e.g. read it back from
+     * the Fintava virtual-wallet balance endpoint after the
+     * wallet-to-wallet transfer landed). When the upstream balance
+     * read fails for transient reasons, the caller can pass 0.0 —
+     * the row still records the movement, and the "Post Balance"
+     * column on the history page renders 0.00 for that row only.
+     * That degraded display is intentionally preferred over
+     * dropping the row entirely, because a missing audit entry is
+     * a far worse failure mode than a single zero-stamped row.
+     *
+     * Status defaults to 'completed' — the only supported state
+     * for this helper. Pending/rejected/cancelled rows still go
+     * through the gateway-specific tables (matrix_deposits,
+     * matrix_withdrawals, matrix_billing_transactions) where they
+     * carry their own state machine.
+     *
+     * Returns TRUE on success, FALSE on insert failure (logged).
+     * Callers should treat a FALSE return as advisory: the actual
+     * money movement already landed, so we do NOT roll it back —
+     * we just lose the audit row. The error_log line is the trail
+     * ops uses to reconcile.
+     *
+     * @param int    $user_id
+     * @param float  $amount           Positive amount of the movement.
+     * @param string $type             'credit' or 'debit'.
+     * @param string $transaction_type Free-text tag persisted to the
+     *                                  varchar(50) column. Use a stable
+     *                                  identifier so admin filters /
+     *                                  reports can group by it (e.g.
+     *                                  'bank_transfer', 'bill_airtime',
+     *                                  'bill_admin_refund_virtual').
+     * @param string $description      Human-readable line for the
+     *                                  Description column. Should
+     *                                  identify the affected wallet
+     *                                  (e.g. "Bank transfer to
+     *                                  GTBank 0123… (from Virtual
+     *                                  Wallet)") so the unified
+     *                                  history reads naturally
+     *                                  alongside Matrix-wallet rows.
+     * @param float  $post_balance     Post-operation balance of the
+     *                                  affected wallet (NOT the Matrix
+     *                                  wallet, unless that's what the
+     *                                  movement was on).
+     * @param string $reference        Optional gateway reference
+     *                                  (UUID, Fintava transfer id,
+     *                                  client_reference, etc.).
+     * @param string $status           One of the matrix_wallet enum
+     *                                  values; defaults to 'completed'.
+     * @return bool
+     */
+    public function record_ledger($user_id, $amount, $type, $transaction_type, $description = '', $post_balance = 0.0, $reference = null, $status = 'completed') {
+        global $wpdb;
+
+        if ($type !== 'credit' && $type !== 'debit') {
+            error_log(sprintf(
+                '[Matrix MLM] record_ledger() rejected unknown type=%s user_id=%d amount=%s tx_type=%s',
+                $type, $user_id, $amount, $transaction_type
+            ));
+            return false;
+        }
+
+        $logged = $wpdb->insert($wpdb->prefix . 'matrix_wallet', [
+            'user_id'          => (int) $user_id,
+            'amount'           => (float) $amount,
+            'post_balance'     => (float) $post_balance,
+            'type'             => $type,
+            'transaction_type' => (string) ($transaction_type ?? ''),
+            'description'      => (string) $description,
+            'reference'        => $reference,
+            'status'           => (string) $status,
+        ]);
+        if ($logged === false) {
+            error_log(sprintf(
+                '[Matrix MLM] record_ledger() INSERT failed: user_id=%d type=%s tx_type=%s amount=%s last_error=%s',
+                $user_id, $type, $transaction_type, $amount, $wpdb->last_error
+            ));
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * Get transaction history
      */
     public function get_transactions($user_id, $limit = 20, $offset = 0, $type = null) {

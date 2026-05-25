@@ -1229,6 +1229,51 @@ class Matrix_MLM_Fintava_Billing {
 
         // 5. Success. Finalize the row.
         $this->complete_transaction($tx_id, $result);
+
+        // Append a row to matrix_wallet so this bill purchase
+        // shows up in the user's unified Transaction History on
+        // the Wallet page. The actual debit landed on the user's
+        // Fintava virtual wallet via the wallet-to-wallet step at
+        // (1), so we use record_ledger() — that helper writes the
+        // audit row WITHOUT touching matrix_user_meta.balance,
+        // which is exactly what we want for a non-Matrix-wallet
+        // movement. Without this call, bill purchases stayed
+        // invisible to the user's transaction history (only
+        // matrix_billing_transactions saw them, and that table
+        // is admin-only).
+        //
+        // post_balance is read back from the user's virtual
+        // wallet after the debit landed. Best-effort: if the
+        // balance probe fails for transient reasons, fall through
+        // to 0.0 so the row still records (a single zero-stamped
+        // post_balance is preferable to dropping the audit row).
+        $post_balance = 0.0;
+        $fintava_for_balance = new Matrix_MLM_Fintava();
+        $virtual_wallet_row = $fintava_for_balance->get_user_wallet($user_id);
+        if ($virtual_wallet_row) {
+            $balance_after = $fintava_for_balance->get_virtual_wallet_balance(
+                $virtual_wallet_row->wallet_id ?? '',
+                $virtual_wallet_row->account_number ?? null,
+                $virtual_wallet_row->customer_id ?? null
+            );
+            if (!is_wp_error($balance_after)
+                && isset($balance_after['available_balance'])
+                && is_numeric($balance_after['available_balance'])) {
+                $post_balance = (float) $balance_after['available_balance'];
+            }
+        }
+
+        $matrix_wallet_logger = new Matrix_MLM_Wallet();
+        $matrix_wallet_logger->record_ledger(
+            $user_id,
+            (float) $total,
+            'debit',
+            'bill_' . preg_replace('/[^a-z0-9_]/', '_', strtolower((string) $type)),
+            $debit_description . ' (from Virtual Wallet)',
+            $post_balance,
+            $debit_reference
+        );
+
         return [
             'kind'           => 'success',
             'transaction_id' => $tx_id,
