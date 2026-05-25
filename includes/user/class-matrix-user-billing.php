@@ -118,6 +118,50 @@ class Matrix_MLM_User_Billing {
             preview.find('.matrix-fee-total').text(window.matrixBillingFormatMoney(total));
             preview.show();
         };
+        // Defence-in-depth: every bill-payment AJAX handler used to
+        // do `alert(r.data.message)` directly. If a future PHP
+        // regression (or an upstream gateway shape change) ever put
+        // a non-string into `data.message`, JS would coerce it via
+        // implicit toString and the user would see a literal
+        // "[object Object]". This helper guards every alert site
+        // with a typeof-string check and a sane fallback so that
+        // can't happen again.
+        window.matrixBillingExtractMessage = function(r, fallback) {
+            if (r && r.data && typeof r.data.message === 'string' && r.data.message.length) {
+                return r.data.message;
+            }
+            return fallback || 'An unexpected error occurred. Please try again.';
+        };
+        // Render Fintava's meter-verify payload (`r.data.meter`) as
+        // plain text. Replaces the previous one-liner that did
+        // `info += k + ': ' + m[k]` and rendered nested objects
+        // (e.g. `customer`, `tariff`, `address`) as the literal
+        // string "[object Object]" — which was the user-visible
+        // "bills payment error [object Object]" bug. Strategy:
+        //   - skip null/undefined
+        //   - render scalars directly
+        //   - JSON.stringify nested objects/arrays so the user
+        //     sees actual content instead of "[object Object]"
+        // We build a textContent string (not HTML), so jQuery's
+        // .text() handles escaping — Fintava is a third-party
+        // upstream and the previous code injected its response
+        // straight into .html(), which was also an XSS foot-gun.
+        window.matrixBillingFormatMeterInfo = function(meter) {
+            if (!meter || typeof meter !== 'object') {
+                return '';
+            }
+            var parts = [];
+            for (var k in meter) {
+                if (!Object.prototype.hasOwnProperty.call(meter, k)) continue;
+                var v = meter[k];
+                if (v === null || typeof v === 'undefined' || v === '') continue;
+                if (typeof v === 'object') {
+                    try { v = JSON.stringify(v); } catch (e) { v = String(v); }
+                }
+                parts.push(k + ': ' + v);
+            }
+            return parts.join(' | ');
+        };
         </script>
 
         <?php
@@ -451,7 +495,11 @@ class Matrix_MLM_User_Billing {
                 e.preventDefault(); var f=$(this), b=f.find('button');
                 b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl, {action:'matrix_fintava_buy_airtime',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),amount:f.find('[name=amount]').val(),network:f.find('[name=network]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')}, function(r){
-                    alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Airtime');
+                    alert(window.matrixBillingExtractMessage(r));
+                    if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Airtime');
+                }).fail(function(){
+                    alert('Network error. Please check your connection and try again.');
+                    b.prop('disabled',false).text('Buy Airtime');
                 });
             });
         })(jQuery);
@@ -522,7 +570,11 @@ class Matrix_MLM_User_Billing {
             $('#matrix-billing-data').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_data',nonce:matrixMLM.nonce,phone:f.find('[name=phone]').val(),plan_id:f.find('[name=plan_id]').val(),network:f.find('[name=network]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
-                    alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Data');
+                    alert(window.matrixBillingExtractMessage(r));
+                    if(r.success) location.reload(); else b.prop('disabled',false).text('Buy Data');
+                }).fail(function(){
+                    alert('Network error. Please check your connection and try again.');
+                    b.prop('disabled',false).text('Buy Data');
                 });
             });
         })(jQuery);
@@ -597,7 +649,11 @@ class Matrix_MLM_User_Billing {
             $('#matrix-billing-cable').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_cable',nonce:matrixMLM.nonce,smartcard_number:f.find('[name=smartcard_number]').val(),plan_id:f.find('[name=plan_id]').val(),provider:f.find('[name=provider]').val(),amount:f.find('[name=amount]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
-                    alert(r.success?r.data.message:r.data.message); if(r.success) location.reload(); else b.prop('disabled',false).text('Subscribe');
+                    alert(window.matrixBillingExtractMessage(r));
+                    if(r.success) location.reload(); else b.prop('disabled',false).text('Subscribe');
+                }).fail(function(){
+                    alert('Network error. Please check your connection and try again.');
+                    b.prop('disabled',false).text('Subscribe');
                 });
             });
         })(jQuery);
@@ -658,9 +714,18 @@ class Matrix_MLM_User_Billing {
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_verify_meter',nonce:matrixMLM.nonce,meter_number:$('#elec-meter').val(),disco:$('#elec-disco').val(),meter_type:$('[name=meter_type]').val()},function(r){
                     btn.prop('disabled',false).text('Verify Meter');
                     if(r.success){
-                        var m=r.data.meter; var info=''; for(var k in m){info+=k+': '+m[k]+' | ';}
-                        $('#meter-info').html(info).show();
-                    } else { alert(r.data.message); }
+                        // Use .text() (not .html()) plus the safe
+                        // formatter — see matrixBillingFormatMeterInfo
+                        // in render() for the rationale on why the
+                        // previous implementation showed "[object
+                        // Object]" for nested fields.
+                        var info = window.matrixBillingFormatMeterInfo(r.data && r.data.meter);
+                        if (info) { $('#meter-info').text(info).show(); }
+                        else { $('#meter-info').text('Meter verified.').show(); }
+                    } else { alert(window.matrixBillingExtractMessage(r, 'Could not verify meter. Please try again.')); }
+                }).fail(function(){
+                    btn.prop('disabled',false).text('Verify Meter');
+                    alert('Network error verifying meter. Please check your connection and try again.');
                 });
             });
             // Recompute the fee preview as the user types the amount.
@@ -670,7 +735,11 @@ class Matrix_MLM_User_Billing {
             $('#matrix-billing-electricity').on('submit',function(e){
                 e.preventDefault(); var f=$(this),b=f.find('button[type=submit]'); b.prop('disabled',true).text('Processing...');
                 $.post(matrixMLM.ajaxUrl,{action:'matrix_fintava_buy_electricity',nonce:matrixMLM.nonce,meter_number:f.find('[name=meter_number]').val(),amount:f.find('[name=amount]').val(),disco:f.find('[name=disco]').val(),meter_type:f.find('[name=meter_type]').val(),transaction_pin:(f.find('[name=transaction_pin]').val()||'')},function(r){
-                    if(r.success){ alert(r.data.message); location.reload(); } else { alert(r.data.message); b.prop('disabled',false).text('Pay Electricity'); }
+                    var msg = window.matrixBillingExtractMessage(r);
+                    if(r.success){ alert(msg); location.reload(); } else { alert(msg); b.prop('disabled',false).text('Pay Electricity'); }
+                }).fail(function(){
+                    alert('Network error. Please check your connection and try again.');
+                    b.prop('disabled',false).text('Pay Electricity');
                 });
             });
         })(jQuery);
