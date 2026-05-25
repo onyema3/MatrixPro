@@ -72,9 +72,24 @@
 }
 
 .matrix-dashboard-nav a .dashicons {
+    /* font-family is set with !important because some themes ship
+       a `nav a span { font-family: inherit !important }` (or
+       similarly worded) reset that wins on the cascade and stops
+       the WP core dashicons font from resolving. Symptom: every
+       sidebar icon renders as an empty 16x16 box (the dashicons
+       span keeps its layout box, but the glyph code points fall
+       back to the theme body font, which has nothing mapped at
+       those Private Use Area positions). The genealogy toolbar's
+       dashicons keep working in that scenario because they're
+       not inside <nav> — only the sidebar is hit. Locking the
+       font-family here makes the rendering theme-independent.
+       Reported on a fresh production deploy onto a new theme
+       after PR #334 enqueued dashicons globally. */
+    font-family: dashicons !important;
     font-size: 16px;
     width: 16px;
     height: 16px;
+    line-height: 1;
 }
 
 .matrix-nav-logout {
