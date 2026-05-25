@@ -47,7 +47,18 @@ class Matrix_MLM_GDPR {
         function matrixAcceptCookies() {
             document.cookie = "matrix_cookie_consent=accepted; path=/; max-age=" + (365 * 24 * 60 * 60);
             document.getElementById('matrix-cookie-consent').style.display = 'none';
-            jQuery.post(matrixMLM.ajaxUrl, {action: 'matrix_accept_cookies', consent: 'accepted'});
+            // CSRF guard: include the matrix_mlm_nonce localized on
+            // window.matrixMLM by the matrix-mlm-public handle. The
+            // accept_cookies AJAX handler is a no-op today but the
+            // endpoint is reachable from any origin (it has both an
+            // authenticated and a wp_ajax_nopriv_* registration), so
+            // gating it now prevents a future addition of business
+            // logic from silently inheriting a CSRF foothold. The
+            // matrixMLM object is enqueued in the head and therefore
+            // always defined before this function is invoked from
+            // the footer-rendered banner.
+            var nonce = (window.matrixMLM && window.matrixMLM.nonce) ? window.matrixMLM.nonce : '';
+            jQuery.post(matrixMLM.ajaxUrl, {action: 'matrix_accept_cookies', nonce: nonce, consent: 'accepted'});
         }
         function matrixRejectCookies() {
             document.cookie = "matrix_cookie_consent=rejected; path=/; max-age=" + (365 * 24 * 60 * 60);
@@ -58,9 +69,23 @@ class Matrix_MLM_GDPR {
     }
 
     /**
-     * Handle cookie acceptance
+     * Handle cookie acceptance.
+     *
+     * The handler itself does no server-side work today (consent is
+     * authoritative on the client cookie set in the banner script),
+     * but the endpoint is registered for both wp_ajax_* and
+     * wp_ajax_nopriv_*, which makes it reachable from any origin.
+     * Gating it with a nonce now means a future addition of logic
+     * here (e.g. persisting consent in user_meta for analytics or
+     * audit) won't silently inherit a CSRF foothold. The $die=false
+     * variant is used so a stale cached banner without the nonce
+     * still receives a clean JSON response — no end-user impact,
+     * the cookie is already set client-side regardless.
      */
     public function accept_cookies() {
+        if (!check_ajax_referer('matrix_mlm_nonce', 'nonce', false)) {
+            wp_send_json_error(['message' => __('Invalid request', 'matrix-mlm')], 403);
+        }
         wp_send_json_success();
     }
 
