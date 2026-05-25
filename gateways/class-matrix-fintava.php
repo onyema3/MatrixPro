@@ -1832,6 +1832,11 @@ class Matrix_MLM_Fintava {
 
         $account_number = sanitize_text_field($_POST['account_number'] ?? '');
         $bank_code = sanitize_text_field($_POST['bank_code'] ?? '');
+        // Optional - the form already knows the bank's display name from
+        // the dropdown option; passing it lets the Paystack-side bank-code
+        // translator do a name-match fallback for banks the static map
+        // doesn't know about (most fintechs).
+        $bank_name = sanitize_text_field($_POST['bank_name'] ?? '');
 
         if (empty($account_number) || empty($bank_code)) {
             wp_send_json_error(['message' => __('Account number and bank are required', 'matrix-mlm')]);
@@ -1841,8 +1846,16 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Account number must be 10 digits', 'matrix-mlm')]);
         }
 
-        $result = $this->resolve_account($account_number, $bank_code);
-        if (is_wp_error($result)) {
+        // Race two NIBSS-backed resolvers in parallel: Fintava
+        // /name/enquiry and Paystack /bank/resolve. Whichever returns a
+        // usable account holder name first wins. See race_resolve_account
+        // for the full design - the short version is that Fintava's
+        // basic-tier /name/enquiry has spotty coverage of fintech banks
+        // (OPay/Kuda/PalmPay/Moniepoint) where Paystack's free resolver
+        // tends to succeed, and racing in parallel makes the user-perceived
+        // latency the max of the two RTTs instead of the sum.
+        $resolved = $this->race_resolve_account($account_number, $bank_code, $bank_name);
+        if (is_wp_error($resolved)) {
             // Always allow the JS to offer a "continue without verification"
             // path. Fintava's /name/enquiry returns "Unable to resolve
             // account information" for at least three distinct failure
@@ -1858,49 +1871,266 @@ class Matrix_MLM_Fintava {
             // account name to the operator and lets the actual transfer
             // arbitrate correctness.
             wp_send_json_error([
-                'message'              => $result->get_error_message(),
-                'allow_manual_override' => true,
-            ]);
-        }
-
-        // Fintava's /name/enquiry returns camelCase
-        // (`accountName`/`accountNumber`/`bankName`); the inline JS in
-        // class-matrix-user-bank-payout.php reads our response under
-        // snake_case keys (`response.data.account_name` etc.). Use the
-        // existing casing-tolerant extractors as the bridge so the JS
-        // keeps working regardless of which casing Fintava sends back
-        // on a given tier — they accept both shapes and were already
-        // correctly used elsewhere; this site was the leftover.
-        $resolved_name   = self::extract_account_name($result) ?: ($result['account_name'] ?? '');
-        $resolved_number = self::extract_account_number($result) ?: ($result['account_number'] ?? $account_number);
-        $resolved_bank   = self::extract_bank_name($result) ?: ($result['bank_name'] ?? '');
-
-        // Some merchant tiers ack /name/enquiry with HTTP 200 but no
-        // usable accountName (empty string, "null", or the field
-        // missing entirely). Treating that as `success: true` would
-        // populate the readonly name field with '', flip the JS
-        // accountVerified flag to true, enable Submit, and the user
-        // would only learn the name was missing when ajax_initiate_transfer
-        // throws "Account name is required" on submit — with no UI
-        // path to recover, since the field stays readonly on the
-        // verified branch. Convert empty resolved names into the same
-        // resolve_error + allow_manual_override response we already
-        // emit for is_wp_error() so the JS surfaces the manual-entry
-        // notice and the operator can type the holder's name and
-        // proceed. The actual /bank/credit/merchant call still
-        // arbitrates whether the account is real on Fintava's side.
-        if (trim((string) $resolved_name) === '') {
-            wp_send_json_error([
-                'message'               => __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm'),
+                'message'              => $resolved->get_error_message(),
                 'allow_manual_override' => true,
             ]);
         }
 
         wp_send_json_success([
-            'account_name'   => $resolved_name,
-            'account_number' => $resolved_number,
-            'bank_name'      => $resolved_bank,
+            'account_name'   => $resolved['account_name'],
+            'account_number' => $resolved['account_number'],
+            'bank_name'      => $resolved['bank_name'] ?? $bank_name,
         ]);
+    }
+
+    /**
+     * Race the two NIBSS-backed account-name resolvers in parallel.
+     *
+     * Fires Fintava /name/enquiry (always) and Paystack /bank/resolve
+     * (when configured + the sortCode translates to a known CBN code)
+     * concurrently via Requests::request_multiple, then walks the
+     * responses in priority order to pick a winner.
+     *
+     * Why a race rather than Paystack-first or Fintava-first:
+     *
+     *   - Both resolvers ultimately hit the same NIBSS infrastructure,
+     *     so when both succeed they return the same name; the only
+     *     difference is which hop has degraded latency on a given day.
+     *     Racing means the slow hop never becomes the user's wait.
+     *   - Coverage is asymmetric and unstable. Fintava's basic tier
+     *     historically refuses lookups for OPay / Kuda / PalmPay /
+     *     Moniepoint while Paystack succeeds; a Paystack tier change
+     *     could flip that. Racing both means we always succeed when
+     *     either resolver does, regardless of which one the day
+     *     happens to favour.
+     *   - User-perceived latency is max(RTT_a, RTT_b) instead of
+     *     RTT_a + RTT_b. With name-enquiry typically <1s, that's a
+     *     real human-noticeable improvement.
+     *
+     * Priority order on tie (both succeed): Paystack first. Reasoning:
+     * Paystack normalises name casing more consistently across banks
+     * (Fintava sometimes returns the name in all-caps, sometimes
+     * mixed-case, depending on the destination bank's NIBSS feed);
+     * users prefer the cleaner display.
+     *
+     * Single-resolver fallbacks:
+     *   - Paystack key not configured OR sortCode doesn't translate
+     *     to a known CBN code -> Fintava-only.
+     *   - Fintava call construction fails (no secret_key) -> we still
+     *     run Paystack alone if it's available.
+     *   - Both unavailable -> WP_Error.
+     *
+     * @return array|WP_Error  Normalised result (account_name,
+     *                          account_number, bank_name) or WP_Error
+     *                          when neither resolver returned a name.
+     */
+    private function race_resolve_account($account_number, $bank_code, $bank_name = '') {
+        $request_specs = [];
+        $request_meta  = []; // numeric index in $request_specs => 'fintava' | 'paystack'
+
+        // ---- Fintava leg --------------------------------------------------
+        // Same lean-header shape make_request() uses for /name/enquiry.
+        if (!empty($this->secret_key)) {
+            $fintava_url = rtrim($this->base_url, '/') . '/name/enquiry?' . http_build_query([
+                'accountNumber' => $account_number,
+                'sortCode'      => $bank_code,
+            ]);
+            $request_specs[] = [
+                'url'     => $fintava_url,
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->secret_key,
+                    'Accept'        => 'application/json',
+                ],
+                'type'    => 'GET',
+            ];
+            $request_meta[count($request_specs) - 1] = 'fintava';
+        }
+
+        // ---- Paystack leg -------------------------------------------------
+        // Skipped when Paystack isn't configured OR when the sortCode the
+        // form sent doesn't translate to a CBN code Paystack recognises.
+        // The single-resolver path then falls through to Fintava-only,
+        // which is exactly today's behaviour.
+        $paystack         = new Matrix_MLM_Paystack();
+        $paystack_secret  = $paystack->get_secret_key_for_resolver();
+        $paystack_cbn     = $paystack->nibss_sortcode_to_cbn_code($bank_code, $bank_name);
+        if ($paystack_secret !== '' && $paystack_cbn !== '') {
+            $paystack_url = 'https://api.paystack.co/bank/resolve?' . http_build_query([
+                'account_number' => $account_number,
+                'bank_code'      => $paystack_cbn,
+            ]);
+            $request_specs[] = [
+                'url'     => $paystack_url,
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $paystack_secret,
+                    'Accept'        => 'application/json',
+                ],
+                'type'    => 'GET',
+            ];
+            $request_meta[count($request_specs) - 1] = 'paystack';
+        }
+
+        // Nothing to call - shouldn't happen because Fintava credentials
+        // gate the entire payout surface, but guard against it anyway.
+        if (empty($request_specs)) {
+            return new WP_Error(
+                'no_resolver_configured',
+                __('No name-enquiry resolver is configured. Please continue without verification and type the holder\'s name.', 'matrix-mlm')
+            );
+        }
+
+        // ---- Fire in parallel -------------------------------------------
+        // Requests::request_multiple is the WordPress core primitive for
+        // parallel HTTP - it's what Core uses internally for
+        // plugin/theme update checks. WP 6.2 renamed the class to
+        // WpOrg\Requests\Requests but ships a class_alias() back to
+        // \Requests, so the legacy name keeps working. We probe for
+        // both to be portable across versions and against installs that
+        // disable the legacy alias.
+        $requests_class = class_exists('\\Requests') ? '\\Requests' : (class_exists('\\WpOrg\\Requests\\Requests') ? '\\WpOrg\\Requests\\Requests' : '');
+        if ($requests_class === '' || !is_callable([$requests_class, 'request_multiple'])) {
+            // Single-resolver fallback: parallel primitive isn't
+            // available on this install, so just use the existing
+            // Fintava-only path. This branch should be unreachable on
+            // any supported WP version.
+            return $this->race_fallback_serial($account_number, $bank_code, $bank_name);
+        }
+
+        $responses = call_user_func(
+            [$requests_class, 'request_multiple'],
+            $request_specs,
+            ['timeout' => 8]
+        );
+
+        // ---- Pick a winner ---------------------------------------------
+        // Walk in resolver-priority order. First non-empty name wins.
+        // Track per-leg failure messages so we can include them in the
+        // error log if both lose.
+        $leg_errors = [];
+        foreach (['paystack', 'fintava'] as $resolver) {
+            foreach ($request_meta as $idx => $name) {
+                if ($name !== $resolver) {
+                    continue;
+                }
+                $response = $responses[$idx] ?? null;
+
+                // Requests transport-level failure (timeout, DNS,
+                // connection refused) lands as an Exception object in
+                // the responses array. Both class names are handled
+                // for cross-version safety.
+                if ($response instanceof \Exception) {
+                    $leg_errors[$resolver] = $response->getMessage();
+                    continue;
+                }
+                // Anything that isn't a Requests_Response: skip.
+                $body_str = '';
+                if (is_object($response) && property_exists($response, 'body')) {
+                    $body_str = (string) $response->body;
+                } elseif (is_object($response) && method_exists($response, 'get_body')) {
+                    $body_str = (string) $response->get_body();
+                }
+                if ($body_str === '') {
+                    $leg_errors[$resolver] = 'empty body';
+                    continue;
+                }
+
+                $body = json_decode($body_str, true);
+                if (!is_array($body)) {
+                    $leg_errors[$resolver] = 'malformed JSON';
+                    continue;
+                }
+
+                $resolved = $this->parse_resolver_body($body, $resolver, $account_number, $bank_name);
+                if ($resolved !== null && trim($resolved['account_name']) !== '') {
+                    if (defined('WP_DEBUG') && WP_DEBUG) {
+                        error_log(sprintf(
+                            '[Matrix MLM] resolve_account: %s won (sortCode=%s, cbn_code=%s)',
+                            $resolver, $bank_code, $paystack_cbn
+                        ));
+                    }
+                    return $resolved;
+                }
+                $leg_errors[$resolver] = (string) ($body['message'] ?? 'no name in response');
+            }
+        }
+
+        // Both resolvers came back without a usable name. Log the
+        // per-leg cause for diagnostic purposes; surface a single
+        // friendly message to the user so they know to fall through
+        // to the manual-entry path.
+        error_log(sprintf(
+            '[Matrix MLM] resolve_account: all resolvers failed. sortCode=%s cbn=%s legs=%s',
+            $bank_code,
+            $paystack_cbn !== '' ? $paystack_cbn : '(no-cbn-mapping)',
+            json_encode($leg_errors)
+        ));
+        return new WP_Error(
+            'all_resolvers_failed',
+            __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm')
+        );
+    }
+
+    /**
+     * Serial fallback for the (theoretically unreachable) case where
+     * Requests::request_multiple isn't callable on the host. Calls the
+     * legacy Fintava-only path - same behaviour the plugin had before
+     * the parallel race was introduced.
+     */
+    private function race_fallback_serial($account_number, $bank_code, $bank_name = '') {
+        $result = $this->resolve_account($account_number, $bank_code);
+        if (is_wp_error($result)) {
+            return $result;
+        }
+        $name = self::extract_account_name($result) ?: ($result['account_name'] ?? '');
+        if (trim((string) $name) === '') {
+            return new WP_Error(
+                'fintava_resolve_empty',
+                __('Could not auto-verify the account name. Please continue without verification and type the holder\'s name.', 'matrix-mlm')
+            );
+        }
+        return [
+            'account_name'   => $name,
+            'account_number' => self::extract_account_number($result) ?: ($result['account_number'] ?? $account_number),
+            'bank_name'      => self::extract_bank_name($result) ?: ($result['bank_name'] ?? $bank_name),
+        ];
+    }
+
+    /**
+     * Parse a decoded JSON body from one of the two resolvers into the
+     * normalized shape ajax_resolve_account expects. Returns null when
+     * the body has no usable account name.
+     */
+    private function parse_resolver_body($body, $resolver, $account_number, $bank_name = '') {
+        if ($resolver === 'paystack') {
+            $parsed = Matrix_MLM_Paystack::parse_resolve_body($body);
+            if ($parsed === null) {
+                return null;
+            }
+            return [
+                'account_name'   => $parsed['account_name'],
+                'account_number' => $parsed['account_number'] !== '' ? $parsed['account_number'] : $account_number,
+                'bank_name'      => $bank_name, // Paystack returns bank_id, not name
+            ];
+        }
+
+        // Fintava leg. Mirror the parsing the legacy resolve_account()
+        // method does: success indicated by `status: true` (or the
+        // is_api_success heuristic for variants), name in
+        // data.accountName / accountName / account_name etc. - the
+        // existing extractors handle the casing variance.
+        if (!self::is_api_success($body)) {
+            return null;
+        }
+        $data = isset($body['data']) && is_array($body['data']) ? $body['data'] : $body;
+        $name = self::extract_account_name($data) ?: ($data['account_name'] ?? '');
+        if (trim((string) $name) === '') {
+            return null;
+        }
+        return [
+            'account_name'   => $name,
+            'account_number' => self::extract_account_number($data) ?: ($data['account_number'] ?? $account_number),
+            'bank_name'      => self::extract_bank_name($data) ?: ($data['bank_name'] ?? $bank_name),
+        ];
     }
 
     public function ajax_initiate_transfer() {

@@ -629,7 +629,14 @@ class Matrix_MLM_User_Bank_Payout {
                         action: 'matrix_fintava_resolve_account',
                         nonce: matrixMLM.nonce,
                         account_number: accountNumber,
-                        bank_code: bankCode
+                        bank_code: bankCode,
+                        // The bank's display name (from the dropdown
+                        // option we already populated above) lets the
+                        // server's Paystack-side bank-code translator
+                        // do a name-match fallback for fintech banks
+                        // not in the static NIBSS<->CBN map. Optional;
+                        // empty string is fine.
+                        bank_name: ($('#fintava-bank-select').find(':selected').data('name') || '')
                     },
                     success: function(response) {
                         $('#fintava-resolving').hide();
