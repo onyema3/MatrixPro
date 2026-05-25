@@ -1846,14 +1846,18 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => __('Account number must be 10 digits', 'matrix-mlm')]);
         }
 
-        // Race two NIBSS-backed resolvers in parallel: Fintava
-        // /name/enquiry and Paystack /bank/resolve. Whichever returns a
-        // usable account holder name first wins. See race_resolve_account
-        // for the full design - the short version is that Fintava's
-        // basic-tier /name/enquiry has spotty coverage of fintech banks
-        // (OPay/Kuda/PalmPay/Moniepoint) where Paystack's free resolver
-        // tends to succeed, and racing in parallel makes the user-perceived
-        // latency the max of the two RTTs instead of the sum.
+        // Race three NIBSS-backed resolvers in parallel: Fintava
+        // /name/enquiry, Paystack /bank/resolve, and Flutterwave
+        // /accounts/resolve. Whichever returns a usable account holder
+        // name first wins. See race_resolve_account for the full design
+        // - the short version is that Fintava's basic-tier /name/enquiry
+        // has spotty coverage of fintech banks (OPay/Kuda/PalmPay/
+        // Moniepoint) where Paystack and Flutterwave's free resolvers
+        // tend to succeed (often via different bank-code shapes -
+        // Flutterwave uses 999992 for OPay where Paystack uses 100004,
+        // so a query that fails on one can still land on the other),
+        // and racing in parallel makes the user-perceived latency the
+        // max of the three RTTs instead of the sum.
         $resolved = $this->race_resolve_account($account_number, $bank_code, $bank_name);
         if (is_wp_error($resolved)) {
             // Always allow the JS to offer a "continue without verification"
@@ -1884,49 +1888,62 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Race the two NIBSS-backed account-name resolvers in parallel.
+     * Race the three NIBSS-backed account-name resolvers in parallel.
      *
-     * Fires Fintava /name/enquiry (always) and Paystack /bank/resolve
-     * (when configured + the sortCode translates to a known CBN code)
-     * concurrently via Requests::request_multiple, then walks the
-     * responses in priority order to pick a winner.
+     * Fires Fintava /name/enquiry (always), Paystack /bank/resolve
+     * (when configured + the sortCode translates to a known CBN code),
+     * and Flutterwave /accounts/resolve (when configured + the sortCode
+     * translates to a known Flutterwave bank code) concurrently via
+     * Requests::request_multiple, then walks the responses in priority
+     * order to pick a winner.
      *
-     * Why a race rather than Paystack-first or Fintava-first:
+     * Why a race rather than a fixed primary-then-fallback chain:
      *
-     *   - Both resolvers ultimately hit the same NIBSS infrastructure,
-     *     so when both succeed they return the same name; the only
-     *     difference is which hop has degraded latency on a given day.
-     *     Racing means the slow hop never becomes the user's wait.
+     *   - All three resolvers ultimately hit the same NIBSS
+     *     infrastructure, so when they succeed they return the same
+     *     name; the only difference is which hop has degraded
+     *     latency on a given day. Racing means the slow hop never
+     *     becomes the user's wait.
      *   - Coverage is asymmetric and unstable. Fintava's basic tier
      *     historically refuses lookups for OPay / Kuda / PalmPay /
-     *     Moniepoint while Paystack succeeds; a Paystack tier change
-     *     could flip that. Racing both means we always succeed when
-     *     either resolver does, regardless of which one the day
+     *     Moniepoint while Paystack succeeds; Paystack and
+     *     Flutterwave use different institution-code shapes for the
+     *     same fintechs (OPay is 100004 on Paystack but 999992 on
+     *     Flutterwave) so a query that fails on one can still land
+     *     on the other when a tier change at one provider drops
+     *     coverage. Racing all three means we always succeed when
+     *     any resolver does, regardless of which one the day
      *     happens to favour.
-     *   - User-perceived latency is max(RTT_a, RTT_b) instead of
-     *     RTT_a + RTT_b. With name-enquiry typically <1s, that's a
-     *     real human-noticeable improvement.
+     *   - User-perceived latency is max(RTT_a, RTT_b, RTT_c) instead
+     *     of RTT_a + RTT_b + RTT_c. With name-enquiry typically <1s,
+     *     that's a real human-noticeable improvement.
      *
-     * Priority order on tie (both succeed): Paystack first. Reasoning:
-     * Paystack normalises name casing more consistently across banks
-     * (Fintava sometimes returns the name in all-caps, sometimes
-     * mixed-case, depending on the destination bank's NIBSS feed);
-     * users prefer the cleaner display.
+     * Priority order on tie (multiple succeed): Paystack, Flutterwave,
+     * then Fintava. Reasoning: Paystack and Flutterwave both normalise
+     * name casing more consistently across banks (Fintava sometimes
+     * returns the name in all-caps, sometimes mixed-case, depending on
+     * the destination bank's NIBSS feed); users prefer the cleaner
+     * display. Paystack stays first to preserve existing behaviour for
+     * the cases where it already wins; Flutterwave second because it
+     * tends to be the one that succeeds on the OPay/PalmPay sortCode
+     * shape variants that trip up Paystack's static map.
      *
      * Single-resolver fallbacks:
      *   - Paystack key not configured OR sortCode doesn't translate
-     *     to a known CBN code -> Fintava-only.
+     *     to a known CBN code -> drop the Paystack leg.
+     *   - Flutterwave key not configured OR sortCode doesn't translate
+     *     to a known Flutterwave bank code -> drop the Flutterwave leg.
      *   - Fintava call construction fails (no secret_key) -> we still
-     *     run Paystack alone if it's available.
-     *   - Both unavailable -> WP_Error.
+     *     run the others alone if they're available.
+     *   - All three unavailable -> WP_Error.
      *
      * @return array|WP_Error  Normalised result (account_name,
      *                          account_number, bank_name) or WP_Error
-     *                          when neither resolver returned a name.
+     *                          when no resolver returned a name.
      */
     private function race_resolve_account($account_number, $bank_code, $bank_name = '') {
         $request_specs = [];
-        $request_meta  = []; // numeric index in $request_specs => 'fintava' | 'paystack'
+        $request_meta  = []; // numeric index in $request_specs => 'fintava' | 'paystack' | 'flutterwave'
 
         // ---- Fintava leg --------------------------------------------------
         // Same lean-header shape make_request() uses for /name/enquiry.
@@ -1970,6 +1987,32 @@ class Matrix_MLM_Fintava {
             $request_meta[count($request_specs) - 1] = 'paystack';
         }
 
+        // ---- Flutterwave leg ---------------------------------------------
+        // Skipped when Flutterwave isn't configured OR when the sortCode
+        // the form sent doesn't translate to a Flutterwave bank code.
+        // Worth a leg because Flutterwave uses its own institution codes
+        // for OPay / PalmPay (999992 / 999991) that bypass the NIBSS
+        // sortCode shape mismatches Paystack and Fintava sometimes hit.
+        $flutterwave        = new Matrix_MLM_Flutterwave();
+        $flutterwave_secret = $flutterwave->get_secret_key_for_resolver();
+        $flutterwave_code   = $flutterwave->nibss_sortcode_to_flw_code($bank_code, $bank_name);
+        if ($flutterwave_secret !== '' && $flutterwave_code !== '') {
+            $request_specs[] = [
+                'url'     => 'https://api.flutterwave.com/v3/accounts/resolve',
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $flutterwave_secret,
+                    'Accept'        => 'application/json',
+                    'Content-Type'  => 'application/json',
+                ],
+                'type'    => 'POST',
+                'data'    => json_encode([
+                    'account_number' => $account_number,
+                    'account_bank'   => $flutterwave_code,
+                ]),
+            ];
+            $request_meta[count($request_specs) - 1] = 'flutterwave';
+        }
+
         // Nothing to call - shouldn't happen because Fintava credentials
         // gate the entire payout surface, but guard against it anyway.
         if (empty($request_specs)) {
@@ -2007,7 +2050,7 @@ class Matrix_MLM_Fintava {
         // Track per-leg failure messages so we can include them in the
         // error log if both lose.
         $leg_errors = [];
-        foreach (['paystack', 'fintava'] as $resolver) {
+        foreach (['paystack', 'flutterwave', 'fintava'] as $resolver) {
             foreach ($request_meta as $idx => $name) {
                 if ($name !== $resolver) {
                     continue;
@@ -2044,8 +2087,8 @@ class Matrix_MLM_Fintava {
                 if ($resolved !== null && trim($resolved['account_name']) !== '') {
                     if (defined('WP_DEBUG') && WP_DEBUG) {
                         error_log(sprintf(
-                            '[Matrix MLM] resolve_account: %s won (sortCode=%s, cbn_code=%s)',
-                            $resolver, $bank_code, $paystack_cbn
+                            '[Matrix MLM] resolve_account: %s won (sortCode=%s, cbn_code=%s, flw_code=%s)',
+                            $resolver, $bank_code, $paystack_cbn, $flutterwave_code
                         ));
                     }
                     return $resolved;
@@ -2054,14 +2097,15 @@ class Matrix_MLM_Fintava {
             }
         }
 
-        // Both resolvers came back without a usable name. Log the
+        // All resolvers came back without a usable name. Log the
         // per-leg cause for diagnostic purposes; surface a single
         // friendly message to the user so they know to fall through
         // to the manual-entry path.
         error_log(sprintf(
-            '[Matrix MLM] resolve_account: all resolvers failed. sortCode=%s cbn=%s legs=%s',
+            '[Matrix MLM] resolve_account: all resolvers failed. sortCode=%s cbn=%s flw=%s legs=%s',
             $bank_code,
             $paystack_cbn !== '' ? $paystack_cbn : '(no-cbn-mapping)',
+            $flutterwave_code !== '' ? $flutterwave_code : '(no-flw-mapping)',
             json_encode($leg_errors)
         ));
         return new WP_Error(
@@ -2096,9 +2140,9 @@ class Matrix_MLM_Fintava {
     }
 
     /**
-     * Parse a decoded JSON body from one of the two resolvers into the
-     * normalized shape ajax_resolve_account expects. Returns null when
-     * the body has no usable account name.
+     * Parse a decoded JSON body from one of the three resolvers into
+     * the normalized shape ajax_resolve_account expects. Returns null
+     * when the body has no usable account name.
      */
     private function parse_resolver_body($body, $resolver, $account_number, $bank_name = '') {
         if ($resolver === 'paystack') {
@@ -2110,6 +2154,18 @@ class Matrix_MLM_Fintava {
                 'account_name'   => $parsed['account_name'],
                 'account_number' => $parsed['account_number'] !== '' ? $parsed['account_number'] : $account_number,
                 'bank_name'      => $bank_name, // Paystack returns bank_id, not name
+            ];
+        }
+
+        if ($resolver === 'flutterwave') {
+            $parsed = Matrix_MLM_Flutterwave::parse_resolve_body($body);
+            if ($parsed === null) {
+                return null;
+            }
+            return [
+                'account_name'   => $parsed['account_name'],
+                'account_number' => $parsed['account_number'] !== '' ? $parsed['account_number'] : $account_number,
+                'bank_name'      => $bank_name, // Flutterwave's response doesn't echo back the bank name
             ];
         }
 
