@@ -460,9 +460,76 @@ class Matrix_MLM_Transaction_Pin {
      * the form would prompt for a PIN the server didn't enforce
      * (or vice versa). Funnel both through here so the lockstep
      * is mechanical rather than convention.
+     *
+     * Returns TRUE only when the path is admin-required AND the
+     * user has a PIN set. The third state — admin-required but
+     * user has not enrolled — is handled by requires_enrolment()
+     * (block + prompt) and consulted by both callers ahead of
+     * should_gate(), so the form / server pairing stays in
+     * lockstep across all three branches:
+     *
+     *   - admin not requiring → no field, no enforcement
+     *   - admin requiring, no PIN → enrolment callout, pin_not_set
+     *   - admin requiring, PIN set → input field, verify gate
      */
     public static function should_gate($user_id, $path) {
         return self::pin_required_for($path) && self::is_set((int) $user_id);
+    }
+
+    /**
+     * Whether the user must enrol before they can transact on this
+     * path. Returns TRUE when the admin requires a PIN for the path
+     * AND the user has not set one. The matching server gate
+     * verify_request() returns a 'pin_not_set' WP_Error in this
+     * branch and render_field() returns the enrolment callout
+     * (rather than the input or empty string).
+     *
+     * Originally PR #269 chose to fail-OPEN here — users without
+     * a PIN transacted ungated so admins could enable enforcement
+     * without locking out un-enrolled accounts. The intended UX
+     * follow-up (prompt the user to enrol on first gated attempt)
+     * was deferred and the failure mode it created — users
+     * silently bypassing the gate forever because they never got
+     * around to setting a PIN — was reported in production.
+     * Mandatory enrolment closes that loop: admin-enabled paths
+     * are now actually enforced, but the caller surfaces a clear
+     * "set a PIN first" callout rather than a confusing generic
+     * error, and the dashboard surfaces a one-time banner the
+     * first time a user lands on a session with at least one
+     * gated path and no PIN configured (see
+     * any_path_requires_enrolment).
+     */
+    public static function requires_enrolment($user_id, $path) {
+        return self::pin_required_for($path) && !self::is_set((int) $user_id);
+    }
+
+    /**
+     * Whether the user must enrol on at least one currently-gated
+     * path. Drives the dashboard-wide enrolment banner — distinct
+     * from requires_enrolment($user_id, $path) which is per-path
+     * and consulted by the form / gate pair.
+     *
+     * Loops over self::paths() (filter-aware, picks up extension
+     * paths as well) and returns true on the first match so a
+     * site with five gated paths still costs only one is_set()
+     * lookup in the worst case.
+     */
+    public static function any_path_requires_enrolment($user_id) {
+        $user_id = (int) $user_id;
+        if (!self::is_master_enabled()) {
+            return false;
+        }
+        // Cheap precheck — if the user already has a PIN set,
+        // no path can possibly require enrolment for them.
+        if (self::is_set($user_id)) {
+            return false;
+        }
+        foreach (array_keys(self::paths()) as $path) {
+            if ((bool) get_option('matrix_mlm_pin_required_for_' . $path, 0)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -792,8 +859,32 @@ class Matrix_MLM_Transaction_Pin {
      */
     public static function verify_request($user_id, $path) {
         $user_id = (int) $user_id;
-        if (!self::should_gate($user_id, $path)) {
+
+        // Admin doesn't require PIN for this path → gate inert,
+        // transaction proceeds.
+        if (!self::pin_required_for($path)) {
             return true;
+        }
+
+        // Admin requires PIN but user hasn't enrolled. Block + prompt
+        // (was: silently let through; reported as the "I just did a
+        // wallet transfer without being asked for a PIN" bug).
+        // Surfaces 'pin_not_set' so the caller (require_pin_for_request)
+        // can include a security_url in the JSON payload, and the
+        // form-side render_field returns the matching enrolment
+        // callout rather than the input — both ends of the pair are
+        // consulted before should_gate() so they stay in lockstep
+        // across all three branches.
+        if (!self::is_set($user_id)) {
+            self::log_event($user_id, 'verify_blocked', 'pin_not_set');
+            return new WP_Error(
+                'pin_not_set',
+                __('You must set a transaction PIN before you can use this feature. Visit your Security settings to set one.', 'matrix-mlm'),
+                [
+                    'pin_not_set' => true,
+                    'security_url' => home_url('/matrix-dashboard/security/'),
+                ]
+            );
         }
 
         // (2) Hard lockout. Cheap (single row read shared with the
@@ -888,21 +979,43 @@ class Matrix_MLM_Transaction_Pin {
     /**
      * Render the user-side PIN <input> for a fund-movement form, or
      * the empty string when the gate isn't active for this user/path
-     * pair.
+     * pair, or an enrolment callout when the path is admin-required
+     * but the user hasn't set a PIN yet.
      *
      * (Item #9) Optional $instance suffix lets the same path render
      * twice on one page (airtime + data on the bills page) without
      * minting duplicate HTML ids. Defaults to a trivial counter so
      * existing single-render callers don't have to pass anything.
      *
-     * (Item #10) Uses should_gate() rather than re-implementing the
-     * predicate so the form and the server gate stay locked together.
+     * (Item #10) Funnels through pin_required_for() / is_set() in
+     * the same order as verify_request() so prompt and enforcement
+     * stay locked together across the three-branch fork:
+     *   - admin not requiring → ''   (no field rendered)
+     *   - admin requiring, no PIN → render_enrolment_callout()
+     *   - admin requiring, PIN set → the actual <input> field
      *
      * @return string HTML fragment, or '' if the gate isn't active.
      */
     public static function render_field($user_id, $path, $instance = '') {
-        if (!self::should_gate((int) $user_id, $path)) {
+        // Admin doesn't require PIN for this path → no field, no
+        // callout. Same predicate gate-side returns true (skip),
+        // so prompt and enforcement stay in lockstep.
+        if (!self::pin_required_for($path)) {
             return '';
+        }
+
+        $user_id = (int) $user_id;
+
+        // Admin requires PIN but user hasn't enrolled. Show the
+        // enrolment callout instead of the input. The caller's
+        // submit button is left clickable (the call site owns it)
+        // so the user is free to try anyway — the server-side gate
+        // returns pin_not_set with a security_url in the JSON
+        // payload, and existing per-form alert(message) handlers
+        // will surface that copy. The callout's own CTA is the
+        // primary path though.
+        if (!self::is_set($user_id)) {
+            return self::render_enrolment_callout($path);
         }
 
         static $counter = 0;
@@ -937,6 +1050,68 @@ class Matrix_MLM_Transaction_Pin {
                 required
                 placeholder="<?php echo esc_attr($ph); ?>">
             <small class="description"><?php echo esc_html($hint); ?></small>
+        </div>
+        <?php
+        return (string) ob_get_clean();
+    }
+
+    /**
+     * Enrolment callout rendered in place of the PIN <input> when
+     * the path is admin-required but the user has not set a PIN.
+     *
+     * The callout's primary CTA links to the dashboard's Security
+     * tab where the user can complete enrolment via the existing
+     * Set PIN flow (matrixTogglePinForm('set')). The link uses the
+     * tab_url() helper indirectly via home_url() so it survives
+     * the pretty-URL / plain-permalink fork the dashboard already
+     * defends against.
+     *
+     * Why an inline alert instead of disabling the form's submit
+     * button? The submit button is owned by the call site (each
+     * form is rendered by a different file: user-wallet,
+     * bank-payout, billing, etc.), and reaching across that
+     * boundary to disable it would require either a JS handle the
+     * call sites would have to standardise on, or a server-side
+     * rewrite of the button HTML the helper currently doesn't
+     * touch. The callout instead leaves the submit clickable and
+     * leans on the existing per-form alert(message) handlers to
+     * surface the server-side pin_not_set message if the user
+     * tries anyway. The CTA is the primary path; the submit-then-
+     * see-error flow is the safety net.
+     *
+     * Path-aware copy via $path for future refinement (e.g. a
+     * different message for bills vs. peer transfers); current
+     * release uses generic copy because the gate is binary.
+     *
+     * @param string $path Path key for which the callout is being
+     *                     rendered. Currently unused in copy but
+     *                     reserved for path-specific messaging.
+     * @return string HTML fragment.
+     */
+    private static function render_enrolment_callout($path) {
+        // $path reserved for future per-path messaging; suppress
+        // unused-arg lint by referencing it in a comment-equivalent
+        // no-op (assigning to a discard variable is the idiom WP
+        // uses elsewhere for the same purpose).
+        $path = (string) $path;
+
+        $security_url = home_url('/matrix-dashboard/security/');
+        $title        = __('Set a transaction PIN to continue', 'matrix-mlm');
+        $body         = __('A transaction PIN is required to authorise this action. You haven\'t set one yet — click the button below to set a 4 to 6 digit PIN on your Security tab. This is a one-time setup; future transactions will simply prompt you for the PIN.', 'matrix-mlm');
+        $cta          = __('Set Transaction PIN', 'matrix-mlm');
+
+        ob_start();
+        ?>
+        <div class="matrix-form-group matrix-pin-enrolment-callout">
+            <div class="matrix-alert matrix-alert-warning">
+                <strong><?php echo esc_html($title); ?></strong>
+                <p style="margin:8px 0 12px 0;">
+                    <?php echo esc_html($body); ?>
+                </p>
+                <a href="<?php echo esc_url($security_url); ?>" class="matrix-btn matrix-btn-primary">
+                    <?php echo esc_html($cta); ?>
+                </a>
+            </div>
         </div>
         <?php
         return (string) ob_get_clean();

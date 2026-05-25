@@ -279,9 +279,23 @@ class Matrix_MLM_User_Dashboard {
         // overlay, but it also has to flow through the same buffer.
         $level_toasts_html = $this->build_level_completion_toasts($user_id);
 
+        // Transaction-PIN enrolment banner. Surfaces a one-time
+        // (per session) prompt at the top of the dashboard when
+        // the admin has enabled PIN enforcement on at least one
+        // path AND the current user has not set a PIN. Pairs with
+        // the inline render_enrolment_callout() in the actual
+        // gated forms — the banner is the discovery surface, the
+        // form callout is the just-in-time prompt at the moment
+        // the user tries to act. Returns '' when no path requires
+        // enrolment for this user, so users with a PIN already
+        // set never see this and the dashboard render is unchanged
+        // for the steady-state case.
+        $pin_enrolment_banner_html = $this->build_pin_enrolment_banner($user_id);
+
         ob_start();
         ?>
         <?php echo $level_toasts_html; ?>
+        <?php echo $pin_enrolment_banner_html; ?>
         <div class="matrix-dashboard">
             <div class="matrix-dashboard-sidebar">
                 <div class="matrix-user-info">
@@ -521,6 +535,148 @@ class Matrix_MLM_User_Dashboard {
         <?php endif; ?>
         <?php
         return ob_get_clean();
+    }
+
+    /**
+     * Build the inline banner that prompts un-enrolled users to set
+     * a transaction PIN, when the admin has enabled enforcement on
+     * at least one path. Returns the empty string in the steady-
+     * state case (user has a PIN, OR no path is gated, OR master
+     * toggle off), so users who have already enrolled — and
+     * installs that haven't enabled enforcement — see no UI change.
+     *
+     * Design notes:
+     *
+     * - The dashboard banner is the discovery surface: a user
+     *   logging in for the first time after the admin enables
+     *   enforcement gets an immediate "you need to set a PIN"
+     *   nudge instead of finding out only when they try to
+     *   transact and hit the form-side render_enrolment_callout().
+     *
+     * - Dismissal is sessionStorage-scoped, not durable. A user
+     *   can dismiss to clear the visual real-estate during a
+     *   session, but the banner reappears on the next login. The
+     *   only way to make it permanent is to actually set a PIN,
+     *   which is the desired outcome. A durable per-user dismiss
+     *   would let users opt out of the prompt forever and never
+     *   discover the gate, which is exactly the failure mode this
+     *   banner exists to close.
+     *
+     * - Self-contained <style>+<script> block (no external CSS or
+     *   matrix-public.js dependency) for the same reason the
+     *   level-completion toast is self-contained: caching plugins
+     *   and asset optimisers strip plugin JS from the page on
+     *   some installs, and the banner must work regardless. Pure
+     *   DOM APIs, no jQuery, no fetch — sessionStorage is the
+     *   only browser API used.
+     *
+     * - Banner is suppressed when the user is already on the
+     *   Security tab (the "Set PIN" CTA the banner points at is
+     *   already visible on that page; showing the banner there
+     *   would be redundant and the user would have to scroll past
+     *   it to reach the actual control).
+     *
+     * @param int $user_id Current user id.
+     * @return string HTML to inline ahead of the dashboard wrapper.
+     *                Empty string when no enrolment is required.
+     */
+    private function build_pin_enrolment_banner($user_id) {
+        if (!class_exists('Matrix_MLM_Transaction_Pin')) {
+            return '';
+        }
+        if (!Matrix_MLM_Transaction_Pin::any_path_requires_enrolment((int) $user_id)) {
+            return '';
+        }
+
+        // Suppress on the Security tab — the "Set PIN" control the
+        // banner CTA points at is the entire focus of that page,
+        // so the banner above it would be visual noise.
+        $current_tab = $this->resolve_active_tab();
+        if ($current_tab === 'security') {
+            return '';
+        }
+
+        $security_url = self::tab_url('security');
+        $title        = __('Set a transaction PIN', 'matrix-mlm');
+        $body         = __('Your administrator now requires a transaction PIN to authorise wallet transfers, bill payments, and other fund-movement actions. Set a 4 to 6 digit PIN now to keep using these features without interruption.', 'matrix-mlm');
+        $cta          = __('Set Transaction PIN', 'matrix-mlm');
+        $dismiss      = __('Remind me later', 'matrix-mlm');
+
+        $css = '<style>
+            .matrix-pin-enrol-banner {
+                display: flex; gap: 16px; align-items: flex-start;
+                padding: 16px 20px;
+                margin: 0 0 20px 0;
+                background: #fff7ed; border: 1px solid #fed7aa;
+                border-left: 4px solid #ea580c; border-radius: 8px;
+                color: #7c2d12;
+            }
+            .matrix-pin-enrol-banner-icon {
+                flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                background: #fed7aa; color: #9a3412;
+            }
+            .matrix-pin-enrol-banner-icon .dashicons { font-size: 20px; width: 20px; height: 20px; }
+            .matrix-pin-enrol-banner-body { flex: 1 1 auto; min-width: 0; }
+            .matrix-pin-enrol-banner-title { font-weight: 700; font-size: 15px; color: #7c2d12; margin-bottom: 4px; }
+            .matrix-pin-enrol-banner-msg { font-size: 13.5px; color: #7c2d12; line-height: 1.5; margin-bottom: 10px; }
+            .matrix-pin-enrol-banner-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+            .matrix-pin-enrol-banner-cta {
+                display: inline-block; padding: 8px 16px; border-radius: 6px;
+                background: #ea580c; color: #fff; text-decoration: none;
+                font-weight: 600; font-size: 13.5px;
+            }
+            .matrix-pin-enrol-banner-cta:hover { background: #c2410c; color: #fff; }
+            .matrix-pin-enrol-banner-dismiss {
+                background: transparent; border: 0; padding: 8px 12px;
+                color: #9a3412; cursor: pointer; font-size: 13.5px;
+                text-decoration: underline;
+            }
+            .matrix-pin-enrol-banner-dismiss:hover { color: #7c2d12; }
+        </style>';
+
+        $html = '<div class="matrix-pin-enrol-banner" id="matrix-pin-enrol-banner" role="alert">'
+            . '<div class="matrix-pin-enrol-banner-icon" aria-hidden="true">'
+            . '<span class="dashicons dashicons-shield-alt"></span>'
+            . '</div>'
+            . '<div class="matrix-pin-enrol-banner-body">'
+            . '<div class="matrix-pin-enrol-banner-title">' . esc_html($title) . '</div>'
+            . '<div class="matrix-pin-enrol-banner-msg">' . esc_html($body) . '</div>'
+            . '<div class="matrix-pin-enrol-banner-actions">'
+            . '<a href="' . esc_url($security_url) . '" class="matrix-pin-enrol-banner-cta">'
+            . esc_html($cta)
+            . '</a>'
+            . '<button type="button" class="matrix-pin-enrol-banner-dismiss" id="matrix-pin-enrol-banner-dismiss">'
+            . esc_html($dismiss)
+            . '</button>'
+            . '</div>'
+            . '</div>'
+            . '</div>';
+
+        // Pure-DOM JS, no jQuery. sessionStorage-scoped dismiss so
+        // the banner reappears on a fresh session — see method
+        // docblock for the rationale on rejecting durable
+        // per-user dismiss.
+        $js = '<script>(function(){
+            try {
+                var KEY = "matrix_pin_enrol_banner_dismissed";
+                var banner = document.getElementById("matrix-pin-enrol-banner");
+                if (!banner) return;
+                if (window.sessionStorage && sessionStorage.getItem(KEY) === "1") {
+                    banner.style.display = "none";
+                    return;
+                }
+                var btn = document.getElementById("matrix-pin-enrol-banner-dismiss");
+                if (btn) {
+                    btn.addEventListener("click", function(){
+                        try { if (window.sessionStorage) sessionStorage.setItem(KEY, "1"); } catch (e) {}
+                        if (banner && banner.parentNode) banner.parentNode.removeChild(banner);
+                    });
+                }
+            } catch (e) { /* never let a banner break the dashboard */ }
+        })();</script>';
+
+        return $css . $html . $js;
     }
 
     /**
