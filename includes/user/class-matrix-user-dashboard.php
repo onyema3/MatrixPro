@@ -311,7 +311,6 @@ class Matrix_MLM_User_Dashboard {
                     <h4><?php echo esc_html(wp_get_current_user()->display_name); ?></h4>
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
                 </div>
-                <?php echo $this->build_notification_bell($user_id); ?>
                 <nav class="matrix-dashboard-nav">
                     <?php
                     // Render only menu items the admin hasn't explicitly
@@ -328,6 +327,7 @@ class Matrix_MLM_User_Dashboard {
                         <?php
                     }
                     ?>
+                    <?php echo $this->build_notification_bell($user_id); ?>
                     <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>
