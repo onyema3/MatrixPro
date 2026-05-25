@@ -79,6 +79,17 @@ class Matrix_MLM_Admin_Import {
     const OPT_LAST_RESULT = 'matrix_mlm_import_last_result';
 
     /**
+     * Persistent state for the "Delete previously imported users" tool.
+     *
+     * Lives in its own option (not OPT_STATE) so a delete run after a
+     * committed-then-reset import doesn't have to share schema with the
+     * import-state machine, and so a future operator who wants to wipe
+     * imports without ever uploading a fresh dump can use this tool
+     * standalone. Shape: see init_delete_state().
+     */
+    const OPT_DELETE_STATE = 'matrix_mlm_import_delete_state';
+
+    /**
      * Tables we stage and consume.
      *
      * PR 1 added: users, plans, levels (foundation — WP users, tree, plan/level config).
@@ -264,6 +275,18 @@ class Matrix_MLM_Admin_Import {
     const CHUNK_SUBS      = 500;
 
     /**
+     * Batch size for the delete-imported-users tool.
+     *
+     * Each AJAX chunk SELECTs up to this many user ids from wp_users,
+     * then runs ~20 cascade DELETEs across plugin tables plus the
+     * wp_users / wp_usermeta deletes themselves. 200 keeps the per-
+     * chunk wall time comfortably under the typical shared-hosting
+     * 30s PHP timeout while still finishing an 11k-user wipe in
+     * roughly a minute of wall time.
+     */
+    const CHUNK_DELETE_USERS = 200;
+
+    /**
      * Register every hook this module owns. Idempotent — safe to call
      * from multiple bootstrap paths because every callback is static
      * so add_action() de-duplicates by callable identity.
@@ -274,6 +297,13 @@ class Matrix_MLM_Admin_Import {
         add_action('admin_post_matrix_mlm_import_commit', [__CLASS__, 'handle_commit_start']);
         add_action('admin_post_matrix_mlm_import_reset',  [__CLASS__, 'handle_reset']);
         add_action('wp_ajax_matrix_mlm_import_chunk',     [__CLASS__, 'handle_commit_chunk']);
+
+        // "Delete previously imported users" tool — see the
+        // Delete Imported Users block at the bottom of this class.
+        add_action('admin_post_matrix_mlm_import_delete_users_count', [__CLASS__, 'handle_delete_users_count']);
+        add_action('admin_post_matrix_mlm_import_delete_users_start', [__CLASS__, 'handle_delete_users_start']);
+        add_action('admin_post_matrix_mlm_import_delete_users_reset', [__CLASS__, 'handle_delete_users_reset']);
+        add_action('wp_ajax_matrix_mlm_import_delete_users_chunk',    [__CLASS__, 'handle_delete_users_chunk']);
 
         // Bcrypt-compatible login filter — runs on every authentication
         // attempt, lets imported Laravel users keep their existing
@@ -3987,6 +4017,616 @@ class Matrix_MLM_Admin_Import {
                         <button type="submit" class="button button-link-delete"><?php _e('Reset', 'matrix-mlm'); ?></button>
                     </form>
                 </div>
+            <?php endif; ?>
+
+            <?php
+            // "Delete previously imported users" tool. Always rendered
+            // (no $status gate) because the operator may need to wipe
+            // a previously-committed import after Reset has already
+            // dropped the staging tables — at which point $status is
+            // back to 'idle' and the rest of the page chrome is gone.
+            self::render_delete_users_section();
+            ?>
+        </div>
+        <?php
+    }
+
+
+    /* ================================================================
+     * Delete Previously Imported Users
+     *
+     * Operator tool for wiping users that were created by a previous
+     * Laravel-import commit, so the operator can re-run a fresh import
+     * without "username already exists" collisions blocking every row.
+     *
+     * Identification
+     *   The importer (see process_users()) creates each WP user with
+     *     - user_pass = the raw bcrypt $2y$/$2a$/$2b$ hash from
+     *       Laravel (preserved verbatim so members can keep logging
+     *       in with their existing passwords via the bcrypt-compat
+     *       check_password filter)
+     *     - wp_capabilities = a:1:{s:10:"subscriber";b:1;}
+     *   We match that exact pair. WordPress core never produces $2y$
+     *   hashes — it uses PHPass ($P$, $H$) or, on newer cores, $wp$ —
+     *   so the bcrypt fingerprint alone is already strong, but
+     *   anchoring on the exact subscriber-only capability serialization
+     *   makes the match conservative on two fronts:
+     *     1. An operator who has manually promoted any imported member
+     *        to a higher role (admin, editor, custom) keeps that user.
+     *     2. Any locally-created administrator/editor account is
+     *        structurally excluded even if (somehow) its password
+     *        happened to be 60 chars and start with $2y$.
+     *
+     * Edge case the match deliberately misses
+     *   Members who logged in via the bcrypt filter and then changed
+     *   their password through the dashboard now have a $P$/$wp$
+     *   hash and won't be picked up. For a fresh-import scenario
+     *   this is the right default — the operator usually wants to
+     *   keep any member who has actively engaged with the new site,
+     *   and that password change is exactly the engagement signal.
+     *   To wipe ALL imported users including those, the operator
+     *   must restore from a pre-import SQL backup.
+     *
+     * Cleanup scope
+     *   For each matched user we delete the wp_users row, all
+     *   wp_usermeta rows, and rows from every plugin table that
+     *   carries a user-id column the importer writes to. Subscribers
+     *   list (matrix_subscribers) is intentionally NOT touched —
+     *   it's email-keyed, the importer re-creates subscriber rows
+     *   idempotently via the email UNIQUE index, and operators who
+     *   delete-and-reimport usually want to keep their mailing list
+     *   intact across the operation.
+     *
+     *   We also do NOT touch authored content (wp_posts, wp_comments).
+     *   On an MLM site members are subscribers and don't post, but
+     *   if a forked deployment lets members publish anything, the
+     *   operator should run wp_delete_user() with reassignment first
+     *   on those specific accounts. The matched set here excludes
+     *   everyone whose role was raised above 'subscriber', so any
+     *   member promoted to a content-creating role is already safe.
+     *
+     * Batching
+     *   Same chunked-AJAX shape as the import commit: each chunk
+     *   deletes up to CHUNK_DELETE_USERS users, returns progress,
+     *   and the JS re-fires until done. State (status, deleted,
+     *   total, started_at) lives in OPT_DELETE_STATE so a closed
+     *   browser tab doesn't lose progress — reload and the UI
+     *   resumes where it stopped.
+     * ================================================================ */
+
+    /**
+     * Exact serialized form of wp_capabilities the importer writes
+     * for every imported member. The match in count_imported_users()
+     * is against this literal string, so any role change moves the
+     * user out of the matched set.
+     */
+    const IMPORTED_CAPABILITIES_VALUE = 'a:1:{s:10:"subscriber";b:1;}';
+
+    /**
+     * Plugin tables that carry a user-id column written by some phase
+     * of the import pipeline. Each table maps to one or more column
+     * names; each column gets its own DELETE WHERE col IN (...) pass.
+     *
+     * Composite-key tables (matrix_ticket_messages joined via tickets,
+     * matrix_billing_refunds joined via transactions) are handled
+     * separately in delete_imported_users_batch() because cleaning up
+     * the child via the parent's user_id requires a JOIN-DELETE that
+     * doesn't fit the column-list shape.
+     *
+     * Tables on this list that don't exist on a given install (e.g.
+     * gateway tables on an install that never activated that gateway)
+     * are skipped at runtime via SHOW TABLES LIKE. Adding a table
+     * here that the importer doesn't write to is harmless — the
+     * IN (...) clause just won't match anything.
+     */
+    private static function user_keyed_cleanup_tables() {
+        global $wpdb;
+        $p = $wpdb->prefix;
+        return [
+            $p . 'matrix_user_meta'                => ['user_id'],
+            $p . 'matrix_positions'                => ['user_id'],
+            $p . 'matrix_wallet'                   => ['user_id'],
+            $p . 'matrix_deposits'                 => ['user_id'],
+            $p . 'matrix_withdrawals'              => ['user_id'],
+            $p . 'matrix_commissions'              => ['user_id', 'from_user_id'],
+            $p . 'matrix_epins'                    => ['used_by', 'created_by'],
+            $p . 'matrix_transfers'                => ['from_user_id', 'to_user_id'],
+            $p . 'matrix_fintava_wallets'          => ['user_id'],
+            $p . 'matrix_fintava_cards'            => ['user_id'],
+            $p . 'matrix_position_history'         => ['user_id', 'actor_user_id'],
+            $p . 'matrix_share_tokens'             => ['user_id', 'pivot_user_id'],
+            $p . 'matrix_level_completions'        => ['user_id'],
+            $p . 'matrix_cug_requests'             => ['user_id'],
+            $p . 'matrix_loan_applications'        => ['user_id'],
+            $p . 'matrix_healthcare_applications'  => ['user_id'],
+            $p . 'matrix_notifications'            => ['user_id'],
+            $p . 'matrix_zebra_notifications'      => ['handled_by_user_id'],
+            $p . 'matrix_billing_transactions'     => ['user_id'],
+            // matrix_ticket_messages is also covered by the JOIN-via-
+            // tickets pass in delete_imported_users_batch() — that
+            // pass catches messages whose author wasn't imported (the
+            // fallback admin) but whose parent ticket was. This direct
+            // user_id pass handles the symmetric case where the author
+            // IS imported but the parent ticket isn't (e.g. operator-
+            // raised promotional ticket reopened by a member).
+            $p . 'matrix_ticket_messages'          => ['user_id'],
+            $p . 'matrix_tickets'                  => ['user_id'],
+        ];
+    }
+
+    /** Read delete-tool state with sensible defaults. */
+    private static function get_delete_state() {
+        $s = get_option(self::OPT_DELETE_STATE);
+        if (!is_array($s)) {
+            $s = [];
+        }
+        return array_merge([
+            'status'        => 'idle',     // idle | counted | running | completed | failed
+            'total'         => 0,           // matched-user count at start of run
+            'deleted'       => 0,           // users removed so far
+            'last_message'  => '',
+            'started_at'    => null,
+            'completed_at'  => null,
+            'last_count'    => null,        // most recent dry-run count
+            'last_count_at' => null,
+        ], $s);
+    }
+
+    /** Patch delete-tool state and persist. Returns the merged state. */
+    private static function set_delete_state(array $patch) {
+        $s = array_merge(self::get_delete_state(), $patch);
+        update_option(self::OPT_DELETE_STATE, $s);
+        return $s;
+    }
+
+    /**
+     * Cheap existence check used when iterating the cleanup-tables
+     * list, so a missing gateway table on a partial install doesn't
+     * raise a DELETE error.
+     */
+    private static function table_exists($table) {
+        global $wpdb;
+        $found = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+        return $found === $table;
+    }
+
+    /**
+     * Count users that match the imported-from-Laravel fingerprint.
+     * See the block-level docblock above for the match criteria.
+     */
+    private static function count_imported_users() {
+        global $wpdb;
+        $cap_meta_key = $wpdb->prefix . 'capabilities';
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*)
+             FROM {$wpdb->users} u
+             INNER JOIN {$wpdb->usermeta} m
+               ON m.user_id = u.ID AND m.meta_key = %s
+             WHERE LENGTH(u.user_pass) = 60
+               AND (u.user_pass LIKE %s OR u.user_pass LIKE %s OR u.user_pass LIKE %s)
+               AND m.meta_value = %s",
+            $cap_meta_key,
+            '$2y$%',
+            '$2a$%',
+            '$2b$%',
+            self::IMPORTED_CAPABILITIES_VALUE
+        ));
+    }
+
+    /**
+     * Fetch the next batch of matched user ids. We don't need an
+     * id-based cursor because each batch deletes its rows, so the
+     * next call's LIMIT naturally returns the next slice.
+     */
+    private static function fetch_imported_user_ids_batch($limit) {
+        global $wpdb;
+        $cap_meta_key = $wpdb->prefix . 'capabilities';
+        $rows = $wpdb->get_col($wpdb->prepare(
+            "SELECT u.ID
+             FROM {$wpdb->users} u
+             INNER JOIN {$wpdb->usermeta} m
+               ON m.user_id = u.ID AND m.meta_key = %s
+             WHERE LENGTH(u.user_pass) = 60
+               AND (u.user_pass LIKE %s OR u.user_pass LIKE %s OR u.user_pass LIKE %s)
+               AND m.meta_value = %s
+             ORDER BY u.ID ASC
+             LIMIT %d",
+            $cap_meta_key,
+            '$2y$%',
+            '$2a$%',
+            '$2b$%',
+            self::IMPORTED_CAPABILITIES_VALUE,
+            (int) $limit
+        ));
+        return array_map('intval', $rows ?: []);
+    }
+
+    /**
+     * Delete one batch of imported users plus all their plugin-side
+     * rows. Returns the number of users actually deleted.
+     *
+     * Order of operations:
+     *   1. JOIN-DELETE child rows (ticket_messages via tickets,
+     *      billing_refunds via billing_transactions) so the
+     *      subsequent parent-row delete doesn't orphan them.
+     *   2. Direct DELETE on every column in user_keyed_cleanup_tables().
+     *   3. DELETE FROM wp_usermeta WHERE user_id IN (...).
+     *   4. DELETE FROM wp_users WHERE ID IN (...).
+     *
+     * We deliberately bypass wp_delete_user() because:
+     *   - It re-assigns posts (we have none) and fires hooks that
+     *     other plugins listen to — wiping 11k users via that path
+     *     means 11k iterations of the global hook chain, which is
+     *     slow on shared hosting.
+     *   - The importer also bypasses wp_insert_user() (so it can
+     *     preserve the bcrypt hash); this delete path is symmetric.
+     */
+    private static function delete_imported_users_batch() {
+        global $wpdb;
+
+        $ids = self::fetch_imported_user_ids_batch(self::CHUNK_DELETE_USERS);
+        if (empty($ids)) {
+            return 0;
+        }
+
+        // CSV of integer-cast ids for the IN clauses. fetch_* already
+        // intval-mapped, but we re-cast to keep the SQL locally
+        // auditable — no string can leak into these clauses.
+        $id_csv = implode(',', array_map('intval', $ids));
+
+        $p = $wpdb->prefix;
+
+        // 1a. ticket_messages whose parent ticket belongs to a
+        //     deleted user. Catches staff replies authored by the
+        //     fallback admin, which the direct user_id pass below
+        //     wouldn't otherwise remove (the admin themselves isn't
+        //     in $ids — only the imported subscribers are).
+        $tickets_table  = $p . 'matrix_tickets';
+        $messages_table = $p . 'matrix_ticket_messages';
+        if (self::table_exists($tickets_table) && self::table_exists($messages_table)) {
+            $wpdb->query(
+                "DELETE m FROM `$messages_table` m
+                 INNER JOIN `$tickets_table` t ON t.id = m.ticket_id
+                 WHERE t.user_id IN ($id_csv)"
+            );
+        }
+
+        // 1b. billing_refunds whose parent transaction belongs to a
+        //     deleted user. matrix_billing_refunds is keyed by
+        //     transaction_id, not user_id, so the column-list pass
+        //     can't reach it.
+        $bt_table = $p . 'matrix_billing_transactions';
+        $br_table = $p . 'matrix_billing_refunds';
+        if (self::table_exists($bt_table) && self::table_exists($br_table)) {
+            $wpdb->query(
+                "DELETE r FROM `$br_table` r
+                 INNER JOIN `$bt_table` t ON t.id = r.transaction_id
+                 WHERE t.user_id IN ($id_csv)"
+            );
+        }
+
+        // 2. Column-list pass over every direct user-id-bearing table.
+        foreach (self::user_keyed_cleanup_tables() as $table => $cols) {
+            if (!self::table_exists($table)) {
+                continue;
+            }
+            foreach ($cols as $col) {
+                $wpdb->query("DELETE FROM `$table` WHERE `$col` IN ($id_csv)");
+            }
+        }
+
+        // 3. wp_usermeta — every meta row for these users.
+        $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE user_id IN ($id_csv)");
+
+        // 4. wp_users itself. Order matters only here: usermeta first
+        //    so we never have a stale meta row pointing at a vanished
+        //    user (some admin reports JOIN through usermeta and would
+        //    surface ghost rows).
+        $wpdb->query("DELETE FROM {$wpdb->users} WHERE ID IN ($id_csv)");
+
+        return count($ids);
+    }
+
+    /**
+     * Synchronous count — fired by the "Count imported users" button.
+     * Shows the result in a one-shot notice and stores the count in
+     * delete state so the page render can surface it persistently
+     * and so the matching delete button can offer the same number.
+     */
+    public static function handle_delete_users_count() {
+        self::require_admin();
+        check_admin_referer('matrix_mlm_import_delete_users_count');
+
+        $count = self::count_imported_users();
+        $prev  = self::get_delete_state();
+        self::set_delete_state([
+            'last_count'    => $count,
+            'last_count_at' => current_time('mysql'),
+            // If a previous run completed and the operator is just
+            // re-counting before another wipe, drop status back to
+            // 'counted' so the delete button is offered again.
+            'status'        => $count > 0 ? 'counted' : $prev['status'],
+        ]);
+
+        if ($count === 0) {
+            self::redirect_with_notice(
+                'success',
+                __('No previously-imported users found. Nothing to delete.', 'matrix-mlm')
+            );
+        }
+
+        self::redirect_with_notice(
+            'success',
+            sprintf(
+                /* translators: %d is the number of imported WP users that match the bcrypt + subscriber-only fingerprint. */
+                __('%d previously-imported users found. Click "Delete imported users" to wipe them.', 'matrix-mlm'),
+                $count
+            )
+        );
+    }
+
+    /**
+     * Initialise the delete state and redirect back to the page so
+     * the AJAX progress UI can pick up. The actual deletion happens
+     * in handle_delete_users_chunk(), called repeatedly by JS.
+     */
+    public static function handle_delete_users_start() {
+        self::require_admin();
+        check_admin_referer('matrix_mlm_import_delete_users_start');
+
+        $total = self::count_imported_users();
+        if ($total === 0) {
+            self::redirect_with_notice(
+                'success',
+                __('No previously-imported users found. Nothing to delete.', 'matrix-mlm')
+            );
+        }
+
+        self::set_delete_state([
+            'status'       => 'running',
+            'total'        => $total,
+            'deleted'      => 0,
+            'last_message' => '',
+            'started_at'   => current_time('mysql'),
+            'completed_at' => null,
+        ]);
+
+        self::redirect_with_notice(
+            'success',
+            sprintf(
+                /* translators: %d is the user count being wiped. */
+                __('Starting delete of %d previously-imported users. Keep this page open until it completes.', 'matrix-mlm'),
+                $total
+            )
+        );
+    }
+
+    /**
+     * AJAX chunk handler — deletes one CHUNK_DELETE_USERS-sized batch.
+     * Returns JSON shaped to match what the progress JS expects.
+     */
+    public static function handle_delete_users_chunk() {
+        self::require_admin();
+        check_ajax_referer('matrix_mlm_import_delete_users_chunk', 'nonce');
+
+        $state = self::get_delete_state();
+        if ($state['status'] !== 'running') {
+            wp_send_json_error(['message' => 'Delete is not running. Reload the page.']);
+        }
+
+        try {
+            $deleted_in_chunk = self::delete_imported_users_batch();
+        } catch (Throwable $e) {
+            $state = self::set_delete_state([
+                'status'       => 'failed',
+                'last_message' => 'Error: ' . $e->getMessage(),
+            ]);
+            wp_send_json_error([
+                'message' => $e->getMessage(),
+                'state'   => $state,
+            ]);
+        }
+
+        $state['deleted']     += $deleted_in_chunk;
+        $state['last_message'] = $deleted_in_chunk > 0
+            ? sprintf('Deleted %d users (%d / %d)', $deleted_in_chunk, $state['deleted'], $state['total'])
+            : 'No more matching users — finishing up';
+
+        // Done condition: the most recent chunk returned zero. We
+        // trust that signal over `$deleted >= $total` because a
+        // long-running deletion could in principle race against
+        // another import committing concurrently, and we want to
+        // drain the queue completely either way.
+        if ($deleted_in_chunk === 0) {
+            $state['status']       = 'completed';
+            $state['completed_at'] = current_time('mysql');
+            $state['last_message'] = sprintf('Done. Deleted %d users total.', $state['deleted']);
+        }
+
+        self::set_delete_state($state);
+
+        wp_send_json_success([
+            'status'           => $state['status'],
+            'deleted'          => (int) $state['deleted'],
+            'total'            => (int) $state['total'],
+            'deleted_in_chunk' => (int) $deleted_in_chunk,
+            'message'          => $state['last_message'],
+        ]);
+    }
+
+    /**
+     * Clear the delete-tool state. Doesn't touch users — that's what
+     * Start does. Useful after a completed run so the section returns
+     * to its initial "Count imported users" call-to-action, and as a
+     * recovery path after a 'failed' chunk.
+     */
+    public static function handle_delete_users_reset() {
+        self::require_admin();
+        check_admin_referer('matrix_mlm_import_delete_users_reset');
+
+        delete_option(self::OPT_DELETE_STATE);
+
+        self::redirect_with_notice('success', __('Delete-imported-users state cleared.', 'matrix-mlm'));
+    }
+
+    /**
+     * Render the "Delete previously imported users" section. Called
+     * from render() at the very bottom of the page, regardless of
+     * import status — the operator may need this tool independently
+     * of any active import (e.g. after a previously-committed import
+     * has been Reset and the staging tables are gone).
+     */
+    private static function render_delete_users_section() {
+        $ds         = self::get_delete_state();
+        $ajax_nonce = wp_create_nonce('matrix_mlm_import_delete_users_chunk');
+        ?>
+        <div class="matrix-admin-card" style="padding:16px;border:1px solid #b32d2e;background:#fff8f8;margin-top:16px;">
+            <h2 style="color:#b32d2e;">
+                <?php _e('Danger Zone — Delete Previously Imported Users', 'matrix-mlm'); ?>
+            </h2>
+            <p>
+                <?php _e('Wipes WordPress users that were created by a previous Laravel-import commit, so you can re-upload your dump and run a fresh import without "username already exists" collisions.', 'matrix-mlm'); ?>
+            </p>
+            <p class="description">
+                <strong><?php _e('Match criteria:', 'matrix-mlm'); ?></strong>
+                <?php _e('user_pass is a 60-character bcrypt hash <code>($2y$ / $2a$ / $2b$)</code> AND wp_capabilities is exactly the importer\'s subscriber-only value. WordPress core never produces bcrypt hashes, so this fingerprint is unique to imported members. Any user whose role has been raised above subscriber, or whose password has been changed via the dashboard since import, will NOT be deleted.', 'matrix-mlm'); ?>
+            </p>
+            <p class="description">
+                <strong><?php _e('What gets removed for each matched user:', 'matrix-mlm'); ?></strong>
+                <?php _e('the wp_users row, all wp_usermeta rows, and rows from matrix_user_meta, matrix_positions, matrix_wallet, matrix_deposits, matrix_withdrawals, matrix_commissions, matrix_epins, matrix_transfers, matrix_fintava_wallets, matrix_fintava_cards, matrix_tickets, matrix_ticket_messages, matrix_billing_transactions, matrix_billing_refunds, matrix_position_history, matrix_share_tokens, matrix_level_completions, matrix_cug_requests, matrix_loan_applications, matrix_healthcare_applications, matrix_notifications, matrix_zebra_notifications.', 'matrix-mlm'); ?>
+            </p>
+            <p class="description">
+                <strong><?php _e('What is preserved:', 'matrix-mlm'); ?></strong>
+                <?php _e('matrix_subscribers (mailing list — email-keyed; the next import re-creates rows idempotently), matrix_plans, matrix_pages, matrix_benefits, matrix_hospitals, matrix_gateways, and any users whose role you\'ve manually raised above subscriber.', 'matrix-mlm'); ?>
+            </p>
+            <p style="padding:8px 12px;background:#fef0f0;border-left:4px solid #b32d2e;">
+                <strong><?php _e('Back up your database before clicking delete.', 'matrix-mlm'); ?></strong>
+                <?php _e('There is no undo.', 'matrix-mlm'); ?>
+            </p>
+
+            <?php if (!empty($ds['last_count_at'])): ?>
+                <p>
+                    <?php printf(
+                        /* translators: 1: matched user count, 2: timestamp of the count. */
+                        esc_html__('Last count: %1$d users matched (%2$s).', 'matrix-mlm'),
+                        (int) $ds['last_count'],
+                        esc_html($ds['last_count_at'])
+                    ); ?>
+                </p>
+            <?php endif; ?>
+
+            <?php if ($ds['status'] === 'running'): ?>
+                <div id="matrix-delete-progress" style="padding:12px;background:#fff0f0;border-left:4px solid #b32d2e;font-family:monospace;">
+                    <div><strong><?php _e('Status:', 'matrix-mlm'); ?></strong> <span id="md-status">running…</span></div>
+                    <div><strong><?php _e('Progress:', 'matrix-mlm'); ?></strong>
+                        <span id="md-deleted"><?php echo (int) $ds['deleted']; ?></span>
+                        / <span id="md-total"><?php echo (int) $ds['total']; ?></span>
+                    </div>
+                    <div><strong><?php _e('Last message:', 'matrix-mlm'); ?></strong> <span id="md-message">—</span></div>
+                </div>
+                <script>
+                (function(){
+                    var nonce   = '<?php echo esc_js($ajax_nonce); ?>';
+                    var ajaxurl = '<?php echo esc_js(admin_url('admin-ajax.php')); ?>';
+                    function tick() {
+                        var data = new FormData();
+                        data.append('action', 'matrix_mlm_import_delete_users_chunk');
+                        data.append('nonce', nonce);
+                        fetch(ajaxurl, { method: 'POST', body: data, credentials: 'same-origin' })
+                            .then(function(r){ return r.json(); })
+                            .then(function(j){
+                                if (!j.success) {
+                                    document.getElementById('md-status').textContent = 'FAILED';
+                                    document.getElementById('md-message').textContent = (j.data && j.data.message) || 'Unknown error';
+                                    return;
+                                }
+                                var d = j.data;
+                                document.getElementById('md-status').textContent  = d.status;
+                                document.getElementById('md-deleted').textContent = d.deleted;
+                                document.getElementById('md-total').textContent   = d.total;
+                                document.getElementById('md-message').textContent = d.message || '';
+                                if (d.status === 'completed') {
+                                    setTimeout(function(){ window.location.reload(); }, 800);
+                                } else if (d.status === 'running') {
+                                    // 200ms gap mirrors the import-commit
+                                    // chunker — gives the browser room to
+                                    // paint the updated counter without
+                                    // hammering the server.
+                                    setTimeout(tick, 200);
+                                }
+                            })
+                            .catch(function(err){
+                                document.getElementById('md-status').textContent  = 'NETWORK ERROR';
+                                document.getElementById('md-message').textContent = err.toString();
+                            });
+                    }
+                    tick();
+                })();
+                </script>
+            <?php elseif ($ds['status'] === 'completed'): ?>
+                <div style="padding:12px;background:#edfaef;border-left:4px solid #2c8b3a;">
+                    <strong><?php _e('Delete complete!', 'matrix-mlm'); ?></strong>
+                    <p>
+                        <?php printf(
+                            /* translators: %d is the number of users deleted in the just-completed run. */
+                            esc_html__('Removed %d previously-imported users and all their plugin-side rows.', 'matrix-mlm'),
+                            (int) $ds['deleted']
+                        ); ?>
+                    </p>
+                    <p>
+                        <?php _e('You can now click <strong>Reset</strong> on the import section above (if any staging tables remain) and re-upload your Laravel dump for a fresh import.', 'matrix-mlm'); ?>
+                    </p>
+                </div>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:8px;">
+                    <?php wp_nonce_field('matrix_mlm_import_delete_users_reset'); ?>
+                    <input type="hidden" name="action" value="matrix_mlm_import_delete_users_reset">
+                    <button type="submit" class="button"><?php _e('Clear delete-tool state', 'matrix-mlm'); ?></button>
+                </form>
+            <?php elseif ($ds['status'] === 'failed'): ?>
+                <div style="padding:12px;background:#fef0f0;border-left:4px solid #b32d2e;">
+                    <strong><?php _e('Delete failed.', 'matrix-mlm'); ?></strong>
+                    <p><?php echo esc_html($ds['last_message']); ?></p>
+                    <p><?php _e('Clear the state below and try again, or restore from your backup.', 'matrix-mlm'); ?></p>
+                </div>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:8px;">
+                    <?php wp_nonce_field('matrix_mlm_import_delete_users_reset'); ?>
+                    <input type="hidden" name="action" value="matrix_mlm_import_delete_users_reset">
+                    <button type="submit" class="button"><?php _e('Clear delete-tool state', 'matrix-mlm'); ?></button>
+                </form>
+            <?php else: /* idle | counted */ ?>
+                <p style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px;">
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin:0;">
+                        <?php wp_nonce_field('matrix_mlm_import_delete_users_count'); ?>
+                        <input type="hidden" name="action" value="matrix_mlm_import_delete_users_count">
+                        <button type="submit" class="button"><?php _e('Count imported users', 'matrix-mlm'); ?></button>
+                    </form>
+
+                    <?php if (!empty($ds['last_count']) && (int) $ds['last_count'] > 0): ?>
+                        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin:0;"
+                              onsubmit="return confirm('<?php
+                                  echo esc_js(sprintf(
+                                      /* translators: %d is the number of users that will be permanently deleted. */
+                                      __('Permanently delete %d previously-imported users and all their plugin-side rows? This cannot be undone — make sure you have a database backup.', 'matrix-mlm'),
+                                      (int) $ds['last_count']
+                                  ));
+                              ?>');">
+                            <?php wp_nonce_field('matrix_mlm_import_delete_users_start'); ?>
+                            <input type="hidden" name="action" value="matrix_mlm_import_delete_users_start">
+                            <button type="submit" class="button button-link-delete">
+                                <?php printf(
+                                    /* translators: %d is the matched-user count. */
+                                    esc_html__('Delete %d imported users', 'matrix-mlm'),
+                                    (int) $ds['last_count']
+                                ); ?>
+                            </button>
+                        </form>
+                    <?php endif; ?>
+                </p>
+                <?php if (empty($ds['last_count_at'])): ?>
+                    <p class="description">
+                        <?php _e('Click "Count imported users" first. The delete button only appears once we know how many users would be affected.', 'matrix-mlm'); ?>
+                    </p>
+                <?php endif; ?>
             <?php endif; ?>
         </div>
         <?php
