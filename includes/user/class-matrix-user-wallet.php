@@ -675,7 +675,16 @@ class Matrix_MLM_User_Wallet {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale. Without
+                    // this, the .matrix-wallet-action-btn document-
+                    // delegated handler binds only after DCL fires,
+                    // and an early click on Transfer to Own Wallet /
+                    // Wallet to Wallet / Transfer to Bank silently
+                    // no-ops — the exact "until I refresh" symptom
+                    // on the Wallet tab.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -1585,7 +1594,16 @@ class Matrix_MLM_User_Wallet {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale. Without
+                    // this, the .matrix-wallet-action-btn document-
+                    // delegated handler binds only after DCL fires,
+                    // and an early click on Transfer to Own Wallet /
+                    // Wallet to Wallet / Transfer to Bank silently
+                    // no-ops — the exact "until I refresh" symptom
+                    // on the Wallet tab.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {

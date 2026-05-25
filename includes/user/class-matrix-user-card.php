@@ -309,7 +309,19 @@ class Matrix_MLM_User_Card {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale.
+                    // Particularly important on this file because the
+                    // verve-card action buttons use inline onclick=
+                    // attributes that call matrixCardOpenPanForm /
+                    // matrixViewCardDetails — globals defined inside
+                    // cb. Pre-fix, those globals weren't defined
+                    // until DOMContentLoaded, so early clicks hit
+                    // ReferenceError and silently no-op'd. The
+                    // user-visible effect was "buttons don't work
+                    // until I refresh".
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -824,7 +836,19 @@ class Matrix_MLM_User_Card {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Synchronous dispatch — see the matching comment
+                    // in class-matrix-user-billing.php's airtime
+                    // whenJQueryReady for the full rationale.
+                    // Particularly important on this file because the
+                    // verve-card action buttons use inline onclick=
+                    // attributes that call matrixCardOpenPanForm /
+                    // matrixViewCardDetails — globals defined inside
+                    // cb. Pre-fix, those globals weren't defined
+                    // until DOMContentLoaded, so early clicks hit
+                    // ReferenceError and silently no-op'd. The
+                    // user-visible effect was "buttons don't work
+                    // until I refresh".
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {

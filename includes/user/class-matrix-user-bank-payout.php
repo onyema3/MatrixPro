@@ -447,12 +447,29 @@ class Matrix_MLM_User_Bank_Payout {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    // jQuery(cb) calls cb($) once DOM-ready fires (or
-                    // immediately if DOM is already ready), passing
-                    // jQuery as the first argument — same contract the
-                    // old `jQuery(function($){})` wrapper relied on, so
-                    // the inner code below doesn't need to change.
-                    window.jQuery(cb);
+                    // Synchronous dispatch — call cb the moment jQuery
+                    // is detected, instead of going through
+                    // `window.jQuery(cb)` (== `$(document).ready(cb)`)
+                    // which queues cb for after DOMContentLoaded.
+                    //
+                    // The DCL deferral was a contributor to the
+                    // "buttons don't work until I refresh" symptom on
+                    // Wallet, Verve Card, Bills Payment, and Benefits:
+                    // even after PR #289 head-loaded jQuery, this
+                    // inline <script> still wouldn't bind handlers
+                    // until the entire body finished parsing. In that
+                    // window, document-delegated handlers on
+                    // .matrix-bank-payout-form (and its sibling
+                    // controls) weren't bound, so an early click /
+                    // submit silently no-op'd. Calling cb synchronously
+                    // closes the gap: by the time the user can see and
+                    // click the form, document delegation is already
+                    // in place.
+                    //
+                    // Same contract as the old jQuery(cb) wrapper:
+                    // jQuery passed in as the first argument, so the
+                    // inner code below doesn't need to change.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {

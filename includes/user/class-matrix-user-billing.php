@@ -701,7 +701,28 @@ class Matrix_MLM_User_Billing {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Run cb synchronously the moment jQuery is detected,
+                    // instead of deferring to DOMContentLoaded via
+                    // `window.jQuery(cb)` (== `$(document).ready(cb)`).
+                    // The previous DCL deferral was the residual race
+                    // behind the user-reported "buttons don't work
+                    // until I refresh" symptom on Wallet, Verve Card,
+                    // Bills Payment, Benefits — even after PR #289
+                    // head-loaded jQuery: the inline <script> ran in
+                    // the body, jQuery was already defined, but cb
+                    // was queued for AFTER the entire body finished
+                    // parsing. In that window the inline-onclick
+                    // globals (matrixCardOpenPanForm) were undefined
+                    // and the document-delegated handlers (.matrix-
+                    // wallet-action-btn click, form submits) weren't
+                    // bound yet, so early clicks silently no-op'd.
+                    // None of the cb bodies need DOM-ready: they
+                    // either define globals (called later, by which
+                    // time DOM is fully ready) or bind via
+                    // $(document).on(...) delegation (document
+                    // always exists). Calling cb synchronously
+                    // closes the gap.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -820,7 +841,28 @@ class Matrix_MLM_User_Billing {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Run cb synchronously the moment jQuery is detected,
+                    // instead of deferring to DOMContentLoaded via
+                    // `window.jQuery(cb)` (== `$(document).ready(cb)`).
+                    // The previous DCL deferral was the residual race
+                    // behind the user-reported "buttons don't work
+                    // until I refresh" symptom on Wallet, Verve Card,
+                    // Bills Payment, Benefits — even after PR #289
+                    // head-loaded jQuery: the inline <script> ran in
+                    // the body, jQuery was already defined, but cb
+                    // was queued for AFTER the entire body finished
+                    // parsing. In that window the inline-onclick
+                    // globals (matrixCardOpenPanForm) were undefined
+                    // and the document-delegated handlers (.matrix-
+                    // wallet-action-btn click, form submits) weren't
+                    // bound yet, so early clicks silently no-op'd.
+                    // None of the cb bodies need DOM-ready: they
+                    // either define globals (called later, by which
+                    // time DOM is fully ready) or bind via
+                    // $(document).on(...) delegation (document
+                    // always exists). Calling cb synchronously
+                    // closes the gap.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -923,7 +965,28 @@ class Matrix_MLM_User_Billing {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Run cb synchronously the moment jQuery is detected,
+                    // instead of deferring to DOMContentLoaded via
+                    // `window.jQuery(cb)` (== `$(document).ready(cb)`).
+                    // The previous DCL deferral was the residual race
+                    // behind the user-reported "buttons don't work
+                    // until I refresh" symptom on Wallet, Verve Card,
+                    // Bills Payment, Benefits — even after PR #289
+                    // head-loaded jQuery: the inline <script> ran in
+                    // the body, jQuery was already defined, but cb
+                    // was queued for AFTER the entire body finished
+                    // parsing. In that window the inline-onclick
+                    // globals (matrixCardOpenPanForm) were undefined
+                    // and the document-delegated handlers (.matrix-
+                    // wallet-action-btn click, form submits) weren't
+                    // bound yet, so early clicks silently no-op'd.
+                    // None of the cb bodies need DOM-ready: they
+                    // either define globals (called later, by which
+                    // time DOM is fully ready) or bind via
+                    // $(document).on(...) delegation (document
+                    // always exists). Calling cb synchronously
+                    // closes the gap.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
@@ -1039,7 +1102,28 @@ class Matrix_MLM_User_Billing {
 
             function whenJQueryReady(cb) {
                 if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
-                    window.jQuery(cb);
+                    // Run cb synchronously the moment jQuery is detected,
+                    // instead of deferring to DOMContentLoaded via
+                    // `window.jQuery(cb)` (== `$(document).ready(cb)`).
+                    // The previous DCL deferral was the residual race
+                    // behind the user-reported "buttons don't work
+                    // until I refresh" symptom on Wallet, Verve Card,
+                    // Bills Payment, Benefits — even after PR #289
+                    // head-loaded jQuery: the inline <script> ran in
+                    // the body, jQuery was already defined, but cb
+                    // was queued for AFTER the entire body finished
+                    // parsing. In that window the inline-onclick
+                    // globals (matrixCardOpenPanForm) were undefined
+                    // and the document-delegated handlers (.matrix-
+                    // wallet-action-btn click, form submits) weren't
+                    // bound yet, so early clicks silently no-op'd.
+                    // None of the cb bodies need DOM-ready: they
+                    // either define globals (called later, by which
+                    // time DOM is fully ready) or bind via
+                    // $(document).on(...) delegation (document
+                    // always exists). Calling cb synchronously
+                    // closes the gap.
+                    cb(window.jQuery);
                     return;
                 }
                 if (++attempts > maxAttempts) {
