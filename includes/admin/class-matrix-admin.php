@@ -1286,6 +1286,101 @@ class Matrix_MLM_Admin {
     }
 
     /**
+     * Audit L8 — per-actor daily aggregate cap on admin balance
+     * adjustments.
+     *
+     * The per-call cap (matrix_mlm_admin_balance_adjust_max,
+     * default 1,000,000) bounds a SINGLE request, but does
+     * nothing about looped requests. A compromised admin
+     * session can call this endpoint thousands of times in
+     * seconds and drain unlimited float — the per-call cap
+     * just controls how many calls it takes.
+     *
+     * Adds a per-actor, per-day aggregate cap on top: sum
+     * every credit/debit this admin has issued today (read
+     * directly from the matrix_wallet auditor rows we already
+     * write with reference 'ADMIN-CREDIT-<actor>-<target>-<ts>'
+     * / 'ADMIN-DEBIT-...'), refuse the new movement if its
+     * landing amount would push the aggregate above the cap.
+     *
+     * Reading from matrix_wallet rather than a transient
+     * counter is deliberate:
+     *   - No drift on transient expiry / cache-backend
+     *     differences. The auditor is the source of truth.
+     *   - No race on concurrent increments (we read SUM under
+     *     a single SQL query; small concurrency overshoots
+     *     are acceptable on a soft cap).
+     *   - One less storage system to debug if the cap ever
+     *     fires unexpectedly.
+     *
+     * Cap defaults to 5x the per-call ceiling. Operators can
+     * tune via matrix_mlm_admin_balance_adjust_daily_max; set
+     * to 0 to disable the daily cap entirely (per-call cap
+     * still applies).
+     *
+     * @param int   $actor_id Acting admin's WP user id.
+     * @param float $amount   Pending adjustment amount (positive).
+     * @param string $verb    'credit' or 'debit' — purely for the
+     *                        error message; the cap is symmetric.
+     * @return void Calls wp_send_json_error() and exits if the
+     *              cap would be exceeded; returns silently
+     *              otherwise (matches the wp_send_json_*
+     *              control-flow pattern used throughout this
+     *              dispatcher).
+     */
+    private function enforce_admin_daily_cap($actor_id, $amount, $verb) {
+        $cap = floatval(get_option('matrix_mlm_admin_balance_adjust_daily_max', 5000000));
+        if ($cap <= 0) {
+            return; // operator opted out
+        }
+
+        global $wpdb;
+
+        // Local-time start-of-day. Using current_time() keeps the
+        // window aligned with the site's timezone (the admin's
+        // mental model) rather than UTC. matrix_wallet.created_at
+        // is written via current_time('mysql') by $wpdb->insert
+        // through Matrix_MLM_Wallet, so the timezone is consistent.
+        $today_start = current_time('Y-m-d 00:00:00');
+
+        // Sum every admin-issued movement by THIS actor today.
+        // The reference convention is fixed by the credit/debit
+        // emitters in add_user_balance() / subtract_user_balance()
+        // below — both stamp 'ADMIN-CREDIT-<actor>-<target>-<ts>'
+        // and 'ADMIN-DEBIT-<actor>-<target>-<ts>' respectively.
+        // Anchor the LIKE on the leading 'ADMIN-(CREDIT|DEBIT)-<id>-'
+        // prefix so a different-id admin's references never match.
+        $credit_prefix = $wpdb->esc_like('ADMIN-CREDIT-' . (int) $actor_id . '-') . '%';
+        $debit_prefix  = $wpdb->esc_like('ADMIN-DEBIT-'  . (int) $actor_id . '-') . '%';
+
+        $today_total = (float) $wpdb->get_var($wpdb->prepare(
+            "SELECT COALESCE(SUM(amount), 0)
+               FROM {$wpdb->prefix}matrix_wallet
+              WHERE created_at >= %s
+                AND (reference LIKE %s OR reference LIKE %s)",
+            $today_start,
+            $credit_prefix,
+            $debit_prefix
+        ));
+
+        if ($today_total + $amount > $cap) {
+            $remaining = max(0, $cap - $today_total);
+            wp_send_json_error([
+                'message' => sprintf(
+                    /* translators: 1: verb (credit/debit), 2: daily cap, 3: remaining headroom for today */
+                    __('This %1$s would exceed your daily adjustment cap (%2$s). You have %3$s left for today.', 'matrix-mlm'),
+                    $verb,
+                    number_format($cap, 2),
+                    number_format($remaining, 2)
+                ),
+                'code'    => 'admin_daily_cap_exceeded',
+                'cap'     => $cap,
+                'used'    => $today_total,
+            ]);
+        }
+    }
+
+    /**
      * Admin: directly credit a user's wallet.
      *
      * Hardened in audit fix C9:
@@ -1329,6 +1424,11 @@ class Matrix_MLM_Admin {
         }
 
         $actor_id = get_current_user_id();
+        // Per-actor daily aggregate cap (audit L8). Bounds the
+        // total an admin can move in a 24h window so a compromised
+        // session can't loop the per-call cap to drain float.
+        $this->enforce_admin_daily_cap($actor_id, $amount, 'credit');
+
         $actor = get_userdata($actor_id);
         $actor_login = $actor ? $actor->user_login : 'admin';
         $reference = sprintf('ADMIN-CREDIT-%d-%d-%d', $actor_id, $user_id, time());
@@ -1378,6 +1478,13 @@ class Matrix_MLM_Admin {
         }
 
         $actor_id = get_current_user_id();
+        // Per-actor daily aggregate cap (audit L8). Same gate as
+        // add_user_balance — see enforce_admin_daily_cap() for the
+        // rationale. Symmetric on credits and debits because either
+        // direction moves float and a compromised admin session
+        // could exploit either.
+        $this->enforce_admin_daily_cap($actor_id, $amount, 'debit');
+
         $actor = get_userdata($actor_id);
         $actor_login = $actor ? $actor->user_login : 'admin';
         $reference = sprintf('ADMIN-DEBIT-%d-%d-%d', $actor_id, $user_id, time());
