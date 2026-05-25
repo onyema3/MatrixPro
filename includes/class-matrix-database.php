@@ -446,6 +446,113 @@ class Matrix_MLM_Database {
             }
         }
 
+        // 1.0.17: extend matrix_withdrawals so Zebra Wallet
+        // (Bibimoney) /Remit can plug into the existing admin-
+        // approval flow as a vendor->customer payout. Three new
+        // columns plus a widened status enum:
+        //
+        //   gateway          VARCHAR(50) — which payment provider
+        //                    actually settles the row when the
+        //                    admin clicks Approve. NULL on legacy
+        //                    rows means "the historical Fintava-
+        //                    credit branch", so today's behaviour
+        //                    is preserved exactly. 'zebra'
+        //                    dispatches to remit_to_account().
+        //                    Indexed because the dispatcher
+        //                    branches on this column on every
+        //                    approve and the admin Withdrawals
+        //                    page filters by it.
+        //
+        //   transaction_id   VARCHAR(255) — VendorReference we
+        //                    generated for the /Remit request,
+        //                    stored at lock time so a duplicate
+        //                    delivery can be reconciled by ref
+        //                    without re-deriving from the row id.
+        //                    Same length / shape as
+        //                    matrix_deposits.transaction_id.
+        //
+        //   gateway_response TEXT — JSON envelope with PSPreference,
+        //                    raw API response, source ('sync'),
+        //                    and the locked-amount snapshot. Used
+        //                    by the admin page to surface a
+        //                    diagnostic on a failed remit, and by
+        //                    a future reconciliation worker that
+        //                    needs to re-query Bibimoney.
+        //
+        //   status enum widened to include 'processing'. Acts as
+        //                    a one-row lock between "admin
+        //                    clicked approve" and "Bibimoney
+        //                    confirmed the credit on the
+        //                    customer's wallet". Without it, two
+        //                    admins clicking Approve on the same
+        //                    row in the same second would each
+        //                    win the conditional UPDATE pending
+        //                    -> approved AND each fire /Remit,
+        //                    debiting the vendor wallet twice
+        //                    and crediting the customer twice.
+        //                    With 'processing' as the
+        //                    intermediate state, only the first
+        //                    click wins pending -> processing,
+        //                    fires /Remit, then transitions
+        //                    processing -> approved on success
+        //                    or processing -> pending on
+        //                    transient failure (which lets the
+        //                    operator retry).
+        //
+        // dbDelta does not reliably alter ENUM definitions or
+        // add columns to existing tables, so we run each piece
+        // through INFORMATION_SCHEMA probes. Idempotent: a
+        // fresh install gets the wider schema from the CREATE
+        // TABLE above and skips this block; an existing install
+        // gets each ADD COLUMN / MODIFY exactly once.
+        $withdrawals_table = $wpdb->prefix . 'matrix_withdrawals';
+        $withdrawals_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $withdrawals_table
+        ));
+        if ($withdrawals_exists > 0) {
+            $withdrawal_columns = [
+                'gateway' => "ALTER TABLE {$withdrawals_table}
+                                ADD COLUMN gateway VARCHAR(50) DEFAULT NULL
+                                AFTER method,
+                                ADD KEY gateway (gateway)",
+                'transaction_id' => "ALTER TABLE {$withdrawals_table}
+                                       ADD COLUMN transaction_id VARCHAR(255) DEFAULT NULL
+                                       AFTER currency,
+                                       ADD KEY transaction_id (transaction_id)",
+                'gateway_response' => "ALTER TABLE {$withdrawals_table}
+                                         ADD COLUMN gateway_response TEXT DEFAULT NULL
+                                         AFTER admin_note",
+            ];
+            foreach ($withdrawal_columns as $col_name => $alter_sql) {
+                $exists = (int) $wpdb->get_var($wpdb->prepare(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                      WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                        AND COLUMN_NAME = %s",
+                    DB_NAME, $withdrawals_table, $col_name
+                ));
+                if ($exists === 0) {
+                    $wpdb->query($alter_sql);
+                }
+            }
+
+            $withdrawals_status_type = (string) $wpdb->get_var($wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'status'",
+                DB_NAME, $withdrawals_table
+            ));
+            if ($withdrawals_status_type !== ''
+                && stripos($withdrawals_status_type, "'processing'") === false) {
+                $wpdb->query(
+                    "ALTER TABLE {$withdrawals_table}
+                       MODIFY status ENUM('pending','processing','approved','rejected','cancelled')
+                              NOT NULL DEFAULT 'pending'"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -653,19 +760,38 @@ class Matrix_MLM_Database {
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id bigint(20) UNSIGNED NOT NULL,
             method varchar(50) NOT NULL,
+            gateway varchar(50) DEFAULT NULL,
             amount decimal(12,2) NOT NULL,
             charge decimal(12,2) NOT NULL DEFAULT 0.00,
             net_amount decimal(12,2) NOT NULL,
             currency varchar(10) NOT NULL DEFAULT 'NGN',
+            transaction_id varchar(255) DEFAULT NULL,
             account_details text,
             admin_note text,
-            status enum('pending','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
+            gateway_response text,
+            status enum('pending','processing','approved','rejected','cancelled') NOT NULL DEFAULT 'pending',
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             updated_at datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             KEY user_id (user_id),
-            KEY status (status)
+            KEY status (status),
+            KEY gateway (gateway),
+            KEY transaction_id (transaction_id)
         ) $charset_collate;";
+        // Note: 'gateway', 'transaction_id', 'gateway_response',
+        // and the 'processing' enum value were added in 1.0.17 to
+        // wire Zebra Wallet (Bibimoney) /Remit into the existing
+        // matrix_withdrawals admin-approval flow as a vendor->
+        // customer payout. Legacy rows leave gateway NULL and fall
+        // through to the today's-behaviour Fintava-credit branch
+        // in approve_withdrawal(); a row with gateway='zebra'
+        // dispatches to Matrix_MLM_Zebra::remit_to_account()
+        // instead. dbDelta does not reliably alter ENUM
+        // definitions or add columns to existing tables across
+        // MySQL versions, so the matching idempotent ALTER block
+        // lives in maybe_upgrade() (probes COLUMN_TYPE /
+        // INFORMATION_SCHEMA.COLUMNS and only runs each piece
+        // when missing).
         dbDelta($sql_withdrawals);
 
         // Commissions

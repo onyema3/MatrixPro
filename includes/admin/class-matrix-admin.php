@@ -651,11 +651,54 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('Invalid withdrawal id', 'matrix-mlm')]);
         }
 
+        // Read once up front so we can dispatch by gateway. The
+        // gateway column was added in 1.0.17 alongside the Zebra
+        // /Remit wiring; a NULL value means "legacy row" and falls
+        // through to the today's-behaviour Fintava-credit branch.
+        $withdrawal = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d",
+            $id
+        ));
+        if (!$withdrawal) {
+            wp_send_json_error(['message' => __('Withdrawal not found.', 'matrix-mlm')]);
+        }
+
+        $gateway = strtolower((string) ($withdrawal->gateway ?? ''));
+        $note    = isset($_POST['note']) ? sanitize_textarea_field((string) $_POST['note']) : '';
+
+        if ($gateway === 'zebra') {
+            // Vendor -> customer payout via Bibimoney /Remit. The
+            // gateway class owns the full pending -> processing
+            // -> approved (or pending) state machine, including
+            // the conditional-UPDATE lock that prevents two
+            // simultaneous Approve clicks from double-firing
+            // /Remit. We just forward the result envelope.
+            if (!class_exists('Matrix_MLM_Zebra')) {
+                wp_send_json_error(['message' => __('Zebra gateway not available.', 'matrix-mlm')]);
+            }
+            $zebra  = new Matrix_MLM_Zebra();
+            $result = $zebra->remit_to_account($id, $note);
+            if (!empty($result['success'])) {
+                wp_send_json_success([
+                    'message'        => $result['message'] ?? __('Remit completed.', 'matrix-mlm'),
+                    'transaction_id' => $result['transaction_id'] ?? '',
+                    'psp_reference'  => $result['psp_reference'] ?? '',
+                ]);
+            }
+            wp_send_json_error(['message' => $result['message'] ?? __('Remit failed.', 'matrix-mlm')]);
+        }
+
+        // Legacy Fintava-credit branch (gateway IS NULL or any
+        // non-zebra value). Behaviour is unchanged from before
+        // 1.0.17: conditional UPDATE pending -> approved, then
+        // credit the user's Fintava virtual wallet.
+        //
         // Conditional UPDATE: only the first request that flips
-        // pending -> approved wins. A second click (same admin or two
-        // admins on the page) sees affected_rows == 0 and bails out.
-        // This replaces the previous pattern of unconditional UPDATE +
-        // SELECT, which could double-credit when raced.
+        // pending -> approved wins. A second click (same admin or
+        // two admins on the page) sees affected_rows == 0 and
+        // bails out. This replaces the previous pattern of
+        // unconditional UPDATE + SELECT, which could double-
+        // credit when raced.
         $rows = $wpdb->update(
             $wpdb->prefix . 'matrix_withdrawals',
             ['status' => 'approved'],
@@ -665,7 +708,8 @@ class Matrix_MLM_Admin {
             wp_send_json_error(['message' => __('This withdrawal has already been processed.', 'matrix-mlm')]);
         }
 
-        // Now we own the transition. Read the row for the side-effects.
+        // Now we own the transition. Re-read for the side-effects
+        // (the row may have been mutated by the UPDATE above).
         $withdrawal = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d", $id));
         if ($withdrawal) {
             // Credit the withdrawal amount to user's Fintava wallet
@@ -689,15 +733,27 @@ class Matrix_MLM_Admin {
         // Read first to capture the user_id / amount / charge for the
         // refund; the conditional UPDATE below confirms we won the race
         // before the wallet credit lands.
+        //
+        // Source status accepts BOTH 'pending' (the normal reject
+        // path) and 'processing' (the escape hatch for a Zebra
+        // /Remit row that's stuck mid-flight — e.g. the platform
+        // returned a transient 5xx and the operator wants to
+        // reject + refund rather than retry). The legacy fast-
+        // path-pending UPDATE wouldn't have matched a processing
+        // row before 1.0.17, but processing is new in 1.0.17 so
+        // there's no behaviour drift for legacy installs.
         $withdrawal = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}matrix_withdrawals WHERE id = %d", $id));
         if (!$withdrawal) {
             wp_send_json_error(['message' => __('Not found', 'matrix-mlm')]);
+        }
+        if ($withdrawal->status !== 'pending' && $withdrawal->status !== 'processing') {
+            wp_send_json_error(['message' => __('This withdrawal cannot be rejected (already finalised).', 'matrix-mlm')]);
         }
 
         $rows = $wpdb->update(
             $wpdb->prefix . 'matrix_withdrawals',
             ['status' => 'rejected', 'admin_note' => $note],
-            ['id' => $id, 'status' => 'pending']
+            ['id' => $id, 'status' => $withdrawal->status]
         );
         if ($rows !== 1) {
             wp_send_json_error(['message' => __('This withdrawal has already been processed.', 'matrix-mlm')]);

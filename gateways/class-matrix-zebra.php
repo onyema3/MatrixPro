@@ -105,6 +105,32 @@ class Matrix_MLM_Zebra {
     const EVENT_CAPTURE      = 'CAPTURE';
     const EVENT_CANCEL       = 'CANCEL';
 
+    /* ====================================================================
+     * Vendor->customer payout EventType (Bibimoney /Remit endpoint).
+     *
+     * /Remit is the vendor-side counterpart to the deposit flow:
+     * the platform debits the merchant's vendor wallet and credits
+     * the customer's Zebra Wallet (keyed on the customer's
+     * PrimaryAccountNumber — IWAN, MSISDN, or local reference,
+     * same identifier shape /PaymentAuth accepts on the deposit
+     * side).
+     *
+     * Wired into the existing matrix_withdrawals admin-approval
+     * flow rather than auto-credited so an operator still
+     * approves each payout. See remit_to_account() for the
+     * pending -> processing -> approved state machine and
+     * Matrix_MLM_Admin::approve_withdrawal() for the dispatch
+     * branch.
+     *
+     * The endpoint path itself (defaults to 'Remit') and the
+     * EventType literal (defaults to 'REMIT') are filterable
+     * because the published Bibimoney spec we have is ambiguous
+     * about which token the platform expects; operators whose
+     * environment expects e.g. 'VENDOR_REMIT' can override
+     * either via filter without a code change.
+     * ==================================================================== */
+    const EVENT_REMIT = 'REMIT';
+
     private $api_key;
     private $api_secret;
     private $vendor_id;
@@ -266,6 +292,39 @@ class Matrix_MLM_Zebra {
                  . $event_type
                  . $this->vendor_id
                  . $psp_reference
+                 . (string) $amount_minor
+                 . strtoupper($currency);
+
+        $method = (string) apply_filters('matrix_zebra_hmac_method', 'hmac_sha256');
+        if ($method === 'sha256') {
+            return hash('sha256', $message);
+        }
+        return hash_hmac('sha256', $message, $this->api_secret);
+    }
+
+    /**
+     * HMAC for the /Remit endpoint (vendor -> customer payout).
+     *
+     * Mirrors the 8-field concat compute_hmac() uses for the
+     * deposit flow because /Remit is the symmetric counterpart:
+     * same VendorReference + PrimaryAccountNumber shape, just
+     * money moving the other way. Concat order:
+     *
+     *   api_key + api_secret + EventType + VendorID +
+     *   VendorReference + PrimaryAccountNumber + Amount + Currency
+     *
+     * Same matrix_zebra_hmac_method filter as compute_hmac() and
+     * compute_capture_hmac() so an operator whose Bibimoney env
+     * expects plain SHA-256 (vs. HMAC-SHA256 keyed by api_secret)
+     * flips one filter and all three signing paths follow.
+     */
+    private function compute_remit_hmac($event_type, $vendor_reference, $primary_account, $amount_minor, $currency) {
+        $message = $this->api_key
+                 . $this->api_secret
+                 . $event_type
+                 . $this->vendor_id
+                 . $vendor_reference
+                 . $primary_account
                  . (string) $amount_minor
                  . strtoupper($currency);
 
@@ -844,6 +903,356 @@ class Matrix_MLM_Zebra {
             'success' => true,
             'message' => __('Authorisation released. The customer was not charged.', 'matrix-mlm'),
         ];
+    }
+
+    /* ====================================================================
+     * /Remit — vendor -> customer payout
+     *
+     * Plugs the Zebra (Bibimoney) platform into the existing
+     * matrix_withdrawals admin-approval flow as a payout rail:
+     *
+     *   1. A pending matrix_withdrawals row exists with
+     *      gateway='zebra' and account_details holding the
+     *      customer's Zebra Wallet identifier (IWAN, MSISDN, or
+     *      local reference — same shape /PaymentAuth accepts on
+     *      the deposit side).
+     *
+     *   2. Admin clicks Approve on the Withdrawals page. The
+     *      AJAX handler in class-matrix-admin.php dispatches to
+     *      remit_to_account(), passing the row id.
+     *
+     *   3. remit_to_account() acquires a per-row lock by
+     *      conditionally UPDATEing pending -> processing. Two
+     *      admins clicking Approve on the same row in the same
+     *      second see exactly one winner; the loser bails out
+     *      with a "already being processed" message before any
+     *      money moves.
+     *
+     *   4. The lock-holder posts /Remit with EventType=REMIT.
+     *      Both the endpoint path and the EventType are
+     *      filterable (matrix_zebra_remit_endpoint /
+     *      matrix_zebra_remit_event_type) because the published
+     *      Bibimoney spec we have is ambiguous about the exact
+     *      tokens the platform expects, and we don't want a
+     *      one-line spec change to require a code patch.
+     *
+     *   5. On success: processing -> approved with the audit
+     *      stash (PSPreference, raw response, source='sync').
+     *      Customer notification fires once. Operator sees a
+     *      green "Remit completed" banner.
+     *
+     *   6. On non-success status code: processing -> pending
+     *      (release the lock so the operator can retry).
+     *      gateway_response stashes the failure detail so the
+     *      operator can see why; admin_note is left untouched.
+     *
+     *   7. On transport error (timeout / network): same as 6.
+     *      Bibimoney either credited the customer or didn't,
+     *      and we don't know — the operator retries, and the
+     *      idempotent VendorReference (regenerated per attempt
+     *      because Bibimoney's /Remit doesn't accept a duplicate
+     *      VendorReference for the same vendor) means a stuck
+     *      retry loop self-resolves once Bibimoney finishes
+     *      processing the original.
+     *
+     * The /Remit endpoint does NOT have an IPN counterpart in
+     * scope here. /Notify (dispute / fraud / chargeback) is the
+     * platform-side post-settlement event and is reserved for a
+     * separate follow-up. /Remit is sync-only for now: if the
+     * sync response says success, we treat the payout as
+     * settled. A future PR can add an async-confirmation path
+     * if the operator's /Remit settlement window grows beyond
+     * the HTTP timeout we set in post().
+     *
+     * Idempotence and double-credit defenses:
+     *
+     *   - The pending -> processing conditional UPDATE is the
+     *     primary lock. Only one /Remit call fires per row.
+     *
+     *   - VendorReference is freshly minted per attempt
+     *     (REM-{withdrawal_id}-{microtime}) so a retry after a
+     *     transient failure doesn't reuse the prior reference.
+     *     Bibimoney's spec says VendorReference must be unique
+     *     per /Remit call (same constraint as /PaymentAuth);
+     *     reusing one would either no-op or error depending on
+     *     env build, neither of which is acceptable for a
+     *     retry.
+     *
+     *   - Reject path also handles 'processing' (releases lock
+     *     to 'rejected' + refunds the Matrix wallet) so an
+     *     operator who mis-clicks Approve and immediately
+     *     clicks Reject still ends up with consistent state.
+     *
+     * No /Remit IPN dispatch exists today, but if Bibimoney
+     * adds one later, the ack pattern in handle_webhook() can
+     * route it through finalize_remit() with a conditional
+     * UPDATE keyed on status='processing' (or 'approved' for a
+     * post-settle ack), mirroring the deposit path.
+     * ==================================================================== */
+
+    /**
+     * Public dispatch from class-matrix-admin.php's
+     * approve_withdrawal handler. Returns the standard
+     * [success, message] envelope the AJAX layer forwards
+     * verbatim.
+     *
+     * Caller has already gated on manage_matrix_mlm + nonce.
+     * We re-verify the row's gateway='zebra' here as defense
+     * in depth.
+     */
+    public function remit_to_account($withdrawal_id, $note = '') {
+        global $wpdb;
+
+        $withdrawal_id = (int) $withdrawal_id;
+        if ($withdrawal_id <= 0) {
+            return ['success' => false, 'message' => __('Invalid withdrawal id.', 'matrix-mlm')];
+        }
+
+        if (!$this->is_configured()) {
+            return [
+                'success' => false,
+                'message' => __('Zebra Wallet is not fully configured. Contact the administrator.', 'matrix-mlm'),
+            ];
+        }
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        // Read first so we can validate the gateway + amount + the
+        // operator-entered Zebra Wallet identifier before we even
+        // attempt the lock. Any of these missing means the row
+        // wasn't created for /Remit and we should bail without
+        // touching the platform.
+        $withdrawal = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM {$table} WHERE id = %d",
+            $withdrawal_id
+        ));
+        if (!$withdrawal) {
+            return ['success' => false, 'message' => __('Withdrawal not found.', 'matrix-mlm')];
+        }
+        if (strtolower((string) ($withdrawal->gateway ?? '')) !== 'zebra') {
+            return ['success' => false, 'message' => __('This withdrawal is not configured for Zebra Wallet.', 'matrix-mlm')];
+        }
+        if ($withdrawal->status !== 'pending') {
+            return [
+                'success' => false,
+                'message' => sprintf(
+                    /* translators: %s = current withdrawal status */
+                    __('This withdrawal is %s and cannot be remitted.', 'matrix-mlm'),
+                    $withdrawal->status
+                ),
+            ];
+        }
+
+        $primary_account = trim((string) ($withdrawal->account_details ?? ''));
+        if ($primary_account === '') {
+            return ['success' => false, 'message' => __('Missing customer Zebra Wallet identifier on this withdrawal.', 'matrix-mlm')];
+        }
+
+        // Acquire the lock. Conditional UPDATE pending ->
+        // processing. Two simultaneous Approve clicks see
+        // exactly one winner here; the loser's $rows is 0 and
+        // we bail before any platform call fires.
+        $rows = $wpdb->update(
+            $table,
+            ['status' => 'processing'],
+            ['id' => $withdrawal_id, 'status' => 'pending']
+        );
+        if ($rows !== 1) {
+            return ['success' => false, 'message' => __('This withdrawal is already being processed.', 'matrix-mlm')];
+        }
+
+        $currency       = strtoupper((string) ($withdrawal->currency ?? $this->default_currency));
+        // Per spec section 6.1.3 amount on the wire is integer
+        // minor units. We send net_amount (the figure already
+        // displayed to the user / operator on the row) — the
+        // plugin-side charge is bookkept separately on the
+        // matrix_withdrawals row.
+        $amount_minor   = (int) round(((float) $withdrawal->net_amount) * 100);
+
+        // Fresh VendorReference per attempt (see retry rationale
+        // in the section docblock above). Microtime suffix
+        // guarantees uniqueness even if an operator double-clicks
+        // through the lock somehow.
+        $vendor_reference = sprintf(
+            'MTX-RMT-%d-%d-%s',
+            $withdrawal_id,
+            time(),
+            substr(str_replace('.', '', (string) microtime(true)), -4)
+        );
+
+        $event_type = (string) apply_filters('matrix_zebra_remit_event_type', self::EVENT_REMIT);
+        $endpoint   = (string) apply_filters('matrix_zebra_remit_endpoint', 'Remit');
+
+        $hmac = $this->compute_remit_hmac(
+            $event_type,
+            $vendor_reference,
+            $primary_account,
+            $amount_minor,
+            $currency
+        );
+
+        $payload = [
+            'api_key'              => $this->api_key,
+            'api_secret'           => $this->api_secret,
+            'VendorID'             => $this->vendor_id,
+            'EventType'            => $event_type,
+            'VendorReference'      => $vendor_reference,
+            'PrimaryAccountNumber' => $primary_account,
+            'Amount'               => $amount_minor,
+            'Currency'             => $currency,
+            'HMACdigest'           => $hmac,
+            'UserData'             => [
+                'withdrawal_id' => $withdrawal_id,
+                'user_id'       => (int) $withdrawal->user_id,
+                'plugin'        => 'matrix-mlm',
+                'note'          => (string) $note,
+            ],
+        ];
+
+        // Stash the in-flight reference + masked account on the
+        // row before the network call fires so a crashed PHP
+        // worker still leaves an audit trail for the operator
+        // to reconcile.
+        $wpdb->update(
+            $table,
+            [
+                'transaction_id'   => $vendor_reference,
+                'gateway_response' => wp_json_encode([
+                    'step'             => 'remit_in_flight',
+                    'vendor_reference' => $vendor_reference,
+                    'event_type'       => $event_type,
+                    'endpoint'         => $endpoint,
+                    'primary_account'  => self::mask_account($primary_account),
+                    'amount_minor'     => $amount_minor,
+                    'currency'         => $currency,
+                    'note'             => (string) $note,
+                ]),
+            ],
+            ['id' => $withdrawal_id]
+        );
+
+        $response = $this->post($endpoint, $payload);
+
+        $status_code = (string) ($response['StatusCode'] ?? '');
+        if (!self::is_success_code($status_code)) {
+            // Release the lock back to 'pending' so the operator
+            // can retry from the same admin row. Stash the failure
+            // for diagnosis in gateway_response.
+            $error_text = (string) ($response['ErrorText'] ?? $response['Status'] ?? __('Remit failed.', 'matrix-mlm'));
+            $this->release_remit_lock($withdrawal_id, $vendor_reference, $event_type, $endpoint, $primary_account, $amount_minor, $currency, $response, 'pending', $error_text);
+            return [
+                'success' => false,
+                'message' => $error_text,
+            ];
+        }
+
+        // Success. processing -> approved with the audit stash.
+        $info = isset($response['Information']) && is_array($response['Information']) ? $response['Information'] : [];
+        $psp_reference = (string) ($response['PSPreference'] ?? $info['PSPreference'] ?? '');
+
+        $this->finalize_remit($withdrawal_id, $vendor_reference, $event_type, $endpoint, $primary_account, $amount_minor, $currency, $response, $psp_reference, (string) $note);
+
+        return [
+            'success'          => true,
+            'message'          => __('Remit completed. The customer\'s Zebra Wallet has been credited.', 'matrix-mlm'),
+            'transaction_id'   => $vendor_reference,
+            'psp_reference'    => $psp_reference,
+        ];
+    }
+
+    /**
+     * Internal: success transition. processing -> approved with
+     * audit stash. Conditional UPDATE keyed on the lock state so
+     * a duplicate sync delivery (which shouldn't happen because
+     * the platform-side /Remit is request/response, not async,
+     * but defense in depth) collapses to a no-op.
+     *
+     * Customer notification fires inside the conditional so a
+     * row that was already finalised by another process doesn't
+     * generate a duplicate "withdrawal approved" email.
+     */
+    private function finalize_remit($withdrawal_id, $vendor_reference, $event_type, $endpoint, $primary_account, $amount_minor, $currency, $response, $psp_reference, $note) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        $stash = [
+            'step'             => 'remit_completed',
+            'vendor_reference' => $vendor_reference,
+            'psp_reference'    => $psp_reference,
+            'event_type'       => $event_type,
+            'endpoint'         => $endpoint,
+            'primary_account'  => self::mask_account($primary_account),
+            'amount_minor'     => $amount_minor,
+            'currency'         => $currency,
+            'source'           => 'sync',
+            'note'             => $note,
+            'response'         => $response,
+        ];
+
+        $updated = $wpdb->update(
+            $table,
+            [
+                'status'           => 'approved',
+                'gateway_response' => wp_json_encode($stash),
+            ],
+            ['id' => $withdrawal_id, 'status' => 'processing']
+        );
+
+        if ($updated === 1) {
+            $withdrawal = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table} WHERE id = %d",
+                $withdrawal_id
+            ));
+            if ($withdrawal && class_exists('Matrix_MLM_Notifications')) {
+                Matrix_MLM_Notifications::send_withdrawal_notification(
+                    $withdrawal->user_id,
+                    $withdrawal->amount,
+                    'approved'
+                );
+            }
+        }
+    }
+
+    /**
+     * Internal: failure transition. processing -> $target_status
+     * (either 'pending' to allow operator retry, or 'rejected'
+     * to surface a non-retryable failure). Stash the failure
+     * envelope on gateway_response for diagnosis and audit.
+     *
+     * No customer notification on this path — a transient
+     * /Remit failure that the operator retries should not
+     * emit a "withdrawal rejected" email and then a confusing
+     * "withdrawal approved" email moments later. The reject_
+     * withdrawal admin path remains the single channel for the
+     * "rejected" customer notification.
+     */
+    private function release_remit_lock($withdrawal_id, $vendor_reference, $event_type, $endpoint, $primary_account, $amount_minor, $currency, $response, $target_status, $error_text) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'matrix_withdrawals';
+
+        $stash = [
+            'step'             => 'remit_failed',
+            'vendor_reference' => $vendor_reference,
+            'event_type'       => $event_type,
+            'endpoint'         => $endpoint,
+            'primary_account'  => self::mask_account($primary_account),
+            'amount_minor'     => $amount_minor,
+            'currency'         => $currency,
+            'source'           => 'sync',
+            'error_text'       => $error_text,
+            'response'         => $response,
+        ];
+
+        $wpdb->update(
+            $table,
+            [
+                'status'           => $target_status,
+                'gateway_response' => wp_json_encode($stash),
+            ],
+            ['id' => $withdrawal_id, 'status' => 'processing']
+        );
     }
 
     /* ====================================================================
