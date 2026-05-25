@@ -1213,7 +1213,22 @@ class Matrix_MLM_Fintava_Billing {
             case 'http_error':
                 /** @var WP_Error $err */
                 $err = $outcome['wp_error'];
-                wp_send_json_error(['message' => $err->get_error_message()]);
+                // Belt-and-braces: WP_Error::get_error_message()
+                // returns whatever was stored, including arrays /
+                // objects when a caller mis-set the message slot.
+                // make_request() now stringifies upstream-API
+                // messages at their boundary, so this branch
+                // normally receives a clean string — but if a
+                // future code path constructs a WP_Error with a
+                // non-string message (or a third-party plugin
+                // hooks our error filter and inserts one), the
+                // user must NOT see "[object Object]" again.
+                $message = $err->get_error_message();
+                $message = self::stringify_api_message(
+                    $message,
+                    __('An unexpected error occurred. Please try again.', 'matrix-mlm')
+                );
+                wp_send_json_error(['message' => $message]);
                 return;
 
             case 'transport_error':
@@ -1782,10 +1797,115 @@ class Matrix_MLM_Fintava_Billing {
         $body = json_decode(wp_remote_retrieve_body($response), true);
 
         if ($status_code >= 400) {
-            return new WP_Error('fintava_billing_error', $body['message'] ?? sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code));
+            // Fintava (and several upstream payment APIs) commonly
+            // return validation errors as a NESTED structure rather
+            // than a string — e.g. `{"message":{"phone":"Invalid
+            // phone number"}}` or `{"message":["err1","err2"]}`. The
+            // raw value used to be passed straight into WP_Error,
+            // which stores it as-is, so get_error_message() returned
+            // an array. respond_to_outcome() then sent it through
+            // wp_send_json_error(['message' => <array>]) and the
+            // browser saw `data.message` as an object — which JS
+            // coerced via implicit toString into the literal string
+            // "[object Object]" the moment any caller did
+            // `alert(r.data.message)`. That was the user-visible
+            // "[object Object]" bug on Buy Airtime.
+            //
+            // Stringify HERE — at the boundary where untrusted
+            // upstream JSON enters the WP_Error pipeline — so every
+            // downstream consumer (respond_to_outcome, the legacy
+            // wp_send_json_error sites in the four ajax_buy_*
+            // handlers, the ops log) sees a usable human-readable
+            // string. The fallback HTTP-status message is preserved
+            // for the (rare) case where Fintava returns no body or
+            // an unrecognised shape.
+            $message = self::stringify_api_message(
+                $body['message'] ?? null,
+                sprintf(__('API Error (HTTP %d)', 'matrix-mlm'), $status_code)
+            );
+            return new WP_Error('fintava_billing_error', $message);
         }
 
         return $body;
+    }
+
+    /**
+     * Coerce an upstream API "message" field into a single
+     * human-readable string. The Fintava billing endpoints (and many
+     * other payment gateways) ship validation errors as nested
+     * objects or arrays rather than strings:
+     *
+     *   - String:        "Insufficient balance"   → kept as-is
+     *   - Flat list:     ["err1","err2"]          → "err1; err2"
+     *   - Field map:     {"phone":"Bad number"}   → "phone: Bad number"
+     *   - Mixed map:     {"phone":["a","b"]}      → "phone: a; b"
+     *   - Anything else  (deeply nested, etc.)    → JSON-encoded
+     *
+     * Returns the supplied $fallback when the message slot is null
+     * or empty so call sites don't have to special-case "no body".
+     *
+     * @param mixed  $raw      The raw `message` value from the upstream JSON body.
+     * @param string $fallback Sentinel used when $raw is null/empty.
+     * @return string Always a non-empty string.
+     */
+    private static function stringify_api_message($raw, $fallback) {
+        if (is_string($raw)) {
+            return $raw !== '' ? $raw : $fallback;
+        }
+        if ($raw === null) {
+            return $fallback;
+        }
+        if (is_scalar($raw)) {
+            // numeric / bool — extremely unlikely from Fintava but
+            // cheap to handle.
+            return (string) $raw;
+        }
+        if (is_array($raw)) {
+            if (empty($raw)) {
+                return $fallback;
+            }
+            // Detect a flat list of scalars (numeric keys, string
+            // values) and join with semicolons.
+            $is_list = array_keys($raw) === range(0, count($raw) - 1);
+            $parts   = [];
+            foreach ($raw as $key => $val) {
+                if (is_array($val)) {
+                    // One level deeper: flatten a list of strings
+                    // (typical Laravel/validation-style "errors":
+                    // {"phone":["err1","err2"]}). Anything more
+                    // complex falls back to JSON.
+                    $sub_is_list = array_keys($val) === range(0, max(0, count($val) - 1));
+                    if ($sub_is_list && $val !== [] && self::all_scalars($val)) {
+                        $val_str = implode('; ', array_map('strval', $val));
+                    } else {
+                        $val_str = wp_json_encode($val);
+                    }
+                } elseif (is_scalar($val)) {
+                    $val_str = (string) $val;
+                } else {
+                    $val_str = wp_json_encode($val);
+                }
+                $parts[] = $is_list ? $val_str : ($key . ': ' . $val_str);
+            }
+            $joined = implode('; ', array_filter($parts, function ($s) { return $s !== ''; }));
+            return $joined !== '' ? $joined : $fallback;
+        }
+        // Object or resource — JSON-encode as a last resort.
+        $encoded = wp_json_encode($raw);
+        return is_string($encoded) && $encoded !== '' ? $encoded : $fallback;
+    }
+
+    /**
+     * True when every element of $arr is a PHP scalar. Helper for
+     * stringify_api_message()'s nested-list flattening.
+     */
+    private static function all_scalars(array $arr) {
+        foreach ($arr as $v) {
+            if (!is_scalar($v)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
