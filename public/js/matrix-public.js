@@ -196,28 +196,132 @@
         });
     });
 
+    // Toggle the Zebra Wallet wallet-account field based on the
+    // currently selected gateway radio. The field stays in the
+    // DOM (so the value persists if the user toggles back) but is
+    // visually hidden when a non-Zebra gateway is picked. Also
+    // updates the `required` attribute so HTML5 validation only
+    // demands a wallet number when Zebra is the active choice.
+    $(document).on('change', '#matrix-deposit-form [name="gateway"]', function() {
+        var $form = $(this).closest('#matrix-deposit-form');
+        var isZebra = $form.find('[name="gateway"]:checked').val() === 'zebra';
+        var $fields = $form.find('.matrix-zebra-fields');
+        $fields.toggle(isZebra);
+        $fields.find('input[name="wallet_account"]').prop('required', isZebra);
+    });
+
     // Deposit form
+    //
+    // Two response shapes are possible from matrix_action=deposit:
+    //
+    //   - Hosted-checkout gateways (Paystack, Flutterwave) return
+    //     { authorization_url } and we redirect the browser there.
+    //
+    //   - Zebra Wallet (Bibimoney) returns { requires_otp: true,
+    //     deposit_id, psp_reference, message } because Bibimoney
+    //     debits the customer's existing wallet directly after an
+    //     OTP — there is no hosted checkout page to redirect to.
+    //     We swap the form for the OTP dialog and a second
+    //     matrix_action=zebra_complete_otp call finishes the
+    //     payment.
     $(document).on('submit', '#matrix-deposit-form', function(e) {
         e.preventDefault();
         const form = $(this);
         const btn = form.find('button[type="submit"]');
+        const gateway = form.find('[name="gateway"]:checked').val();
         btn.prop('disabled', true).text('Processing...');
 
-        matrixAjax({
+        const payload = {
             action: 'matrix_mlm_action',
             matrix_action: 'deposit',
             amount: form.find('[name="amount"]').val(),
-            gateway: form.find('[name="gateway"]:checked').val()
-        }, function(data) {
+            gateway: gateway
+        };
+        if (gateway === 'zebra') {
+            payload.wallet_account = form.find('[name="wallet_account"]').val();
+        }
+
+        matrixAjax(payload, function(data) {
             if (data.authorization_url) {
                 window.location.href = data.authorization_url;
-            } else {
-                showNotification('Deposit initiated!', 'success');
+                return;
             }
+            if (data.requires_otp) {
+                // Zebra Wallet step 1 succeeded - swap UI for the
+                // OTP dialog. The deposit_id + psp_reference are
+                // stashed as data-* on the OTP form so step 2
+                // can echo them back to the server.
+                const $card = form.closest('.matrix-form-card');
+                const $dialog = $('.matrix-zebra-otp-dialog');
+                const $otpForm = $dialog.find('#matrix-zebra-otp-form');
+                $otpForm.attr('data-deposit-id', data.deposit_id || '');
+                $otpForm.attr('data-psp-reference', data.psp_reference || '');
+                if (data.message) {
+                    $dialog.find('.matrix-zebra-otp-message').text(data.message);
+                }
+                $card.hide();
+                $dialog.show();
+                $otpForm.find('[name="otp"]').val('').focus();
+                return;
+            }
+            showNotification(data.message || 'Deposit initiated!', 'success');
         }, function() {
             btn.prop('disabled', false).text('Proceed to Payment');
         });
     });
+
+    // Zebra Wallet OTP submit (step 2 of the deposit flow).
+    $(document).on('submit', '#matrix-zebra-otp-form', function(e) {
+        e.preventDefault();
+        const $form = $(this);
+        const $btn = $form.find('button[type="submit"]');
+        const depositId = $form.attr('data-deposit-id');
+        const pspRef = $form.attr('data-psp-reference');
+        const otp = $form.find('[name="otp"]').val();
+
+        if (!depositId || !pspRef) {
+            showNotification('Payment session expired. Please start the deposit again.', 'error');
+            return;
+        }
+
+        $btn.prop('disabled', true).text('Confirming...');
+        matrixAjax({
+            action: 'matrix_mlm_action',
+            matrix_action: 'zebra_complete_otp',
+            deposit_id: depositId,
+            psp_reference: pspRef,
+            otp: otp
+        }, function(data) {
+            showNotification(data.message || 'Payment confirmed!', 'success');
+            // Reload through the cache-busting helper so the
+            // deposit history pane reflects the new completed
+            // row + the wallet balance updates.
+            if (typeof window.matrixMLMReload === 'function') {
+                setTimeout(window.matrixMLMReload, 1200);
+            } else {
+                setTimeout(function() { window.location.reload(); }, 1200);
+            }
+        }, function() {
+            $btn.prop('disabled', false).text('Confirm Payment');
+        });
+    });
+
+    // Cancel button on the Zebra OTP dialog: just send the user
+    // back to the original deposit form. The pending deposit row
+    // stays in the database but will sit at status='pending'
+    // forever unless the IPN lands or the user re-tries; that's
+    // consistent with how Paystack/Flutterwave abandoned-checkout
+    // rows behave today.
+    $(document).on('click', '.matrix-zebra-otp-cancel', function() {
+        $('.matrix-zebra-otp-dialog').hide();
+        $('#matrix-deposit-form').closest('.matrix-form-card').show();
+        $('#matrix-deposit-form button[type="submit"]').prop('disabled', false).text('Proceed to Payment');
+    });
+
+    // Legacy single-step deposit handler removed - replaced by the
+    // two-shape handler above which dispatches between hosted
+    // checkout (Paystack/Flutterwave) and the Zebra Wallet OTP
+    // flow on the response shape.
 
     // Withdraw form handler removed — see feat/admin-controlled-withdrawals
     // and refactor/withdrawal-controls-five-toggles. The Withdraw tab,

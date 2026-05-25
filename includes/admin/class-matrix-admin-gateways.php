@@ -45,6 +45,35 @@ class Matrix_MLM_Admin_Gateways {
                 'percent_charge' => 1.40,
                 'status' => 1,
             ],
+            [
+                // Zebra Wallet - Bibimoney / Nazmo Banking Platform.
+                // Two-step OTP-authenticated deposit (no hosted
+                // checkout redirect), Instant Payment Notifications
+                // for completion. Status defaults to 0 (inactive)
+                // because every install needs a unique vendor_id +
+                // api_key + api_secret + webhook_token from the
+                // Bibimoney developer team before deposits will
+                // route through it. The slug-based seed creates the
+                // empty row so the credentials form appears under
+                // Admin -> Gateways out-of-box.
+                'name' => 'Zebra Wallet',
+                'slug' => 'zebra',
+                'gateway_parameters' => json_encode([
+                    'api_key'           => '',
+                    'api_secret'        => '',
+                    'vendor_id'         => '',
+                    'environment'       => 'qa',
+                    'base_url_override' => '',
+                    'webhook_token'     => '',
+                    'default_currency'  => 'NGN',
+                ]),
+                'supported_currencies' => json_encode(['NGN', 'USD', 'GBP', 'EUR']),
+                'min_amount'    => 100.00,
+                'max_amount'    => 5000000.00,
+                'fixed_charge'  => 0.00,
+                'percent_charge' => 0.00,
+                'status'        => 0,
+            ],
         ];
     }
 
@@ -780,6 +809,87 @@ class Matrix_MLM_Admin_Gateways {
                     <td>
                         <input type="text" name="params[webhook_hash]" class="regular-text" value="<?php echo esc_attr($params['webhook_hash'] ?? ''); ?>">
                         <p class="description"><?php _e('Webhook URL:', 'matrix-mlm'); ?> <code><?php echo rest_url('matrix-mlm/v1/payment/callback/flutterwave'); ?></code></p>
+                    </td>
+                </tr>
+                <?php
+                break;
+
+            case 'zebra':
+                // Zebra Wallet (Bibimoney / Nazmo Banking Platform).
+                //
+                // The IPN URL embeds a per-install webhook_token in
+                // the path. Bibimoney's IPN does NOT carry a
+                // signature header, so the only thing keeping a
+                // random attacker from posting forged completions
+                // to our public REST route is "they don't know the
+                // token." The operator generates a random token here
+                // and emails it together with the IPN URL below to
+                // developers@bibimoney.com so the platform registers
+                // that exact URL as the destination for our IPNs.
+                // check_payment_callback_permission() in core.php
+                // enforces the token segment matches before the
+                // gateway handler runs.
+                $zebra_token   = (string) ($params['webhook_token'] ?? '');
+                $zebra_environ = (string) ($params['environment'] ?? 'qa');
+                $zebra_ipn_url = $zebra_token !== ''
+                    ? rest_url('matrix-mlm/v1/payment/callback/zebra/' . rawurlencode($zebra_token))
+                    : rest_url('matrix-mlm/v1/payment/callback/zebra/<set-webhook-token-first>');
+                ?>
+                <tr>
+                    <th><?php _e('Vendor ID', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="text" name="params[vendor_id]" class="regular-text" value="<?php echo esc_attr($params['vendor_id'] ?? ''); ?>" autocomplete="off">
+                        <p class="description"><?php _e('Issued by developers@bibimoney.com when your vendor account is enabled.', 'matrix-mlm'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><?php _e('API Key', 'matrix-mlm'); ?></th>
+                    <td><input type="text" name="params[api_key]" class="regular-text" value="<?php echo esc_attr($params['api_key'] ?? ''); ?>" autocomplete="off"></td>
+                </tr>
+                <tr>
+                    <th><?php _e('API Secret', 'matrix-mlm'); ?></th>
+                    <td><input type="password" name="params[api_secret]" class="regular-text" value="<?php echo esc_attr($params['api_secret'] ?? ''); ?>" autocomplete="off"></td>
+                </tr>
+                <tr>
+                    <th><?php _e('Environment', 'matrix-mlm'); ?></th>
+                    <td>
+                        <select name="params[environment]">
+                            <option value="qa"   <?php selected($zebra_environ, 'qa'); ?>><?php _e('QA / Sandbox', 'matrix-mlm'); ?></option>
+                            <option value="live" <?php selected($zebra_environ, 'live'); ?>><?php _e('Live (production)', 'matrix-mlm'); ?></option>
+                        </select>
+                        <p class="description">
+                            <?php _e('QA defaults to', 'matrix-mlm'); ?>
+                            <code><?php echo esc_html(Matrix_MLM_Zebra::QA_BASE_URL); ?></code>.
+                            <?php _e('Live URLs are country-specific and must be pasted into Base URL Override below.', 'matrix-mlm'); ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><?php _e('Base URL Override', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="url" name="params[base_url_override]" class="regular-text" value="<?php echo esc_attr($params['base_url_override'] ?? ''); ?>" placeholder="https://api.bibimoney.com/api/vendor">
+                        <p class="description"><?php _e('Leave empty to use the QA default. Required for live - paste the URL Bibimoney shared for your country/tenant.', 'matrix-mlm'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><?php _e('Default Currency', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="text" name="params[default_currency]" class="regular-text" value="<?php echo esc_attr(strtoupper($params['default_currency'] ?? 'NGN')); ?>" maxlength="3" pattern="[A-Za-z]{3}" style="text-transform:uppercase;width:6em;">
+                        <p class="description"><?php _e('ISO 4217 code (e.g. NGN). Used when a deposit row has no currency stamped on it.', 'matrix-mlm'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><?php _e('Webhook Token', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="text" name="params[webhook_token]" class="regular-text" value="<?php echo esc_attr($zebra_token); ?>" autocomplete="off">
+                        <p class="description">
+                            <?php _e('Random per-install secret. Bibimoney IPNs do not carry a signature header, so the IPN URL embeds this token to authenticate inbound calls. Generate any random string (32+ chars) and email it together with the URL below to', 'matrix-mlm'); ?>
+                            <code>developers@bibimoney.com</code>.
+                        </p>
+                        <p class="description">
+                            <strong><?php _e('IPN URL:', 'matrix-mlm'); ?></strong>
+                            <code><?php echo esc_html($zebra_ipn_url); ?></code>
+                        </p>
                     </td>
                 </tr>
                 <?php
