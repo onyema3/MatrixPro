@@ -779,6 +779,118 @@ class Matrix_MLM_User_Dashboard {
                 </div>
             </div>
         </div>
+
+        <?php $this->render_security_transaction_pin($user_id); ?>
+        <?php
+    }
+
+    /**
+     * Transaction PIN sub-section on the user dashboard's Security
+     * tab. Rendered as a sibling of the 2FA block so the two
+     * primitives sit side-by-side; visually identical wrapper
+     * (.matrix-security-section) so the page styling stays
+     * consistent.
+     *
+     * Hidden entirely when the admin has turned the master
+     * "Transaction PIN" toggle off on Settings → Security — there's
+     * no value showing a feature the admin has disabled, and a
+     * defence-in-depth probe in the AJAX handlers refuses set/change
+     * operations on a master-disabled site so a stale dashboard
+     * page can't sneak past this UI gate either.
+     *
+     * The form is the same inline reauth widget the 2FA section
+     * uses (server-rendered, password-autofill-friendly, JS-driven
+     * mode toggling). Three modes:
+     *   - 'set'     — first-time set: password + new + confirm
+     *   - 'change'  — rotate: password + current + new + confirm
+     *   - 'disable' — clear: password + current
+     *
+     * matrixTogglePinForm() in matrix-public.js shows the right
+     * input rows for each mode and dispatches the right AJAX action.
+     */
+    private function render_security_transaction_pin($user_id) {
+        if (!Matrix_MLM_Transaction_Pin::is_master_enabled()) {
+            return;
+        }
+        $is_set = Matrix_MLM_Transaction_Pin::is_set($user_id);
+        ?>
+        <h2><?php _e('Transaction PIN', 'matrix-mlm'); ?></h2>
+        <div class="matrix-security-section">
+            <p>
+                <?php
+                printf(
+                    /* translators: 1: minimum digits, 2: maximum digits */
+                    esc_html__('A %1$d-to-%2$d-digit numeric PIN that authorises sensitive fund-movement actions (withdrawals, transfers, bill payments). Stored as a one-way hash &mdash; only you know the PIN itself.', 'matrix-mlm'),
+                    Matrix_MLM_Transaction_Pin::MIN_LEN,
+                    Matrix_MLM_Transaction_Pin::MAX_LEN
+                );
+                ?>
+            </p>
+
+            <div class="matrix-2fa-status">
+                <strong><?php _e('Status:', 'matrix-mlm'); ?></strong>
+                <?php if ($is_set): ?>
+                    <span class="matrix-badge matrix-badge-active"><?php _e('Set', 'matrix-mlm'); ?></span>
+                    <button class="matrix-btn matrix-btn-secondary" onclick="matrixTogglePinForm('change')"><?php _e('Change PIN', 'matrix-mlm'); ?></button>
+                    <button class="matrix-btn matrix-btn-danger" onclick="matrixTogglePinForm('disable')"><?php _e('Disable PIN', 'matrix-mlm'); ?></button>
+                <?php else: ?>
+                    <span class="matrix-badge matrix-badge-inactive"><?php _e('Not set', 'matrix-mlm'); ?></span>
+                    <button class="matrix-btn matrix-btn-primary" onclick="matrixTogglePinForm('set')"><?php _e('Set PIN', 'matrix-mlm'); ?></button>
+                <?php endif; ?>
+            </div>
+
+            <?php if (!$is_set): ?>
+                <p class="description" style="margin-top:8px;">
+                    <?php _e('Until you set a PIN, fund-movement actions configured to require one will fall through ungated. The admin may still require a PIN for some paths &mdash; setting one now means a single configuration change away from a UI prompt won\'t lock you out mid-transaction.', 'matrix-mlm'); ?>
+                </p>
+            <?php endif; ?>
+
+            <!--
+                Inline reauth form. Same shape and rationale as the
+                2FA form above — server-rendered so the password
+                field gets the regular browser autofill / enterprise
+                password-fill treatment, no nonce field (matrixAjax
+                injects matrixMLM.nonce on every request).
+
+                The PIN inputs are type=password (masking) with
+                inputmode=numeric (mobile numeric keypad),
+                pattern=[0-9]{4,6} (HTML5 client-side hint, server
+                normaliser is the security gate), maxlength=6
+                (hard cap so a paste can't accidentally submit a
+                100-digit string the server then has to bcrypt).
+                autocomplete="off" because PIN is not a password
+                managers should ever propose to autofill.
+            -->
+            <div id="matrix-pin-form" style="display: none;" class="matrix-2fa-form">
+                <h3 id="matrix-pin-form-title"></h3>
+                <p id="matrix-pin-form-help" class="matrix-2fa-help"></p>
+
+                <div class="matrix-form-row">
+                    <label for="matrix-pin-password"><?php _e('Current password', 'matrix-mlm'); ?></label>
+                    <input type="password" id="matrix-pin-password" autocomplete="current-password">
+                </div>
+
+                <div class="matrix-form-row" id="matrix-pin-current-row" style="display: none;">
+                    <label for="matrix-pin-current"><?php _e('Current PIN', 'matrix-mlm'); ?></label>
+                    <input type="password" id="matrix-pin-current" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" autocomplete="off">
+                </div>
+
+                <div class="matrix-form-row" id="matrix-pin-new-row" style="display: none;">
+                    <label for="matrix-pin-new"><?php _e('New PIN', 'matrix-mlm'); ?></label>
+                    <input type="password" id="matrix-pin-new" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" autocomplete="off">
+                </div>
+
+                <div class="matrix-form-row" id="matrix-pin-confirm-row" style="display: none;">
+                    <label for="matrix-pin-confirm"><?php _e('Confirm new PIN', 'matrix-mlm'); ?></label>
+                    <input type="password" id="matrix-pin-confirm" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" autocomplete="off">
+                </div>
+
+                <div class="matrix-form-actions">
+                    <button class="matrix-btn matrix-btn-primary" id="matrix-pin-submit"></button>
+                    <button class="matrix-btn matrix-btn-secondary" type="button" onclick="matrixCancelPinForm()"><?php _e('Cancel', 'matrix-mlm'); ?></button>
+                </div>
+            </div>
+        </div>
         <?php
     }
 }

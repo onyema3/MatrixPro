@@ -407,6 +407,15 @@ class Matrix_MLM_Core {
             case 'regenerate_recovery_codes':
                 $this->process_regenerate_recovery_codes();
                 break;
+            case 'set_transaction_pin':
+                $this->process_set_transaction_pin();
+                break;
+            case 'change_transaction_pin':
+                $this->process_change_transaction_pin();
+                break;
+            case 'disable_transaction_pin':
+                $this->process_disable_transaction_pin();
+                break;
             case 'pay_subscription':
                 $this->process_pay_subscription();
                 break;
@@ -2798,6 +2807,217 @@ class Matrix_MLM_Core {
         wp_send_json_success([
             'recovery_codes' => $codes,
             'message' => __('New recovery codes generated. Save them now — they are shown only once.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Set a transaction PIN for the current user.
+     *
+     * Threat-model ordering matches process_enable_2fa:
+     *   1. Authentication required.
+     *   2. Rate-limit (5 / 15 min) BEFORE any bcrypt or state probe.
+     *      Without this a session-only attacker could spam the
+     *      endpoint to drain password_verify cycles.
+     *   3. Master-feature check. The admin can disable PIN setup
+     *      site-wide via Settings → Security; defence-in-depth
+     *      against UI drift (a stale dashboard page that still
+     *      shows the PIN form after the admin disabled the feature
+     *      shouldn't be able to set a PIN).
+     *   4. Password reauth — proves the caller still has the
+     *      password, not just a hijacked session cookie. Comes
+     *      BEFORE the is_set() probe so the endpoint can't be
+     *      used as an oracle to learn whether a hijacked account
+     *      already has a PIN.
+     *   5. Reject if a PIN is already set — caller must use the
+     *      change_transaction_pin path, which gates the swap on
+     *      the current PIN as well as the password.
+     *   6. Hash + store. Reset the rate-limit counter on success
+     *      so a real user who fat-fingered their password a few
+     *      times isn't penalised on the good attempt that
+     *      followed.
+     *
+     * POST shape:
+     *   - current_password: existing WP password (re-auth gate)
+     *   - pin            : 4–6 digits, normalised server-side
+     */
+    private function process_set_transaction_pin() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'transaction_pin_set',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        if (!Matrix_MLM_Transaction_Pin::is_master_enabled()) {
+            wp_send_json_error([
+                'message' => __('Transaction PIN is not enabled on this site.', 'matrix-mlm'),
+            ]);
+        }
+
+        $this->require_password_reauth($user_id);
+
+        if (Matrix_MLM_Transaction_Pin::is_set($user_id)) {
+            wp_send_json_error([
+                'message' => __('A transaction PIN is already set on this account. Use Change PIN to update it.', 'matrix-mlm'),
+                'already_set' => true,
+            ]);
+        }
+
+        $pin = isset($_POST['pin']) ? $_POST['pin'] : '';
+        $transaction_pin = new Matrix_MLM_Transaction_Pin();
+        $result = $transaction_pin->set($user_id, $pin);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+
+        Matrix_MLM_Rate_Limiter::reset(
+            'transaction_pin_set',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
+        wp_send_json_success([
+            'message' => __('Transaction PIN set. You will be asked for it on fund-movement actions configured to require it.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Change an existing transaction PIN.
+     *
+     * Two gates: a fresh password reauth, and proof the caller
+     * knows the current PIN. The second gate is what makes the
+     * change endpoint safe to publish — without it, a hijacked
+     * session could rotate the PIN to one the attacker controls
+     * and then drain the wallet behind the new PIN gate.
+     *
+     * POST shape:
+     *   - current_password: existing WP password (re-auth gate)
+     *   - current_pin     : the PIN currently on file
+     *   - new_pin         : 4–6 digits
+     */
+    private function process_change_transaction_pin() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'transaction_pin_change',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        if (!Matrix_MLM_Transaction_Pin::is_master_enabled()) {
+            wp_send_json_error([
+                'message' => __('Transaction PIN is not enabled on this site.', 'matrix-mlm'),
+            ]);
+        }
+
+        $this->require_password_reauth($user_id);
+
+        $current_pin = isset($_POST['current_pin']) ? $_POST['current_pin'] : '';
+        $new_pin     = isset($_POST['new_pin'])     ? $_POST['new_pin']     : '';
+
+        $transaction_pin = new Matrix_MLM_Transaction_Pin();
+        $result = $transaction_pin->change($user_id, $current_pin, $new_pin);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+
+        Matrix_MLM_Rate_Limiter::reset(
+            'transaction_pin_change',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
+        wp_send_json_success([
+            'message' => __('Transaction PIN updated.', 'matrix-mlm'),
+        ]);
+    }
+
+    /**
+     * Disable / clear an existing transaction PIN.
+     *
+     * Gated on password reauth + a current-PIN verify. Idempotent
+     * on the no-PIN-set path (returns success rather than an error
+     * so a quick double-click doesn't surface a confusing message
+     * after the underlying state already flipped).
+     *
+     * Note: disabling a PIN does NOT bypass any per-path
+     * "Require PIN" admin toggles. With no PIN set the gate
+     * helper short-circuits to "allowed" — disabling moves the
+     * user from the gated state back to the ungated state.
+     * Admins who want to mandate a PIN site-wide can ship a
+     * follow-up that turns the user-side disable button off
+     * conditionally; that's deliberately out of scope here so
+     * users always have a self-service path back to a known-good
+     * state if they fat-finger a PIN they later forget.
+     *
+     * POST shape:
+     *   - current_password: existing WP password (re-auth gate)
+     *   - current_pin     : the PIN currently on file
+     */
+    private function process_disable_transaction_pin() {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            wp_send_json_error(['message' => __('Authentication required.', 'matrix-mlm')]);
+        }
+
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'transaction_pin_disable',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            ['max_attempts' => 5, 'window_seconds' => 15 * MINUTE_IN_SECONDS]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many attempts. Please wait a few minutes before trying again.', 'matrix-mlm'),
+            ]);
+        }
+
+        // Reauth before the is_set() probe — same reasoning as
+        // process_disable_2fa. Don't let this endpoint be a
+        // PIN-state oracle for a session-only attacker.
+        $this->require_password_reauth($user_id);
+
+        if (!Matrix_MLM_Transaction_Pin::is_set($user_id)) {
+            // Idempotent — disable on an already-disabled account
+            // is a no-op success rather than an error so the UI
+            // doesn't surface a confusing message after a quick
+            // double-click. Reset the throttle on this path too:
+            // a successful password reauth has happened.
+            Matrix_MLM_Rate_Limiter::reset(
+                'transaction_pin_disable',
+                Matrix_MLM_Rate_Limiter::key_for_request()
+            );
+            wp_send_json_success([
+                'message' => __('Transaction PIN is already disabled.', 'matrix-mlm'),
+            ]);
+        }
+
+        $current_pin = isset($_POST['current_pin']) ? $_POST['current_pin'] : '';
+
+        $transaction_pin = new Matrix_MLM_Transaction_Pin();
+        $result = $transaction_pin->disable($user_id, $current_pin);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+
+        Matrix_MLM_Rate_Limiter::reset(
+            'transaction_pin_disable',
+            Matrix_MLM_Rate_Limiter::key_for_request()
+        );
+
+        wp_send_json_success([
+            'message' => __('Transaction PIN disabled.', 'matrix-mlm'),
         ]);
     }
 

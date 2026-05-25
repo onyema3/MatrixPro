@@ -437,6 +437,77 @@ class Matrix_MLM_Admin_Settings {
                         <?php _e('Path-specific toggle. Gates the <strong>Transfer to Bank</strong> button + pane in the External Transfers group on the Wallet page (Fintava virtual wallet &rarr; external Nigerian bank, instant via Fintava\'s /bank/credit endpoint). Defaults on. Uncheck to keep the Fintava integration available (virtual wallet, Matrix &rarr; Virtual transfer, bills) while blocking only the external cash-out pane &mdash; useful when you want to freeze the highest-risk surface without breaking the rest of the platform. This option moved here from Gateways &rarr; Fintava in refactor/withdrawal-controls-five-toggles; the legacy <code>matrix_mlm_fintava_payouts_enabled</code> key is still read as a fallback so existing installs don\'t lose their setting until they re-save here.', 'matrix-mlm'); ?>
                     </p>
                 </td></tr>
+
+            <tr><td colspan="2" style="padding-top:24px;border-bottom:1px solid #e5e7eb;padding-bottom:8px;">
+                <h3 style="margin:0;color:#1f2937;"><?php _e('Transaction PIN Requirements', 'matrix-mlm'); ?></h3>
+                <p class="description" style="margin-top:4px;">
+                    <?php
+                    printf(
+                        /* translators: 1: link to Settings → Security tab */
+                        wp_kses(
+                            __('Per-path toggles that decide which fund-movement actions demand a transaction PIN. Defaults OFF on every path so turning the feature on does not break any existing flows mid-deploy. The master switch lives on <a href="%1$s">Settings &rarr; Security</a>; gating only fires when both the master is on AND the user has set a PIN. Users with no PIN set transact ungated regardless of the toggles below &mdash; this is deliberate so a user is never stranded mid-transaction by a single configuration change. The actual gate code lands in a sibling PR; until then these toggles persist but have no runtime effect.', 'matrix-mlm'),
+                            ['a' => ['href' => []], 'strong' => [], 'code' => []]
+                        ),
+                        esc_url(admin_url('admin.php?page=matrix-mlm-settings&tab=security'))
+                    );
+                    ?>
+                </p>
+            </td></tr>
+
+            <tr><th><?php _e('Peer wallet transfers', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_pin_required_for_transfers" value="1" <?php checked(get_option('matrix_mlm_pin_required_for_transfers', 0)); ?>>
+                        <?php _e('Require transaction PIN for peer Wallet&nbsp;&rarr;&nbsp;Wallet transfers', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Gates the <strong>Wallet to Wallet</strong> form on the user wallet page (Matrix wallet &rarr; another member\'s Matrix wallet).', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Transfer to own virtual wallet', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_pin_required_for_matrix_to_virtual" value="1" <?php checked(get_option('matrix_mlm_pin_required_for_matrix_to_virtual', 0)); ?>>
+                        <?php _e('Require transaction PIN for Matrix&nbsp;&rarr;&nbsp;Fintava virtual transfers', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Gates the <strong>Transfer to Own Wallet</strong> button (Matrix wallet &rarr; user\'s own Fintava virtual wallet).', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Transfer to bank', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_pin_required_for_bank" value="1" <?php checked(get_option('matrix_mlm_pin_required_for_bank', 0)); ?>>
+                        <?php _e('Require transaction PIN for Fintava virtual&nbsp;&rarr;&nbsp;external bank transfers', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Gates the <strong>Transfer to Bank</strong> form (Fintava virtual wallet &rarr; external Nigerian bank). Highest-risk surface &mdash; recommended ON in production.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Bill payments', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_pin_required_for_bills" value="1" <?php checked(get_option('matrix_mlm_pin_required_for_bills', 0)); ?>>
+                        <?php _e('Require transaction PIN for airtime, data, cable, and electricity purchases', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Gates all four bill-payment AJAX endpoints uniformly. Per-category visibility is still controlled on the Bill Payments tab; this toggle only adds the PIN gate on top.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
+
+            <tr><th><?php _e('Subscription manual pay', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_pin_required_for_subscription" value="1" <?php checked(get_option('matrix_mlm_pin_required_for_subscription', 0)); ?>>
+                        <?php _e('Require transaction PIN for the manual subscription-pay button', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php _e('Gates the user-initiated subscription debit. The cron-driven monthly billing job is unaffected &mdash; it never sees a user request and so never has a PIN to verify.', 'matrix-mlm'); ?>
+                    </p>
+                </td></tr>
         </table>
     <?php }
 
@@ -506,6 +577,25 @@ class Matrix_MLM_Admin_Settings {
         <table class="form-table">
             <tr><th><?php _e('Two-Factor Authentication', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_2fa_enabled" value="1" <?php checked(get_option('matrix_mlm_2fa_enabled', 1)); ?>> <?php _e('Allow users to enable 2FA', 'matrix-mlm'); ?></label></td></tr>
+            <tr><th><?php _e('Transaction PIN', 'matrix-mlm'); ?></th>
+                <td>
+                    <label>
+                        <input type="checkbox" name="matrix_mlm_transaction_pin_enabled" value="1" <?php checked(get_option('matrix_mlm_transaction_pin_enabled', 1)); ?>>
+                        <?php _e('Allow users to set a transaction PIN', 'matrix-mlm'); ?>
+                    </label>
+                    <p class="description">
+                        <?php
+                        printf(
+                            /* translators: 1: link to Financial settings tab */
+                            wp_kses(
+                                __('Master switch for the per-user transaction PIN feature. When on, users see a "Transaction PIN" section on their <em>Account → 2FA Security</em> tab and can set a 4&ndash;6 digit numeric PIN that authorises sensitive fund-movement actions. The per-path requirement toggles (which fund-movement paths actually demand a PIN) live on the <a href="%1$s">Financial</a> tab. Turning this off hides the user-side UI entirely and refuses set/change/disable AJAX calls; existing PINs stay in storage and are reactivated if you turn it back on.', 'matrix-mlm'),
+                                ['a' => ['href' => []], 'em' => [], 'code' => []]
+                            ),
+                            esc_url(admin_url('admin.php?page=matrix-mlm-settings&tab=financial'))
+                        );
+                        ?>
+                    </p>
+                </td></tr>
             <tr><th><?php _e('Google reCAPTCHA', 'matrix-mlm'); ?></th>
                 <td><label><input type="checkbox" name="matrix_mlm_captcha_enabled" value="1" <?php checked(get_option('matrix_mlm_captcha_enabled', 0)); ?>> <?php _e('Enable captcha on forms', 'matrix-mlm'); ?></label></td></tr>
             <tr><th><?php _e('Captcha Site Key', 'matrix-mlm'); ?></th>
@@ -1018,7 +1108,7 @@ class Matrix_MLM_Admin_Settings {
                 }
                 break;
             case 'financial':
-                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
+                $settings = ['matrix_mlm_min_deposit', 'matrix_mlm_max_deposit', 'matrix_mlm_min_withdraw', 'matrix_mlm_max_withdraw', 'matrix_mlm_withdraw_charge_type', 'matrix_mlm_withdraw_charge', 'matrix_mlm_transfer_charge_type', 'matrix_mlm_transfer_charge', 'matrix_mlm_min_transfer', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled', 'matrix_mlm_pin_required_for_transfers', 'matrix_mlm_pin_required_for_matrix_to_virtual', 'matrix_mlm_pin_required_for_bank', 'matrix_mlm_pin_required_for_bills', 'matrix_mlm_pin_required_for_subscription'];
                 // Required-plans multi-checkbox is the one field on
                 // this tab whose POST shape is an array, not a scalar.
                 // The generic save loop further down runs every value
@@ -1036,7 +1126,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_application_notification_email', 'matrix_mlm_cug_notification_email', 'matrix_mlm_loan_notification_email', 'matrix_mlm_healthcare_notification_email'];
                 break;
             case 'security':
-                $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
+                $settings = ['matrix_mlm_2fa_enabled', 'matrix_mlm_transaction_pin_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_captcha_site_key', 'matrix_mlm_captcha_secret_key'];
                 break;
             case 'appearance':
                 $settings = ['matrix_mlm_primary_color', 'matrix_mlm_secondary_color', 'matrix_mlm_custom_css', 'matrix_mlm_login_logo_url', 'matrix_mlm_login_logo_id'];
@@ -1203,7 +1293,7 @@ class Matrix_MLM_Admin_Settings {
         }
 
         // Handle checkboxes that might not be sent
-        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled'];
+        $checkboxes = ['matrix_mlm_registration_enabled', 'matrix_mlm_gdpr_enabled', 'matrix_mlm_email_verification', 'matrix_mlm_sms_verification', 'matrix_mlm_2fa_enabled', 'matrix_mlm_transaction_pin_enabled', 'matrix_mlm_captcha_enabled', 'matrix_mlm_livechat_enabled', 'matrix_mlm_auto_reentry', 'matrix_mlm_subscription_enabled', 'matrix_mlm_withdrawals_enabled', 'matrix_mlm_withdraw_require_active_user', 'matrix_mlm_matrix_transfers_enabled', 'matrix_mlm_bank_transfers_enabled', 'matrix_mlm_pin_required_for_transfers', 'matrix_mlm_pin_required_for_matrix_to_virtual', 'matrix_mlm_pin_required_for_bank', 'matrix_mlm_pin_required_for_bills', 'matrix_mlm_pin_required_for_subscription'];
         foreach ($checkboxes as $cb) {
             if (in_array($cb, $settings) && !isset($_POST[$cb])) {
                 update_option($cb, 0);

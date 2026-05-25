@@ -238,6 +238,35 @@ class Matrix_MLM_Database {
             }
         }
 
+        // Defensive ADD COLUMN for transaction_pin_hash. Same lazy-
+        // migration pattern as two_factor_recovery_codes above —
+        // dbDelta in create_tables() handles a fresh CREATE TABLE,
+        // but copy-deploys / partial dbDelta runs / older installs
+        // need the explicit ALTER for the column to land. Probe
+        // INFORMATION_SCHEMA and skip if present; idempotent across
+        // unlimited re-runs.
+        //
+        // Stores a single password_hash() bcrypt digest of the
+        // user's normalised numeric PIN. varchar(255) matches the
+        // two_factor_secret column above and gives plenty of room
+        // for future hash format upgrades (PASSWORD_DEFAULT
+        // currently emits 60 chars, but a future PHP could widen).
+        if ($um_exists > 0) {
+            $pin_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'transaction_pin_hash'",
+                DB_NAME, $um_table
+            ));
+            if ($pin_col_exists === 0) {
+                $wpdb->query(
+                    "ALTER TABLE {$um_table}
+                       ADD COLUMN transaction_pin_hash VARCHAR(255) DEFAULT NULL
+                       AFTER two_factor_recovery_codes"
+                );
+            }
+        }
+
         // 1.0.11: one-time backfill of matrix_position_history with
         // a 'backfilled' row per existing position, dated at the
         // position's joined_at column. Without this, the genealogy
@@ -588,6 +617,7 @@ class Matrix_MLM_Database {
             two_factor_enabled tinyint(1) NOT NULL DEFAULT 0,
             two_factor_secret varchar(255) DEFAULT NULL,
             two_factor_recovery_codes longtext DEFAULT NULL,
+            transaction_pin_hash varchar(255) DEFAULT NULL,
             email_verified tinyint(1) NOT NULL DEFAULT 0,
             sms_verified tinyint(1) NOT NULL DEFAULT 0,
             kyc_verified tinyint(1) NOT NULL DEFAULT 0,
