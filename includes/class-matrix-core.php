@@ -3625,6 +3625,47 @@ class Matrix_MLM_Core {
             return new WP_REST_Response(['status' => 'error', 'message' => 'Reference is required'], 400);
         }
 
+        // Audit L10 — per-IP rate limit on the unauthenticated
+        // verify route.
+        //
+        // The route is intentionally permission_callback => true:
+        // it's the user-return surface after a redirect from
+        // Paystack / Flutterwave / Zebra and there's no way to
+        // authenticate the bouncing browser at the framework
+        // boundary. Forging a credit through this endpoint is not
+        // possible without first compromising the gateway's API
+        // key (verify_payment() calls the gateway server-to-server
+        // and the gateway is the source of truth), but an attacker
+        // who knows the route can still abuse it for:
+        //
+        //   - Upstream-quota exhaustion: every call hits the
+        //     gateway's verify endpoint, which is rate-limited
+        //     server-side. Burning through the merchant's quota
+        //     starves legitimate user-return flows.
+        //   - Reference enumeration: probing for valid tx_refs
+        //     to learn deposit IDs / amounts via the response
+        //     shape.
+        //
+        // Cap inputs through the same per-action / per-IP
+        // limiter the AJAX handlers use. 60 attempts per 15
+        // minutes per IP is generous enough to never bother a
+        // real user retrying their post-redirect verify a few
+        // times, and far below the rate that would meaningfully
+        // burn upstream quota or enable enumeration. Both numbers
+        // are filterable per-action via matrix_mlm_rate_limit_max
+        // / matrix_mlm_rate_limit_window so installs behind a
+        // shared NAT can tune up.
+        $rate_key = 'ip:' . sha1(Matrix_MLM_Rate_Limiter::client_ip());
+        if (Matrix_MLM_Rate_Limiter::throttle('payment_verify', $rate_key, [
+            'max_attempts'   => 60,
+            'window_seconds' => 15 * MINUTE_IN_SECONDS,
+        ])) {
+            return new WP_REST_Response(
+                ['status' => 'error', 'message' => 'Too many verification attempts. Please wait a few minutes and try again.'],
+                429
+            );
+        }
+
         if ($gateway === 'paystack') {
             $paystack = new Matrix_MLM_Paystack();
             return $paystack->verify_payment($reference);
