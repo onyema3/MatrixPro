@@ -291,7 +291,37 @@ class Matrix_MLM_User_Card {
         </div>
 
         <script>
-        (function($) {
+        // jQuery-footer-race guard. Without this, the inline IIFE
+        // throws ReferenceError at parse time on installs where
+        // jQuery is deferred to the footer, none of the
+        // matrixCardOpenPanForm / matrixSubmitCardPan /
+        // matrixViewCardDetails globals get defined, and every
+        // action button on this page silently does nothing when
+        // clicked (the buttons are wired via inline onclick that
+        // calls window.matrixCardOpenPanForm — which doesn't
+        // exist if the IIFE never ran). Same polling pattern as
+        // class-matrix-user-wallet.php's render_scripts_no_wallet
+        // and the airtime form in class-matrix-user-billing.php —
+        // see that airtime <script> for the full historical context.
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; card-management handlers not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             'use strict';
 
             // Map of action keys → {ajax action, dialog copy}. Lookup is by
@@ -731,7 +761,8 @@ class Matrix_MLM_User_Card {
                     }
                 });
             };
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
@@ -781,7 +812,31 @@ class Matrix_MLM_User_Card {
         </div>
 
         <script>
-        (function($) {
+        // jQuery-footer-race guard. See the corresponding wrapper
+        // on the larger render_card_details <script> earlier in
+        // this file for the full rationale. Without it, the
+        // 'Create Verve Card' submit handler never binds and the
+        // form falls back to a native HTML submit (page reload,
+        // no card created).
+        (function() {
+            var attempts = 0;
+            var maxAttempts = 200; // 200 * 50ms = 10s ceiling
+
+            function whenJQueryReady(cb) {
+                if (typeof window.jQuery !== 'undefined' && typeof window.jQuery.fn !== 'undefined') {
+                    window.jQuery(cb);
+                    return;
+                }
+                if (++attempts > maxAttempts) {
+                    if (window.console && console.error) {
+                        console.error('[Matrix MLM] jQuery not loaded after 10s; create-card handler not bound.');
+                    }
+                    return;
+                }
+                setTimeout(function() { whenJQueryReady(cb); }, 50);
+            }
+
+            whenJQueryReady(function($) {
             'use strict';
             $('#matrix-request-card-form').on('submit', function(e) {
                 e.preventDefault();
@@ -806,7 +861,8 @@ class Matrix_MLM_User_Card {
                     }
                 });
             });
-        })(jQuery);
+            }); // whenJQueryReady
+        })(); // poll-for-jQuery IIFE
         </script>
         <?php
     }
