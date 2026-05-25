@@ -1940,6 +1940,19 @@ class Matrix_MLM_Fintava {
             wp_send_json_error(['message' => $eligibility['reason']]);
         }
 
+        // Transaction PIN gate (PR 2). Highest-risk surface — runs
+        // after the can_move_funds eligibility check and BEFORE the
+        // is_active() probe, the balance pre-flight, the
+        // matrix_fintava_payouts row INSERT, and the upstream
+        // /bank/credit HTTP call. A wrong PIN here therefore burns
+        // zero database rows and zero outbound HTTP cycles, which
+        // matters because /bank/credit has a 5xx retry budget on
+        // Fintava's side that we'd rather not exercise on bot
+        // traffic. Path key 'bank' maps to the
+        // matrix_mlm_pin_required_for_bank admin toggle on
+        // Settings → Financial.
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'bank');
+
         if (!$this->is_active()) {
             wp_send_json_error(['message' => __('Bank payouts are not available at the moment.', 'matrix-mlm')]);
         }
@@ -2309,6 +2322,19 @@ class Matrix_MLM_Fintava {
         if (!$eligibility['allowed']) {
             wp_send_json_error(['message' => $eligibility['reason']]);
         }
+
+        // Transaction PIN gate (PR 2). Sits between the
+        // can_move_funds eligibility check and the START TRANSACTION
+        // / Matrix wallet debit / Fintava /transaction/wallet-to-wallet
+        // call below, so a wrong PIN cannot half-move money into the
+        // user's Fintava virtual wallet — neither the Matrix-side
+        // ledger nor the merchant Fintava wallet is touched until
+        // the gate clears. Path key 'matrix_to_virtual' maps to the
+        // matrix_mlm_pin_required_for_matrix_to_virtual admin
+        // toggle. Helper short-circuits when the path isn't gated
+        // or the user has no PIN set, matching the design contract
+        // documented on require_pin_for_request().
+        Matrix_MLM_Transaction_Pin::require_pin_for_request($user_id, 'matrix_to_virtual');
 
         if (!$this->is_active()) {
             wp_send_json_error(['message' => __('Wallet transfers are not available at the moment.', 'matrix-mlm')]);

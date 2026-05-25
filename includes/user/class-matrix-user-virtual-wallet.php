@@ -288,6 +288,15 @@ class Matrix_MLM_User_Virtual_Wallet {
                         </small>
                     </div>
                 </div>
+                <?php
+                // Transaction PIN field (PR 2). This form's submit
+                // hits matrix_fintava_initiate_transfer (the same
+                // endpoint the bank-payout form uses), so it shares
+                // the 'bank' path key. Helper returns '' for ungated
+                // paths or users with no PIN.
+                echo Matrix_MLM_Transaction_Pin::render_field($user_id, 'bank');
+                ?>
+
                 <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block" id="fintava-transfer-btn">
                     <?php _e('Transfer to Fintava Wallet', 'matrix-mlm'); ?>
                 </button>
@@ -459,7 +468,13 @@ class Matrix_MLM_User_Virtual_Wallet {
                         bank_code: bankCode,
                         bank_name: bankName,
                         account_name: accountName,
-                        narration: '<?php _e("Matrix to Fintava wallet transfer", "matrix-mlm"); ?>'
+                        narration: '<?php _e("Matrix to Fintava wallet transfer", "matrix-mlm"); ?>',
+                        // Transaction PIN (PR 2). See class-matrix-
+                        // user-bank-payout.php for the always-post-
+                        // empty rationale; this form uses the same
+                        // path key ('bank') because the AJAX action
+                        // is the same.
+                        transaction_pin: ($('#matrix-transfer-to-fintava-form [name=transaction_pin]').val() || '')
                     },
                     success: function(response) {
                         if (response.success) {
