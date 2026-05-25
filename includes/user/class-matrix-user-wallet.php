@@ -471,50 +471,77 @@ class Matrix_MLM_User_Wallet {
      * same Bank Transfers policy toggle).
      */
     private function render_panes($wallet, $user_id, $matrix_balance, $currency, $payouts_enabled = true, $zebra_enabled = false) {
+        // Modal shell. The .matrix-wallet-pane sections retain their
+        // [hidden] attribute and existing data-pane="X" identifiers
+        // verbatim — the click handler in render_scripts() still
+        // shows exactly one of them at a time. The only thing that
+        // changes is *where* they render: instead of unfolding inline
+        // beneath the action-button row, the matching pane appears
+        // inside a centered overlay dialog with a backdrop, a close
+        // affordance, and ESC / outside-click dismissal.
+        //
+        // Why no markup changes inside the panes themselves:
+        //   - All form IDs (#matrix-transfer-to-own-wallet-form,
+        //     #matrix-w2w-form, the embedded Bank Payout / Zebra
+        //     forms) stay untouched, so every event-delegated
+        //     submit handler on document keeps firing.
+        //   - All AJAX endpoints, nonces, charge-preview math, and
+        //     embedded inline scripts coexist exactly as before —
+        //     they live inside the modal dialog now, but the
+        //     selectors they query are unchanged.
+        //   - render_panes_no_wallet() uses the same shell so the
+        //     onboarding state behaves identically.
         ?>
-        <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
-            <?php $this->render_transfer_to_own_wallet_form($wallet, $user_id, $matrix_balance, $currency); ?>
-        </section>
+        <div class="matrix-wallet-modal" id="matrix-wallet-modal" hidden role="dialog" aria-modal="true" aria-labelledby="matrix-wallet-modal-title">
+            <div class="matrix-wallet-modal-backdrop" data-modal-close="1"></div>
+            <div class="matrix-wallet-modal-dialog" role="document">
+                <button type="button" class="matrix-wallet-modal-close" data-modal-close="1" aria-label="<?php esc_attr_e('Close', 'matrix-mlm'); ?>">&times;</button>
+                <div class="matrix-wallet-modal-body">
+                    <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
+                        <?php $this->render_transfer_to_own_wallet_form($wallet, $user_id, $matrix_balance, $currency); ?>
+                    </section>
 
-        <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
-            <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
-        </section>
+                    <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
+                        <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
+                    </section>
 
-        <?php if ($payouts_enabled): ?>
-        <section class="matrix-wallet-pane" data-pane="bank" hidden>
-            <?php
-            // Embed the existing Bank Payout flow body (form + history +
-            // its own JS). $skip_header=true suppresses the legacy H2
-            // and subtitle so this page's own header is the only one
-            // visible. The bank-payout class still owns its bank list,
-            // account-resolver, charge preview, manual-override path,
-            // submit-status hint, and "Clear failed transactions"
-            // toolbar — none of which need to be re-implemented here.
-            //
-            // [hidden] by default, like the other two panes. The form
-            // only appears when the user clicks the "Transfer to Bank"
-            // action button above (see the click handler in
-            // render_scripts() — it removes [hidden] from the matching
-            // pane and adds .is-active to the matching button).
-            (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
-            ?>
-        </section>
-        <?php endif; ?>
+                    <?php if ($payouts_enabled): ?>
+                    <section class="matrix-wallet-pane" data-pane="bank" hidden>
+                        <?php
+                        // Embed the existing Bank Payout flow body
+                        // (form + history + its own JS). $skip_header=true
+                        // suppresses the legacy H2 and subtitle so this
+                        // page's own header is the only one visible.
+                        // The bank-payout class still owns its bank list,
+                        // account-resolver, charge preview, manual-override
+                        // path, submit-status hint, and "Clear failed
+                        // transactions" toolbar — none of which need to
+                        // be re-implemented here. The form is rendered
+                        // server-side regardless of which pane the user
+                        // ends up clicking, so its delegated handlers
+                        // are bound on first page load.
+                        (new Matrix_MLM_User_Bank_Payout())->render($user_id, true);
+                        ?>
+                    </section>
+                    <?php endif; ?>
 
-        <?php if ($zebra_enabled): ?>
-        <section class="matrix-wallet-pane" data-pane="zebra" hidden>
-            <?php
-            // Embed the Zebra Wallet payout flow (rail picker +
-            // form + history + its own JS). Self-contained:
-            // owns its bank dropdown, account resolver
-            // (delegated to the existing 3-leg
-            // matrix_fintava_resolve_account AJAX endpoint),
-            // PIN field render, submit-state gate, history
-            // table.
-            (new Matrix_MLM_User_Zebra_Payout())->render($user_id);
-            ?>
-        </section>
-        <?php endif; ?>
+                    <?php if ($zebra_enabled): ?>
+                    <section class="matrix-wallet-pane" data-pane="zebra" hidden>
+                        <?php
+                        // Embed the Zebra Wallet payout flow (rail
+                        // picker + form + history + its own JS).
+                        // Self-contained: owns its bank dropdown,
+                        // account resolver (delegated to the
+                        // existing 3-leg matrix_fintava_resolve_account
+                        // AJAX endpoint), PIN field render, submit-
+                        // state gate, history table.
+                        (new Matrix_MLM_User_Zebra_Payout())->render($user_id);
+                        ?>
+                    </section>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
         <?php
     }
 
@@ -659,33 +686,50 @@ class Matrix_MLM_User_Wallet {
     private function render_panes_no_wallet($user_id, $matrix_balance, $currency) {
         $user = get_userdata($user_id);
         $meta = Matrix_MLM_User::get_meta($user_id);
+        // Same modal shell as render_panes(). The three onboarding-
+        // state panes (own-wallet notice, wallet-to-wallet form,
+        // create-wallet form) live inside the dialog body unchanged.
+        // The "Create Virtual Wallet to Continue" CTA inside the
+        // own-wallet pane still triggers a click on the create-wallet
+        // action button — render_scripts_no_wallet()'s updated handler
+        // simply swaps which pane is visible inside the same already-
+        // open modal, so the user lands on the create form without
+        // a flicker.
         ?>
-        <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
-            <h3><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></h3>
+        <div class="matrix-wallet-modal" id="matrix-wallet-modal" hidden role="dialog" aria-modal="true" aria-labelledby="matrix-wallet-modal-title">
+            <div class="matrix-wallet-modal-backdrop" data-modal-close="1"></div>
+            <div class="matrix-wallet-modal-dialog" role="document">
+                <button type="button" class="matrix-wallet-modal-close" data-modal-close="1" aria-label="<?php esc_attr_e('Close', 'matrix-mlm'); ?>">&times;</button>
+                <div class="matrix-wallet-modal-body">
+                    <section class="matrix-wallet-pane" data-pane="own-wallet" hidden>
+                        <h3><?php esc_html_e('Transfer to Own Wallet', 'matrix-mlm'); ?></h3>
 
-            <div class="matrix-transfer-note">
-                <?php esc_html_e('To transfer funds from your Matrix wallet into your own Virtual account you first need to create a Fintava virtual wallet. It only takes a moment — once it is set up, this option will be enabled for you.', 'matrix-mlm'); ?>
+                        <div class="matrix-transfer-note">
+                            <?php esc_html_e('To transfer funds from your Matrix wallet into your own Virtual account you first need to create a Fintava virtual wallet. It only takes a moment — once it is set up, this option will be enabled for you.', 'matrix-mlm'); ?>
+                        </div>
+
+                        <div class="matrix-info-box">
+                            <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
+                            <p><strong><?php esc_html_e('Destination:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Your Virtual Account (not yet created)', 'matrix-mlm'); ?></p>
+                        </div>
+
+                        <button type="button"
+                                class="matrix-btn matrix-btn-primary matrix-btn-block"
+                                id="matrix-own-wallet-create-cta">
+                            <?php esc_html_e('Create Virtual Wallet to Continue', 'matrix-mlm'); ?>
+                        </button>
+                    </section>
+
+                    <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
+                        <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
+                    </section>
+
+                    <section class="matrix-wallet-pane" data-pane="create-wallet" hidden>
+                        <?php (new Matrix_MLM_User_Virtual_Wallet())->render_create_form($user, $meta); ?>
+                    </section>
+                </div>
             </div>
-
-            <div class="matrix-info-box">
-                <p><strong><?php esc_html_e('Source:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Matrix Wallet', 'matrix-mlm'); ?> &mdash; <?php echo esc_html($currency . number_format($matrix_balance, 2)); ?></p>
-                <p><strong><?php esc_html_e('Destination:', 'matrix-mlm'); ?></strong> <?php esc_html_e('Your Virtual Account (not yet created)', 'matrix-mlm'); ?></p>
-            </div>
-
-            <button type="button"
-                    class="matrix-btn matrix-btn-primary matrix-btn-block"
-                    id="matrix-own-wallet-create-cta">
-                <?php esc_html_e('Create Virtual Wallet to Continue', 'matrix-mlm'); ?>
-            </button>
-        </section>
-
-        <section class="matrix-wallet-pane" data-pane="user-wallet" hidden>
-            <?php $this->render_wallet_to_wallet_form($user_id, $matrix_balance, $currency); ?>
-        </section>
-
-        <section class="matrix-wallet-pane" data-pane="create-wallet" hidden>
-            <?php (new Matrix_MLM_User_Virtual_Wallet())->render_create_form($user, $meta); ?>
-        </section>
+        </div>
         <?php
     }
 
@@ -795,23 +839,62 @@ class Matrix_MLM_User_Wallet {
                 // beat any non-!important selector), and removing
                 // [hidden] keeps the HTML semantics aligned with the
                 // visual state.
-                $(document).on('click', '.matrix-wallet-action-btn', function() {
-                    var $btn    = $(this);
-                    var target  = $btn.attr('data-target');
-                    var $pane   = $('.matrix-wallet-pane[data-pane="' + target + '"]');
-                    var wasOpen = $btn.hasClass('is-active');
+                // Action button → modal pane. Same contract as the
+                // wallet-exists handler in render_scripts(): clicking
+                // a .matrix-wallet-action-btn reveals the
+                // #matrix-wallet-modal overlay and shows the matching
+                // .matrix-wallet-pane[data-pane="X"] inside it. Dismiss
+                // is via the X button, the backdrop, or ESC. The
+                // "Create Virtual Wallet to Continue" CTA below
+                // re-enters this handler with target=create-wallet,
+                // which simply swaps which pane is visible inside
+                // the already-open modal — no flicker, no
+                // re-animation.
+                function matrixWalletOpenModal(target) {
+                    var $modal = $('#matrix-wallet-modal');
+                    if (!$modal.length) { return; }
+                    var $pane = $modal.find('.matrix-wallet-pane[data-pane="' + target + '"]');
+                    if (!$pane.length) { return; }
 
-                    $('.matrix-wallet-action-btn').removeClass('is-active');
-                    $('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                    $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                    $pane.removeAttr('hidden').css('display', '');
 
-                    if (!wasOpen) {
-                        $btn.addClass('is-active');
-                        $pane.removeAttr('hidden').css('display', '');
-                        if (window.innerWidth < 900) {
-                            var top = $pane.offset().top - 20;
-                            $('html, body').animate({ scrollTop: top }, 250);
-                        }
+                    $modal.removeAttr('hidden');
+                    $('body').addClass('matrix-modal-open');
+                    $modal.find('.matrix-wallet-modal-body').scrollTop(0);
+
+                    var focusTarget = $pane.find('input, select, textarea, button').not('[disabled]').first();
+                    if (!focusTarget.length) {
+                        focusTarget = $modal.find('.matrix-wallet-modal-close');
                     }
+                    setTimeout(function() { focusTarget.trigger('focus'); }, 30);
+                }
+                window.matrixWalletOpenModal = matrixWalletOpenModal;
+
+                function matrixWalletCloseModal() {
+                    var $modal = $('#matrix-wallet-modal');
+                    if (!$modal.length) { return; }
+                    $modal.attr('hidden', 'hidden');
+                    $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                    $('body').removeClass('matrix-modal-open');
+                }
+                window.matrixWalletCloseModal = matrixWalletCloseModal;
+
+                $(document).on('click', '.matrix-wallet-action-btn', function() {
+                    var target = $(this).attr('data-target');
+                    if (!target) { return; }
+                    matrixWalletOpenModal(target);
+                });
+
+                $(document).on('click', '#matrix-wallet-modal [data-modal-close]', function(e) {
+                    if (e.currentTarget !== e.target) { return; }
+                    matrixWalletCloseModal();
+                });
+
+                $(document).on('keydown.matrixWalletModal', function(e) {
+                    if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
+                    if ($('#matrix-wallet-modal').is('[hidden]')) { return; }
+                    matrixWalletCloseModal();
                 });
 
                 // "Create Virtual Wallet to Continue" CTA inside the
@@ -1654,14 +1737,122 @@ class Matrix_MLM_User_Wallet {
         }
 
         .matrix-wallet-pane {
-            background: #f9fafb;
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 24px;
+            /* Inside the modal dialog the pane no longer needs its own
+               card chrome — the dialog itself is the card. We keep the
+               original ruleset selector so any descendant styles that
+               assumed `.matrix-wallet-pane h3:first-child { margin-top:0 }`
+               (and similar) still match, but drop the outer
+               background / border / radius / padding so the form sits
+               flush against the dialog body's own padding. */
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            padding: 0;
+            margin-bottom: 0;
         }
         .matrix-wallet-pane[hidden] { display: none; }
         .matrix-wallet-pane h3:first-child { margin-top: 0; }
+
+        /* -----------------------------------------------------------
+           Modal overlay
+           -----------------------------------------------------------
+           A single full-viewport overlay that contains every transfer
+           pane (own-wallet, user-wallet, bank, zebra in the wallet-
+           exists state; own-wallet, user-wallet, create-wallet in the
+           onboarding state). The pane sections inside still toggle
+           via [hidden] just like the old inline pattern — the modal
+           wrapper itself only controls overall visibility, the
+           backdrop, and the dismiss affordances.
+
+           Implementation notes:
+           - z-index 9998/9999: high enough to clear typical theme
+             headers and admin bars without colliding with WordPress
+             core's own toolbar (32xxx) — the toolbar stays usable on
+             top of the dim overlay if it happens to be visible.
+           - The dialog uses max-height: calc(100vh - 40px) plus
+             overflow-y: auto on .matrix-wallet-modal-body so the
+             embedded bank-payout / zebra-payout forms (which include
+             their own history tables) stay scrollable inside the
+             modal even on short viewports. The dialog frame itself
+             stays fixed so the close button never scrolls away.
+           - body.matrix-modal-open is added by the JS handler and
+             pinned to overflow:hidden so the page underneath doesn't
+             scroll while the modal is open — same pattern WP's own
+             media modal uses.
+           - @media (max-width: 640px): the dialog goes full-width
+             with reduced corner-radius so it reads as a sheet rather
+             than a tiny floating card on phones. Existing form
+             markup already adapts (the wallet-exists transfer forms
+             use a single-column layout below 900px). */
+        .matrix-wallet-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 9998;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 40px 20px;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        .matrix-wallet-modal[hidden] { display: none; }
+        .matrix-wallet-modal-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            backdrop-filter: blur(2px);
+            -webkit-backdrop-filter: blur(2px);
+            z-index: 1;
+            cursor: pointer;
+        }
+        .matrix-wallet-modal-dialog {
+            position: relative;
+            z-index: 2;
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 20px 50px -10px rgba(0, 0, 0, 0.45);
+            width: 100%;
+            max-width: 640px;
+            max-height: calc(100vh - 80px);
+            display: flex;
+            flex-direction: column;
+            animation: matrixWalletModalIn 180ms ease-out;
+        }
+        @keyframes matrixWalletModalIn {
+            from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .matrix-wallet-modal-close {
+            position: absolute;
+            top: 8px;
+            right: 12px;
+            background: transparent;
+            border: 0;
+            font-size: 28px;
+            line-height: 1;
+            color: #6b7280;
+            cursor: pointer;
+            padding: 6px 10px;
+            border-radius: 6px;
+            z-index: 3;
+        }
+        .matrix-wallet-modal-close:hover { background: #f3f4f6; color: #111827; }
+        .matrix-wallet-modal-close:focus { outline: 2px solid #4f46e5; outline-offset: 2px; }
+        .matrix-wallet-modal-body {
+            padding: 32px 28px 28px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        body.matrix-modal-open { overflow: hidden; }
+        @media (max-width: 640px) {
+            .matrix-wallet-modal { padding: 0; align-items: stretch; }
+            .matrix-wallet-modal-dialog {
+                max-width: 100%;
+                max-height: 100vh;
+                border-radius: 0;
+            }
+            .matrix-wallet-modal-body { padding: 28px 18px 22px; }
+        }
 
         /* Transaction History is rendered as an always-visible
            top-level section, not a pane. It needs breathing room
@@ -1794,34 +1985,109 @@ class Matrix_MLM_User_Wallet {
             // which is why a refresh hid the bug. Same fix is already
             // applied in render_scripts_no_wallet() above.
             // -----------------------------------------------------------
-            $(document).on('click', '.matrix-wallet-action-btn', function() {
-                var $btn    = $(this);
-                // Use attr('data-target') (NOT .data('target')) so a
-                // cached value from an earlier render — e.g. when
-                // a theme/optimizer reuses the same DOM nodes after
-                // a navigation swap — never wins over the current
-                // attribute on the clicked element.
-                var target  = $btn.attr('data-target');
-                var $pane   = $('.matrix-wallet-pane[data-pane="' + target + '"]');
-                var wasOpen = $btn.hasClass('is-active');
+            // -----------------------------------------------------------
+            // Action button → modal pane.
+            //
+            // Click reveals the #matrix-wallet-modal overlay and shows
+            // exactly one .matrix-wallet-pane[data-pane="X"] section
+            // inside it (matched against the button's data-target).
+            // The modal stays open until the user dismisses it via:
+            //   - the × close button (data-modal-close)
+            //   - clicking the dim backdrop (data-modal-close)
+            //   - pressing ESC
+            //   - inside-modal navigation (e.g. the no-wallet
+            //     "Create Virtual Wallet to Continue" CTA, which
+            //     simulates a click on the create-wallet action
+            //     button — that re-enters this handler and just
+            //     swaps which pane is visible, leaving the modal
+            //     open)
+            //
+            // Why event delegation on document and attr() rather than
+            // .data() — same rationale as the previous inline-pane
+            // handler: handlers must survive late-arriving DOM and
+            // jQuery's data-cache, since the buttons can re-render
+            // mid-session if a pane action triggers a partial refresh.
+            //
+            // What's intentionally gone vs the previous version:
+            //   - .is-active toggle on the action buttons. With a
+            //     modal, "which transfer is open" is communicated by
+            //     the dialog title bar / form heading, not by a
+            //     persistent highlight on the button row underneath.
+            //   - The "click again to close" wasOpen behaviour. A
+            //     click always opens; close is via the dismiss
+            //     affordances above.
+            //   - The mobile scroll-into-view animate(). Modals are
+            //     position:fixed so the button position underneath
+            //     doesn't matter.
+            // -----------------------------------------------------------
+            function matrixWalletOpenModal(target) {
+                var $modal = $('#matrix-wallet-modal');
+                if (!$modal.length) { return; }
+                var $pane = $modal.find('.matrix-wallet-pane[data-pane="' + target + '"]');
+                if (!$pane.length) { return; }
 
-                $('.matrix-wallet-action-btn').removeClass('is-active');
-                // Belt-and-braces: set both [hidden] AND inline
-                // display:none so themes that ship a competing
-                // `section { display: block !important }` rule can't
-                // leave the pane visible. Mirrors render_scripts_no_wallet().
-                $('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                // Hide every pane, then reveal only the target. Belt
+                // and braces with both [hidden] and inline display:
+                // some themes ship `section { display: block !important }`
+                // which beats the [hidden] attribute on its own.
+                $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                $pane.removeAttr('hidden').css('display', '');
 
-                if (!wasOpen) {
-                    $btn.addClass('is-active');
-                    $pane.removeAttr('hidden').css('display', '');
-                    // Smooth-scroll the pane into view on small screens
-                    // where the form might otherwise sit below the fold.
-                    if (window.innerWidth < 900) {
-                        var top = $pane.offset().top - 20;
-                        $('html, body').animate({ scrollTop: top }, 250);
-                    }
+                // Reveal the modal itself and lock body scroll. We
+                // also reset the body's scroll position to the top of
+                // the modal so re-opening lands the user at the form
+                // header even if they had scrolled inside an embedded
+                // history table during a previous session.
+                $modal.removeAttr('hidden');
+                $('body').addClass('matrix-modal-open');
+                $modal.find('.matrix-wallet-modal-body').scrollTop(0);
+
+                // Move keyboard focus inside the dialog so screen
+                // readers (and tab order) follow the popup. Prefer
+                // the first focusable form input within the active
+                // pane; fall back to the close button.
+                var focusTarget = $pane.find('input, select, textarea, button').not('[disabled]').first();
+                if (!focusTarget.length) {
+                    focusTarget = $modal.find('.matrix-wallet-modal-close');
                 }
+                // Use a microtask delay so the animation start frame
+                // is committed before focus moves (prevents the focus
+                // ring flashing in a half-rendered dialog).
+                setTimeout(function() { focusTarget.trigger('focus'); }, 30);
+            }
+            window.matrixWalletOpenModal = matrixWalletOpenModal;
+
+            function matrixWalletCloseModal() {
+                var $modal = $('#matrix-wallet-modal');
+                if (!$modal.length) { return; }
+                $modal.attr('hidden', 'hidden');
+                $modal.find('.matrix-wallet-pane').attr('hidden', 'hidden').css('display', 'none');
+                $('body').removeClass('matrix-modal-open');
+            }
+            window.matrixWalletCloseModal = matrixWalletCloseModal;
+
+            $(document).on('click', '.matrix-wallet-action-btn', function() {
+                var target = $(this).attr('data-target');
+                if (!target) { return; }
+                matrixWalletOpenModal(target);
+            });
+
+            // Backdrop + close button. Both carry data-modal-close="1"
+            // so a single delegated handler dismisses either one. We
+            // bail out on clicks that bubble up from inside the
+            // dialog body (e.g. tabbing through a form field) by
+            // checking the click target carries the attribute itself.
+            $(document).on('click', '#matrix-wallet-modal [data-modal-close]', function(e) {
+                if (e.currentTarget !== e.target) { return; }
+                matrixWalletCloseModal();
+            });
+
+            // ESC dismiss. Bound on document so it works regardless
+            // of which element inside the modal currently has focus.
+            $(document).on('keydown.matrixWalletModal', function(e) {
+                if (e.key !== 'Escape' && e.keyCode !== 27) { return; }
+                if ($('#matrix-wallet-modal').is('[hidden]')) { return; }
+                matrixWalletCloseModal();
             });
 
             // -----------------------------------------------------------
