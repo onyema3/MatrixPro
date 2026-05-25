@@ -80,6 +80,35 @@ class Matrix_MLM_Wallet {
 
         $table = $wpdb->prefix . 'matrix_user_meta';
 
+        // Atomicity model (audit L4):
+        //
+        // The balance UPSERT and the post-balance read are wrapped in
+        // a short InnoDB transaction so the auditor row's
+        // post_balance reflects exactly the value persisted by THIS
+        // call, not some later state mutated by a concurrent
+        // credit/debit between our UPDATE and our read. The UPSERT
+        // takes an exclusive row lock on (user_id) which is held
+        // until COMMIT, so the SELECT inside the same transaction
+        // sees our own write (read-your-writes) and no other
+        // connection can interleave.
+        //
+        // The audit-row INSERT is intentionally OUTSIDE the
+        // transaction — it preserves the existing semantics where a
+        // failed audit insert returns false but does not roll back
+        // the balance change (the caller's docblock contract: "if we
+        // can't write the matrix_wallet row, we don't have a way to
+        // reconcile this movement later" — same callers, same
+        // behavior, just an atomic read for the value we record).
+        //
+        // Constraint: no caller in this plugin wraps credit() in its
+        // own START TRANSACTION (verified at the time of writing).
+        // If a future caller does, our START TRANSACTION here will
+        // implicitly commit theirs in MySQL — at which point the
+        // safer fix is for that caller to switch to a SAVEPOINT
+        // around the credit() call.
+
+        $wpdb->query('START TRANSACTION');
+
         // Atomic UPSERT. INSERT a new row at the credit amount if the
         // user has no matrix_user_meta row yet; otherwise add the
         // amount to the existing balance. INSERT...ON DUPLICATE KEY
@@ -100,6 +129,7 @@ class Matrix_MLM_Wallet {
             $user_id, $amount
         ));
         if ($result === false) {
+            $wpdb->query('ROLLBACK');
             error_log(sprintf(
                 '[Matrix MLM] credit() UPSERT failed: user_id=%d, amount=%s, last_error=%s',
                 $user_id, $amount, $wpdb->last_error
@@ -107,11 +137,29 @@ class Matrix_MLM_Wallet {
             return false;
         }
 
-        // Read back the persisted balance for the auditor row so
-        // post_balance reflects exactly what landed on disk
-        // (DECIMAL(12,2) precision, not a PHP-float round of the
-        // pre-credit balance + amount).
-        $new_balance = $this->get_balance($user_id);
+        // Read back the persisted balance INSIDE the transaction.
+        // The UPSERT above holds an X-lock on this row until COMMIT,
+        // so the SELECT sees our own write and no concurrent
+        // credit/debit can interleave.
+        $new_balance_raw = $wpdb->get_var($wpdb->prepare(
+            "SELECT balance FROM $table WHERE user_id = %d",
+            $user_id
+        ));
+
+        $committed = $wpdb->query('COMMIT');
+        if ($committed === false) {
+            // COMMIT failures are rare (lock timeout, connection
+            // interruption, etc.) and MySQL rolls the transaction
+            // back automatically, so treat this as a balance-update
+            // failure and surface it to the caller.
+            error_log(sprintf(
+                '[Matrix MLM] credit() COMMIT failed: user_id=%d, amount=%s, last_error=%s',
+                $user_id, $amount, $wpdb->last_error
+            ));
+            return false;
+        }
+
+        $new_balance = (float) $new_balance_raw;
 
         // Auditor row. Treated as required: if we can't write the
         // matrix_wallet row, we don't have a way to reconcile this
@@ -173,6 +221,14 @@ class Matrix_MLM_Wallet {
 
         $table = $wpdb->prefix . 'matrix_user_meta';
 
+        // Wrap the conditional UPDATE and the post-balance read in a
+        // single InnoDB transaction so the auditor row's post_balance
+        // reflects the exact value persisted by THIS call. See the
+        // matching block in credit() for the full atomicity model
+        // (audit L4); same constraints apply (no caller wraps debit()
+        // in its own transaction at the time of writing).
+        $wpdb->query('START TRANSACTION');
+
         // Atomic conditional UPDATE. The `AND balance >= %f` clause
         // means insufficient-balance is a single-statement decision,
         // not a separate read-then-decide step that a concurrent
@@ -182,6 +238,7 @@ class Matrix_MLM_Wallet {
             $amount, $user_id, $amount
         ));
         if ($result === false) {
+            $wpdb->query('ROLLBACK');
             error_log(sprintf(
                 '[Matrix MLM] debit() UPDATE failed: user_id=%d, amount=%s, last_error=%s',
                 $user_id, $amount, $wpdb->last_error
@@ -192,6 +249,7 @@ class Matrix_MLM_Wallet {
             // Either no matrix_user_meta row for this user, or the
             // balance was insufficient. Either way the debit didn't
             // land, and the caller must surface the failure.
+            $wpdb->query('ROLLBACK');
             error_log(sprintf(
                 '[Matrix MLM] debit() affected zero rows (no row OR insufficient balance): user_id=%d, amount=%s',
                 $user_id, $amount
@@ -199,8 +257,29 @@ class Matrix_MLM_Wallet {
             return false;
         }
 
-        // Read back the persisted balance for the auditor row.
-        $new_balance = $this->get_balance($user_id);
+        // Read back the persisted balance INSIDE the transaction.
+        // The UPDATE above holds an X-lock on this row until COMMIT,
+        // so the SELECT sees our own write and no concurrent
+        // credit/debit can interleave.
+        $new_balance_raw = $wpdb->get_var($wpdb->prepare(
+            "SELECT balance FROM $table WHERE user_id = %d",
+            $user_id
+        ));
+
+        $committed = $wpdb->query('COMMIT');
+        if ($committed === false) {
+            // COMMIT failures are rare (lock timeout, connection
+            // interruption, etc.) and MySQL rolls the transaction
+            // back automatically, so treat this as a balance-update
+            // failure and surface it to the caller.
+            error_log(sprintf(
+                '[Matrix MLM] debit() COMMIT failed: user_id=%d, amount=%s, last_error=%s',
+                $user_id, $amount, $wpdb->last_error
+            ));
+            return false;
+        }
+
+        $new_balance = (float) $new_balance_raw;
 
         // Auditor row for the debit. transaction_type coerced to ''
         // on null for the same reason as the credit() insert above —
