@@ -118,6 +118,104 @@ class Matrix_MLM_User_Card {
            of the page is still allowed; only the unmasked-on-screen
            PAN/CVV panel is removed. */
         @media print { .matrix-cd-card { display: none !important; } }
+
+        /* -----------------------------------------------------------
+           PAN-entry modal (Activate / Reactivate / Freeze)
+           -----------------------------------------------------------
+           Promoted from inline-revealed div to a centered modal
+           overlay so the activation flow has the user's full
+           attention on click. The dialog wraps #matrix-card-pan-form
+           verbatim so its existing IDs (form fields, title, desc,
+           hidden action input) and the matrixSubmitCardPan handler
+           keep working unchanged. Visibility is driven from
+           matrixCardOpenPanForm() / matrixHideCardPanForm() —
+           toggling style.display on #matrix-card-modal — which means
+           the historical contract of those two functions ("show /
+           hide the PAN form") is preserved; only what they actually
+           reveal changes from inline-div to centered-dialog.
+
+           z-index 9998/9999 follows the same convention as the
+           wallet modal: high enough to clear typical theme headers
+           and admin bars but below WP's own toolbar. body.matrix-
+           card-modal-open locks page scroll while the modal is up. */
+        .matrix-card-modal {
+            position: fixed;
+            inset: 0;
+            z-index: 9998;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 60px 20px 20px;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+        .matrix-card-modal-backdrop {
+            position: absolute;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            backdrop-filter: blur(2px);
+            -webkit-backdrop-filter: blur(2px);
+            z-index: 1;
+            cursor: pointer;
+        }
+        .matrix-card-modal-dialog {
+            position: relative;
+            z-index: 2;
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 20px 50px -10px rgba(0, 0, 0, 0.45);
+            width: 100%;
+            max-width: 480px;
+            max-height: calc(100vh - 100px);
+            display: flex;
+            flex-direction: column;
+            animation: matrixCardModalIn 180ms ease-out;
+        }
+        @keyframes matrixCardModalIn {
+            from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .matrix-card-modal-close {
+            position: absolute;
+            top: 8px;
+            right: 12px;
+            background: transparent;
+            border: 0;
+            font-size: 28px;
+            line-height: 1;
+            color: #6b7280;
+            cursor: pointer;
+            padding: 6px 10px;
+            border-radius: 6px;
+            z-index: 3;
+        }
+        .matrix-card-modal-close:hover { background: #f3f4f6; color: #111827; }
+        .matrix-card-modal-close:focus { outline: 2px solid #4f46e5; outline-offset: 2px; }
+        .matrix-card-modal-body {
+            padding: 28px 24px 22px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        /* The inner #matrix-card-pan-form keeps its own .matrix-form-card
+           styling, but inside the dialog it doesn't need its own
+           background/border — the dialog itself is the card. */
+        .matrix-card-modal-body #matrix-card-pan-form {
+            background: transparent;
+            border: 0;
+            box-shadow: none;
+            padding: 0;
+            margin: 0;
+        }
+        body.matrix-card-modal-open { overflow: hidden; }
+        @media (max-width: 640px) {
+            .matrix-card-modal { padding: 0; align-items: stretch; }
+            .matrix-card-modal-dialog {
+                max-width: 100%;
+                max-height: 100vh;
+                border-radius: 0;
+            }
+            .matrix-card-modal-body { padding: 26px 18px 18px; }
+        }
         </style>
         <?php
     }
@@ -247,25 +345,44 @@ class Matrix_MLM_User_Card {
         </div>
 
         <!--
-            PAN-entry form. Re-used for setup (link+activate), activate-only,
-            and deactivate. The action is set via matrixCardOpenPanForm()
-            and decides which AJAX endpoint and confirm copy is used. The
-            PAN itself is forwarded to Fintava and never persisted locally
-            — only the last four digits, which the server derives from the
-            entered PAN on success.
+            PAN-entry form, presented as a modal popover. Re-used for
+            setup (link+activate), activate-only, and deactivate. The
+            action is set via matrixCardOpenPanForm() and decides
+            which AJAX endpoint and confirm copy is used. The PAN
+            itself is forwarded to Fintava and never persisted locally
+            — only the last four digits, which the server derives
+            from the entered PAN on success.
+
+            Wrapping in #matrix-card-modal: the form was previously
+            an inline-revealed div above the page footer. Promoting
+            it to a modal overlay keeps the activation flow front-
+            and-centre on click, dims the page underneath so the
+            user's attention stays on the PAN input, and gives them
+            three explicit dismiss paths (the × button, the dim
+            backdrop, ESC). The form ID and field markup are
+            unchanged so matrixSubmitCardPan keeps wiring up to the
+            same selectors.
         -->
-        <div id="matrix-card-pan-form" style="display:none;" class="matrix-form-card matrix-pan-form">
-            <h3 id="matrix-card-pan-form-title"><?php _e('Enter Card PAN', 'matrix-mlm'); ?></h3>
-            <p id="matrix-card-pan-form-desc" style="color: #6b7280;"><?php _e('Type the 16-digit number printed on the front of your physical card.', 'matrix-mlm'); ?></p>
-            <form class="matrix-form" onsubmit="matrixSubmitCardPan(event)">
-                <input type="hidden" name="card_action" value="">
-                <div class="matrix-form-group">
-                    <label><?php _e('Card Number (PAN)', 'matrix-mlm'); ?></label>
-                    <input type="text" name="pan" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="0000 0000 0000 0000" required>
+        <div id="matrix-card-modal" class="matrix-card-modal" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="matrix-card-pan-form-title">
+            <div class="matrix-card-modal-backdrop" data-card-modal-close="1"></div>
+            <div class="matrix-card-modal-dialog" role="document">
+                <button type="button" class="matrix-card-modal-close" data-card-modal-close="1" aria-label="<?php esc_attr_e('Close', 'matrix-mlm'); ?>">&times;</button>
+                <div class="matrix-card-modal-body">
+                    <div id="matrix-card-pan-form" class="matrix-form-card matrix-pan-form">
+                        <h3 id="matrix-card-pan-form-title"><?php _e('Enter Card PAN', 'matrix-mlm'); ?></h3>
+                        <p id="matrix-card-pan-form-desc" style="color: #6b7280;"><?php _e('Type the 16-digit number printed on the front of your physical card.', 'matrix-mlm'); ?></p>
+                        <form class="matrix-form" onsubmit="matrixSubmitCardPan(event)">
+                            <input type="hidden" name="card_action" value="">
+                            <div class="matrix-form-group">
+                                <label><?php _e('Card Number (PAN)', 'matrix-mlm'); ?></label>
+                                <input type="text" name="pan" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="0000 0000 0000 0000" required>
+                            </div>
+                            <button type="submit" class="matrix-btn matrix-btn-primary"><?php _e('Continue', 'matrix-mlm'); ?></button>
+                            <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixHideCardPanForm()"><?php _e('Cancel', 'matrix-mlm'); ?></button>
+                        </form>
+                    </div>
                 </div>
-                <button type="submit" class="matrix-btn matrix-btn-primary"><?php _e('Continue', 'matrix-mlm'); ?></button>
-                <button type="button" class="matrix-btn matrix-btn-secondary" onclick="matrixHideCardPanForm()"><?php _e('Cancel', 'matrix-mlm'); ?></button>
-            </form>
+            </div>
         </div>
 
         <!-- Card details panel, populated by /cards/fetch/{cardMapId} -->
@@ -370,6 +487,15 @@ class Matrix_MLM_User_Card {
             // pattern the rest of the dashboard uses (see
             // matrixViewCardDetails) and it's robust to that class of
             // failure.
+            //
+            // Promoted from inline-revealed div to a centered modal:
+            // matrixCardOpenPanForm() now reveals #matrix-card-modal
+            // (the wrapper) and the inner #matrix-card-pan-form sits
+            // inside it unchanged. The two functions still own the
+            // "show/hide PAN form" contract — only what they reveal
+            // changes from inline-div to modal-overlay. matrixSubmit
+            // CardPan keeps reading from #matrix-card-pan-form
+            // selectors so the AJAX submit path is untouched.
             window.matrixCardOpenPanForm = function(target) {
                 var cfg = ACTIONS[target];
                 if (!cfg) return;
@@ -377,13 +503,47 @@ class Matrix_MLM_User_Card {
                 $('#matrix-card-pan-form-desc').text(cfg.desc);
                 $('#matrix-card-pan-form [name="card_action"]').val(cfg.action);
                 $('#matrix-card-pan-form [name="pan"]').val('');
-                $('#matrix-card-pan-form').show();
-                $('#matrix-card-pan-form [name="pan"]').focus();
+                // Surface the modal wrapper itself; the inner
+                // pan-form is no longer toggled directly. body
+                // class locks page scroll while the modal is open.
+                $('#matrix-card-modal').css('display', 'flex');
+                $('body').addClass('matrix-card-modal-open');
+                // Microtask delay so the slide-in animation has its
+                // first frame committed before focus moves — same
+                // rationale as matrixWalletOpenModal in the wallet
+                // page. Without it, the focus ring can flash in a
+                // half-rendered dialog on slower devices.
+                setTimeout(function() {
+                    $('#matrix-card-pan-form [name="pan"]').trigger('focus');
+                }, 30);
             };
 
             window.matrixHideCardPanForm = function() {
-                $('#matrix-card-pan-form').hide();
+                $('#matrix-card-modal').css('display', 'none');
+                $('body').removeClass('matrix-card-modal-open');
             };
+
+            // Backdrop + close button. Both carry data-card-modal-close
+            // so a single delegated handler dismisses either one. The
+            // currentTarget === target guard prevents bubbled clicks
+            // from inside the dialog body from leaking through (e.g.
+            // a click on a label that bubbles up to a parent — none
+            // exist with the attribute today, but the guard is cheap
+            // insurance against a future refactor).
+            $(document).on('click', '#matrix-card-modal [data-card-modal-close]', function(e) {
+                if (e.currentTarget !== e.target) return;
+                window.matrixHideCardPanForm();
+            });
+
+            // ESC dismiss. Bound on document so it works regardless
+            // of which input inside the modal currently has focus.
+            // Namespaced so we can selectively unbind in the future
+            // without touching other keydown listeners on document.
+            $(document).on('keydown.matrixCardModal', function(e) {
+                if (e.key !== 'Escape' && e.keyCode !== 27) return;
+                if ($('#matrix-card-modal').css('display') === 'none') return;
+                window.matrixHideCardPanForm();
+            });
 
             window.matrixSubmitCardPan = function(e) {
                 e.preventDefault();
