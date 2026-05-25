@@ -1181,9 +1181,57 @@ class Matrix_MLM_Transaction_Pin {
      *
      * Returned as an object with the column names so callers can
      * dot-access. Returns null if the user has no meta row at all.
+     *
+     * Schema-drift defence (added in response to the production
+     * "PIN status says Not set after I just set it" report):
+     *
+     * The lazy ALTER block in Matrix_MLM_Database::maybe_upgrade
+     * adds the five 1.0.13 sibling columns (set_at, last_used_at,
+     * history, failed_attempts, locked_until) on existing installs
+     * that pre-date the column. dbDelta in create_tables() also
+     * defines them, so the steady state is "all six columns
+     * exist". But there's a known failure mode: an install that
+     * stamped matrix_mlm_db_version='1.0.13' before the lazy
+     * ALTERs landed would skip the slow path of maybe_upgrade
+     * forever (fast-path early-return on stamp match), leaving
+     * the schema in a partial state.
+     *
+     * On a partial-schema install, the full six-column SELECT
+     * raises MySQL "Unknown column" errors, $wpdb->get_row
+     * returns null, and is_set() returned false even when the
+     * underlying transaction_pin_hash column DID hold a fresh
+     * bcrypt digest. The user-visible symptom: the dashboard
+     * banner won't go away after Set PIN, the Security tab
+     * shows "Not set", and gated transactions silently bypass
+     * the gate (because is_set() lying about the PIN being
+     * unset feeds into should_gate() and verify_request()).
+     *
+     * Defence: try the full SELECT first; on "Unknown column"
+     * specifically, fall back to a single-column SELECT of just
+     * transaction_pin_hash and synthesise the missing fields as
+     * their schema defaults (NULL for the timestamps and JSON
+     * column, 0 for the integer counter). is_set() then returns
+     * the right answer regardless of schema drift, and the
+     * other accessors (is_locked, set_at, last_used_at) degrade
+     * to "not locked / unknown" rather than fatal-erroring.
+     *
+     * The DB_VERSION bump in matrix-mlm.php (1.0.13 → 1.0.14)
+     * paired with this change forces maybe_upgrade to re-run
+     * the idempotent lazy ALTERs on every existing install, so
+     * the schema heals on the next plugin load and the
+     * steady-state full SELECT resumes. The fallback then
+     * becomes inert.
      */
     private static function fetch_meta($user_id) {
         global $wpdb;
+
+        // Suppress the wpdb error trigger only for the duration
+        // of this probe — a real SQL error elsewhere in the
+        // request should still surface normally. Capture the
+        // last_error string so we can distinguish "no meta row"
+        // (a benign empty result) from "Unknown column" (the
+        // schema-drift signal).
+        $prev_suppress = $wpdb->suppress_errors(true);
         $row = $wpdb->get_row($wpdb->prepare(
             "SELECT
                 transaction_pin_hash,
@@ -1196,7 +1244,59 @@ class Matrix_MLM_Transaction_Pin {
              WHERE user_id = %d",
             (int) $user_id
         ));
-        return $row ?: null;
+        $err = (string) $wpdb->last_error;
+        $wpdb->suppress_errors($prev_suppress);
+
+        if ($row !== null) {
+            return $row;
+        }
+
+        // Distinguish "no row for this user" (the normal
+        // pre-registration case — return null and let callers
+        // treat the user as un-enrolled) from "schema drift on
+        // this install" (the bug we're patching — fall back to
+        // a focused read so is_set() answers correctly).
+        if (stripos($err, 'unknown column') === false) {
+            return null;
+        }
+
+        $hash_row = $wpdb->get_row($wpdb->prepare(
+            "SELECT transaction_pin_hash
+             FROM {$wpdb->prefix}matrix_user_meta
+             WHERE user_id = %d",
+            (int) $user_id
+        ));
+        if ($hash_row === null) {
+            return null;
+        }
+
+        // Synthesise the missing fields as their schema defaults
+        // so callers don't blow up on dot-access. is_set() reads
+        // only transaction_pin_hash and ignores everything else,
+        // so it gets the right answer. is_locked() / lockout_info
+        // / set_at / last_used_at all check the relevant column
+        // for empty/null and degrade to "not locked / unknown" —
+        // the same behaviour they would have shown on a fresh
+        // install with no PIN history yet.
+        $hash_row->transaction_pin_set_at           = null;
+        $hash_row->transaction_pin_last_used_at     = null;
+        $hash_row->transaction_pin_history          = null;
+        $hash_row->transaction_pin_failed_attempts  = 0;
+        $hash_row->transaction_pin_locked_until     = null;
+
+        // Cheap audit-log breadcrumb so an operator triaging
+        // "why is the dashboard banner stuck on for half my
+        // users" finds the right culprit (partial schema) rather
+        // than chasing PHP / cache plugin red herrings. Logged
+        // at WARN-level severity via error_log because the
+        // condition is recoverable (the maybe_upgrade re-run
+        // heals it on the next load) but NOT silently fine.
+        error_log(sprintf(
+            '[Matrix PIN] schema-drift fallback active for user_id=%d on matrix_user_meta — re-run plugin activation or wait for next maybe_upgrade pass to add missing columns.',
+            (int) $user_id
+        ));
+
+        return $hash_row;
     }
 
     /**

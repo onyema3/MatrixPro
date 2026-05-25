@@ -273,6 +273,34 @@ class Matrix_MLM_Database {
         // / no-reuse, set/used timestamps, forgot-PIN flow). Same
         // lazy-migration idiom as transaction_pin_hash above.
         //
+        // 1.0.14 forces a re-run of this same idempotent block.
+        // Production-reported schema-drift case: an install that
+        // stamped matrix_mlm_db_version='1.0.13' before the lazy
+        // ALTERs landed (or where one of the ALTERs failed
+        // silently due to a transient permission error) skipped
+        // the slow path of maybe_upgrade forever via the fast-
+        // path early-return. The result was a partial schema
+        // (transaction_pin_hash present, some sibling columns
+        // missing) and Matrix_MLM_Transaction_Pin::fetch_meta's
+        // six-column SELECT raised "Unknown column" errors
+        // every time, making is_set() return false even for
+        // users who had just successfully written a hash. The
+        // user-visible symptom was the dashboard enrolment
+        // banner refusing to dismiss after Set PIN, the Security
+        // tab status stuck on "Not set", and gated transactions
+        // silently bypassing the gate. Bumping DB_VERSION here
+        // forces every existing install to enter the slow path
+        // exactly once on next plugin load; the column-existence
+        // probes below skip already-added columns and add the
+        // missing ones, healing the schema. Paired with the
+        // schema-drift fallback in fetch_meta(), the bug is
+        // closed both retroactively (existing affected users
+        // see correct status the moment the page reloads after
+        // the migration runs) and going forward (any future
+        // partial-migration scenario degrades to "PIN
+        // present-or-not is correct, sibling features
+        // gracefully reduced" instead of total feature breakage).
+        //
         //   - transaction_pin_set_at        : DATETIME — written
         //         on every set/change, surfaced on the dashboard's
         //         Security tab as "PIN set on …" so users can spot
