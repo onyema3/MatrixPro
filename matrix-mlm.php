@@ -166,6 +166,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-epin.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-transfer.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-tickets.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-bank-payout.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-zebra-payout.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-virtual-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-card.php';

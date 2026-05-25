@@ -78,6 +78,16 @@ class Matrix_MLM_Core {
         // run-time bootstraps above.
         Matrix_MLM_In_App_Notifications::register_hooks();
 
+        // Register the Zebra Wallet user-facing payout AJAX hook.
+        // Static so we don't pay the cost of constructing the
+        // gateway just to register a single endpoint — the
+        // instance gets built lazily inside the handler. Mirrors
+        // the deposit / OTP flow's lazy-construct pattern in
+        // Matrix_MLM_Core::process_zebra_complete_otp.
+        if (class_exists('Matrix_MLM_Zebra')) {
+            Matrix_MLM_Zebra::register_user_payout_hooks();
+        }
+
         // Initialize monthly subscription
         new Matrix_MLM_Subscription();
 
