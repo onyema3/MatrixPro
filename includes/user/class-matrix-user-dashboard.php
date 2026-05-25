@@ -522,7 +522,17 @@ class Matrix_MLM_User_Dashboard {
                 return;
             }
 
-            $('#matrix-pay-subscription-form').on('submit', function(e) {
+            // Delegated on document for the same DOM-timing reason
+            // documented in class-matrix-user-wallet.php's render_scripts():
+            // direct binding races the matched form's DOM arrival on
+            // stacks with deferred jQuery / Rocket Loader / WP Rocket /
+            // FlyingPress / Astra / GeneratePress / OceanWP, etc., and
+            // silently no-op's. Critical here because this form is the
+            // ONLY recovery path for users whose subscription has lapsed
+            // — every other dashboard tab is locked out behind the
+            // inactive-status gate. A failed bind here means the user
+            // has to refresh (and may give up first).
+            $(document).on('submit', '#matrix-pay-subscription-form', function(e) {
                 e.preventDefault();
 
                 var $form = $(this);
