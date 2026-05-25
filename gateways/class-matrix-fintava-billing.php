@@ -1216,8 +1216,62 @@ class Matrix_MLM_Fintava_Billing {
                 ];
             }
             $this->fail_transaction($tx_id, $result);
+
+            // Read source_wallet from the row authoritatively
+            // rather than trusting a hardcoded 'virtual' here.
+            // process_purchase() debits the Fintava virtual wallet
+            // and writes 'virtual' at begin_transaction() time, so
+            // in steady state both values agree — but reading the
+            // row makes the refund routing self-healing against:
+            //
+            //   - Pre-PR-#294 rows that were debited from the
+            //     Matrix wallet and tagged 'matrix' (these would
+            //     have been refunded correctly to Matrix in the
+            //     legacy code; the hardcoded 'virtual' here would
+            //     have crossed wallets and left them uncovered).
+            //   - Any future code path or migration that flips
+            //     source_wallet on an existing row.
+            //   - Race conditions where this branch runs against
+            //     a row whose source_wallet was set by a different
+            //     caller than the current process_purchase().
+            //
+            // The admin manual-refund path in
+            // class-matrix-admin-billing-history.php has used the
+            // row-as-source-of-truth pattern since PR #294. The
+            // runtime auto-refund here is now consistent with it.
+            //
+            // Defensive fallback: if the row is missing or has an
+            // unexpected source_wallet value (corrupted, schema
+            // drift, etc.), fall back to 'virtual' (the post-PR-
+            // #294 default) since process_purchase() ALWAYS debits
+            // Fintava — refunding to Matrix would credit a wallet
+            // that wasn't debited. The fallback also ships an
+            // error_log line so ops sees the schema drift.
+            global $wpdb;
+            $row_source_wallet = $wpdb->get_var($wpdb->prepare(
+                "SELECT source_wallet FROM {$wpdb->prefix}matrix_billing_transactions WHERE id = %d",
+                (int) $tx_id
+            ));
+            if (!in_array($row_source_wallet, ['matrix', 'virtual'], true)) {
+                error_log(sprintf(
+                    '[Matrix Fintava Billing] auto-refund: source_wallet on tx_id=%d is missing or invalid (%s); defaulting to virtual',
+                    (int) $tx_id, var_export($row_source_wallet, true)
+                ));
+                $row_source_wallet = 'virtual';
+            }
+
+            // Structured log of the routing decision so an ops
+            // grep on a specific tx_id can answer "where did this
+            // refund go?" without re-deriving from row history.
+            error_log(sprintf(
+                '[Matrix Fintava Billing] auto-refund routing: tx_id=%d user_id=%d type=%s amount=%.2f source_wallet=%s debit_ref=%s reason=%s',
+                (int) $tx_id, (int) $user_id, $type, (float) $total,
+                $row_source_wallet, $debit_reference,
+                $result->get_error_message()
+            ));
+
             self::refund_failed_purchase(
-                $user_id, $total, $type, $debit_reference, 'virtual', $result->get_error_message()
+                $user_id, $total, $type, $debit_reference, $row_source_wallet, $result->get_error_message()
             );
             return [
                 'kind'           => 'http_error',
