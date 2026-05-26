@@ -4017,6 +4017,57 @@ class Matrix_MLM_Core {
     }
 
     private function process_subscribe() {
+        // Per-IP rate limit on the unauth subscribe surface.
+        //
+        // process_subscribe is registered on wp_ajax_nopriv_matrix_mlm_action,
+        // so any visitor — including a scripted abuser — can fire it
+        // without authentication. The handler is intentionally
+        // idempotent (UNIQUE KEY on matrix_subscribers.email collapses
+        // duplicates at the storage layer) and intentionally
+        // enumeration-safe (uniform success message regardless of
+        // pre-existence; see the comment block below). What was
+        // missing was the rate-limit gate that every other anonymous
+        // surface in this plugin already has — login, registration,
+        // and the payment_verify REST route all run the same
+        // Matrix_MLM_Rate_Limiter throttle before doing any work, but
+        // this surface had been documented as "no rate limit beyond
+        // the registration one" without one being added.
+        //
+        // For a live financial-services platform the missing gate is
+        // worth closing even at low severity: an attacker can otherwise
+        // bloat matrix_subscribers with junk emails at line rate, or
+        // flood the table with addresses harvested from a separate
+        // breach so the operator's next bulk send goes to a list
+        // contaminated with stranger emails. The UNIQUE index keeps
+        // any single email from being inserted twice, but it does
+        // nothing to bound the rate of fresh-email inserts. 10
+        // attempts / hour / IP is generous for any human use case
+        // (a typical visitor subscribes once, ever; a couple of typo
+        // retries is fine) and reduces a free abuse loop to
+        // operational cost (botnet / IP rotation). The cap and window
+        // are filterable via matrix_mlm_rate_limit_max /
+        // matrix_mlm_rate_limit_window per-action so installs behind
+        // a shared-NAT carrier can tune up if the cap turns out to
+        // bite a real audience.
+        //
+        // Gate runs BEFORE input validation so a flood of garbage
+        // POSTs (no `email` field, malformed value, etc.) is bounded
+        // the same way as well-formed ones — the goal is to bound the
+        // rate of work the handler does, not just the rate of valid
+        // subscriptions.
+        if (Matrix_MLM_Rate_Limiter::throttle(
+            'subscribe',
+            Matrix_MLM_Rate_Limiter::key_for_request(),
+            [
+                'max_attempts'   => 10,
+                'window_seconds' => HOUR_IN_SECONDS,
+            ]
+        )) {
+            wp_send_json_error([
+                'message' => __('Too many subscribe attempts. Please wait a few minutes and try again.', 'matrix-mlm'),
+            ]);
+        }
+
         $email = sanitize_email($_POST['email'] ?? '');
         if (!is_email($email)) {
             wp_send_json_error(['message' => __('Invalid email address', 'matrix-mlm')]);
