@@ -3389,6 +3389,25 @@ class Matrix_MLM_Messaging {
         // tied to those messages stay (foreign key is loose) so the
         // moderation history survives the GC pass.
         $cutoff = gmdate('Y-m-d H:i:s', time() - (30 * DAY_IN_SECONDS));
+
+        // Voice-attachment GC (DB 1.0.25). Runs BEFORE the
+        // matrix_messages DELETE so we still have the rows we
+        // need to find the attachments by. Hard-deletes the
+        // WP attachment post AND the on-disk file for any
+        // voice attachment whose owning message has crossed
+        // the soft-delete-to-hard-delete cutoff.
+        //
+        // Image attachments are intentionally left alone here.
+        // They live in the standard WP media library and may
+        // be linked from elsewhere on the site (a draft post,
+        // a user profile, etc.); the existing operator
+        // workflow is to clean them up via the media library
+        // proper. Voice files have no other lifecycle — they
+        // exist solely to back a message — so it's safe to
+        // pair their disk-cleanup directly with the message
+        // hard-delete.
+        self::cleanup_expired_voice_files($cutoff);
+
         $wpdb->query($wpdb->prepare(
             "DELETE FROM {$wpdb->prefix}matrix_messages
               WHERE deleted_at IS NOT NULL AND deleted_at < %s",
@@ -3401,6 +3420,168 @@ class Matrix_MLM_Messaging {
               WHERE muted_until IS NOT NULL AND muted_until < %s",
             current_time('mysql', true)
         ));
+    }
+
+    /**
+     * Voice-attachment file GC for cron_cleanup (DB 1.0.25).
+     *
+     * Walks every soft-deleted-and-aged-out matrix_messages row,
+     * pulls its kind='voice' attachments, and hard-deletes both
+     * the WP attachment post and the on-disk file for each. Then
+     * cleans up the matrix_message_attachments rows for the same
+     * message ids — those rows would otherwise be orphaned by the
+     * matrix_messages DELETE that follows in cron_cleanup() (no
+     * FK cascade in the schema; the current behaviour for image
+     * attachment rows is the same orphan, which is fine because
+     * the WP post they reference is the source of truth).
+     *
+     * Operator-tunable via the matrix_messaging_voice_cleanup_age_days
+     * filter (default 30) so an operator with a different
+     * retention requirement can shorten or lengthen the window
+     * without forking the plugin. The filter takes the integer
+     * days; values <= 0 are floored to 1 day to prevent a
+     * misconfigured filter from racing the matrix_messages
+     * DELETE and producing surprising loss-on-same-day-as-
+     * deletion behaviour.
+     *
+     * Best-effort — wp_delete_attachment() returning false (file
+     * already removed via media library, or the WP post is gone)
+     * is logged and skipped, never aborts the pass. The
+     * matrix_message_attachments row is removed regardless so the
+     * row doesn't leak as an orphan referencing a non-existent
+     * attachment post.
+     *
+     * Logs a one-line summary to error_log when at least one file
+     * was processed. The summary is the simplest observability
+     * surface that doesn't require operators to grep across
+     * multiple cron runs to figure out whether the voice GC is
+     * actually running.
+     *
+     * @param string|null $cutoff_mysql Optional cutoff in 'Y-m-d H:i:s'
+     *                                  GMT. When null, recomputes from
+     *                                  the current age-days filter.
+     *                                  Passing it in keeps cron_cleanup
+     *                                  using exactly the same cutoff
+     *                                  for both the voice-file pass
+     *                                  and the row pass.
+     * @return array{deleted_files:int, bytes_freed:int, orphan_rows:int}
+     */
+    public static function cleanup_expired_voice_files($cutoff_mysql = null) {
+        global $wpdb;
+
+        $age_days = (int) apply_filters('matrix_messaging_voice_cleanup_age_days', 30);
+        if ($age_days < 1) {
+            $age_days = 1;
+        }
+        if ($cutoff_mysql === null) {
+            $cutoff_mysql = gmdate('Y-m-d H:i:s', time() - ($age_days * DAY_IN_SECONDS));
+        }
+
+        $stats = ['deleted_files' => 0, 'bytes_freed' => 0, 'orphan_rows' => 0];
+
+        // Step 1: every soft-deleted-and-aged-out message id.
+        // Capped at 1000 per cron tick so a one-off mass delete
+        // (a moderator flushing 50k spam voice notes) doesn't
+        // tie up the daily cron longer than the WP scheduler's
+        // single-run budget. Subsequent cron ticks will pick up
+        // the next batch on the next day. The daily cadence is
+        // fine for a 30-day cleanup horizon — drift of one day
+        // does not turn a 30-day retention into a 60-day one.
+        $message_ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}matrix_messages
+              WHERE deleted_at IS NOT NULL AND deleted_at < %s
+              ORDER BY id ASC
+              LIMIT 1000",
+            $cutoff_mysql
+        ));
+        if (empty($message_ids)) {
+            return $stats;
+        }
+        $message_ids = array_map('intval', $message_ids);
+        $placeholders = implode(',', array_fill(0, count($message_ids), '%d'));
+
+        // Step 2: voice attachment ids for those messages. We
+        // also pull the matrix_message_attachments.id so we can
+        // delete that row regardless of whether the WP post
+        // still exists (orphaned-row cleanup).
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- placeholders are %d-only and pass through prepare.
+        $voice_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, attachment_id, message_id
+               FROM {$wpdb->prefix}matrix_message_attachments
+              WHERE kind = 'voice'
+                AND message_id IN ($placeholders)",
+            $message_ids
+        ));
+
+        // Step 3: hard-delete each WP attachment + on-disk file.
+        // wp_delete_attachment($id, true) does both in one call —
+        // posts, postmeta, and the actual file get removed. The
+        // file-size lookup happens BEFORE the delete because once
+        // the file is gone we can't measure what we freed.
+        $row_ids_to_remove = [];
+        foreach ($voice_rows as $vr) {
+            $aid = (int) $vr->attachment_id;
+            $row_ids_to_remove[] = (int) $vr->id;
+            if ($aid <= 0) {
+                $stats['orphan_rows']++;
+                continue;
+            }
+            // Best-effort byte accounting. get_attached_file may
+            // return false for an attachment whose file is already
+            // gone; size lookup wraps in @ to keep the cron quiet
+            // even if the path resolves under a permission-locked
+            // mount.
+            $path = get_attached_file($aid);
+            $size = 0;
+            if ($path && file_exists($path)) {
+                $size = (int) @filesize($path);
+            }
+            $deleted = wp_delete_attachment($aid, true);
+            if ($deleted === false || $deleted === null) {
+                // Could be: post already gone, capability issue
+                // for the runner (cron runs as no user), or the
+                // file system refused. Don't abort — just count
+                // it as an orphan and move on.
+                $stats['orphan_rows']++;
+                error_log(sprintf(
+                    '[Matrix Messaging] cron_cleanup: wp_delete_attachment(%d) returned falsy for message_id=%d',
+                    $aid,
+                    (int) $vr->message_id
+                ));
+                continue;
+            }
+            $stats['deleted_files']++;
+            $stats['bytes_freed'] += $size;
+        }
+
+        // Step 4: drop the matrix_message_attachments rows we
+        // touched. We delete by the row ids gathered above,
+        // not by message_id IN, because a future schema change
+        // that lets a single message carry both image and voice
+        // attachments would otherwise wipe the image rows too —
+        // and we explicitly DO NOT want to fan into image
+        // cleanup on this code path.
+        if (!empty($row_ids_to_remove)) {
+            $row_placeholders = implode(',', array_fill(0, count($row_ids_to_remove), '%d'));
+            // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- placeholders are %d-only.
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->prefix}matrix_message_attachments
+                  WHERE id IN ($row_placeholders)",
+                $row_ids_to_remove
+            ));
+        }
+
+        if ($stats['deleted_files'] > 0 || $stats['orphan_rows'] > 0) {
+            error_log(sprintf(
+                '[Matrix Messaging] Voice GC: deleted %d files (%d bytes), skipped %d orphan rows, age cutoff %d days',
+                $stats['deleted_files'],
+                $stats['bytes_freed'],
+                $stats['orphan_rows'],
+                $age_days
+            ));
+        }
+
+        return $stats;
     }
 
     // ---------------------------------------------------------------
