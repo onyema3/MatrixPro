@@ -323,18 +323,19 @@ class Matrix_MLM_User_Dashboard {
                         }
                         $is_active = ($tab === $item['slug']) ? 'active' : '';
                         ?>
-                        <?php /* style="font-family:dashicons!important" defends against theme nav resets that win the cascade against class-based rules.
-                                 PR #335 added the same rule via .matrix-dashboard-nav a .dashicons {} but DevTools
-                                 showed font-family computed as the system stack on the live site (libertyhub.ng) —
-                                 meaning the theme's own !important + later source order beat the plugin selector.
-                                 Inline style has specificity (1,0,0,0), un-overridable except by another inline
-                                 style assigned via JS, which themes don't do for nav children. See PR #336. */ ?>
-                        <a href="<?php echo esc_url(self::tab_url($item['slug'])); ?>" class="<?php echo esc_attr($is_active); ?>"><span class="dashicons <?php echo esc_attr($item['icon']); ?>" style="font-family:dashicons!important"></span> <?php echo esc_html($item['label']); ?></a>
+                        <?php /* Inline SVG icons replace the previous <span class="dashicons dashicons-X"> markup.
+                                 PRs #335 and #336 tried to defend the icon-font path against theme nav resets
+                                 (font-family !important via class selector, then via inline style). Both got
+                                 beaten on the production deploy because the theme's CSS won the cascade with
+                                 its own !important + later source order. SVG bypasses the font system entirely,
+                                 so theme rules targeting font-family / ::before / line-height on <nav> children
+                                 cannot affect the rendering. See class-matrix-icons.php for the registry. */ ?>
+                        <a href="<?php echo esc_url(self::tab_url($item['slug'])); ?>" class="<?php echo esc_attr($is_active); ?>"><?php echo Matrix_MLM_Icons::svg($item['icon']); ?> <?php echo esc_html($item['label']); ?></a>
                         <?php
                     }
                     ?>
                     <?php echo $this->build_notification_bell($user_id); ?>
-                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><span class="dashicons dashicons-exit" style="font-family:dashicons!important"></span> <?php _e('Logout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><?php echo Matrix_MLM_Icons::svg('exit'); ?> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </nav>
             </div>
             <div class="matrix-dashboard-content">
@@ -1442,7 +1443,10 @@ class Matrix_MLM_User_Dashboard {
                     aria-expanded="false"
                     aria-haspopup="true"
                     data-matrix-notif-trigger>
-                <span class="dashicons dashicons-bell" aria-hidden="true" style="font-family:dashicons!important"></span>
+                <?php /* Inline SVG bell — theme-cascade-immune. See class-matrix-icons.php and PR notes
+                         on the sidebar nav swap for the full rationale on why icon-font glyphs were
+                         abandoned for this surface. */ ?>
+                <?php echo Matrix_MLM_Icons::svg('bell', 'matrix-notif-bell-icon', 20); ?>
                 <span class="matrix-notif-bell-label"><?php esc_html_e('Notifications', 'matrix-mlm'); ?></span>
                 <span class="matrix-notif-bell-badge<?php echo $unread > 0 ? ' is-visible' : ''; ?>"
                       data-matrix-notif-badge
@@ -1486,7 +1490,12 @@ class Matrix_MLM_User_Dashboard {
                             data-matrix-notif-item
                             data-id="<?php echo (int) $row->id; ?>"
                             data-link="<?php echo esc_attr($href); ?>">
-                            <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true" style="font-family:dashicons!important"></span>
+                            <?php /* Inline SVG icon wrapped in the .matrix-notif-icon badge — the
+                                     CSS-styled colored bubble. The icon name comes from
+                                     notification_icon_name() which mirrors iconNameFor() in
+                                     matrix-mlm-notifications.js so server render and JS-polled rows
+                                     agree on the symbol. */ ?>
+                            <span class="matrix-notif-icon" aria-hidden="true"><?php echo Matrix_MLM_Icons::svg($this->notification_icon_name((string) $row->type), '', 18); ?></span>
                             <div class="matrix-notif-body">
                                 <div class="matrix-notif-title"><?php echo esc_html($row->title); ?></div>
                                 <?php if (!empty($row->body)): ?>
@@ -1510,48 +1519,53 @@ class Matrix_MLM_User_Dashboard {
     }
 
     /**
-     * Map a notification type slug to the dashicons class the
-     * bell dropdown should render. Unknown slugs fall through to
-     * a generic info icon. Mirrored verbatim by the JS-side
-     * iconClassFor() in matrix-mlm-notifications.js so server
-     * render and client polled updates stay aligned.
+     * Map a notification type slug to the icon NAME that the
+     * bell dropdown / notifications page should render. Names
+     * here are bare (no 'dashicons-' prefix) so they can be
+     * passed straight through to Matrix_MLM_Icons::svg() and to
+     * the matrixNotifConfig.icons map for the JS poll path.
+     *
+     * Unknown slugs fall through to a generic info icon.
+     * Mirrored verbatim by the JS-side iconNameFor() in
+     * matrix-mlm-notifications.js so server render and client
+     * polled updates agree on the symbol for every type.
      */
-    private function notification_icon_class($type) {
+    private function notification_icon_name($type) {
         $map = [
-            'transfer_received'           => 'dashicons-money-alt',
-            'transfer_sent'               => 'dashicons-share',
-            'commission_referral'         => 'dashicons-groups',
-            'commission_level'            => 'dashicons-chart-area',
-            'commission_matrix_completion' => 'dashicons-awards',
-            'commission'                  => 'dashicons-chart-area',
-            'level_completion'            => 'dashicons-awards',
-            'deposit'                     => 'dashicons-download',
-            'withdrawal_approved'         => 'dashicons-yes-alt',
-            'withdrawal_rejected'         => 'dashicons-no-alt',
-            'withdrawal_completed'        => 'dashicons-yes-alt',
-            'withdrawal'                  => 'dashicons-bank',
-            'bank_payout'                 => 'dashicons-bank',
-            'bank_payout_failed'          => 'dashicons-warning',
-            'bill_payment'                => 'dashicons-smartphone',
-            'bill_payment_airtime'        => 'dashicons-smartphone',
-            'bill_payment_data'           => 'dashicons-smartphone',
-            'bill_payment_cable'          => 'dashicons-format-video',
-            'bill_payment_electricity'    => 'dashicons-lightbulb',
-            'bill_refund'                 => 'dashicons-image-rotate',
-            'card_status'                 => 'dashicons-id-alt',
-            'epin_redeemed'               => 'dashicons-tickets-alt',
-            'subscription'                => 'dashicons-calendar-alt',
-            'subscription_deactivation'   => 'dashicons-warning',
-            'password_changed'            => 'dashicons-shield',
-            'loan_approved'               => 'dashicons-yes-alt',
-            'loan_rejected'               => 'dashicons-no-alt',
-            'loan'                        => 'dashicons-money-alt',
-            'healthcare_approved'         => 'dashicons-heart',
-            'healthcare_rejected'         => 'dashicons-no-alt',
-            'healthcare'                  => 'dashicons-heart',
-            'admin_announcement'          => 'dashicons-megaphone',
+            'transfer_received'           => 'money-alt',
+            'transfer_sent'               => 'share',
+            'commission_referral'         => 'groups',
+            'commission_level'            => 'chart-area',
+            'commission_matrix_completion' => 'awards',
+            'commission'                  => 'chart-area',
+            'level_completion'            => 'awards',
+            'deposit'                     => 'download',
+            'withdrawal_approved'         => 'yes-alt',
+            'withdrawal_rejected'         => 'no-alt',
+            'withdrawal_completed'        => 'yes-alt',
+            'withdrawal'                  => 'bank',
+            'bank_payout'                 => 'bank',
+            'bank_payout_failed'          => 'warning',
+            'bill_payment'                => 'smartphone',
+            'bill_payment_airtime'        => 'smartphone',
+            'bill_payment_data'           => 'smartphone',
+            'bill_payment_cable'          => 'format-video',
+            'bill_payment_electricity'    => 'lightbulb',
+            'bill_refund'                 => 'image-rotate',
+            'card_status'                 => 'id-alt',
+            'epin_redeemed'               => 'tickets-alt',
+            'subscription'                => 'calendar-alt',
+            'subscription_deactivation'   => 'warning',
+            'password_changed'            => 'shield',
+            'loan_approved'               => 'yes-alt',
+            'loan_rejected'               => 'no-alt',
+            'loan'                        => 'money-alt',
+            'healthcare_approved'         => 'heart',
+            'healthcare_rejected'         => 'no-alt',
+            'healthcare'                  => 'heart',
+            'admin_announcement'          => 'megaphone',
         ];
-        return $map[$type] ?? 'dashicons-info-outline';
+        return $map[$type] ?? 'info-outline';
     }
 
     /**
@@ -1630,7 +1644,7 @@ class Matrix_MLM_User_Dashboard {
                     <li class="matrix-notif-page-item<?php echo $is_read ? ' is-read' : ' is-unread'; ?>"
                         data-matrix-notif-page-item
                         data-id="<?php echo (int) $row->id; ?>">
-                        <span class="matrix-notif-icon dashicons <?php echo esc_attr($this->notification_icon_class((string) $row->type)); ?>" aria-hidden="true" style="font-family:dashicons!important"></span>
+                        <span class="matrix-notif-icon" aria-hidden="true"><?php echo Matrix_MLM_Icons::svg($this->notification_icon_name((string) $row->type), '', 18); ?></span>
                         <div class="matrix-notif-page-body">
                             <div class="matrix-notif-page-title">
                                 <?php if (!empty($row->link_url)): ?>
