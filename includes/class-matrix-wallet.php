@@ -531,6 +531,39 @@ class Matrix_MLM_Wallet {
         // narration, failure_reason) so the renderer can build the
         // masked "Transfer to Bank — Bank ****1234" description
         // from the row data without a follow-up query.
+        //
+        // The matrix_fintava_payouts table is shared by two flows
+        // with opposite accounting semantics on the virtual-wallet
+        // side:
+        //
+        //   1. External bank payout (Fintava virtual → external
+        //      Nigerian bank via /bank/credit). Funds LEAVE the
+        //      virtual wallet → DEBIT, amount = total_debit
+        //      (amount + Fintava charge), source = 'bank',
+        //      description prefix "Transfer to Bank — ...".
+        //
+        //   2. Matrix → Virtual wallet transfer (Matrix balance →
+        //      user's OWN Fintava virtual wallet via
+        //      /transaction/wallet-to-wallet). The Matrix-side
+        //      debit is already recorded in matrix_wallet; the
+        //      payouts row is the credit leg landing in the
+        //      virtual wallet → CREDIT, amount = `amount` (the
+        //      net that actually arrives, NOT total_debit which
+        //      double-counts the Matrix-side charge), source =
+        //      'virtual', description prefix "Credit from Matrix
+        //      wallet — ...".
+        //
+        // Discriminator: a payout row whose `account_number`
+        // matches the user's own matrix_fintava_wallets row IS a
+        // Matrix→Virtual credit leg; everything else is an
+        // external bank payout. NUBANs are unique per wallet and
+        // external bank payouts route to a destination at a
+        // DIFFERENT bank, so this match is reliable. The LEFT
+        // JOIN handles the (rare) case where the user has a
+        // payout row but their wallet was deleted — the join
+        // yields NULL, the CASE evaluates to FALSE, and the row
+        // falls back to the existing "external bank" treatment.
+        $wallets_table = $wpdb->prefix . 'matrix_fintava_wallets';
         $sql = "
             SELECT * FROM (
                 (SELECT
@@ -551,21 +584,31 @@ class Matrix_MLM_Wallet {
                  WHERE user_id = %d)
                 UNION ALL
                 (SELECT
-                    created_at,
-                    'debit' AS type,
-                    total_debit AS amount,
+                    p.created_at,
+                    CASE WHEN w.account_number IS NOT NULL
+                              AND p.account_number = w.account_number
+                         THEN 'credit' ELSE 'debit' END AS type,
+                    CASE WHEN w.account_number IS NOT NULL
+                              AND p.account_number = w.account_number
+                         THEN p.amount ELSE p.total_debit END AS amount,
                     NULL AS post_balance,
                     NULL AS description,
-                    status,
-                    'bank_transfer' AS transaction_type,
-                    reference,
-                    bank_name,
-                    account_number,
-                    narration,
-                    failure_reason,
-                    'bank' AS source
-                 FROM $payouts_table
-                 WHERE user_id = %d)
+                    p.status,
+                    CASE WHEN w.account_number IS NOT NULL
+                              AND p.account_number = w.account_number
+                         THEN 'matrix_to_virtual_credit'
+                         ELSE 'bank_transfer' END AS transaction_type,
+                    p.reference,
+                    p.bank_name,
+                    p.account_number,
+                    p.narration,
+                    p.failure_reason,
+                    CASE WHEN w.account_number IS NOT NULL
+                              AND p.account_number = w.account_number
+                         THEN 'virtual' ELSE 'bank' END AS source
+                 FROM $payouts_table p
+                 LEFT JOIN $wallets_table w ON w.user_id = p.user_id
+                 WHERE p.user_id = %d)
             ) AS unified
             ORDER BY created_at DESC
             LIMIT %d OFFSET %d
@@ -574,24 +617,40 @@ class Matrix_MLM_Wallet {
             $sql, $user_id, $user_id, $limit, $offset
         ));
 
-        // Build the human-readable description for bank-payout
+        // Build the human-readable description for payout-table
         // rows from the per-row metadata. Account numbers are
         // masked to last-4 because the unified history lives
         // behind a single-factor session and we don't want the
         // full NUBAN appearing in plain text alongside arbitrary
         // wallet activity.
+        //
+        // The two flows produce different prefixes so the user
+        // can tell at a glance whether money LEFT the platform
+        // (external bank payout) or merely moved between their
+        // own Matrix and Fintava wallets (Matrix→Virtual credit
+        // leg). Same masking + narration suffix + failure-reason
+        // suffix logic for both.
         foreach ($rows as $r) {
-            if ($r->source === 'bank') {
+            if ($r->source === 'bank' || $r->source === 'virtual') {
                 $acct = (string) $r->account_number;
                 $masked = strlen($acct) >= 4
                     ? '****' . substr($acct, -4)
                     : $acct;
-                $desc = sprintf(
-                    /* translators: 1: bank name, 2: masked account number */
-                    __('Transfer to Bank — %1$s %2$s', 'matrix-mlm'),
-                    $r->bank_name,
-                    $masked
-                );
+                if ($r->source === 'virtual') {
+                    $desc = sprintf(
+                        /* translators: 1: virtual wallet bank name (typically "Fintava"), 2: masked account number */
+                        __('Credit from Matrix wallet — %1$s %2$s', 'matrix-mlm'),
+                        $r->bank_name,
+                        $masked
+                    );
+                } else {
+                    $desc = sprintf(
+                        /* translators: 1: bank name, 2: masked account number */
+                        __('Transfer to Bank — %1$s %2$s', 'matrix-mlm'),
+                        $r->bank_name,
+                        $masked
+                    );
+                }
                 if (!empty($r->narration)) {
                     $desc .= ' — ' . $r->narration;
                 }

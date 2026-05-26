@@ -1183,9 +1183,23 @@ class Matrix_MLM_User_Wallet {
                     <tbody>
                         <?php foreach ($transactions as $tx):
                             $source       = isset($tx->source) ? (string) $tx->source : 'matrix';
-                            $source_label = $source === 'bank'
-                                ? __('Bank Transfer', 'matrix-mlm')
-                                : __('Matrix Wallet', 'matrix-mlm');
+                            // Three-way mapping. 'virtual' rows are
+                            // the credit leg of a Matrix→Virtual
+                            // wallet transfer (funds landing in the
+                            // user's own Fintava virtual wallet);
+                            // they share the matrix_fintava_payouts
+                            // backing table with true 'bank' rows
+                            // (external bank payouts) but represent
+                            // a fundamentally different accounting
+                            // direction, so they need a distinct
+                            // source badge.
+                            if ($source === 'bank') {
+                                $source_label = __('Bank Transfer', 'matrix-mlm');
+                            } elseif ($source === 'virtual') {
+                                $source_label = __('Virtual Wallet', 'matrix-mlm');
+                            } else {
+                                $source_label = __('Matrix Wallet', 'matrix-mlm');
+                            }
                             $status       = isset($tx->status) ? (string) $tx->status : 'completed';
                             $status_label = ucfirst(str_replace('_', ' ', $status));
                         ?>
