@@ -9,6 +9,24 @@ if (!defined('ABSPATH')) {
 
 class Matrix_MLM_Core {
 
+    /**
+     * Subdirectory under wp_upload_dir()['basedir'] that all
+     * avatar uploads land in. Owned exclusively by this plugin —
+     * the orphan-cleanup admin tool scans this subtree without
+     * fear of touching unrelated media-library files because
+     * nothing else writes here.
+     *
+     * Per-user scoping (matrix-mlm-avatars/<user_id>/<filename>)
+     * is applied inside the upload_dir filter in
+     * process_upload_avatar(); this constant is the root.
+     *
+     * Stored as a class constant so the admin tool
+     * (Matrix_MLM_Admin_Tools) and the cleanup helper
+     * (delete_avatar_file_safely) reference the same value
+     * rather than duplicating a literal that could drift.
+     */
+    const AVATAR_UPLOAD_SUBDIR = 'matrix-mlm-avatars';
+
     protected $admin;
     protected $user_dashboard;
 
@@ -3219,10 +3237,56 @@ class Matrix_MLM_Core {
         // success path is committed.
         $previous_avatar_url = (string) get_user_meta($user_id, 'matrix_avatar_url', true);
 
-        $upload = wp_handle_upload($file, [
-            'test_form' => false,
-            'mimes'     => $allowed_mimes,
-        ]);
+        // Route this specific upload into wp-content/uploads/
+        // matrix-mlm-avatars/<user_id>/ via a scoped upload_dir
+        // filter. Three things matter here:
+        //
+        //   1. We OWN the subtree. Nothing else in WordPress, the
+        //      theme, or other plugins writes to matrix-mlm-avatars/,
+        //      which is what makes the orphan-cleanup admin tool
+        //      (Matrix_MLM_Admin_Tools) safe to run — it can scan
+        //      the directory and treat any file not in the current
+        //      keep-set as an orphan, with no risk of touching a
+        //      post attachment or theme upload that happens to sit
+        //      in the same year/month folder.
+        //
+        //   2. Per-user scoping (<user_id>/) keeps a misbehaving or
+        //      compromised user from cluttering the shared root.
+        //      It also gives operators a one-shot per-user purge
+        //      path (rm -rf .../matrix-mlm-avatars/123/) without
+        //      grepping the whole tree.
+        //
+        //   3. The filter is registered immediately before
+        //      wp_handle_upload and removed in a finally block
+        //      immediately after, so no concurrent upload from a
+        //      different surface (Fintava KYC, loan docs, backup
+        //      uploads, etc.) sees this scoping. add_filter and
+        //      remove_filter must be paired by exact callable
+        //      identity, which is why the closure is stored in a
+        //      variable and the same reference is passed to both.
+        //
+        // Pre-existing avatars under wp-content/uploads/YYYY/MM/
+        // (from before this PR) are left in place — the user's
+        // matrix_avatar_url meta still points at them and the
+        // cleanup helper handles deletion correctly regardless of
+        // which subtree the file lives in. Only NEW uploads get
+        // the per-user routing.
+        $avatar_upload_dir_filter = function ($dirs) use ($user_id) {
+            $sub             = '/' . self::AVATAR_UPLOAD_SUBDIR . '/' . (int) $user_id;
+            $dirs['subdir']  = $sub;
+            $dirs['path']    = $dirs['basedir'] . $sub;
+            $dirs['url']     = $dirs['baseurl'] . $sub;
+            return $dirs;
+        };
+        add_filter('upload_dir', $avatar_upload_dir_filter);
+        try {
+            $upload = wp_handle_upload($file, [
+                'test_form' => false,
+                'mimes'     => $allowed_mimes,
+            ]);
+        } finally {
+            remove_filter('upload_dir', $avatar_upload_dir_filter);
+        }
         if (isset($upload['error'])) {
             wp_send_json_error(['message' => $upload['error']]);
         }
