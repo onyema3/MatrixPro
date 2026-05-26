@@ -200,3 +200,145 @@
 .matrix-messaging__message.is-own .matrix-messaging__message-attachment img {
     margin-left: auto;
 }
+
+
+
+/* -------------------------------------------------------------------
+ * Cross-thread search (DB 1.0.20 / plugin 2.0.3).
+ *
+ * The search input lives in the sidebar header next to the New
+ * Message button; results render in a separate <ul> that takes over
+ * the same scroll region the threads list occupies, swapping in
+ * place rather than pushing chrome around.
+ * ----------------------------------------------------------------- */
+
+.matrix-messaging__search {
+    position: relative;
+    margin-top: 8px;
+}
+
+.matrix-messaging__search-input {
+    width: 100%;
+    padding: 6px 28px 6px 10px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 13px;
+    background: #fff;
+    box-sizing: border-box;
+}
+
+.matrix-messaging__search-input:focus {
+    outline: none;
+    border-color: #4f46e5;
+    box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.18);
+}
+
+.matrix-messaging__search-clear {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: 0;
+    color: #6b7280;
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    padding: 2px 6px;
+}
+
+.matrix-messaging__search-clear:hover {
+    color: #1f2937;
+}
+
+.matrix-messaging__search-results {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    flex: 1;
+    background: #fff;
+}
+
+.matrix-messaging__search-header {
+    padding: 8px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6b7280;
+    background: #f3f4f6;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.matrix-messaging__search-empty {
+    padding: 20px 14px;
+    color: #6b7280;
+    text-align: center;
+    font-size: 13px;
+}
+
+.matrix-messaging__search-result {
+    padding: 10px 12px;
+    border-bottom: 1px solid #eef2f7;
+    cursor: pointer;
+}
+
+.matrix-messaging__search-result:hover {
+    background: #eef2ff;
+}
+
+.matrix-messaging__search-result-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.matrix-messaging__search-result-head strong {
+    font-size: 13px;
+    color: #1f2937;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 160px;
+}
+
+.matrix-messaging__search-result-when {
+    font-size: 11px;
+    color: #9ca3af;
+    flex-shrink: 0;
+}
+
+.matrix-messaging__search-result-sender {
+    font-size: 11px;
+    color: #6b7280;
+    margin-top: 2px;
+}
+
+.matrix-messaging__search-result-snippet {
+    font-size: 12px;
+    color: #4b5563;
+    margin-top: 4px;
+    line-height: 1.4;
+    word-wrap: break-word;
+}
+
+.matrix-messaging__search-mark {
+    background: #fde68a;
+    color: #92400e;
+    padding: 0 2px;
+    border-radius: 2px;
+}
+
+/* Flash highlight applied transiently to a message row when the
+ * user jumps to it from a search result. The animation is short
+ * (about 2.4s) so it cues the eye without lingering as background
+ * noise. */
+.matrix-messaging__message--flash {
+    animation: matrix-messaging-flash 2.4s ease-out;
+}
+
+@keyframes matrix-messaging-flash {
+    0%   { box-shadow: 0 0 0 3px rgba(253, 230, 138, 0.95); }
+    100% { box-shadow: 0 0 0 3px rgba(253, 230, 138, 0); }
+}

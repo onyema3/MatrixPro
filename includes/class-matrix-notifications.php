@@ -1118,6 +1118,130 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send a "you have a new message" notification to a recipient
+     * who is currently OFFLINE (no recent presence pulse — see
+     * Matrix_MLM_Messaging::is_online()).
+     *
+     * Fired idempotently from
+     * Matrix_MLM_Messaging::dispatch_post_send_notifications() after
+     * the message row has committed and the in-app bell row has
+     * already been enqueued. Distinct from every other helper in
+     * this class in one important way: the in-app row is written
+     * by the caller, NOT by this method. That's deliberate — the
+     * bell row needs to be written for EVERY recipient (online and
+     * offline) so an in-tab dashboard sees the badge bump on the
+     * next bell poll, while the email path is offline-only.
+     * Splitting the write keeps each channel's gating crisp and
+     * avoids a "channel A wrote, channel B suppressed" mismatch
+     * if a future caller forgets to gate.
+     *
+     * Coalescing is the caller's responsibility (a per-(recipient,
+     * thread) cooldown user_meta in
+     * Matrix_MLM_Messaging::OFFLINE_EMAIL_META_PREFIX). Re-entry
+     * here within the cooldown window is harmless: this method
+     * does no de-dup itself, just fires the email and an optional
+     * SMS twin.
+     *
+     * @param int    $recipient_id   Recipient WP user id (offline).
+     * @param int    $sender_id      Author of the message.
+     * @param object $thread         Row from matrix_message_threads
+     *                               (id, type, title, ...).
+     * @param string $preview        Short body preview already
+     *                               trimmed to ~280 chars by the
+     *                               caller.
+     * @param bool   $has_attachment True when the message had an
+     *                               image attachment (used in the
+     *                               body copy when the preview is
+     *                               empty).
+     * @return bool True if email was attempted, false if recipient
+     *              was unresolvable.
+     */
+    public static function send_message_notification($recipient_id, $sender_id, $thread, $preview, $has_attachment = false) {
+        $recipient_id = (int) $recipient_id;
+        $user = get_userdata($recipient_id);
+        if (!$user || empty($user->user_email)) {
+            return false;
+        }
+
+        $sender = get_userdata((int) $sender_id);
+        $sender_label = $sender
+            ? ($sender->display_name ?: $sender->user_login)
+            : __('A member', 'matrix-mlm');
+
+        $is_dm = is_object($thread) && isset($thread->type) && $thread->type === 'dm';
+        $thread_id = is_object($thread) && isset($thread->id) ? (int) $thread->id : 0;
+        $thread_title = is_object($thread) && !empty($thread->title) ? (string) $thread->title : '';
+        // For DMs the "thread label" from the recipient's POV is
+        // just the sender's name; for team rooms it's the saved
+        // title (or a generic fallback).
+        $thread_label = $is_dm
+            ? $sender_label
+            : ($thread_title !== '' ? $thread_title : __('Team Room', 'matrix-mlm'));
+
+        $subject = $is_dm
+            ? sprintf(
+                /* translators: 1: site name, 2: sender display name */
+                __('[%1$s] New message from %2$s', 'matrix-mlm'),
+                get_bloginfo('name'),
+                $sender_label
+            )
+            : sprintf(
+                /* translators: 1: site name, 2: team-room title */
+                __('[%1$s] New message in %2$s', 'matrix-mlm'),
+                get_bloginfo('name'),
+                $thread_label
+            );
+
+        $dashboard_url = home_url('/matrix-dashboard/messages/?open=' . $thread_id);
+
+        // Fall back to a clear "(image attachment)" line when the
+        // preview is empty and an attachment is present, so the
+        // inbox entry isn't a blank body.
+        if ($preview === '' && $has_attachment) {
+            $preview = __('(image attachment)', 'matrix-mlm');
+        }
+
+        $message = self::get_email_template('message-notification', [
+            'username'      => $user->user_login,
+            'sender'        => $sender_label,
+            'thread_label'  => $thread_label,
+            'is_dm'         => $is_dm,
+            'preview'       => $preview,
+            'dashboard_url' => $dashboard_url,
+            'site_name'     => get_bloginfo('name'),
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+
+        // SMS twin — same gating as send_commission_notification: only
+        // when SMS verification is on and the recipient has a phone
+        // on file. Body is intentionally short (no preview text) so
+        // the recipient is nudged back to the dashboard rather than
+        // having a private DM excerpt land in cleartext on a carrier
+        // gateway log.
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone($recipient_id);
+            if ($phone) {
+                $sms = $is_dm
+                    ? sprintf(
+                        /* translators: %s: sender display name */
+                        __('You have a new message from %s. Login to your dashboard to read it.', 'matrix-mlm'),
+                        $sender_label
+                    )
+                    : sprintf(
+                        /* translators: 1: sender display name, 2: thread/team-room name */
+                        __('New message from %1$s in %2$s. Login to read it.', 'matrix-mlm'),
+                        $sender_label,
+                        $thread_label
+                    );
+                self::send_sms($phone, $sms);
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Send admin notification
      */
     public static function send_admin_notification($type, $message) {
@@ -1368,6 +1492,46 @@ class Matrix_MLM_Notifications {
             case 'withdrawal':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('Your withdrawal of %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
+                break;
+            case 'message-notification':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/message-notification.php
+                // on disk. Distinct from the generic "(unknown
+                // template) wrapper" path because messaging carries
+                // a privacy expectation: the email should look like
+                // a notification, not a leak — so we render the
+                // sender label and a "you have a new message" CTA
+                // but keep the body preview short and clearly
+                // bracketed so a recipient can tell at a glance
+                // whether to log in.
+                $is_dm = !empty($vars['is_dm']);
+                $sender = isset($vars['sender']) ? (string) $vars['sender'] : __('A member', 'matrix-mlm');
+                $thread_label = isset($vars['thread_label']) ? (string) $vars['thread_label'] : '';
+                $preview = isset($vars['preview']) ? (string) $vars['preview'] : '';
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), esc_html($vars['username'])) . '</p>';
+                if ($is_dm) {
+                    $content .= '<p>' . sprintf(
+                        /* translators: %s: sender display name */
+                        __('You have a new message from <strong>%s</strong>.', 'matrix-mlm'),
+                        esc_html($sender)
+                    ) . '</p>';
+                } else {
+                    $content .= '<p>' . sprintf(
+                        /* translators: 1: sender display name, 2: team-room title */
+                        __('<strong>%1$s</strong> posted in <strong>%2$s</strong>.', 'matrix-mlm'),
+                        esc_html($sender),
+                        esc_html($thread_label)
+                    ) . '</p>';
+                }
+                if ($preview !== '') {
+                    $content .= '<blockquote style="margin:16px 0;padding:12px 16px;border-left:3px solid #4f46e5;background:#f9fafb;color:#4b5563;font-style:italic;">'
+                        . nl2br(esc_html($preview))
+                        . '</blockquote>';
+                }
+                if (!empty($vars['dashboard_url'])) {
+                    $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('Open Conversation', 'matrix-mlm') . '</a></p>';
+                }
+                $content .= '<p style="font-size: 12px; color: #6b7280; margin-top: 20px;">' . __('You are receiving this because you were not online when the message arrived. Sign in to reply or to mute this conversation.', 'matrix-mlm') . '</p>';
                 break;
             case 'matrix-to-virtual':
                 // Inline fallback for installs without a dedicated

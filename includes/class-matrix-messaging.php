@@ -57,9 +57,51 @@ class Matrix_MLM_Messaging {
     const BAN_META_REASON = 'matrix_messaging_ban_reason';
 
     /**
+     * Presence + offline-push metadata keys.
+     *
+     * PRESENCE_META is a UNIX timestamp last-seen pulse, refreshed on
+     * every messaging AJAX guard hit AND on every bell-icon poll
+     * (Matrix_MLM_In_App_Notifications::ajax_fetch — see that class).
+     * is_online() compares (now - last_seen) against the
+     * presence_window_seconds setting.
+     *
+     * OFFLINE_EMAIL_META_PREFIX is the cooldown timestamp for the
+     * per-(recipient, thread) email-coalescing window — prevents a
+     * burst of six rapid-fire messages on one thread from generating
+     * six separate inbox pings to an offline recipient. Stored as a
+     * separate user_meta row per thread so a recipient receiving
+     * messages on threads A and B in parallel still gets two emails
+     * (one per thread) rather than one mute on both.
+     *
+     * NEW_MESSAGE_NOTIF_TYPE is the slug used in the bell-icon row's
+     * `type` column so the JS-side icon registry can render it with
+     * a chat-bubble glyph distinct from commission / withdrawal /
+     * etc. Conventional [a-z0-9_] form per Matrix_MLM_In_App_Notifications::sanitize_slug.
+     */
+    const PRESENCE_META             = 'matrix_messaging_last_seen';
+    const OFFLINE_EMAIL_META_PREFIX = 'matrix_messaging_offline_email_at_';
+    const NEW_MESSAGE_NOTIF_TYPE    = 'message_received';
+
+    /**
      * Default settings. Stored as a single option row to mirror the way
      * Flutterwave / Fintava settings are persisted, so the admin UI can
      * round-trip the whole blob in one save.
+     *
+     * Push delivery keys (presence_window_seconds, offline_email_enabled,
+     * offline_email_cooldown_seconds) drive the offline-recipient fanout
+     * in dispatch_post_send_notifications(). Defaults are tuned to:
+     *
+     *   - 120s presence window: long enough to ride out a single
+     *     network glitch on a slow connection between bell polls (the
+     *     bell defaults to ~30s polling, so two missed beats still
+     *     keeps a real user "online"); short enough that an inactive
+     *     user reliably falls through to the email path within a
+     *     couple of minutes of leaving the dashboard.
+     *
+     *   - 600s (10min) email cooldown: aggressive enough to stop a
+     *     spam-style burst from generating dozens of inbox pings;
+     *     long enough that a genuine "are you there?" follow-up
+     *     ten minutes later does re-trigger the email.
      */
     public static function default_settings() {
         return [
@@ -71,6 +113,10 @@ class Matrix_MLM_Messaging {
             'max_attachment_bytes'          => 5 * 1024 * 1024,
             'team_rooms_auto_create'        => 1,
             'polling_interval_ms'           => 10000,
+            // Push delivery for offline recipients (DB 1.0.20 / plugin 2.0.3).
+            'presence_window_seconds'       => 120,
+            'offline_email_enabled'         => 1,
+            'offline_email_cooldown_seconds'=> 600,
         ];
     }
 
@@ -99,6 +145,21 @@ class Matrix_MLM_Messaging {
         add_action('wp_ajax_matrix_messaging_unblock',       [__CLASS__, 'ajax_unblock']);
         add_action('wp_ajax_matrix_messaging_mute',          [__CLASS__, 'ajax_mute']);
         add_action('wp_ajax_matrix_messaging_report',        [__CLASS__, 'ajax_report']);
+        // Cross-thread search across the messages a user can see.
+        // Kept POST-shaped (via ajax_guard) so the nonce / login
+        // gates apply identically to every other messaging
+        // endpoint — search has no side effects so a GET would
+        // have been semantically fine but keeping POST means one
+        // consistent CSRF model.
+        add_action('wp_ajax_matrix_messaging_search',        [__CLASS__, 'ajax_search']);
+        // Lightweight presence beacon. The dashboard ticks this
+        // on a slow cadence so the server has a fresh last-seen
+        // pulse to gate offline-email dispatch on for users who
+        // are on the dashboard but NOT in the messages tab. A tab
+        // actively chatting doesn't need this beacon at all —
+        // every other messaging AJAX endpoint already touches the
+        // same user_meta via ajax_guard().
+        add_action('wp_ajax_matrix_messaging_presence',      [__CLASS__, 'ajax_presence']);
 
         // Self-healing team-room membership: when a new user is created,
         // ensure their sponsor's team room exists and add the new user as
@@ -468,6 +529,32 @@ class Matrix_MLM_Messaging {
         // — saves a round-trip on the next fetch.
         self::mark_thread_read($thread_id, $sender_id);
 
+        // Push delivery fanout (DB 1.0.20 / plugin 2.0.3).
+        //
+        // Runs AFTER the row + last_message_at update have committed,
+        // so a recipient bell-poll arriving in the same tick already
+        // sees the row. Soft-fails: any error inside the dispatch is
+        // logged and swallowed so a wp_mail or in-app insert failure
+        // never aborts the underlying message insert (which the
+        // sender's UI has already optimistically rendered).
+        try {
+            self::dispatch_post_send_notifications(
+                $thread,
+                $sender_id,
+                $message_id,
+                $body,
+                $attachment_id
+            );
+        } catch (Exception $e) {
+            if (function_exists('error_log')) {
+                error_log(sprintf(
+                    '[Matrix MLM] Messaging dispatch failed for message %d: %s',
+                    $message_id,
+                    $e->getMessage()
+                ));
+            }
+        }
+
         return $message_id;
     }
 
@@ -749,6 +836,430 @@ class Matrix_MLM_Messaging {
     }
 
     // ---------------------------------------------------------------
+    // Presence + offline push fanout (DB 1.0.20 / plugin 2.0.3)
+    //
+    // The recipient-side delivery question is "is the user reachable
+    // through the bell channel right now, or do we need to fall back
+    // to email?". We answer it with a presence pulse:
+    //
+    //   - PRESENCE_META is touched on every messaging AJAX guard, on
+    //     every bell-icon poll (Matrix_MLM_In_App_Notifications::ajax_fetch),
+    //     on Matrix_MLM_User_Messaging::render(), and on the dedicated
+    //     ajax_presence beacon below.
+    //
+    //   - is_online() compares (now - last_seen) against the
+    //     presence_window_seconds setting. Default 120s comfortably
+    //     covers the bell's ~30s poll cadence with a couple of
+    //     missed beats; tunable if an operator runs the bell on a
+    //     much slower schedule.
+    //
+    // dispatch_post_send_notifications() is the fanout entry point
+    // called from send_message() after the row commits. It does THREE
+    // things per recipient:
+    //
+    //   1. Always enqueue an in-app row (drives the bell badge bump
+    //      on the recipient's next poll — solves the original "only
+    //      shows up on next dashboard load" report for ALL recipients,
+    //      online or offline).
+    //
+    //   2. If recipient is OFFLINE and not on cooldown for this
+    //      thread, dispatch email (and SMS if enabled) via
+    //      Matrix_MLM_Notifications::send_message_notification — the
+    //      "push" channel for users who aren't currently on platform.
+    //
+    //   3. Update the per-(recipient, thread) cooldown so a six-message
+    //      burst from the same sender doesn't generate six emails.
+    //
+    // Filterable (matrix_messaging_should_offline_email) so an
+    // operator can plug in a more aggressive batching policy without
+    // editing this file.
+    // ---------------------------------------------------------------
+
+    /**
+     * Refresh the calling user's last-seen presence pulse.
+     *
+     * Idempotent. Stored as a unix timestamp (not mysql datetime) to
+     * keep the comparison in is_online() a single integer subtraction
+     * — datetime parsing on every recipient in a fanout would dominate
+     * the cost on a wide team-room broadcast.
+     */
+    public static function update_presence($user_id) {
+        $user_id = (int) $user_id;
+        if ($user_id <= 0) {
+            return;
+        }
+        update_user_meta($user_id, self::PRESENCE_META, time());
+    }
+
+    /**
+     * Is $user_id currently considered "on platform"?
+     *
+     * Returns false if there's no presence pulse on record (user has
+     * not been seen since this feature shipped) — that's the safe
+     * default: an unknown user gets the email so we don't silently
+     * swallow notifications during the rollout window before every
+     * member's first AJAX request lands.
+     */
+    public static function is_online($user_id) {
+        $user_id = (int) $user_id;
+        if ($user_id <= 0) {
+            return false;
+        }
+        $last = (int) get_user_meta($user_id, self::PRESENCE_META, true);
+        if ($last <= 0) {
+            return false;
+        }
+        $settings = self::get_settings();
+        $window   = max(30, (int) $settings['presence_window_seconds']);
+        return (time() - $last) < $window;
+    }
+
+    /**
+     * Build the short preview used as the in-app body and the email
+     * body. Caps at 280 chars (UTF-8-safe) — long enough to be
+     * recognisable in an inbox, short enough to never blow past
+     * the in-app `body` column or generate an unscrollable bell row.
+     */
+    private static function build_preview($body, $has_attachment) {
+        $body = trim((string) $body);
+        if ($body === '') {
+            return $has_attachment ? __('(image attachment)', 'matrix-mlm') : '';
+        }
+        if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+            if (mb_strlen($body, 'UTF-8') > 280) {
+                return mb_substr($body, 0, 277, 'UTF-8') . '…';
+            }
+            return $body;
+        }
+        return strlen($body) > 280 ? substr($body, 0, 277) . '…' : $body;
+    }
+
+    /**
+     * Resolve the human-readable label for a thread. For DMs, it's
+     * the OTHER party's display name from the recipient's POV (so
+     * "Alice → Bob" thread shows as "Alice" in Bob's inbox); for
+     * team rooms, it's the saved title.
+     */
+    private static function thread_label_for_recipient($thread, $recipient_id) {
+        if (isset($thread->type) && $thread->type === 'dm') {
+            $other = self::get_dm_other_party((int) $thread->id, (int) $recipient_id);
+            $u = $other ? get_userdata($other) : null;
+            if ($u) {
+                return $u->display_name ?: $u->user_login;
+            }
+            return __('(unknown user)', 'matrix-mlm');
+        }
+        return !empty($thread->title) ? (string) $thread->title : __('Team Room', 'matrix-mlm');
+    }
+
+    /**
+     * Fanout for a freshly-inserted message. Invoked by
+     * send_message() right after the threads.last_message_at update
+     * lands so a recipient who polls the bell during the same tick
+     * sees the unread badge bump immediately rather than waiting for
+     * the next thread-list refresh.
+     *
+     * Soft-fail: notification delivery MUST NOT bubble an exception
+     * that aborts the underlying message insert (which has already
+     * committed). Any failure to enqueue an in-app row or send an
+     * email is logged via WordPress's normal channels and the send
+     * still reports success to the sender.
+     *
+     * @param object $thread        Row from matrix_message_threads (id, type, title, ...)
+     * @param int    $sender_id     Author of the just-inserted message.
+     * @param int    $message_id    Inserted row id (matrix_messages.id).
+     * @param string $body          Already-stripped, already-stored body.
+     * @param int    $attachment_id Attachment id (or null).
+     * @return void
+     */
+    private static function dispatch_post_send_notifications($thread, $sender_id, $message_id, $body, $attachment_id) {
+        global $wpdb;
+        if (!is_object($thread) || empty($thread->id)) {
+            return;
+        }
+        $thread_id = (int) $thread->id;
+        $sender_id = (int) $sender_id;
+
+        // Active, non-removed participants other than the sender.
+        // Mute is checked per-recipient further down rather than
+        // baked into this query so we can still write the bell row
+        // for muted users (mute = "don't ping me", not "hide it").
+        $participants = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_id, muted_until
+               FROM {$wpdb->prefix}matrix_message_participants
+              WHERE thread_id = %d
+                AND user_id != %d
+                AND removed_at IS NULL",
+            $thread_id, $sender_id
+        ));
+        if (empty($participants)) {
+            return;
+        }
+
+        $sender_user  = get_userdata($sender_id);
+        $sender_label = $sender_user ? ($sender_user->display_name ?: $sender_user->user_login) : __('A member', 'matrix-mlm');
+        $is_dm        = isset($thread->type) && $thread->type === 'dm';
+        $preview      = self::build_preview($body, !empty($attachment_id));
+
+        // Same-host link only — Matrix_MLM_In_App_Notifications drops
+        // off-host links silently, so the dashboard-relative form is
+        // the safe shape here regardless of how home_url() is
+        // configured.
+        $link_url = '/matrix-dashboard/messages/?open=' . $thread_id;
+
+        $settings              = self::get_settings();
+        $offline_email_enabled = !empty($settings['offline_email_enabled']);
+        $cooldown              = max(0, (int) $settings['offline_email_cooldown_seconds']);
+        $now_ts                = time();
+
+        foreach ($participants as $p) {
+            $recipient_id = (int) $p->user_id;
+            if ($recipient_id <= 0) {
+                continue;
+            }
+
+            $thread_label = self::thread_label_for_recipient($thread, $recipient_id);
+            $title = $is_dm
+                ? sprintf(
+                    /* translators: %s: sender display name */
+                    __('New message from %s', 'matrix-mlm'),
+                    $sender_label
+                )
+                : sprintf(
+                    /* translators: %s: thread/team-room name */
+                    __('New message in %s', 'matrix-mlm'),
+                    $thread_label
+                );
+
+            // 1. In-app bell row — for EVERY recipient, online or offline.
+            //    This is the piece that fixes the "messages surface only
+            //    on next dashboard load + polling" complaint: the bell
+            //    poll runs everywhere on the dashboard, so a user with
+            //    the dashboard open in another tab sees the badge bump
+            //    within one bell tick instead of having to navigate to
+            //    the messages page.
+            if (class_exists('Matrix_MLM_In_App_Notifications')) {
+                Matrix_MLM_In_App_Notifications::enqueue(
+                    $recipient_id,
+                    self::NEW_MESSAGE_NOTIF_TYPE,
+                    $title,
+                    $preview,
+                    $link_url,
+                    [
+                        'thread_id'   => $thread_id,
+                        'message_id'  => (int) $message_id,
+                        'sender_id'   => $sender_id,
+                        'thread_type' => isset($thread->type) ? (string) $thread->type : 'dm',
+                    ]
+                );
+            }
+
+            // 2. Email / SMS push — only if recipient is OFFLINE.
+            //    Skip silently for muted threads, banned users, and
+            //    blocked DM counterparties; those are intentional
+            //    recipient-side opt-outs.
+            if (!$offline_email_enabled) {
+                continue;
+            }
+            if (!empty($p->muted_until)) {
+                $mute_ts = strtotime((string) $p->muted_until . ' UTC');
+                if ($mute_ts && $mute_ts > $now_ts) {
+                    continue;
+                }
+            }
+            if (self::is_user_banned($recipient_id)) {
+                continue;
+            }
+            if ($is_dm && self::is_blocked_either_way($sender_id, $recipient_id)) {
+                continue;
+            }
+            if (self::is_online($recipient_id)) {
+                continue;
+            }
+
+            // Per-(recipient, thread) cooldown to coalesce bursts.
+            $cd_key = self::OFFLINE_EMAIL_META_PREFIX . $thread_id;
+            $last_email_at = (int) get_user_meta($recipient_id, $cd_key, true);
+            if ($cooldown > 0 && $last_email_at > 0 && ($now_ts - $last_email_at) < $cooldown) {
+                continue;
+            }
+
+            /**
+             * Filter: matrix_messaging_should_offline_email
+             *
+             * Last gate before dispatch. Return false to suppress
+             * the email for this recipient (e.g. an operator who
+             * wants to disable push for a specific user role).
+             */
+            $should = apply_filters(
+                'matrix_messaging_should_offline_email',
+                true,
+                $recipient_id,
+                $sender_id,
+                $thread,
+                $message_id
+            );
+            if (!$should) {
+                continue;
+            }
+
+            if (class_exists('Matrix_MLM_Notifications')
+                && method_exists('Matrix_MLM_Notifications', 'send_message_notification')) {
+                $sent = Matrix_MLM_Notifications::send_message_notification(
+                    $recipient_id,
+                    $sender_id,
+                    $thread,
+                    $preview,
+                    !empty($attachment_id)
+                );
+                if ($sent) {
+                    update_user_meta($recipient_id, $cd_key, $now_ts);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Cross-thread message search (DB 1.0.20 / plugin 2.0.3)
+    //
+    // Filters to threads the calling user is a participant of (the
+    // INNER JOIN against matrix_message_participants is what makes
+    // this safe — there's no way to surface a message from a thread
+    // the user isn't in), excludes soft-deleted rows, and runs a
+    // LIKE %q% against body. We deliberately do NOT use FULLTEXT:
+    //
+    //   - dbDelta has long-standing issues emitting FULLTEXT against
+    //     InnoDB on older MySQL versions still in our supported range.
+    //
+    //   - The volume per user is tiny (a typical member has thousands
+    //     of messages, not millions); a covering index on
+    //     (thread_id, id) plus the participants filter narrows the
+    //     scan enough that LIKE is fast.
+    //
+    //   - LIKE works identically across MySQL / MariaDB / Aurora
+    //     without a CREATE FULLTEXT migration that operators have
+    //     to opt into.
+    // ---------------------------------------------------------------
+
+    /**
+     * Search messages visible to $user_id whose body matches $query.
+     *
+     * @param int    $user_id Caller — defines the visibility scope.
+     * @param string $query   2..100 chars; shorter queries return [].
+     * @param int    $limit   1..100, default 50.
+     * @return array Each row: id, thread_id, sender_id, body, created_at,
+     *               type, team_owner_id, title (raw thread fields), plus
+     *               sender_label, thread_label, snippet (computed
+     *               server-side so the JS doesn't need locale-aware
+     *               substring math).
+     */
+    public static function search_messages($user_id, $query, $limit = 50) {
+        global $wpdb;
+        $user_id = (int) $user_id;
+        $query   = trim((string) $query);
+        if ($user_id <= 0 || $query === '') {
+            return [];
+        }
+        $qlen = function_exists('mb_strlen') ? mb_strlen($query, 'UTF-8') : strlen($query);
+        if ($qlen < 2 || $qlen > 100) {
+            return [];
+        }
+        $limit = max(1, min(100, (int) $limit));
+        $like  = '%' . $wpdb->esc_like($query) . '%';
+
+        $messages_t     = $wpdb->prefix . 'matrix_messages';
+        $threads_t      = $wpdb->prefix . 'matrix_message_threads';
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+
+        $rows = $wpdb->get_results($wpdb->prepare("
+            SELECT m.id, m.thread_id, m.sender_id, m.body, m.created_at,
+                   t.type, t.team_owner_id, t.title
+              FROM $messages_t m
+              INNER JOIN $threads_t t ON t.id = m.thread_id
+              INNER JOIN $participants_t p ON p.thread_id = t.id AND p.user_id = %d AND p.removed_at IS NULL
+             WHERE m.deleted_at IS NULL
+               AND t.status = 'active'
+               AND m.body LIKE %s
+             ORDER BY m.created_at DESC, m.id DESC
+             LIMIT %d
+        ", $user_id, $like, $limit));
+
+        if (empty($rows)) {
+            return [];
+        }
+
+        // Hydrate sender + thread labels and a query-centred snippet.
+        // We do this in PHP after the SQL because thread_label is
+        // recipient-relative for DMs (the OTHER party's name) and
+        // can't be computed in the same SELECT without a self-join
+        // that would break the readability of the visibility check.
+        foreach ($rows as $r) {
+            $sender = get_userdata((int) $r->sender_id);
+            $r->sender_label = $sender
+                ? ($sender->display_name ?: $sender->user_login)
+                : __('(unknown)', 'matrix-mlm');
+            $r->thread_label = self::thread_label_for_recipient($r, $user_id);
+            $r->snippet      = self::build_search_snippet((string) $r->body, $query, 200);
+        }
+        return $rows;
+    }
+
+    /**
+     * Return ~$window characters of $body centred on the first
+     * occurrence of $query. Adds a leading "…" when we clip the
+     * left edge and a trailing "…" when we clip the right edge so
+     * the user sees that the result is a snippet rather than the
+     * full message.
+     *
+     * UTF-8-safe via mb_* with a degraded ASCII fallback for hosts
+     * without ext/mbstring.
+     */
+    private static function build_search_snippet($body, $query, $window = 200) {
+        $body  = (string) $body;
+        $query = (string) $query;
+        if ($body === '') {
+            return '';
+        }
+        if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+            $len = mb_strlen($body, 'UTF-8');
+            if ($len <= $window) {
+                return $body;
+            }
+            $pos = function_exists('mb_stripos')
+                ? mb_stripos($body, $query, 0, 'UTF-8')
+                : stripos($body, $query);
+            if ($pos === false) {
+                return mb_substr($body, 0, $window, 'UTF-8') . '…';
+            }
+            $start = max(0, (int) $pos - (int) ($window / 4));
+            $snip  = mb_substr($body, $start, $window, 'UTF-8');
+            if ($start > 0) {
+                $snip = '…' . $snip;
+            }
+            if (($start + $window) < $len) {
+                $snip .= '…';
+            }
+            return $snip;
+        }
+        if (strlen($body) <= $window) {
+            return $body;
+        }
+        $pos = stripos($body, $query);
+        if ($pos === false) {
+            return substr($body, 0, $window) . '…';
+        }
+        $start = max(0, (int) $pos - (int) ($window / 4));
+        $snip  = substr($body, $start, $window);
+        if ($start > 0) {
+            $snip = '…' . $snip;
+        }
+        if (($start + $window) < strlen($body)) {
+            $snip .= '…';
+        }
+        return $snip;
+    }
+
+    // ---------------------------------------------------------------
     // AJAX handlers — every endpoint is logged-in only.
     // ---------------------------------------------------------------
 
@@ -757,7 +1268,13 @@ class Matrix_MLM_Messaging {
             wp_send_json_error(['message' => __('Login required', 'matrix-mlm')], 401);
         }
         check_ajax_referer('matrix_messaging', 'nonce');
-        return get_current_user_id();
+        $uid = get_current_user_id();
+        // Touch presence on every authenticated messaging hit. This
+        // is what gates offline-email dispatch — a tab actively
+        // chatting keeps last_seen fresh and so never receives an
+        // email for messages they're already reading.
+        self::update_presence($uid);
+        return $uid;
     }
 
     public static function ajax_list_threads() {
@@ -873,5 +1390,43 @@ class Matrix_MLM_Messaging {
             wp_send_json_error(['message' => $r->get_error_message()]);
         }
         wp_send_json_success(['report_id' => $r]);
+    }
+
+    /**
+     * POST action=matrix_messaging_search with q=<query>.
+     *
+     * Returns up to 50 matching messages across every thread the
+     * caller is a participant of, newest first. Each result row is
+     * shaped for direct rendering — sender label, recipient-relative
+     * thread label, and a query-centred snippet are all already
+     * computed server-side.
+     */
+    public static function ajax_search() {
+        $uid = self::ajax_guard();
+        $q = isset($_REQUEST['q']) ? wp_unslash((string) $_REQUEST['q']) : '';
+        $q = sanitize_text_field($q);
+        $rows = self::search_messages($uid, $q, 50);
+        wp_send_json_success([
+            'query'   => $q,
+            'count'   => count($rows),
+            'results' => $rows,
+        ]);
+    }
+
+    /**
+     * POST action=matrix_messaging_presence.
+     *
+     * Lightweight beacon for users who are on the dashboard but NOT
+     * in the messages tab. The bell-icon poll already touches
+     * presence via Matrix_MLM_In_App_Notifications::ajax_fetch, so
+     * this is mostly redundant on a normal dashboard load — kept
+     * as a dedicated endpoint so a tab without the bell mounted
+     * (e.g. a custom shortcode-only deployment) can still
+     * advertise itself online.
+     */
+    public static function ajax_presence() {
+        $uid = self::ajax_guard();
+        // ajax_guard already updated presence; nothing else to do.
+        wp_send_json_success(['ts' => time(), 'user_id' => $uid]);
     }
 }

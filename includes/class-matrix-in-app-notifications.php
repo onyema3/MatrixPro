@@ -348,6 +348,18 @@ class Matrix_MLM_In_App_Notifications {
         $offset     = isset($_POST['offset']) ? (int) $_POST['offset'] : 0;
         $only_unread = !empty($_POST['unread_only']);
 
+        // Site-wide presence beacon. The bell-icon poll runs on every
+        // dashboard page (not just the messages tab), so this is the
+        // signal Matrix_MLM_Messaging::is_online() relies on to gate
+        // offline-email dispatch for users who are on the platform
+        // but haven't opened the messages tab in this session.
+        // Class-exists guarded so a future deinstall of the messaging
+        // module wouldn't fatal the bell.
+        if (class_exists('Matrix_MLM_Messaging')
+            && method_exists('Matrix_MLM_Messaging', 'update_presence')) {
+            Matrix_MLM_Messaging::update_presence($user_id);
+        }
+
         $rows = self::get_for_user($user_id, $limit, $offset, $only_unread);
         $unread = self::unread_count($user_id);
         $total  = self::total_count($user_id);
