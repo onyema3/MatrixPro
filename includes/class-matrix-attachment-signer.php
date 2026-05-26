@@ -111,10 +111,17 @@ class Matrix_MLM_Attachment_Signer {
      * up-front because legacy healthcare rows may still have URLs
      * in their schema even though the current form doesn't accept
      * uploads anymore — admin doc cards still render those.
+     *
+     * Voice notes (DB 1.0.25) sit alongside the KYC subtrees but
+     * are gated by a different authorisation rule: instead of
+     * `manage_matrix_mlm`, members fetching their own thread's
+     * voice files pass through participant_can_fetch_voice().
+     * See handle_request() for the dispatch.
      */
     const ALLOWED_SUBTREES = [
         '/matrix-loan-files/',
         '/matrix-healthcare-files/',
+        '/matrix-messaging-voice/',
     ];
 
     /**
@@ -237,13 +244,24 @@ class Matrix_MLM_Attachment_Signer {
         // 1. Capability gate. Same gate the admin Loans/Healthcare
         //    pages use; a non-admin who somehow obtained a signed
         //    URL still cannot use it.
-        if (!current_user_can('manage_matrix_mlm')) {
-            return new WP_Error(
-                'matrix_mlm_attachment_forbidden',
-                __('You do not have permission to view this attachment.', 'matrix-mlm'),
-                ['status' => 403]
-            );
-        }
+        //
+        //    Voice-note exception (1.0.25): messaging voice files
+        //    live in their own subtree and have a per-thread
+        //    participant gate instead of the admin capability.
+        //    Admins still pass through (they can play any
+        //    reported voice in the moderation queue), but
+        //    non-admin participants of the owning thread also
+        //    pass. The two-stage check below is structured so
+        //    the path validation runs first regardless — the
+        //    auth gate is the very last thing we evaluate, so a
+        //    leaked URL with a tampered path or expired sig
+        //    fails the integrity checks before the auth branch
+        //    ever fires.
+        $is_admin = current_user_can('manage_matrix_mlm');
+        // Voice files have a participant-level gate that only
+        // resolves once we've parsed the path; defer the
+        // 403-without-cap return until after the integrity gates
+        // have validated the request shape.
 
         $p_b64 = (string) $request->get_param('p');
         $exp   = (int)    $request->get_param('exp');
@@ -337,6 +355,34 @@ class Matrix_MLM_Attachment_Signer {
             );
         }
 
+        // Per-subtree authorisation gate. KYC subtrees stay on
+        // manage_matrix_mlm (the admin reviewing loans/healthcare
+        // is the only legitimate consumer). The voice-notes
+        // subtree adds a participant-level gate so members can
+        // play the audio in their own threads without holding
+        // an admin capability. Admins always pass — they need to
+        // play reported voice notes in the moderation queue.
+        if (!$is_admin) {
+            $voice_prefix = '/matrix-messaging-voice/';
+            if (strpos($real_relative, $voice_prefix) === 0) {
+                if (!self::participant_can_fetch_voice($real_relative)) {
+                    return new WP_Error(
+                        'matrix_mlm_attachment_forbidden',
+                        __('You do not have permission to view this attachment.', 'matrix-mlm'),
+                        ['status' => 403]
+                    );
+                }
+            } else {
+                // Non-voice subtree (loan / healthcare): admin
+                // capability is required.
+                return new WP_Error(
+                    'matrix_mlm_attachment_forbidden',
+                    __('You do not have permission to view this attachment.', 'matrix-mlm'),
+                    ['status' => 403]
+                );
+            }
+        }
+
         // 7. Stream. We bypass the REST response path here because
         //    REST_Server expects JSON; for binary file delivery we
         //    set headers and exit. nocache_headers() so admin
@@ -416,6 +462,88 @@ class Matrix_MLM_Attachment_Signer {
             }
         }
         return false;
+    }
+
+    /**
+     * Voice-note participant gate.
+     *
+     * Resolves a voice-subtree relative path back to the WP
+     * attachment id that owns it on disk, walks to the
+     * matrix_message_attachments row that references that id,
+     * and asks the messaging model whether the current user is
+     * an active participant of the owning thread.
+     *
+     * Soft-deleted messages still pass — moderators see the
+     * "(message deleted)" placeholder UI, but a recipient
+     * already mid-playback when a moderator deletes shouldn't
+     * have the audio yanked out from under them within the same
+     * 10-minute signed-URL lifetime. The deleted_at gate sits
+     * one layer up at hydrate_message_rows (which stops issuing
+     * new signed URLs for deleted messages), so this gate's
+     * job is just "is the caller a participant".
+     *
+     * Returns false for any of:
+     *   - logged-out caller (no get_current_user_id())
+     *   - file not registered as a WP attachment
+     *   - no matrix_message_attachments row for this attachment
+     *   - the owning thread doesn't exist or the caller isn't
+     *     a participant of it
+     *
+     * Designed to be cheap on the happy path: one indexed lookup
+     * on _wp_attached_file → wp_postmeta, one indexed lookup on
+     * matrix_message_attachments.attachment_id, one indexed
+     * lookup on matrix_message_participants. All three keys
+     * already exist; no new index needed.
+     */
+    private static function participant_can_fetch_voice($real_relative) {
+        $user_id = get_current_user_id();
+        if ($user_id <= 0) {
+            return false;
+        }
+        if (!class_exists('Matrix_MLM_Messaging')) {
+            return false;
+        }
+        global $wpdb;
+
+        // _wp_attached_file is stored RELATIVE to wp_upload_dir
+        // basedir, with NO leading slash. Our $real_relative DOES
+        // have a leading slash (it's the substring after basedir).
+        // Strip the leading slash for the meta lookup.
+        $attached = ltrim((string) $real_relative, '/');
+        if ($attached === '') {
+            return false;
+        }
+        $attachment_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+              WHERE meta_key = '_wp_attached_file'
+                AND meta_value = %s
+              LIMIT 1",
+            $attached
+        ));
+        if ($attachment_id <= 0) {
+            return false;
+        }
+
+        // Find the messaging row that owns this attachment.
+        // We restrict to kind='voice' as a defence-in-depth: a
+        // future bug that lets an image attachment land in the
+        // voice subtree should not silently start being served
+        // through the participant gate (which is laxer than the
+        // admin gate non-voice subtrees use).
+        $thread_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT m.thread_id
+               FROM {$wpdb->prefix}matrix_message_attachments ma
+               JOIN {$wpdb->prefix}matrix_messages m ON m.id = ma.message_id
+              WHERE ma.attachment_id = %d
+                AND ma.kind = 'voice'
+              LIMIT 1",
+            $attachment_id
+        ));
+        if ($thread_id <= 0) {
+            return false;
+        }
+
+        return Matrix_MLM_Messaging::user_can_view_thread($thread_id, $user_id);
     }
 
     /**
