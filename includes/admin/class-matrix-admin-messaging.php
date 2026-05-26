@@ -3,20 +3,30 @@
  * Admin Messaging Moderation.
  *
  * Surfaces three things:
- *   1. Open report queue with one-click "Soft-delete message" and
- *      "Ban sender" actions.
- *   2. Active bans (read/unban from wp_usermeta).
+ *   1. Open report queue, grouped by message so a single spam payload
+ *      reported by N members renders as one actionable row. Each row
+ *      offers a single-radio resolution (Dismiss / Delete / Delete + Ban)
+ *      with a duration picker that's only consulted on the ban path.
+ *      Resolving a grouped row clears every open report for that
+ *      message in one UPDATE so the queue empties cleanly. Filters by
+ *      reason and sender, paginated 25 per page.
+ *   2. Active bans queue, with banned_at / banned_by columns surfaced
+ *      from the BAN_META_AT / BAN_META_BY metadata that
+ *      Matrix_MLM_Messaging::ban_user() writes alongside the
+ *      until/reason pair. Includes a direct "Add Ban" form for the
+ *      out-of-band case where a user was reported via support ticket
+ *      or email and there is no in-app report row to resolve.
  *   3. Module settings (rate limits, stripping toggle, attachments,
  *      edit/self-delete window, polling cadence, offline-recipient
  *      push delivery) — saved into the same Matrix_MLM_Messaging::SETTINGS_OPTION
  *      blob the runtime reads, with a separate Reset-to-Defaults form
- *      that deletes the option row outright so a future schema
- *      addition can lazily-default a freshly-reset install.
+ *      that deletes the option row outright.
  *
- * The Settings tab fires the matrix_messaging_settings_saved action on
- * both save and reset, with ($new, $old) effective-merged settings
- * arrays, so audit-log / observability subscribers can record diffs
- * without polling the option.
+ * Both ban and unban writes route through Matrix_MLM_Messaging::ban_user
+ * and unban_user, which fire matrix_messaging_user_banned and
+ * matrix_messaging_user_unbanned actions so audit-log subscribers can
+ * react without observing wp_usermeta. The Settings tab fires
+ * matrix_messaging_settings_saved on save and reset.
  *
  * Capability: manage_matrix_messaging — granted to administrator on
  * activation. Falls back to manage_options for super-admins on multisite.
@@ -70,6 +80,36 @@ class Matrix_MLM_Admin_Messaging {
         <?php
     }
 
+    /**
+     * Translate a duration slug from the admin form into the value
+     * Matrix_MLM_Messaging::ban_user() expects in $until.
+     *
+     * Slugs are kept short for URL-friendliness on the form POST.
+     * Anything unrecognised falls through to 'permanent' rather than
+     * silently downgrading to a finite value, because a typo'd or
+     * tampered slug should fail in the safer direction (longer ban,
+     * which an admin can lift in one click) rather than the unsafe
+     * direction (shorter ban or none, which a malicious sender could
+     * exploit by rotating the slug to "" or "0d").
+     */
+    private static function ban_duration_to_until($duration) {
+        switch ($duration) {
+            case '1d':  return gmdate('Y-m-d H:i:s', time() + DAY_IN_SECONDS);
+            case '7d':  return gmdate('Y-m-d H:i:s', time() + 7 * DAY_IN_SECONDS);
+            case '30d': return gmdate('Y-m-d H:i:s', time() + 30 * DAY_IN_SECONDS);
+            case 'permanent':
+            default:    return 'permanent';
+        }
+    }
+
+    /**
+     * Allowed ban-duration slugs. Single source of truth for both the
+     * resolve form and the direct add-ban form.
+     */
+    private static function allowed_ban_durations() {
+        return ['1d' => '1 day', '7d' => '7 days', '30d' => '30 days', 'permanent' => 'Permanent'];
+    }
+
     private function maybe_handle_post() {
         if (empty($_POST['_matrix_messaging_admin_nonce'])
             || !wp_verify_nonce($_POST['_matrix_messaging_admin_nonce'], 'matrix_messaging_admin')) {
@@ -84,52 +124,150 @@ class Matrix_MLM_Admin_Messaging {
 
         switch ($action) {
             case 'resolve_report':
-                $report_id   = (int) ($_POST['report_id'] ?? 0);
-                $resolution  = sanitize_key($_POST['resolution'] ?? 'no_action');
-                $delete_msg  = !empty($_POST['delete_message']);
-                $ban_sender  = !empty($_POST['ban_sender']);
+                // Resolution model:
+                //   no_action      — dismiss with no side effects
+                //   message_deleted — soft-delete the message
+                //   user_banned    — soft-delete + ban the sender
+                //                    (delete is implied; banning a
+                //                    user without removing the
+                //                    offending content would leave
+                //                    the spam visible to recipients
+                //                    who haven't refreshed)
+                //
+                // Scope: report_id (single report) OR message_id
+                // (every open report for that message). Grouped view
+                // posts message_id; single view posts report_id. We
+                // accept either, prefer report_id when both are
+                // present.
+                $report_id    = (int) ($_POST['report_id'] ?? 0);
+                $message_id   = (int) ($_POST['message_id'] ?? 0);
+                $resolution   = sanitize_key($_POST['resolution'] ?? 'no_action');
+                $ban_duration = sanitize_key($_POST['ban_duration'] ?? 'permanent');
+                if (!in_array($resolution, ['no_action', 'message_deleted', 'user_banned'], true)) {
+                    $resolution = 'no_action';
+                }
+                if ($report_id <= 0 && $message_id <= 0) {
+                    break;
+                }
 
-                $report = $wpdb->get_row($wpdb->prepare(
-                    "SELECT * FROM {$wpdb->prefix}matrix_message_reports WHERE id = %d",
-                    $report_id
+                // Resolve message_id from report row when caller
+                // gave us one but not the other.
+                if ($message_id <= 0 && $report_id > 0) {
+                    $message_id = (int) $wpdb->get_var($wpdb->prepare(
+                        "SELECT message_id FROM {$wpdb->prefix}matrix_message_reports WHERE id = %d",
+                        $report_id
+                    ));
+                }
+                if ($message_id <= 0) {
+                    break;
+                }
+
+                $msg = $wpdb->get_row($wpdb->prepare(
+                    "SELECT id, sender_id, deleted_at FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
+                    $message_id
                 ));
-                if (!$report) break;
 
-                if ($delete_msg) {
+                // Side effects: delete + ban. Apply only if the
+                // underlying message still exists. If the message
+                // row is gone (hard-deleted by cron cleanup) we
+                // still mark the report rows resolved below so the
+                // queue can clear — keeping a stale report in the
+                // open queue forever because its target message
+                // expired is worse than losing the audit shape.
+                if ($msg && in_array($resolution, ['message_deleted', 'user_banned'], true) && empty($msg->deleted_at)) {
                     $wpdb->update(
                         $wpdb->prefix . 'matrix_messages',
                         ['deleted_at' => current_time('mysql', true), 'deleted_by' => get_current_user_id()],
-                        ['id' => (int) $report->message_id]
+                        ['id' => (int) $msg->id]
                     );
                 }
-                if ($ban_sender) {
-                    $msg = $wpdb->get_row($wpdb->prepare(
-                        "SELECT sender_id FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
-                        (int) $report->message_id
-                    ));
-                    if ($msg) {
-                        update_user_meta((int) $msg->sender_id, Matrix_MLM_Messaging::BAN_META_UNTIL, 'permanent');
-                        update_user_meta((int) $msg->sender_id, Matrix_MLM_Messaging::BAN_META_REASON, 'Admin moderation action on report #' . $report_id);
-                    }
+                if ($msg && $resolution === 'user_banned' && (int) $msg->sender_id > 0) {
+                    $until_value = self::ban_duration_to_until($ban_duration);
+                    $reason = sprintf(
+                        /* translators: %d: message id */
+                        __('Admin moderation action on message #%d', 'matrix-mlm'),
+                        (int) $msg->id
+                    );
+                    Matrix_MLM_Messaging::ban_user(
+                        (int) $msg->sender_id,
+                        $until_value,
+                        $reason,
+                        [
+                            'source'     => 'report_resolution',
+                            'message_id' => (int) $msg->id,
+                            'report_id'  => $report_id ?: null,
+                        ]
+                    );
                 }
-                $wpdb->update(
-                    $wpdb->prefix . 'matrix_message_reports',
-                    [
-                        'resolved_at' => current_time('mysql', true),
-                        'resolved_by' => get_current_user_id(),
-                        'resolution'  => $resolution,
-                    ],
-                    ['id' => $report_id]
-                );
+
+                // Mark the actual report row(s) resolved. If
+                // report_id was supplied we resolve only that one;
+                // otherwise we close every open report for the
+                // message. Always-resolve-all matches the grouped
+                // view's mental model — clicking "Resolve" on a row
+                // that says "12 reports" had better clear all 12.
+                $now = current_time('mysql', true);
+                $by  = (int) get_current_user_id();
+                if ($report_id > 0) {
+                    $wpdb->update(
+                        $wpdb->prefix . 'matrix_message_reports',
+                        ['resolved_at' => $now, 'resolved_by' => $by, 'resolution' => $resolution],
+                        ['id' => $report_id]
+                    );
+                } else {
+                    $wpdb->query($wpdb->prepare(
+                        "UPDATE {$wpdb->prefix}matrix_message_reports
+                            SET resolved_at = %s, resolved_by = %d, resolution = %s
+                          WHERE message_id = %d AND resolved_at IS NULL",
+                        $now,
+                        $by,
+                        $resolution,
+                        $message_id
+                    ));
+                }
                 add_settings_error('matrix_messaging', 'resolved', __('Report resolved.', 'matrix-mlm'), 'updated');
                 break;
 
             case 'lift_ban':
                 $user_id = (int) ($_POST['user_id'] ?? 0);
                 if ($user_id) {
-                    delete_user_meta($user_id, Matrix_MLM_Messaging::BAN_META_UNTIL);
-                    delete_user_meta($user_id, Matrix_MLM_Messaging::BAN_META_REASON);
+                    Matrix_MLM_Messaging::unban_user($user_id, ['source' => 'admin_ui']);
                     add_settings_error('matrix_messaging', 'unbanned', __('Ban lifted.', 'matrix-mlm'), 'updated');
+                }
+                break;
+
+            case 'add_ban':
+                // Direct ban from the Bans tab — bypass the report
+                // queue when an admin already knows who they want
+                // to silence (e.g. a user reported via support
+                // ticket rather than the in-app report button).
+                $user_login = isset($_POST['user_login']) ? sanitize_user(wp_unslash($_POST['user_login'])) : '';
+                $duration   = sanitize_key($_POST['ban_duration'] ?? 'permanent');
+                $reason_in  = isset($_POST['ban_reason']) ? wp_unslash($_POST['ban_reason']) : '';
+                $reason     = mb_substr(sanitize_text_field((string) $reason_in), 0, 255);
+                if ($user_login === '') {
+                    add_settings_error('matrix_messaging', 'addban_no_login', __('Username is required.', 'matrix-mlm'));
+                    break;
+                }
+                $user = get_user_by('login', $user_login);
+                if (!$user) {
+                    add_settings_error('matrix_messaging', 'addban_no_user', __('No user found with that username.', 'matrix-mlm'));
+                    break;
+                }
+                $until_value = self::ban_duration_to_until($duration);
+                if ($reason === '') {
+                    $reason = __('Direct admin ban (no report)', 'matrix-mlm');
+                }
+                $result = Matrix_MLM_Messaging::ban_user(
+                    (int) $user->ID,
+                    $until_value,
+                    $reason,
+                    ['source' => 'admin_ui']
+                );
+                if (is_wp_error($result)) {
+                    add_settings_error('matrix_messaging', 'addban_failed', $result->get_error_message());
+                } else {
+                    add_settings_error('matrix_messaging', 'addban_ok', __('Ban placed.', 'matrix-mlm'), 'updated');
                 }
                 break;
 
@@ -228,111 +366,394 @@ class Matrix_MLM_Admin_Messaging {
 
     private function render_reports() {
         global $wpdb;
-        $status = isset($_GET['status']) && $_GET['status'] === 'resolved' ? 'resolved' : 'open';
+
+        // Filters from query string. All sanitised before use; the
+        // sender filter goes through esc_like() before the LIKE.
+        $status   = isset($_GET['status']) && $_GET['status'] === 'resolved' ? 'resolved' : 'open';
+        $reason_f = isset($_GET['reason']) ? sanitize_key($_GET['reason']) : '';
+        if ($reason_f !== '' && !in_array($reason_f, Matrix_MLM_Messaging::ALLOWED_REPORT_REASONS, true)) {
+            $reason_f = '';
+        }
+        $sender_f = isset($_GET['sender']) ? sanitize_user(wp_unslash($_GET['sender'])) : '';
+        $paged    = max(1, (int) ($_GET['paged'] ?? 1));
+        $per_page = 25;
+        $offset   = ($paged - 1) * $per_page;
+
         settings_errors('matrix_messaging');
 
-        $where = $status === 'resolved' ? 'r.resolved_at IS NOT NULL' : 'r.resolved_at IS NULL';
-        $rows = $wpdb->get_results("
-            SELECT r.*, m.body, m.sender_id, m.thread_id, m.deleted_at,
-                   u_r.user_login AS reporter_login,
-                   u_s.user_login AS sender_login
-              FROM {$wpdb->prefix}matrix_message_reports r
-              LEFT JOIN {$wpdb->prefix}matrix_messages m ON m.id = r.message_id
-              LEFT JOIN {$wpdb->users} u_r ON u_r.ID = r.reporter_id
-              LEFT JOIN {$wpdb->users} u_s ON u_s.ID = m.sender_id
-             WHERE $where
-             ORDER BY r.created_at DESC
-             LIMIT 100
-        ");
+        // Per-status WHERE. resolved_at IS NULL gates use the
+        // resolved_at index added in DB 1.0.19.
+        $where_parts = [$status === 'resolved' ? 'r.resolved_at IS NOT NULL' : 'r.resolved_at IS NULL'];
+        $where_args  = [];
+        if ($reason_f !== '') {
+            $where_parts[] = 'r.reason = %s';
+            $where_args[]  = $reason_f;
+        }
+        if ($sender_f !== '') {
+            $where_parts[] = 'u_s.user_login LIKE %s';
+            $where_args[]  = '%' . $wpdb->esc_like($sender_f) . '%';
+        }
+        $where = implode(' AND ', $where_parts);
+
+        // The OPEN view groups by message_id so a single spam
+        // message reported by 12 different members renders as one
+        // actionable row instead of twelve. The RESOLVED view stays
+        // ungrouped — each resolution is a distinct audit event and
+        // an operator scanning history wants to see who reported
+        // what, when, and what action was taken.
+        if ($status === 'open') {
+            $count_sql = "
+                SELECT COUNT(*) FROM (
+                    SELECT 1
+                      FROM {$wpdb->prefix}matrix_message_reports r
+                      LEFT JOIN {$wpdb->prefix}matrix_messages m ON m.id = r.message_id
+                      LEFT JOIN {$wpdb->users} u_s ON u_s.ID = m.sender_id
+                     WHERE $where
+                     GROUP BY r.message_id
+                ) sub";
+            $rows_sql = "
+                SELECT m.id   AS message_id,
+                       m.body,
+                       m.sender_id,
+                       m.thread_id,
+                       m.deleted_at,
+                       COUNT(r.id) AS report_count,
+                       MAX(r.created_at) AS last_reported_at,
+                       GROUP_CONCAT(DISTINCT r.reason ORDER BY r.reason) AS reasons_csv,
+                       u_s.user_login AS sender_login
+                  FROM {$wpdb->prefix}matrix_message_reports r
+                  LEFT JOIN {$wpdb->prefix}matrix_messages m ON m.id = r.message_id
+                  LEFT JOIN {$wpdb->users} u_s ON u_s.ID = m.sender_id
+                 WHERE $where
+                 GROUP BY r.message_id
+                 ORDER BY last_reported_at DESC
+                 LIMIT %d OFFSET %d";
+        } else {
+            $count_sql = "
+                SELECT COUNT(*)
+                  FROM {$wpdb->prefix}matrix_message_reports r
+                  LEFT JOIN {$wpdb->prefix}matrix_messages m ON m.id = r.message_id
+                  LEFT JOIN {$wpdb->users} u_s ON u_s.ID = m.sender_id
+                 WHERE $where";
+            $rows_sql = "
+                SELECT r.*, m.body, m.sender_id, m.thread_id, m.deleted_at,
+                       u_r.user_login AS reporter_login,
+                       u_s.user_login AS sender_login,
+                       u_b.user_login AS resolver_login
+                  FROM {$wpdb->prefix}matrix_message_reports r
+                  LEFT JOIN {$wpdb->prefix}matrix_messages m ON m.id = r.message_id
+                  LEFT JOIN {$wpdb->users} u_r ON u_r.ID = r.reporter_id
+                  LEFT JOIN {$wpdb->users} u_s ON u_s.ID = m.sender_id
+                  LEFT JOIN {$wpdb->users} u_b ON u_b.ID = r.resolved_by
+                 WHERE $where
+                 ORDER BY r.resolved_at DESC
+                 LIMIT %d OFFSET %d";
+        }
+
+        // $wpdb->prepare requires at least one placeholder; if the
+        // base WHERE has no filter args we call get_var/get_results
+        // directly. Both branches still parameterise LIMIT/OFFSET.
+        if (!empty($where_args)) {
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- base SQL is static, only $where_args are user input.
+            $total = (int) $wpdb->get_var($wpdb->prepare($count_sql, $where_args));
+            $rows  = $wpdb->get_results($wpdb->prepare($rows_sql, array_merge($where_args, [$per_page, $offset])));
+        } else {
+            $total = (int) $wpdb->get_var($count_sql); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+            $rows  = $wpdb->get_results($wpdb->prepare($rows_sql, $per_page, $offset));
+        }
+        $total_pages = max(1, (int) ceil($total / $per_page));
+
+        // Open-report counts per status, for the subsubsub.
+        $count_open     = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_message_reports WHERE resolved_at IS NULL");
+        $count_resolved = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}matrix_message_reports WHERE resolved_at IS NOT NULL");
+
+        $base_url = admin_url('admin.php?page=matrix-mlm-messaging&tab=reports');
+        $self_url = add_query_arg(array_filter([
+            'status' => $status,
+            'reason' => $reason_f ?: null,
+            'sender' => $sender_f ?: null,
+        ], static function ($v) { return $v !== null && $v !== ''; }), $base_url);
         ?>
-        <ul class="subsubsub">
-            <li><a href="<?php echo esc_url(admin_url('admin.php?page=matrix-mlm-messaging&tab=reports&status=open')); ?>"
-                   class="<?php echo $status === 'open' ? 'current' : ''; ?>"><?php esc_html_e('Open', 'matrix-mlm'); ?></a> |</li>
-            <li><a href="<?php echo esc_url(admin_url('admin.php?page=matrix-mlm-messaging&tab=reports&status=resolved')); ?>"
-                   class="<?php echo $status === 'resolved' ? 'current' : ''; ?>"><?php esc_html_e('Resolved', 'matrix-mlm'); ?></a></li>
+        <ul class="subsubsub" style="margin-top:14px;">
+            <li><a href="<?php echo esc_url(add_query_arg('status', 'open', $base_url)); ?>"
+                   class="<?php echo $status === 'open' ? 'current' : ''; ?>"><?php esc_html_e('Open', 'matrix-mlm'); ?>
+                   <span class="count">(<?php echo (int) $count_open; ?>)</span></a> |</li>
+            <li><a href="<?php echo esc_url(add_query_arg('status', 'resolved', $base_url)); ?>"
+                   class="<?php echo $status === 'resolved' ? 'current' : ''; ?>"><?php esc_html_e('Resolved', 'matrix-mlm'); ?>
+                   <span class="count">(<?php echo (int) $count_resolved; ?>)</span></a></li>
         </ul>
 
-        <table class="wp-list-table widefat fixed striped" style="margin-top:30px;">
-            <thead><tr>
-                <th>#</th>
-                <th><?php esc_html_e('Reporter', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Sender', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Reason', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Message', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Created', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Action', 'matrix-mlm'); ?></th>
-            </tr></thead>
-            <tbody>
-                <?php if (empty($rows)): ?>
-                    <tr><td colspan="7"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
-                <?php else: foreach ($rows as $r): ?>
-                    <tr>
-                        <td>#<?php echo (int) $r->id; ?></td>
-                        <td><?php echo esc_html($r->reporter_login ?: '—'); ?></td>
-                        <td><?php echo esc_html($r->sender_login ?: '—'); ?></td>
-                        <td><?php echo esc_html($r->reason); ?></td>
-                        <td>
-                            <?php if ($r->deleted_at): ?>
-                                <em><?php esc_html_e('(message deleted)', 'matrix-mlm'); ?></em>
-                            <?php else: ?>
-                                <?php echo esc_html(mb_substr((string) $r->body, 0, 200)); ?>
-                            <?php endif; ?>
-                        </td>
-                        <td><?php echo esc_html($r->created_at); ?></td>
-                        <td>
-                            <?php if ($status === 'open'): ?>
-                                <form method="post" style="display:inline-block;">
+        <form method="get" style="clear:both;margin-top:10px;">
+            <input type="hidden" name="page" value="matrix-mlm-messaging">
+            <input type="hidden" name="tab" value="reports">
+            <input type="hidden" name="status" value="<?php echo esc_attr($status); ?>">
+            <label style="margin-right:6px;">
+                <?php esc_html_e('Reason:', 'matrix-mlm'); ?>
+                <select name="reason">
+                    <option value=""><?php esc_html_e('Any', 'matrix-mlm'); ?></option>
+                    <?php foreach (Matrix_MLM_Messaging::ALLOWED_REPORT_REASONS as $rk): ?>
+                        <option value="<?php echo esc_attr($rk); ?>" <?php selected($reason_f, $rk); ?>><?php echo esc_html($rk); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </label>
+            <label style="margin-right:6px;">
+                <?php esc_html_e('Sender:', 'matrix-mlm'); ?>
+                <input type="search" name="sender" value="<?php echo esc_attr($sender_f); ?>" placeholder="<?php esc_attr_e('username', 'matrix-mlm'); ?>">
+            </label>
+            <button type="submit" class="button"><?php esc_html_e('Filter', 'matrix-mlm'); ?></button>
+            <?php if ($reason_f !== '' || $sender_f !== ''): ?>
+                <a class="button-link" href="<?php echo esc_url(add_query_arg('status', $status, $base_url)); ?>"><?php esc_html_e('Clear filters', 'matrix-mlm'); ?></a>
+            <?php endif; ?>
+        </form>
+
+        <p class="description" style="margin-top:14px;">
+            <?php
+            if ($status === 'open') {
+                printf(
+                    /* translators: %s: number of grouped open-report rows on the current page out of total. */
+                    esc_html__('Open queue is grouped by message — multiple reports for the same message render as one row. Resolving a row clears every open report for that message. Showing %s.', 'matrix-mlm'),
+                    '<strong>' . esc_html(number_format_i18n(count($rows))) . ' / ' . esc_html(number_format_i18n($total)) . '</strong>'
+                );
+            } else {
+                printf(
+                    /* translators: %s: number of resolved rows on the current page out of total. */
+                    esc_html__('Resolved view shows every individual resolution event. Showing %s.', 'matrix-mlm'),
+                    '<strong>' . esc_html(number_format_i18n(count($rows))) . ' / ' . esc_html(number_format_i18n($total)) . '</strong>'
+                );
+            }
+            ?>
+        </p>
+
+        <?php if ($status === 'open'): ?>
+            <table class="wp-list-table widefat fixed striped" style="margin-top:14px;">
+                <thead><tr>
+                    <th style="width:90px;"><?php esc_html_e('Reports', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Sender', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Reasons', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Message', 'matrix-mlm'); ?></th>
+                    <th style="width:170px;"><?php esc_html_e('Last reported', 'matrix-mlm'); ?></th>
+                    <th style="width:380px;"><?php esc_html_e('Action', 'matrix-mlm'); ?></th>
+                </tr></thead>
+                <tbody>
+                    <?php if (empty($rows)): ?>
+                        <tr><td colspan="6"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
+                    <?php else: foreach ($rows as $r):
+                        $sender_id = (int) $r->sender_id;
+                        $sender_ban = $sender_id > 0 ? Matrix_MLM_Messaging::is_user_banned($sender_id) : false;
+                        ?>
+                        <tr>
+                            <td><span class="matrix-badge matrix-badge-warn" title="<?php esc_attr_e('Distinct reporters for this message', 'matrix-mlm'); ?>"><?php echo (int) $r->report_count; ?>&times;</span></td>
+                            <td>
+                                <?php echo esc_html($r->sender_login ?: '#' . $sender_id); ?>
+                                <?php if ($sender_ban): ?>
+                                    <br><span class="matrix-badge matrix-badge-error" style="font-size:11px;"><?php esc_html_e('banned', 'matrix-mlm'); ?></span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php
+                                $reasons = array_filter(array_map('trim', explode(',', (string) $r->reasons_csv)));
+                                foreach ($reasons as $rs) {
+                                    echo '<span class="matrix-badge matrix-badge-info" style="margin-right:4px;">' . esc_html($rs) . '</span>';
+                                }
+                                ?>
+                            </td>
+                            <td>
+                                <?php if ($r->deleted_at): ?>
+                                    <em><?php esc_html_e('(message deleted)', 'matrix-mlm'); ?></em>
+                                <?php else: ?>
+                                    <?php echo esc_html(mb_substr((string) $r->body, 0, 200)); ?>
+                                    <?php if (mb_strlen((string) $r->body) > 200): ?><span aria-hidden="true">…</span><?php endif; ?>
+                                <?php endif; ?>
+                            </td>
+                            <td><?php echo esc_html((string) $r->last_reported_at); ?></td>
+                            <td>
+                                <form method="post" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
                                     <?php wp_nonce_field('matrix_messaging_admin', '_matrix_messaging_admin_nonce'); ?>
                                     <input type="hidden" name="matrix_messaging_admin_action" value="resolve_report">
-                                    <input type="hidden" name="report_id" value="<?php echo (int) $r->id; ?>">
-                                    <select name="resolution">
-                                        <option value="no_action"><?php esc_html_e('No action', 'matrix-mlm'); ?></option>
-                                        <option value="message_deleted"><?php esc_html_e('Delete message', 'matrix-mlm'); ?></option>
-                                        <option value="user_banned"><?php esc_html_e('Ban sender', 'matrix-mlm'); ?></option>
+                                    <input type="hidden" name="message_id" value="<?php echo (int) $r->message_id; ?>">
+                                    <fieldset style="margin:0;padding:0;border:0;">
+                                        <label style="margin-right:6px;"><input type="radio" name="resolution" value="no_action" checked> <?php esc_html_e('Dismiss', 'matrix-mlm'); ?></label>
+                                        <label style="margin-right:6px;"><input type="radio" name="resolution" value="message_deleted"> <?php esc_html_e('Delete', 'matrix-mlm'); ?></label>
+                                        <label><input type="radio" name="resolution" value="user_banned"> <?php esc_html_e('Delete + Ban', 'matrix-mlm'); ?></label>
+                                    </fieldset>
+                                    <select name="ban_duration" title="<?php esc_attr_e('Applied only when "Delete + Ban" is selected', 'matrix-mlm'); ?>">
+                                        <?php foreach (self::allowed_ban_durations() as $slug => $label): ?>
+                                            <option value="<?php echo esc_attr($slug); ?>" <?php selected($slug === 'permanent'); ?>><?php echo esc_html($label); ?></option>
+                                        <?php endforeach; ?>
                                     </select>
-                                    <label><input type="checkbox" name="delete_message" value="1"> <?php esc_html_e('Delete msg', 'matrix-mlm'); ?></label>
-                                    <label><input type="checkbox" name="ban_sender" value="1"> <?php esc_html_e('Ban sender', 'matrix-mlm'); ?></label>
-                                    <button type="submit" class="button"><?php esc_html_e('Resolve', 'matrix-mlm'); ?></button>
+                                    <button type="submit" class="button button-primary"><?php esc_html_e('Resolve', 'matrix-mlm'); ?></button>
                                 </form>
-                            <?php else: ?>
-                                <span class="matrix-badge matrix-badge-info"><?php echo esc_html($r->resolution ?: '—'); ?></span>
-                            <?php endif; ?>
-                        </td>
-                    </tr>
-                <?php endforeach; endif; ?>
-            </tbody>
-        </table>
+                            </td>
+                        </tr>
+                    <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        <?php else: ?>
+            <table class="wp-list-table widefat fixed striped" style="margin-top:14px;">
+                <thead><tr>
+                    <th>#</th>
+                    <th><?php esc_html_e('Reporter', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Sender', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Reason', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Resolution', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Resolved by', 'matrix-mlm'); ?></th>
+                    <th><?php esc_html_e('Resolved at', 'matrix-mlm'); ?></th>
+                </tr></thead>
+                <tbody>
+                    <?php if (empty($rows)): ?>
+                        <tr><td colspan="7"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
+                    <?php else: foreach ($rows as $r): ?>
+                        <tr>
+                            <td>#<?php echo (int) $r->id; ?></td>
+                            <td><?php echo esc_html($r->reporter_login ?: '—'); ?></td>
+                            <td><?php echo esc_html($r->sender_login ?: '—'); ?></td>
+                            <td><span class="matrix-badge matrix-badge-info"><?php echo esc_html($r->reason); ?></span></td>
+                            <td><span class="matrix-badge matrix-badge-info"><?php echo esc_html($r->resolution ?: '—'); ?></span></td>
+                            <td><?php echo esc_html($r->resolver_login ?: '#' . (int) $r->resolved_by); ?></td>
+                            <td><?php echo esc_html((string) $r->resolved_at); ?></td>
+                        </tr>
+                    <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+
+        <?php if ($total_pages > 1): ?>
+            <div class="tablenav bottom" style="margin-top:14px;">
+                <div class="tablenav-pages">
+                    <span class="displaying-num">
+                        <?php
+                        printf(
+                            /* translators: %s: total formatted count. */
+                            esc_html(_n('%s item', '%s items', $total, 'matrix-mlm')),
+                            esc_html(number_format_i18n($total))
+                        );
+                        ?>
+                    </span>
+                    <span class="pagination-links">
+                        <?php
+                        $page_links = paginate_links([
+                            'base'      => add_query_arg('paged', '%#%', $self_url),
+                            'format'    => '',
+                            'prev_text' => '&laquo;',
+                            'next_text' => '&raquo;',
+                            'total'     => $total_pages,
+                            'current'   => $paged,
+                            'type'      => 'plain',
+                        ]);
+                        echo $page_links; // already escaped by paginate_links
+                        ?>
+                    </span>
+                </div>
+            </div>
+        <?php endif; ?>
         <?php
     }
 
     private function render_bans() {
         global $wpdb;
         settings_errors('matrix_messaging');
-        $banned_user_ids = $wpdb->get_col($wpdb->prepare(
-            "SELECT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value <> ''",
+
+        // Surface every user with a non-empty BAN_META_UNTIL. We
+        // also pull BAN_META_AT / BAN_META_BY in the same pass so
+        // the rendering loop doesn't fan into N extra queries.
+        $banned_rows = $wpdb->get_results($wpdb->prepare("
+            SELECT u_until.user_id,
+                   u_until.meta_value AS until_val,
+                   u_reason.meta_value AS reason_val,
+                   u_at.meta_value     AS at_val,
+                   u_by.meta_value     AS by_val
+              FROM {$wpdb->usermeta} u_until
+              LEFT JOIN {$wpdb->usermeta} u_reason ON u_reason.user_id = u_until.user_id AND u_reason.meta_key = %s
+              LEFT JOIN {$wpdb->usermeta} u_at     ON u_at.user_id     = u_until.user_id AND u_at.meta_key     = %s
+              LEFT JOIN {$wpdb->usermeta} u_by     ON u_by.user_id     = u_until.user_id AND u_by.meta_key     = %s
+             WHERE u_until.meta_key = %s
+               AND u_until.meta_value <> ''
+             ORDER BY u_at.meta_value DESC, u_until.user_id DESC
+        ",
+            Matrix_MLM_Messaging::BAN_META_REASON,
+            Matrix_MLM_Messaging::BAN_META_AT,
+            Matrix_MLM_Messaging::BAN_META_BY,
             Matrix_MLM_Messaging::BAN_META_UNTIL
         ));
         ?>
-        <table class="wp-list-table widefat fixed striped" style="margin-top:30px;">
+
+        <h2 class="title" style="margin-top:30px;"><?php esc_html_e('Add Ban', 'matrix-mlm'); ?></h2>
+        <p class="description" style="max-width:780px;">
+            <?php esc_html_e('Place a messaging ban on a user without going through the report queue. Use this when a user was reported via support ticket, email, or any out-of-band channel where there is no in-app report row to resolve.', 'matrix-mlm'); ?>
+        </p>
+        <form method="post" style="margin-top:8px;">
+            <?php wp_nonce_field('matrix_messaging_admin', '_matrix_messaging_admin_nonce'); ?>
+            <input type="hidden" name="matrix_messaging_admin_action" value="add_ban">
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="matrix-msg-ban-login"><?php esc_html_e('Username', 'matrix-mlm'); ?></label></th>
+                    <td><input type="text" id="matrix-msg-ban-login" name="user_login" class="regular-text" required></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="matrix-msg-ban-duration"><?php esc_html_e('Duration', 'matrix-mlm'); ?></label></th>
+                    <td>
+                        <select id="matrix-msg-ban-duration" name="ban_duration">
+                            <?php foreach (self::allowed_ban_durations() as $slug => $label): ?>
+                                <option value="<?php echo esc_attr($slug); ?>" <?php selected($slug === 'permanent'); ?>><?php echo esc_html($label); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="matrix-msg-ban-reason"><?php esc_html_e('Reason', 'matrix-mlm'); ?></label></th>
+                    <td>
+                        <input type="text" id="matrix-msg-ban-reason" name="ban_reason" class="regular-text" maxlength="255" placeholder="<?php esc_attr_e('Optional — surfaced on the bans tab', 'matrix-mlm'); ?>">
+                    </td>
+                </tr>
+            </table>
+            <p><button type="submit" class="button"><?php esc_html_e('Place Ban', 'matrix-mlm'); ?></button></p>
+        </form>
+
+        <h2 class="title" style="margin-top:30px;"><?php esc_html_e('Active Bans', 'matrix-mlm'); ?></h2>
+        <table class="wp-list-table widefat fixed striped">
             <thead><tr>
                 <th><?php esc_html_e('User', 'matrix-mlm'); ?></th>
-                <th><?php esc_html_e('Banned until', 'matrix-mlm'); ?></th>
+                <th><?php esc_html_e('Until', 'matrix-mlm'); ?></th>
                 <th><?php esc_html_e('Reason', 'matrix-mlm'); ?></th>
+                <th><?php esc_html_e('Banned at', 'matrix-mlm'); ?></th>
+                <th><?php esc_html_e('Banned by', 'matrix-mlm'); ?></th>
                 <th><?php esc_html_e('Action', 'matrix-mlm'); ?></th>
             </tr></thead>
             <tbody>
-                <?php if (empty($banned_user_ids)): ?>
-                    <tr><td colspan="4"><?php esc_html_e('No active bans.', 'matrix-mlm'); ?></td></tr>
-                <?php else: foreach ($banned_user_ids as $uid): $u = get_userdata($uid); ?>
+                <?php if (empty($banned_rows)): ?>
+                    <tr><td colspan="6"><?php esc_html_e('No active bans.', 'matrix-mlm'); ?></td></tr>
+                <?php else: foreach ($banned_rows as $row):
+                    $u    = get_userdata((int) $row->user_id);
+                    $by_u = !empty($row->by_val) ? get_userdata((int) $row->by_val) : null;
+                    $is_perm = $row->until_val === 'permanent';
+                    ?>
                     <tr>
-                        <td><?php echo esc_html($u ? $u->user_login : '#' . $uid); ?></td>
-                        <td><?php echo esc_html(get_user_meta($uid, Matrix_MLM_Messaging::BAN_META_UNTIL, true)); ?></td>
-                        <td><?php echo esc_html(get_user_meta($uid, Matrix_MLM_Messaging::BAN_META_REASON, true)); ?></td>
+                        <td><?php echo esc_html($u ? $u->user_login : '#' . (int) $row->user_id); ?></td>
+                        <td>
+                            <?php if ($is_perm): ?>
+                                <span class="matrix-badge matrix-badge-error"><?php esc_html_e('permanent', 'matrix-mlm'); ?></span>
+                            <?php else: ?>
+                                <code><?php echo esc_html((string) $row->until_val); ?></code>
+                            <?php endif; ?>
+                        </td>
+                        <td><?php echo esc_html($row->reason_val ?: '—'); ?></td>
+                        <td><?php echo esc_html($row->at_val ?: '—'); ?></td>
+                        <td>
+                            <?php
+                            if ($by_u) {
+                                echo esc_html($by_u->user_login);
+                            } elseif ((int) $row->by_val > 0) {
+                                echo '#' . (int) $row->by_val;
+                            } else {
+                                echo '—';
+                            }
+                            ?>
+                        </td>
                         <td>
                             <form method="post" style="display:inline-block;">
                                 <?php wp_nonce_field('matrix_messaging_admin', '_matrix_messaging_admin_nonce'); ?>
                                 <input type="hidden" name="matrix_messaging_admin_action" value="lift_ban">
-                                <input type="hidden" name="user_id" value="<?php echo (int) $uid; ?>">
+                                <input type="hidden" name="user_id" value="<?php echo (int) $row->user_id; ?>">
                                 <button class="button"><?php esc_html_e('Lift ban', 'matrix-mlm'); ?></button>
                             </form>
                         </td>

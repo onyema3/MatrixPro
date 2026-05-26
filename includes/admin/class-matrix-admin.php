@@ -79,7 +79,26 @@ class Matrix_MLM_Admin {
         // because messaging moderation is a higher-trust action
         // (it can permanently ban a member, whereas ticket reply
         // is reversible).
-        add_submenu_page('matrix-mlm', __('Messaging', 'matrix-mlm'), __('Messaging', 'matrix-mlm'), 'manage_matrix_messaging', 'matrix-mlm-messaging', [new Matrix_MLM_Admin_Messaging(), 'render']);
+        //
+        // Awaiting-moderation badge mirrors the WP core comments
+        // pattern: when there are open reports, append a styled
+        // count to the submenu label so an admin landing on the
+        // dashboard sees the queue without first navigating to it.
+        // count_open_reports() is one indexed COUNT(*) on a small
+        // table (resolved_at IS NULL is covered by the (resolved_at)
+        // index added in DB 1.0.19), cheap enough to run on every
+        // admin page load. Guarded with class_exists in case the
+        // messaging module is being unloaded mid-deploy.
+        $messaging_label = __('Messaging', 'matrix-mlm');
+        if (class_exists('Matrix_MLM_Messaging')) {
+            $open_reports = Matrix_MLM_Messaging::count_open_reports();
+            if ($open_reports > 0) {
+                $messaging_label .= ' <span class="awaiting-mod count-' . (int) $open_reports . '"><span class="pending-count">'
+                    . esc_html(number_format_i18n($open_reports))
+                    . '</span></span>';
+            }
+        }
+        add_submenu_page('matrix-mlm', __('Messaging', 'matrix-mlm'), $messaging_label, 'manage_matrix_messaging', 'matrix-mlm-messaging', [new Matrix_MLM_Admin_Messaging(), 'render']);
         // Announcements — broadcast composer for in-app notifications
         // pushed to every member. Sits next to Tickets because the
         // two are the platform's outbound + inbound member-comms
