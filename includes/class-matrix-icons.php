@@ -120,6 +120,9 @@ class Matrix_MLM_Icons {
         // Lifebuoy ring — support / SOS.
         'sos' => '<path fill="currentColor" d="M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20zm0 5a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm-7.6 4.6 3.2.7a4.5 4.5 0 0 0 0 1.4l-3.2.7zM19.6 11.6 16.4 12a4.5 4.5 0 0 1 0 1.4l3.2.7zM11.3 4.4l.7 3.2a4.5 4.5 0 0 1 1.4 0l-.7-3.2zM12 16.4a4.5 4.5 0 0 1-1.4 0l-.7 3.2 3.4-.4z"/>',
 
+        // Envelope with a fold line — messages.
+        'email-alt' => '<path fill="currentColor" d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 4 8 5 8-5V6l-8 5-8-5z"/>',
+
         // Single person — profile.
         'admin-users' => '<path fill="currentColor" d="M12 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm0 10c4.4 0 8 2.7 8 6v2H4v-2c0-3.3 3.6-6 8-6z"/>',
 
