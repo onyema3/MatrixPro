@@ -83,6 +83,35 @@ class Matrix_MLM_Messaging {
     const NEW_MESSAGE_NOTIF_TYPE    = 'message_received';
 
     /**
+     * Sender-side edit / self-delete window, in seconds.
+     *
+     * Default 300s (5 minutes) — long enough to catch a typo a
+     * recipient hasn't responded to yet, short enough that nobody
+     * can rewrite the historical record after a conversation has
+     * advanced. Operators who want to widen or narrow the window
+     * can set the same key in matrix_mlm_messaging_settings; the
+     * default is also exposed via the matrix_messaging_edit_window_seconds
+     * filter so a custom_post_install hook can pin it without a
+     * settings round-trip.
+     *
+     * The same window gates BOTH edit and self-delete: if you
+     * can't edit it any more, you can't soft-delete it for the
+     * room either. This matches the WhatsApp / Slack pattern of
+     * a single "I changed my mind" window rather than two
+     * separate timers, and prevents the awkward edge case of a
+     * user being able to delete-but-not-edit a stale message
+     * (or vice versa) which is harder for a recipient to reason
+     * about than a single uniform rule.
+     *
+     * Soft-delete (not hard) — the row stays in matrix_messages
+     * with deleted_at populated, mirroring the moderator-delete
+     * shape so the UI's "(message deleted)" placeholder works
+     * uniformly. cron_cleanup() hard-deletes after 30 days for
+     * both delete origins.
+     */
+    const EDIT_WINDOW_SECONDS_DEFAULT = 300;
+
+    /**
      * Default settings. Stored as a single option row to mirror the way
      * Flutterwave / Fintava settings are persisted, so the admin UI can
      * round-trip the whole blob in one save.
@@ -113,6 +142,9 @@ class Matrix_MLM_Messaging {
             'max_attachment_bytes'          => 5 * 1024 * 1024,
             'team_rooms_auto_create'        => 1,
             'polling_interval_ms'           => 10000,
+            // Sender-side edit / self-delete time window. See
+            // EDIT_WINDOW_SECONDS_DEFAULT above.
+            'edit_window_seconds'           => self::EDIT_WINDOW_SECONDS_DEFAULT,
             // Push delivery for offline recipients (DB 1.0.20 / plugin 2.0.3).
             'presence_window_seconds'       => 120,
             'offline_email_enabled'         => 1,
@@ -138,7 +170,10 @@ class Matrix_MLM_Messaging {
         // intentionally unregistered (handler returns 401 on dispatch).
         add_action('wp_ajax_matrix_messaging_list_threads',  [__CLASS__, 'ajax_list_threads']);
         add_action('wp_ajax_matrix_messaging_fetch_thread',  [__CLASS__, 'ajax_fetch_thread']);
+        add_action('wp_ajax_matrix_messaging_fetch_older',   [__CLASS__, 'ajax_fetch_older']);
         add_action('wp_ajax_matrix_messaging_send',          [__CLASS__, 'ajax_send']);
+        add_action('wp_ajax_matrix_messaging_edit',          [__CLASS__, 'ajax_edit']);
+        add_action('wp_ajax_matrix_messaging_delete',        [__CLASS__, 'ajax_delete']);
         add_action('wp_ajax_matrix_messaging_open_dm',       [__CLASS__, 'ajax_open_dm']);
         add_action('wp_ajax_matrix_messaging_mark_read',     [__CLASS__, 'ajax_mark_read']);
         add_action('wp_ajax_matrix_messaging_block',         [__CLASS__, 'ajax_block']);
@@ -182,6 +217,30 @@ class Matrix_MLM_Messaging {
     public static function is_messaging_enabled() {
         $s = self::get_settings();
         return !empty($s['enabled']);
+    }
+
+    /**
+     * Resolve the effective edit / self-delete window in seconds.
+     *
+     * Reads matrix_mlm_messaging_settings.edit_window_seconds, then
+     * runs it through the matrix_messaging_edit_window_seconds
+     * filter. Floored at 0 (disable feature) and ceilinged at
+     * 24 hours so a misconfigured option can't silently turn into
+     * an unlimited rewrite license.
+     */
+    public static function get_edit_window_seconds() {
+        $s = self::get_settings();
+        $window = (int) (isset($s['edit_window_seconds'])
+            ? $s['edit_window_seconds']
+            : self::EDIT_WINDOW_SECONDS_DEFAULT);
+        $window = (int) apply_filters('matrix_messaging_edit_window_seconds', $window);
+        if ($window < 0) {
+            $window = 0;
+        }
+        if ($window > DAY_IN_SECONDS) {
+            $window = DAY_IN_SECONDS;
+        }
+        return $window;
     }
 
     /**
@@ -598,7 +657,7 @@ class Matrix_MLM_Messaging {
         }
         $limit = max(1, min(200, (int) $limit));
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, deleted_at
+            "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, edited_at, deleted_at
              FROM {$wpdb->prefix}matrix_messages
              WHERE thread_id = %d AND id > %d
              ORDER BY id ASC
@@ -606,20 +665,106 @@ class Matrix_MLM_Messaging {
             (int) $thread_id, (int) $after_id, $limit
         ));
 
-        // Hydrate attachment_url so the JS can render inline images
-        // without an extra round-trip per message.
+        self::hydrate_message_rows($rows);
+        return $rows;
+    }
+
+    /**
+     * Fetch the page of messages in $thread_id whose id is strictly
+     * less than $before_id, newest-first inside the page (the JS
+     * reverses on render so the natural top-to-bottom ordering of
+     * the message column is preserved).
+     *
+     * Drives "Load older messages" — once the user scrolls to the
+     * top of the initial 50-message window the client passes the
+     * smallest already-rendered id and we hand back the next 50
+     * back in time.
+     *
+     * before_id == 0 is a special "no anchor" sentinel that returns
+     * an empty page; the caller should pass the actual oldest
+     * rendered id rather than relying on this.
+     */
+    public static function get_thread_messages_before($thread_id, $user_id, $before_id, $limit = 50) {
+        global $wpdb;
+        if (!self::user_can_view_thread($thread_id, $user_id)) {
+            return [];
+        }
+        $before_id = (int) $before_id;
+        if ($before_id <= 0) {
+            return [];
+        }
+        $limit = max(1, min(200, (int) $limit));
+        // ORDER BY id DESC + LIMIT lets MySQL stop after $limit rows
+        // using the (thread_id, id) covering index; a forward-order
+        // scan would have to read every older row in the thread to
+        // pick the trailing N.
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, edited_at, deleted_at
+             FROM {$wpdb->prefix}matrix_messages
+             WHERE thread_id = %d AND id < %d
+             ORDER BY id DESC
+             LIMIT %d",
+            (int) $thread_id, $before_id, $limit
+        ));
+
+        // Re-order ascending for the wire so the client doesn't have
+        // to reverse — keeps the polling and pagination response
+        // shapes identical.
+        if (!empty($rows)) {
+            $rows = array_reverse($rows);
+        }
+        self::hydrate_message_rows($rows);
+        return $rows;
+    }
+
+    /**
+     * Decorate raw message rows with derived fields the UI needs:
+     *
+     *   - attachment_url: a signed/sized URL for the inline image,
+     *     or null if no attachment / row is soft-deleted.
+     *   - is_deleted: 1 if the row has been soft-deleted (by
+     *     sender or moderator).
+     *   - is_edited: 1 if edited_at is set.
+     *   - editable_until: ISO-style mysql GMT timestamp marking
+     *     when the sender's edit window ends (created_at + window).
+     *     UI uses this to render edit / delete affordances and
+     *     to hide them after expiry without a server round-trip.
+     *
+     * Computed in PHP rather than SQL so the same code path serves
+     * both the forward-poll fetch and the back-pagination fetch
+     * with one source of truth, and so future changes to the
+     * editable_until policy (e.g. role-based windows) only need
+     * to touch one helper.
+     */
+    private static function hydrate_message_rows($rows) {
+        if (empty($rows)) {
+            return;
+        }
+        $window = self::get_edit_window_seconds();
         foreach ($rows as $r) {
             $r->attachment_url = null;
             if (!empty($r->attachment_id) && empty($r->deleted_at)) {
                 $url = wp_get_attachment_url((int) $r->attachment_id);
                 if ($url) {
-                    // Use a medium-size thumbnail for inline display
                     $thumb = wp_get_attachment_image_url((int) $r->attachment_id, 'medium');
                     $r->attachment_url = $thumb ?: $url;
                 }
             }
+            $r->is_deleted = !empty($r->deleted_at) ? 1 : 0;
+            $r->is_edited  = !empty($r->edited_at) ? 1 : 0;
+
+            // editable_until = created_at + window, expressed as a
+            // mysql GMT string so the JS comparison stays string-
+            // ordered (created_at is also GMT-string-shaped, so
+            // monotonic comparisons line up without a parse).
+            $r->editable_until = null;
+            if ($window > 0 && !empty($r->created_at) && empty($r->deleted_at)) {
+                $created_ts = strtotime($r->created_at . ' UTC');
+                if ($created_ts !== false) {
+                    $r->editable_until = gmdate('Y-m-d H:i:s', $created_ts + $window);
+                }
+            }
         }
-        return $rows;
     }
 
     /**
@@ -701,6 +846,178 @@ class Matrix_MLM_Messaging {
     }
 
     // ---------------------------------------------------------------
+    // Sender-side edit / self-delete
+    //
+    // The sender of a message can edit or soft-delete it within
+    // EDIT_WINDOW_SECONDS_DEFAULT (default 300s) of insert. Outside
+    // the window the row is frozen — preventing a sender from
+    // rewriting historical context after a recipient has read and
+    // acted on it. The same window gates both edit and delete; see
+    // the rationale on EDIT_WINDOW_SECONDS_DEFAULT for why we use a
+    // single timer for both.
+    //
+    // Soft-delete (not hard) — the row stays in matrix_messages
+    // with deleted_at populated, mirroring the moderator-delete
+    // shape so the UI's "(message deleted)" placeholder works
+    // uniformly. cron_cleanup() hard-deletes after 30 days for
+    // both delete origins.
+    //
+    // Off-platform contact stripping is re-applied on edit using
+    // the same settings flag as on send. body_stripped is rewritten
+    // (set or cleared) so the moderator UI's "stripped" badge
+    // reflects the post-edit body, not a stale flag from the
+    // original send.
+    // ---------------------------------------------------------------
+
+    /**
+     * Edit a message body. Caller must be the original sender; row
+     * must be inside the edit window and not soft-deleted.
+     *
+     * Returns true on success, WP_Error on policy / lookup failure.
+     * On success, edited_at is stamped to NOW(); body_stripped is
+     * recomputed from the new body.
+     */
+    public static function edit_message($message_id, $sender_id, $new_body) {
+        global $wpdb;
+        $message_id = (int) $message_id;
+        $sender_id  = (int) $sender_id;
+        $new_body   = trim((string) $new_body);
+
+        if (!self::is_messaging_enabled()) {
+            return new WP_Error('matrix_messaging_disabled', __('Messaging is currently disabled.', 'matrix-mlm'));
+        }
+        if ($message_id <= 0 || $sender_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+        if ($new_body === '') {
+            // Empty body would leave a row that's text-empty and
+            // attachment-empty; that's the soft-delete shape, not
+            // an edit. Refuse and let the UI route through delete.
+            return new WP_Error('matrix_messaging_empty', __('Message body required.', 'matrix-mlm'));
+        }
+        if (self::is_user_banned($sender_id)) {
+            return new WP_Error('matrix_messaging_banned', __('You are banned from messaging.', 'matrix-mlm'));
+        }
+
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, sender_id, thread_id, attachment_id, body, body_stripped, created_at, deleted_at
+               FROM {$wpdb->prefix}matrix_messages
+              WHERE id = %d",
+            $message_id
+        ));
+        if (!$row) {
+            return new WP_Error('matrix_messaging_not_found', __('Message not found.', 'matrix-mlm'));
+        }
+        if ((int) $row->sender_id !== $sender_id) {
+            return new WP_Error('matrix_messaging_forbidden', __('You can only edit your own messages.', 'matrix-mlm'));
+        }
+        if (!empty($row->deleted_at)) {
+            return new WP_Error('matrix_messaging_deleted', __('Cannot edit a deleted message.', 'matrix-mlm'));
+        }
+
+        $window = self::get_edit_window_seconds();
+        if ($window <= 0) {
+            return new WP_Error('matrix_messaging_edit_disabled', __('Editing is disabled.', 'matrix-mlm'));
+        }
+        $created_ts = strtotime($row->created_at . ' UTC');
+        if ($created_ts === false || (time() - $created_ts) > $window) {
+            return new WP_Error('matrix_messaging_edit_expired', __('Edit window has expired.', 'matrix-mlm'));
+        }
+
+        // Re-apply off-platform stripping on the new body. Same
+        // semantics as send_message() — keep the moderator-visible
+        // body_stripped flag in sync with what's actually stored.
+        $settings      = self::get_settings();
+        $body_stripped = 0;
+        if (!empty($settings['strip_off_platform_contacts'])) {
+            $stripped = self::strip_off_platform_contacts($new_body);
+            if ($stripped !== $new_body) {
+                $body_stripped = 1;
+                $new_body = $stripped;
+            }
+        }
+
+        $now = current_time('mysql', true);
+        $ok  = $wpdb->update(
+            $wpdb->prefix . 'matrix_messages',
+            [
+                'body'          => $new_body,
+                'body_stripped' => $body_stripped,
+                'edited_at'     => $now,
+            ],
+            ['id' => $message_id, 'sender_id' => $sender_id]
+        );
+        if ($ok === false) {
+            return new WP_Error('matrix_messaging_db_error', __('Could not save edit.', 'matrix-mlm'));
+        }
+        return true;
+    }
+
+    /**
+     * Sender soft-deletes their own message. Same window check as
+     * edit; same soft-delete shape as the admin moderator path so
+     * the UI's "(message deleted)" placeholder rendering doesn't
+     * branch by origin.
+     *
+     * deleted_by is set to the sender's own user id, distinguishing
+     * a self-delete from a moderator delete (where deleted_by is
+     * the admin user id) for forensic / audit purposes.
+     */
+    public static function sender_delete_message($message_id, $sender_id) {
+        global $wpdb;
+        $message_id = (int) $message_id;
+        $sender_id  = (int) $sender_id;
+
+        if (!self::is_messaging_enabled()) {
+            return new WP_Error('matrix_messaging_disabled', __('Messaging is currently disabled.', 'matrix-mlm'));
+        }
+        if ($message_id <= 0 || $sender_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, sender_id, thread_id, created_at, deleted_at
+               FROM {$wpdb->prefix}matrix_messages
+              WHERE id = %d",
+            $message_id
+        ));
+        if (!$row) {
+            return new WP_Error('matrix_messaging_not_found', __('Message not found.', 'matrix-mlm'));
+        }
+        if ((int) $row->sender_id !== $sender_id) {
+            return new WP_Error('matrix_messaging_forbidden', __('You can only delete your own messages.', 'matrix-mlm'));
+        }
+        if (!empty($row->deleted_at)) {
+            // Idempotent: a re-delete is a no-op success rather than
+            // a confusing error. Keeps the UI's optimistic remove +
+            // server canonicalisation contract simple.
+            return true;
+        }
+
+        $window = self::get_edit_window_seconds();
+        if ($window <= 0) {
+            return new WP_Error('matrix_messaging_edit_disabled', __('Self-delete is disabled.', 'matrix-mlm'));
+        }
+        $created_ts = strtotime($row->created_at . ' UTC');
+        if ($created_ts === false || (time() - $created_ts) > $window) {
+            return new WP_Error('matrix_messaging_edit_expired', __('Delete window has expired.', 'matrix-mlm'));
+        }
+
+        $ok = $wpdb->update(
+            $wpdb->prefix . 'matrix_messages',
+            [
+                'deleted_at' => current_time('mysql', true),
+                'deleted_by' => $sender_id,
+            ],
+            ['id' => $message_id, 'sender_id' => $sender_id]
+        );
+        if ($ok === false) {
+            return new WP_Error('matrix_messaging_db_error', __('Could not delete message.', 'matrix-mlm'));
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------
     // Block / mute / report
     // ---------------------------------------------------------------
 
@@ -739,6 +1056,64 @@ class Matrix_MLM_Messaging {
               LIMIT 1",
             $a, $b, $b, $a
         ));
+    }
+
+    /**
+     * Has $blocker_id blocked $blocked_id (one direction)?
+     *
+     * Distinct from is_blocked_either_way() because the UI needs
+     * to know "did THIS user block the other party" to pick
+     * between "Block" and "Unblock" labels — symmetric checks
+     * would conflate "I blocked them" with "they blocked me",
+     * which is the wrong control state to surface.
+     */
+    public static function is_blocking($blocker_id, $blocked_id) {
+        global $wpdb;
+        $blocker_id = (int) $blocker_id;
+        $blocked_id = (int) $blocked_id;
+        if ($blocker_id <= 0 || $blocked_id <= 0) {
+            return false;
+        }
+        return (bool) $wpdb->get_var($wpdb->prepare(
+            "SELECT 1 FROM {$wpdb->prefix}matrix_message_blocks
+              WHERE blocker_id = %d AND blocked_id = %d
+              LIMIT 1",
+            $blocker_id, $blocked_id
+        ));
+    }
+
+    /**
+     * Return the calling user's participant pointer for a thread:
+     * muted_until + a derived is_muted flag computed in PHP so the
+     * JS doesn't have to parse mysql GMT datetimes against its own
+     * (potentially skewed) wall clock.
+     *
+     * Returns a default ['muted_until' => null, 'is_muted' => false]
+     * shape for non-participants so the caller can call this
+     * unconditionally.
+     */
+    public static function get_participant_state($thread_id, $user_id) {
+        global $wpdb;
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT muted_until FROM {$wpdb->prefix}matrix_message_participants
+              WHERE thread_id = %d AND user_id = %d AND removed_at IS NULL
+              LIMIT 1",
+            (int) $thread_id, (int) $user_id
+        ));
+        if (!$row) {
+            return ['muted_until' => null, 'is_muted' => false];
+        }
+        $is_muted = false;
+        if (!empty($row->muted_until)) {
+            $until_ts = strtotime($row->muted_until . ' UTC');
+            if ($until_ts !== false && $until_ts > time()) {
+                $is_muted = true;
+            }
+        }
+        return [
+            'muted_until' => $row->muted_until ?: null,
+            'is_muted'    => $is_muted,
+        ];
     }
 
     public static function mute_thread($thread_id, $user_id, $until_ts) {
@@ -1459,10 +1834,60 @@ class Matrix_MLM_Messaging {
         $thread = self::get_thread($thread_id);
         $thread_type = $thread && isset($thread->type) ? (string) $thread->type : 'dm';
 
+        // Hydrate the thread-level state the UI needs to render
+        // the chrome controls (mute/block surfaces, edit-window
+        // settings) without a second round-trip per pane open.
+        // Returned on every poll tick so a user who mutes /
+        // blocks / unblocks from another tab sees the chrome
+        // converge within one poll without a manual refresh.
+        $participant_state = self::get_participant_state($thread_id, $uid);
+        $other_user_id     = $thread_type === 'dm' ? self::get_dm_other_party($thread_id, $uid) : 0;
+        $is_blocked        = $other_user_id ? (bool) self::is_blocking($uid, $other_user_id) : false;
+
         wp_send_json_success([
             'messages'    => $rows,
             'thread_type' => $thread_type,
             'receipts'    => self::compute_thread_read_receipts($thread_id, $uid),
+            // Edit-window seconds the client uses to hide
+            // edit/delete affordances after the in-memory clock
+            // ticks past created_at + window. Pulled from the
+            // server (rather than baked into wp_localize_script)
+            // so a settings change by the operator propagates
+            // within one poll without a page reload.
+            'edit_window_seconds' => self::get_edit_window_seconds(),
+            // Per-thread chrome state for the active viewer.
+            'thread_state' => [
+                'muted_until'   => $participant_state['muted_until'],
+                'is_muted'      => $participant_state['is_muted'],
+                'other_user_id' => $other_user_id,
+                'is_blocked'    => $is_blocked,
+            ],
+        ]);
+    }
+
+    /**
+     * GET/POST action=matrix_messaging_fetch_older with
+     * thread_id + before_id. Returns up to 50 messages older
+     * than before_id, oldest-first inside the page (matching the
+     * forward-poll wire shape so the JS doesn't need a second
+     * code path).
+     */
+    public static function ajax_fetch_older() {
+        $uid = self::ajax_guard();
+        $thread_id = (int) ($_REQUEST['thread_id'] ?? 0);
+        $before_id = (int) ($_REQUEST['before_id'] ?? 0);
+        if (!self::user_can_view_thread($thread_id, $uid)) {
+            wp_send_json_error(['message' => __('Forbidden', 'matrix-mlm')], 403);
+        }
+        $rows = self::get_thread_messages_before($thread_id, $uid, $before_id);
+        // has_more = whether the returned page hit the limit; if
+        // so there's almost certainly more history to fetch. The
+        // client uses this to hide its "Load older" affordance
+        // once the user has reached the start of the thread.
+        $has_more = count($rows) >= 50;
+        wp_send_json_success([
+            'messages' => $rows,
+            'has_more' => $has_more,
         ]);
     }
 
@@ -1477,6 +1902,61 @@ class Matrix_MLM_Messaging {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
         wp_send_json_success(['message_id' => $result]);
+    }
+
+    /**
+     * POST action=matrix_messaging_edit with message_id + body.
+     *
+     * On success returns the freshly-hydrated message row so the
+     * JS can canonicalise its in-memory copy in one round-trip
+     * (rather than waiting for the next poll to overwrite the
+     * optimistic edit). Hydrate the row through the same helper
+     * the fetch path uses so the client's render keeps the same
+     * shape regardless of which endpoint surfaced the row.
+     */
+    public static function ajax_edit() {
+        global $wpdb;
+        $uid = self::ajax_guard();
+        $message_id = (int) ($_POST['message_id'] ?? 0);
+        $body       = (string) ($_POST['body'] ?? '');
+        $result = self::edit_message($message_id, $uid, $body);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, edited_at, deleted_at
+               FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
+            $message_id
+        ));
+        $rows = [$row];
+        self::hydrate_message_rows($rows);
+        wp_send_json_success(['message' => $rows[0]]);
+    }
+
+    /**
+     * POST action=matrix_messaging_delete with message_id.
+     *
+     * Sender-only soft-delete. Returns the post-delete row so the
+     * UI can replace its optimistic remove with the canonical
+     * "(message deleted)" placeholder shape. Idempotent — a
+     * second delete on the same row succeeds silently.
+     */
+    public static function ajax_delete() {
+        global $wpdb;
+        $uid = self::ajax_guard();
+        $message_id = (int) ($_POST['message_id'] ?? 0);
+        $result = self::sender_delete_message($message_id, $uid);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, edited_at, deleted_at
+               FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
+            $message_id
+        ));
+        $rows = [$row];
+        self::hydrate_message_rows($rows);
+        wp_send_json_success(['message' => $rows[0]]);
     }
 
     public static function ajax_open_dm() {

@@ -12,6 +12,34 @@
  * Anti-double-render: messages keyed by id in a Set; appends ignore ids
  * already rendered. This keeps the optimistic add + poll's authoritative
  * row from rendering twice.
+ *
+ * Sender-side edit / self-delete (DB 1.0.20 / plugin 2.0.3):
+ *   - The fetch_thread response carries editable_until (mysql GMT) per
+ *     own-message row plus an edit_window_seconds top-level value.
+ *   - The render attaches data-editable-until to each own-message DOM
+ *     node. The pencil / trash buttons render inside the bubble; a
+ *     low-cadence sweeper hides them once the window expires so a
+ *     stale tab can't fire an edit AJAX the server would reject.
+ *   - Edit mode swaps the body for an inline textarea + Save/Cancel.
+ *     On Save the response carries the canonical post-edit row, which
+ *     is rerendered in place.
+ *
+ * Older-message pagination (DB 1.0.20 / plugin 2.0.3):
+ *   - The first fetch_thread page returns up to 50 rows. A "Load older"
+ *     pill at the top of the message list calls fetch_older with
+ *     before_id = smallest rendered id, prepends the returned rows
+ *     (preserving scroll position so the user's reading position
+ *     doesn't jump), and hides itself once the server reports
+ *     has_more = false.
+ *
+ * Mute / block UI (DB 1.0.20 / plugin 2.0.3):
+ *   - The existing #matrix-messaging-mute button now opens a small
+ *     dropdown of preset durations. The choice is mapped to hours and
+ *     POSTed to the existing matrix_messaging_mute endpoint.
+ *   - DM threads grow a kebab menu with Block / Unblock entries.
+ *     Block/unblock state is read from the thread_state on every
+ *     fetch_thread tick so a control update from another tab
+ *     converges within one poll.
  */
 
 (function ($) {
@@ -30,9 +58,41 @@
     var $searchResults = $('#matrix-messaging-search-results');
 
     var activeThreadId = null;
+    var activeThreadType = 'dm';
     var renderedIds = Object.create(null);
     var lastId = 0;
+    // Smallest rendered id, used as the before_id anchor for the
+    // "Load older" pagination. Initialised to 0 (sentinel for "no
+    // older pages possible") and updated each time a message is
+    // rendered, taking the minimum.
+    var oldestId = 0;
+    // Server-driven flag: true while older history is reachable.
+    // Set to false when fetch_older returns has_more=false so the
+    // affordance stops nagging the user once they've reached the
+    // start of the thread.
+    var hasMoreOlder = true;
+    var olderFetchInFlight = false;
     var pollTimer = null;
+    // Edit-window sweeper. Runs at low cadence to expire the
+    // edit/delete affordances on already-rendered own messages
+    // without firing a network round-trip per tick. Cleared on
+    // thread switch.
+    var editWindowSweepTimer = null;
+    // Server-supplied edit window (seconds). Cached locally so the
+    // optimistic editable_until for messages the server hasn't
+    // hydrated yet (e.g. a polled-in row in a future protocol
+    // mismatch) still has a sensible default.
+    var editWindowSeconds = 300;
+    // Per-thread chrome state (mute / block) carried over from
+    // the most recent fetch_thread response. Drives the bell
+    // icon's strikethrough state and the kebab's Block/Unblock
+    // label without an extra round-trip.
+    var threadState = {
+        is_muted: false,
+        muted_until: null,
+        other_user_id: 0,
+        is_blocked: false
+    };
 
     // Search state. searchSeq is incremented on each new query so a
     // late-arriving response from a stale request can't overwrite a
@@ -54,20 +114,81 @@
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
-    function renderPane(threadLabel) {
+    /**
+     * Coerce a server mysql GMT string ("2026-05-26 14:32:01") into
+     * a JS Date by appending the Z marker — every server-side
+     * timestamp in this module is written with current_time('mysql', true),
+     * so the UTC interpretation is correct. Returns null on
+     * unparseable input rather than NaN-shaped Date so callers can
+     * gate without isNaN tests.
+     */
+    function parseServerDateUtc(s) {
+        if (!s) { return null; }
+        var d = new Date(String(s).replace(' ', 'T') + 'Z');
+        return isNaN(d.getTime()) ? null : d;
+    }
+
+    function renderPane(threadLabel, threadType) {
         var attachBtn = cfg.allowAttachments
-            ? '<label class="matrix-messaging__attach-btn" title="Attach image">' +
+            ? '<label class="matrix-messaging__attach-btn" title="' + escapeHtml(cfg.i18n.attach || 'Attach image') + '">' +
                   '<input type="file" name="attachment" accept="image/*" style="display:none">' +
                   '<span class="dashicons dashicons-format-image"></span>' +
               '</label>'
             : '';
 
+        // Kebab dropdown is DM-only. Team-room block / unblock
+        // doesn't make sense (the membership comes from sponsor
+        // graph; blocking a teammate would mute the whole room
+        // for that pair across team-room broadcasts and create
+        // cross-cutting moderation invariants we explicitly
+        // declined to widen the scope to support).
+        var kebabHtml = '';
+        if (threadType === 'dm') {
+            kebabHtml =
+                '<div class="matrix-messaging__menu-wrap">' +
+                    '<button type="button" class="button button-small matrix-messaging__kebab" id="matrix-messaging-kebab" aria-haspopup="true" aria-expanded="false" title="' + escapeHtml(cfg.i18n.thread_options || 'Conversation options') + '">' +
+                        '<span class="dashicons dashicons-ellipsis"></span>' +
+                    '</button>' +
+                    '<ul class="matrix-messaging__menu" id="matrix-messaging-kebab-menu" role="menu" hidden>' +
+                        '<li role="menuitem" class="matrix-messaging__menu-item" data-action="block">' + escapeHtml(cfg.i18n.block_user || 'Block user') + '</li>' +
+                        '<li role="menuitem" class="matrix-messaging__menu-item" data-action="unblock" hidden>' + escapeHtml(cfg.i18n.unblock_user || 'Unblock user') + '</li>' +
+                    '</ul>' +
+                '</div>';
+        }
+
+        // Mute popover. Renders as a dropdown anchored to the bell
+        // button. Choices are duration presets, mapped to hours
+        // server-side (1h/8h/24h/7d/30d). "Unmute" is the explicit
+        // 0-hours path.
+        var mutePopoverHtml =
+            '<div class="matrix-messaging__menu-wrap">' +
+                '<button type="button" class="button button-small matrix-messaging__mute-btn" id="matrix-messaging-mute" aria-haspopup="true" aria-expanded="false" title="' + escapeHtml(cfg.i18n.mute_thread || 'Mute conversation') + '">' +
+                    '<span class="dashicons dashicons-bell"></span>' +
+                '</button>' +
+                '<ul class="matrix-messaging__menu" id="matrix-messaging-mute-menu" role="menu" hidden>' +
+                    '<li class="matrix-messaging__menu-header">' + escapeHtml(cfg.i18n.mute_for || 'Mute for…') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item" data-hours="1">' + escapeHtml(cfg.i18n.mute_1h || '1 hour') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item" data-hours="8">' + escapeHtml(cfg.i18n.mute_8h || '8 hours') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item" data-hours="24">' + escapeHtml(cfg.i18n.mute_24h || '24 hours') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item" data-hours="168">' + escapeHtml(cfg.i18n.mute_7d || '1 week') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item" data-hours="720">' + escapeHtml(cfg.i18n.mute_30d || '30 days') + '</li>' +
+                    '<li role="menuitem" class="matrix-messaging__menu-item matrix-messaging__menu-item--unmute" data-hours="0" hidden>' + escapeHtml(cfg.i18n.unmute || 'Unmute') + '</li>' +
+                '</ul>' +
+            '</div>';
+
         $pane.html(
             '<div class="matrix-messaging__pane-header">' +
                 '<strong>' + escapeHtml(threadLabel) + '</strong>' +
-                '<button type="button" class="button button-small" id="matrix-messaging-mute"><span class="dashicons dashicons-bell"></span></button>' +
+                '<div class="matrix-messaging__pane-controls">' +
+                    mutePopoverHtml +
+                    kebabHtml +
+                '</div>' +
             '</div>' +
-            '<div class="matrix-messaging__messages" id="matrix-messaging-messages"></div>' +
+            '<div class="matrix-messaging__messages" id="matrix-messaging-messages">' +
+                '<button type="button" class="matrix-messaging__load-older" id="matrix-messaging-load-older" hidden>' +
+                    escapeHtml(cfg.i18n.load_older || 'Load older messages') +
+                '</button>' +
+            '</div>' +
             '<form class="matrix-messaging__composer" id="matrix-messaging-composer" enctype="multipart/form-data">' +
                 '<div class="matrix-messaging__composer-preview" id="matrix-messaging-preview" style="display:none">' +
                     '<img src="" alt="preview">' +
@@ -83,22 +204,20 @@
         );
     }
 
-    function renderMessage($container, msg) {
-        if (renderedIds[msg.id]) { return; }
-        renderedIds[msg.id] = true;
-        if (parseInt(msg.id, 10) > lastId) { lastId = parseInt(msg.id, 10); }
-
+    /**
+     * Build the inner HTML of a message bubble. Centralised so
+     * that re-render after edit / delete uses exactly the same
+     * shape as initial render — avoiding a class of "the row
+     * looks slightly different after edit" bugs.
+     */
+    function buildMessageInnerHtml(msg) {
+        var deleted = !!(msg.deleted_at || msg.is_deleted);
         var own = parseInt(msg.sender_id, 10) === parseInt(cfg.currentUserId, 10);
-        var deleted = !!msg.deleted_at;
-        var classes = ['matrix-messaging__message'];
-        if (own) classes.push('is-own');
-        if (deleted) classes.push('is-deleted');
 
         var bodyHtml = deleted
-            ? '<em>(message deleted by moderator)</em>'
+            ? '<em>' + escapeHtml(cfg.i18n.message_deleted || '(message deleted)') + '</em>'
             : escapeHtml(msg.body || '').replace(/\n/g, '<br>');
 
-        // Render attached image if present and not deleted.
         var attachHtml = '';
         if (!deleted && msg.attachment_url) {
             attachHtml = '<div class="matrix-messaging__message-attachment">' +
@@ -108,43 +227,154 @@
         }
 
         var strippedFlag = (!deleted && parseInt(msg.body_stripped, 10) === 1)
-            ? ' <span class="matrix-messaging__message-stripped-flag">' + 'stripped' + '</span>'
+            ? ' <span class="matrix-messaging__message-stripped-flag">' + escapeHtml(cfg.i18n.flag_stripped || 'stripped') + '</span>'
+            : '';
+        var editedFlag = (!deleted && (msg.edited_at || parseInt(msg.is_edited, 10) === 1))
+            ? ' <span class="matrix-messaging__message-edited-flag">' + escapeHtml(cfg.i18n.flag_edited || '(edited)') + '</span>'
             : '';
 
-        $container.append(
-            '<div class="' + classes.join(' ') + '" data-id="' + parseInt(msg.id, 10) + '">' +
-                attachHtml +
-                '<div class="matrix-messaging__message-body">' + bodyHtml + '</div>' +
-                '<div class="matrix-messaging__message-meta">' +
-                    escapeHtml(msg.created_at || '') + strippedFlag +
-                '</div>' +
-                // Read-receipt slot, only on own messages. The
-                // server populates it on the next fetch_thread tick
-                // via the receipts map; we leave it empty initially
-                // (no flicker between optimistic add and the first
-                // poll's authoritative state).
-                (own && !deleted ? '<div class="matrix-messaging__message-receipt" data-receipt-for="' + parseInt(msg.id, 10) + '"></div>' : '') +
-            '</div>'
-        );
+        // Edit / delete affordances. Rendered only on own,
+        // non-deleted messages whose editable_until is in the
+        // future. The editWindowSweep tick later hides them once
+        // the timestamp passes; checking here too avoids a brief
+        // flash for messages that arrive in a fetch_thread
+        // response after their window has already expired (e.g.
+        // re-opening a thread with stale messages).
+        var actionsHtml = '';
+        if (own && !deleted) {
+            var until = parseServerDateUtc(msg.editable_until);
+            var inWindow = until && until.getTime() > Date.now();
+            if (inWindow) {
+                actionsHtml =
+                    '<div class="matrix-messaging__message-actions">' +
+                        '<button type="button" class="matrix-messaging__msg-action" data-msg-action="edit" title="' + escapeHtml(cfg.i18n.edit || 'Edit') + '" aria-label="' + escapeHtml(cfg.i18n.edit || 'Edit') + '">' +
+                            '<span class="dashicons dashicons-edit"></span>' +
+                        '</button>' +
+                        '<button type="button" class="matrix-messaging__msg-action" data-msg-action="delete" title="' + escapeHtml(cfg.i18n.delete || 'Delete') + '" aria-label="' + escapeHtml(cfg.i18n.delete || 'Delete') + '">' +
+                            '<span class="dashicons dashicons-trash"></span>' +
+                        '</button>' +
+                    '</div>';
+            }
+        }
 
-        var $msgs = $('#matrix-messaging-messages');
-        if ($msgs.length) { $msgs.scrollTop($msgs[0].scrollHeight); }
+        return actionsHtml +
+            attachHtml +
+            '<div class="matrix-messaging__message-body">' + bodyHtml + '</div>' +
+            '<div class="matrix-messaging__message-meta">' +
+                escapeHtml(msg.created_at || '') + strippedFlag + editedFlag +
+            '</div>' +
+            // Read-receipt slot, only on own messages. The
+            // server populates it on the next fetch_thread tick
+            // via the receipts map; we leave it empty initially
+            // (no flicker between optimistic add and the first
+            // poll's authoritative state).
+            (own && !deleted ? '<div class="matrix-messaging__message-receipt" data-receipt-for="' + parseInt(msg.id, 10) + '"></div>' : '');
+    }
+
+    /**
+     * Apply / refresh the wrapper-level classes and data-* on a
+     * message bubble. Used by both the initial render path and the
+     * post-edit / post-delete in-place rerender so the wrapper
+     * state stays in lockstep with the content.
+     */
+    function applyMessageWrapperState($wrap, msg) {
+        var deleted = !!(msg.deleted_at || msg.is_deleted);
+        var own = parseInt(msg.sender_id, 10) === parseInt(cfg.currentUserId, 10);
+        $wrap.removeClass('is-deleted is-edited is-own');
+        if (own) { $wrap.addClass('is-own'); }
+        if (deleted) { $wrap.addClass('is-deleted'); }
+        if (msg.edited_at || parseInt(msg.is_edited, 10) === 1) { $wrap.addClass('is-edited'); }
+        $wrap.attr('data-id', parseInt(msg.id, 10));
+        if (msg.editable_until) {
+            $wrap.attr('data-editable-until', String(msg.editable_until));
+        } else {
+            $wrap.removeAttr('data-editable-until');
+        }
+    }
+
+    function renderMessage($container, msg, prepend) {
+        if (renderedIds[msg.id]) { return; }
+        renderedIds[msg.id] = true;
+        var idNum = parseInt(msg.id, 10);
+        if (idNum > lastId) { lastId = idNum; }
+        // oldestId tracks the smallest rendered id for the
+        // pagination anchor. 0 means "no anchor yet" so any
+        // non-zero id is smaller for the purposes of the first
+        // assignment.
+        if (oldestId === 0 || idNum < oldestId) { oldestId = idNum; }
+
+        var $wrap = $('<div class="matrix-messaging__message"></div>');
+        applyMessageWrapperState($wrap, msg);
+        $wrap.html(buildMessageInnerHtml(msg));
+
+        if (prepend) {
+            // Prepend after the "Load older" button so it stays
+            // the first child. find().first().after() would
+            // require the button to be present; we anchor on the
+            // button explicitly.
+            var $btn = $container.find('#matrix-messaging-load-older');
+            if ($btn.length) {
+                $btn.after($wrap);
+            } else {
+                $container.prepend($wrap);
+            }
+        } else {
+            $container.append($wrap);
+            // Auto-scroll only on append (new bottom-of-feed
+            // message); a prepend is a "Load older" path where the
+            // user is reading historical context and would lose
+            // their place if we yanked the scroll.
+            if ($container.length) { $container.scrollTop($container[0].scrollHeight); }
+        }
     }
 
     function loadThread(threadId, label) {
         stopPolling();
+        stopEditWindowSweep();
         activeThreadId = threadId;
         renderedIds = Object.create(null);
         lastId = 0;
+        oldestId = 0;
+        hasMoreOlder = true;
 
-        renderPane(label);
+        // Render with a placeholder thread type — the first
+        // fetch_thread response will overwrite it before any
+        // chrome that branches on type renders.
+        renderPane(label, 'dm');
         var $msgs = $('#matrix-messaging-messages');
 
         api('fetch_thread', { thread_id: threadId, after_id: 0 }).done(function (resp) {
             if (!resp || !resp.success) { return; }
-            (resp.data.messages || []).forEach(function (m) { renderMessage($msgs, m); });
-            applyReceipts(resp.data.receipts, resp.data.thread_type);
+            var data = resp.data || {};
+            activeThreadType = data.thread_type || 'dm';
+            if (typeof data.edit_window_seconds !== 'undefined') {
+                editWindowSeconds = parseInt(data.edit_window_seconds, 10) || 300;
+            }
+            // Re-render the chrome with the canonical thread
+            // type so the kebab (DM-only) appears / disappears
+            // before the user has a chance to click anywhere.
+            renderPane(label, activeThreadType);
+            $msgs = $('#matrix-messaging-messages');
+            // Reset the renderedIds set because we threw the
+            // pane away above; the upcoming forEach renders
+            // every message fresh.
+            renderedIds = Object.create(null);
+            lastId = 0;
+            oldestId = 0;
+
+            (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
+            applyReceipts(data.receipts, activeThreadType);
+            applyThreadState(data.thread_state);
+            // hasMoreOlder defaults to true; the first
+            // fetch_older click resolves it. If the initial
+            // page came back with fewer than 50 rows we know
+            // there's no older history at all and can hide the
+            // affordance immediately.
+            hasMoreOlder = (data.messages || []).length >= 50;
+            updateLoadOlderButton();
+
             startPolling();
+            startEditWindowSweep();
 
             // Scroll to and flash a search-jumped message, if one
             // was queued by handleSearchResultClick. Done after the
@@ -168,15 +398,59 @@
             if (!activeThreadId || document.hidden) { return; }
             api('fetch_thread', { thread_id: activeThreadId, after_id: lastId }).done(function (resp) {
                 if (!resp || !resp.success) { return; }
+                var data = resp.data || {};
+                if (typeof data.edit_window_seconds !== 'undefined') {
+                    editWindowSeconds = parseInt(data.edit_window_seconds, 10) || 300;
+                }
+                if (data.thread_type) { activeThreadType = data.thread_type; }
                 var $msgs = $('#matrix-messaging-messages');
-                (resp.data.messages || []).forEach(function (m) { renderMessage($msgs, m); });
-                applyReceipts(resp.data.receipts, resp.data.thread_type);
+                (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
+                applyReceipts(data.receipts, activeThreadType);
+                applyThreadState(data.thread_state);
             });
         }, Math.max(2000, parseInt(cfg.pollingIntervalMs, 10) || 10000));
     }
 
     function stopPolling() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    /**
+     * Sweep already-rendered own messages and hide the
+     * edit/delete affordances on rows whose editable_until has
+     * passed. Runs on a 15-second cadence — fast enough that the
+     * user doesn't see a stale Edit button for long after the
+     * window expires, slow enough that it's invisible to the
+     * profile.
+     *
+     * Idempotent: the .remove() on the actions block has no
+     * effect if it's already gone, and we never re-add the block
+     * on a row that's been swept (the next render of that
+     * specific row would only happen via a server response that
+     * already gates editable_until).
+     */
+    function startEditWindowSweep() {
+        stopEditWindowSweep();
+        editWindowSweepTimer = setInterval(function () {
+            sweepEditWindowOnce();
+        }, 15000);
+    }
+    function stopEditWindowSweep() {
+        if (editWindowSweepTimer) {
+            clearInterval(editWindowSweepTimer);
+            editWindowSweepTimer = null;
+        }
+    }
+    function sweepEditWindowOnce() {
+        var now = Date.now();
+        $('.matrix-messaging__message[data-editable-until]').each(function () {
+            var $row = $(this);
+            var until = parseServerDateUtc($row.attr('data-editable-until'));
+            if (until && until.getTime() <= now) {
+                $row.find('.matrix-messaging__message-actions').remove();
+                $row.removeAttr('data-editable-until');
+            }
+        });
     }
 
     /**
@@ -239,6 +513,44 @@
     }
 
     /**
+     * Apply the thread_state from a fetch_thread response to the
+     * mute / block chrome. Server-driven — running on every poll
+     * keeps the chrome converged when the same user toggles state
+     * from another tab or device.
+     */
+    function applyThreadState(state) {
+        if (!state || typeof state !== 'object') { return; }
+        threadState.is_muted      = !!state.is_muted;
+        threadState.muted_until   = state.muted_until || null;
+        threadState.other_user_id = parseInt(state.other_user_id, 10) || 0;
+        threadState.is_blocked    = !!state.is_blocked;
+
+        // Bell button — strikethrough class when active mute.
+        $('#matrix-messaging-mute').toggleClass('is-active', threadState.is_muted);
+        // Mute menu — show "Unmute" only when currently muted.
+        $('#matrix-messaging-mute-menu .matrix-messaging__menu-item--unmute')
+            .prop('hidden', !threadState.is_muted);
+
+        // Kebab menu — swap Block/Unblock visibility based on
+        // whether THIS user has blocked the OTHER party.
+        $('#matrix-messaging-kebab-menu li[data-action="block"]').prop('hidden', threadState.is_blocked);
+        $('#matrix-messaging-kebab-menu li[data-action="unblock"]').prop('hidden', !threadState.is_blocked);
+    }
+
+    /**
+     * Show / hide the "Load older" button based on the most
+     * recent answer from fetch_older / fetch_thread.
+     */
+    function updateLoadOlderButton() {
+        var $btn = $('#matrix-messaging-load-older');
+        if (!$btn.length) { return; }
+        // Hide when we know there's no older history; also hide
+        // before any messages have rendered (oldestId == 0)
+        // because we have no anchor to pass to fetch_older.
+        $btn.prop('hidden', !hasMoreOlder || oldestId === 0);
+    }
+
+    /**
      * Lightweight printf-ish helper. We can't pull in
      * sprintf-js, and template strings would lose IE11 — keep
      * it ASCII-tier simple.
@@ -257,12 +569,8 @@
      */
     function formatReadTime(serverDt) {
         if (!serverDt) { return ''; }
-        // Server returns mysql GMT format; coerce by appending Z so
-        // browsers interpret as UTC. Avoids a 1-minute "in the future"
-        // glitch on clients with a mildly-skewed clock.
-        var iso = String(serverDt).replace(' ', 'T') + 'Z';
-        var d = new Date(iso);
-        if (isNaN(d.getTime())) { return serverDt; }
+        var d = parseServerDateUtc(serverDt);
+        if (!d) { return serverDt; }
         var diffSec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
         if (diffSec < 60) { return cfg.i18n.receipt_just_now || 'just now'; }
         if (diffSec < 3600) { return Math.floor(diffSec / 60) + 'm'; }
@@ -297,6 +605,274 @@
                 alert((resp && resp.data && resp.data.message) || 'Send failed.');
             }
         }).always(function () { $btn.prop('disabled', false); });
+    });
+
+    // --- Sender-side edit / self-delete ---
+
+    /**
+     * Enter edit mode for a message bubble: replace the body
+     * with a textarea pre-filled with the original text plus
+     * Save / Cancel buttons. The bubble's other parts
+     * (attachment, meta) stay visible so the user has context.
+     *
+     * On Save: POST matrix_messaging_edit, replace innerHTML with
+     * the canonical row from the response. On Cancel: re-render
+     * the bubble from the original message data we cached on
+     * the wrapper.
+     */
+    function enterEditMode($wrap) {
+        if ($wrap.hasClass('is-editing')) { return; }
+        var $body = $wrap.find('.matrix-messaging__message-body').first();
+        if (!$body.length) { return; }
+        var originalText = $body.text();
+        $wrap.addClass('is-editing');
+        $body.html(
+            '<div class="matrix-messaging__edit-form">' +
+                '<textarea class="matrix-messaging__edit-textarea"></textarea>' +
+                '<div class="matrix-messaging__edit-actions">' +
+                    '<button type="button" class="matrix-btn matrix-btn-primary matrix-btn-sm" data-edit-action="save">' + escapeHtml(cfg.i18n.save || 'Save') + '</button>' +
+                    '<button type="button" class="matrix-btn matrix-btn-sm" data-edit-action="cancel">' + escapeHtml(cfg.i18n.cancel || 'Cancel') + '</button>' +
+                '</div>' +
+            '</div>'
+        );
+        var $ta = $body.find('textarea').val(originalText);
+        // Save the original on the wrap so cancel can restore it
+        // without an additional server round-trip.
+        $wrap.data('originalBody', originalText);
+        $ta.focus();
+    }
+
+    function exitEditMode($wrap, originalText) {
+        $wrap.removeClass('is-editing');
+        var $body = $wrap.find('.matrix-messaging__message-body').first();
+        $body.html(escapeHtml(originalText || $wrap.data('originalBody') || '').replace(/\n/g, '<br>'));
+    }
+
+    function rerenderMessage($wrap, msg) {
+        applyMessageWrapperState($wrap, msg);
+        $wrap.removeClass('is-editing');
+        $wrap.html(buildMessageInnerHtml(msg));
+    }
+
+    // Edit / delete icon clicks (delegated on the message list).
+    $pane.on('click', '.matrix-messaging__msg-action', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var $btn = $(this);
+        var action = $btn.data('msg-action');
+        var $wrap = $btn.closest('.matrix-messaging__message');
+        if (!$wrap.length) { return; }
+        var messageId = parseInt($wrap.attr('data-id'), 10);
+        if (!messageId) { return; }
+
+        if (action === 'edit') {
+            enterEditMode($wrap);
+        } else if (action === 'delete') {
+            if (!window.confirm(cfg.i18n.confirm_delete || 'Delete this message? This cannot be undone.')) {
+                return;
+            }
+            api('delete', { message_id: messageId }).done(function (resp) {
+                if (resp && resp.success && resp.data && resp.data.message) {
+                    rerenderMessage($wrap, resp.data.message);
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.delete_failed || 'Delete failed.'));
+                }
+            }).fail(function () {
+                alert(cfg.i18n.delete_failed || 'Delete failed.');
+            });
+        }
+    });
+
+    // Save / Cancel inside an active edit form.
+    $pane.on('click', '.matrix-messaging__edit-actions [data-edit-action]', function (e) {
+        e.preventDefault();
+        var $btn = $(this);
+        var $wrap = $btn.closest('.matrix-messaging__message');
+        if (!$wrap.length) { return; }
+        var act = $btn.data('edit-action');
+        if (act === 'cancel') {
+            exitEditMode($wrap);
+            return;
+        }
+        if (act !== 'save') { return; }
+        var messageId = parseInt($wrap.attr('data-id'), 10);
+        var newBody = ($wrap.find('.matrix-messaging__edit-textarea').val() || '').trim();
+        if (!newBody) {
+            alert(cfg.i18n.edit_empty || 'Message cannot be empty. Use Delete instead.');
+            return;
+        }
+        $btn.prop('disabled', true);
+        api('edit', { message_id: messageId, body: newBody }).done(function (resp) {
+            if (resp && resp.success && resp.data && resp.data.message) {
+                rerenderMessage($wrap, resp.data.message);
+            } else {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.edit_failed || 'Edit failed.'));
+                $btn.prop('disabled', false);
+            }
+        }).fail(function () {
+            alert(cfg.i18n.edit_failed || 'Edit failed.');
+            $btn.prop('disabled', false);
+        });
+    });
+
+    // Esc inside the edit textarea cancels; Ctrl/Cmd+Enter saves.
+    $pane.on('keydown', '.matrix-messaging__edit-textarea', function (e) {
+        if (e.key === 'Escape' || e.keyCode === 27) {
+            e.preventDefault();
+            var $wrap = $(this).closest('.matrix-messaging__message');
+            exitEditMode($wrap);
+        } else if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.keyCode === 13)) {
+            e.preventDefault();
+            $(this).closest('.matrix-messaging__message')
+                   .find('[data-edit-action="save"]').trigger('click');
+        }
+    });
+
+    // --- Older-message pagination ---
+
+    $pane.on('click', '#matrix-messaging-load-older', function () {
+        if (!activeThreadId || olderFetchInFlight || !hasMoreOlder || oldestId === 0) { return; }
+        olderFetchInFlight = true;
+        var $btn = $(this).prop('disabled', true).addClass('is-loading');
+        var $msgs = $('#matrix-messaging-messages');
+
+        // Preserve scroll position relative to the bottom so the
+        // user's viewport doesn't jump when older rows are
+        // prepended above the current top. After the prepend we
+        // restore by setting scrollTop to scrollHeight - savedFromBottom.
+        var fromBottom = $msgs[0].scrollHeight - $msgs[0].scrollTop;
+
+        api('fetch_older', { thread_id: activeThreadId, before_id: oldestId }).done(function (resp) {
+            if (!resp || !resp.success) {
+                $btn.prop('disabled', false).removeClass('is-loading');
+                olderFetchInFlight = false;
+                return;
+            }
+            var data = resp.data || {};
+            var rows = data.messages || [];
+            // Server returns the page in ascending id order. To
+            // prepend onto the message list we want to insert
+            // them top-down (i.e. iterate ascending and prepend
+            // each, which yields a final top-down ordering when
+            // each prepend goes after the "Load older" button).
+            // Equivalent: iterate descending and call prepend
+            // (no anchor) — same result, simpler reasoning.
+            // Either way, renderMessage's prepend=true path
+            // anchors after the button so we keep ascending.
+            rows.forEach(function (m) { renderMessage($msgs, m, true); });
+
+            hasMoreOlder = !!data.has_more;
+            updateLoadOlderButton();
+            $btn.prop('disabled', false).removeClass('is-loading');
+            olderFetchInFlight = false;
+
+            // Restore scroll position so the row the user was
+            // looking at stays at the same screen offset.
+            $msgs[0].scrollTop = $msgs[0].scrollHeight - fromBottom;
+        }).fail(function () {
+            $btn.prop('disabled', false).removeClass('is-loading');
+            olderFetchInFlight = false;
+        });
+    });
+
+    // --- Mute popover ---
+
+    $pane.on('click', '#matrix-messaging-mute', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMenu('#matrix-messaging-mute-menu', $(this));
+    });
+
+    $pane.on('click', '#matrix-messaging-mute-menu .matrix-messaging__menu-item', function () {
+        if (!activeThreadId) { return; }
+        var hours = parseInt($(this).data('hours'), 10);
+        if (isNaN(hours) || hours < 0) { return; }
+        closeAllMenus();
+        api('mute', { thread_id: activeThreadId, hours: hours }).done(function (resp) {
+            if (resp && resp.success) {
+                // Optimistic local apply while waiting for the
+                // next poll to bring the canonical thread_state.
+                threadState.is_muted = hours > 0;
+                applyThreadState(threadState);
+            } else {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.mute_failed || 'Could not change mute state.'));
+            }
+        }).fail(function () {
+            alert(cfg.i18n.mute_failed || 'Could not change mute state.');
+        });
+    });
+
+    // --- Kebab (DM block / unblock) ---
+
+    $pane.on('click', '#matrix-messaging-kebab', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMenu('#matrix-messaging-kebab-menu', $(this));
+    });
+
+    $pane.on('click', '#matrix-messaging-kebab-menu .matrix-messaging__menu-item', function () {
+        if (!activeThreadId) { return; }
+        var action = $(this).data('action');
+        var otherId = parseInt(threadState.other_user_id, 10);
+        if (!otherId) { return; }
+        closeAllMenus();
+        if (action === 'block') {
+            if (!window.confirm(cfg.i18n.confirm_block || 'Block this user? They will no longer be able to message you and you will not be able to message them.')) {
+                return;
+            }
+            api('block', { user_id: otherId }).done(function (resp) {
+                if (resp && resp.success) {
+                    threadState.is_blocked = true;
+                    applyThreadState(threadState);
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.block_failed || 'Could not block user.'));
+                }
+            }).fail(function () {
+                alert(cfg.i18n.block_failed || 'Could not block user.');
+            });
+        } else if (action === 'unblock') {
+            api('unblock', { user_id: otherId }).done(function (resp) {
+                if (resp && resp.success) {
+                    threadState.is_blocked = false;
+                    applyThreadState(threadState);
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.block_failed || 'Could not unblock user.'));
+                }
+            }).fail(function () {
+                alert(cfg.i18n.block_failed || 'Could not unblock user.');
+            });
+        }
+    });
+
+    /**
+     * Generic open-one-menu / close-the-rest helper. Both menus
+     * mount inside the pane so a single document-level click
+     * handler can close them when the user clicks anywhere
+     * outside.
+     */
+    function toggleMenu(menuSelector, $anchor) {
+        var $menu = $(menuSelector);
+        if (!$menu.length) { return; }
+        var willOpen = $menu.prop('hidden');
+        closeAllMenus();
+        if (willOpen) {
+            $menu.prop('hidden', false);
+            if ($anchor) { $anchor.attr('aria-expanded', 'true'); }
+        }
+    }
+    function closeAllMenus() {
+        $('.matrix-messaging__menu').prop('hidden', true);
+        $('.matrix-messaging__mute-btn, .matrix-messaging__kebab').attr('aria-expanded', 'false');
+    }
+    $(document).on('click', function (e) {
+        if (!$(e.target).closest('.matrix-messaging__menu-wrap').length) {
+            closeAllMenus();
+        }
+    });
+    $(document).on('keydown', function (e) {
+        if (e.key === 'Escape' || e.keyCode === 27) {
+            closeAllMenus();
+        }
     });
 
     // --- Attachment upload via async WP media upload ---
