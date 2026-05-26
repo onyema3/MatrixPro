@@ -364,7 +364,21 @@
     color: #6b7280;
 }
 
-/* Responsive */
+/* Responsive
+ * ----------------------------------------------------------------
+ * On phones and tablets the sidebar collapses to the top of the
+ * dashboard. The nav used to be `flex-direction: row; flex-wrap:
+ * wrap;` but with 15+ menu items of widely varying label widths
+ * ("Wallet" vs "Deposit History" vs "E-Pin Recharge") the wrap
+ * produced ragged, uneven rows that read as visually scattered.
+ *
+ * Switching to a 2-column CSS grid forces every cell to the same
+ * width regardless of label length, so the menu reads as a tidy
+ * tile grid instead of a free-flowing pill cloud. The logout link
+ * still gets its visual divider but spans the full row so it
+ * doesn't get visually paired with whatever menu item happened
+ * to land in the last cell.
+ */
 @media (max-width: 900px) {
     .matrix-dashboard {
         grid-template-columns: 1fr;
@@ -373,19 +387,47 @@
         padding: 16px;
     }
     .matrix-dashboard-nav {
-        flex-direction: row;
-        flex-wrap: wrap;
-        gap: 4px;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
     }
     .matrix-dashboard-nav a {
-        padding: 8px 12px;
+        padding: 10px 12px;
         font-size: 12px;
+        line-height: 1.3;
         border-left: none;
         border-radius: 6px;
+        min-height: 40px;
+        /* Allow the inner flex container's text to shrink to the
+         * column width instead of forcing the cell wider than its
+         * 1fr track when a label is long. */
+        min-width: 0;
+        justify-content: flex-start !important;
     }
     .matrix-dashboard-nav a.active {
         background: var(--matrix-primary);
         border-left-color: transparent;
+    }
+    /* The notification bell sits inside the same grid as the menu
+     * links. Strip its desktop wrapper margin so it aligns flush
+     * with neighbouring cells, and tighten the inner button so its
+     * visual height matches the surrounding 40px tiles. */
+    .matrix-dashboard-nav .matrix-notif-bell-wrapper {
+        margin: 0;
+    }
+    .matrix-dashboard-nav .matrix-notif-bell-btn {
+        padding: 8px 12px;
+        min-height: 40px;
+        font-size: 12px;
+    }
+    /* Logout span the full row so the top-border divider still
+     * reads as a separator instead of as a malformed tile beside
+     * an unrelated menu item. */
+    .matrix-dashboard-nav .matrix-nav-logout {
+        grid-column: 1 / -1;
+        margin-top: 8px;
+        padding-top: 12px !important;
+        justify-content: center !important;
     }
     .matrix-dashboard-content {
         padding: 20px;
