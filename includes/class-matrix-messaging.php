@@ -922,13 +922,33 @@ class Matrix_MLM_Messaging {
 
         // Rate limit. Reuse the existing limiter so admin tooling
         // (Repair Database, etc.) can introspect it the same way.
+        //
+        // Matrix_MLM_Rate_Limiter exposes throttle($action, $key, $opts)
+        // and returns TRUE when the request must be rejected. Same
+        // shape as every other caller in this plugin (Fintava
+        // bills/cards/transfers, Core 2FA enable/disable, transaction
+        // PIN verify). An earlier draft of this block called a
+        // non-existent ::check() method, which produced a "Call to
+        // undefined method" fatal on every send and surfaced as the
+        // HTTP 500 the JS submit handler now alerts on (since PR #384
+        // wired the .fail() handler that exposes status-coded
+        // failures to the user).
         $settings = self::get_settings();
         $per_min  = max(1, (int) $settings['rate_limit_per_minute']);
         if (class_exists('Matrix_MLM_Rate_Limiter')) {
-            // Minute window
-            $ok = Matrix_MLM_Rate_Limiter::check('messaging_send_min:' . $sender_id, $per_min, 60);
-            if (!$ok) {
-                return new WP_Error('matrix_messaging_rate', __('Slow down — too many messages this minute.', 'matrix-mlm'));
+            $rl_key = Matrix_MLM_Rate_Limiter::key_for_request();
+            // Authenticated send is gated per-user via key_for_request(),
+            // so a user cannot bypass the cap by switching IPs. Window
+            // is the limiter's own MINUTE_IN_SECONDS floor.
+            if (Matrix_MLM_Rate_Limiter::throttle(
+                'messaging_send_min',
+                $rl_key,
+                ['max_attempts' => $per_min, 'window_seconds' => MINUTE_IN_SECONDS]
+            )) {
+                return new WP_Error(
+                    'matrix_messaging_rate',
+                    __('Slow down — too many messages this minute.', 'matrix-mlm')
+                );
             }
         }
 
