@@ -379,6 +379,15 @@ class Matrix_MLM_Core {
                 // server.
                 'pollMs'  => (int) apply_filters('matrix_mlm_notifications_poll_ms', 60000),
                 'seeAllUrl' => Matrix_MLM_User_Dashboard::tab_url('notifications'),
+                // Inline-SVG markup keyed by icon name. The JS poll
+                // path reads this map (matrixNotifConfig.icons) and
+                // injects the SVG verbatim when re-rendering the
+                // dropdown — keeping JS-rendered rows pixel-identical
+                // to server-rendered ones. Server-driven so a future
+                // icon swap doesn't require a JS change. See
+                // class-matrix-icons.php and the iconSvgFor() helper
+                // in matrix-notifications.js.
+                'icons'   => Matrix_MLM_Icons::svg_string_map(),
                 'l10n' => [
                     'empty'  => __("No notifications yet. We'll let you know here when something happens.", 'matrix-mlm'),
                     'unread' => __('Unread', 'matrix-mlm'),

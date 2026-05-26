@@ -58,6 +58,16 @@
             nonce:    cfg.nonce    || mm.nonce    || '',
             pollMs:   parseInt(cfg.pollMs, 10) || POLL_INTERVAL_MS,
             seeAllUrl: cfg.seeAllUrl || (mm.siteUrl ? (mm.siteUrl.replace(/\/$/, '') + '/matrix-dashboard/notifications/') : '/matrix-dashboard/notifications/'),
+            // Server-rendered SVG markup keyed by icon name. Populated
+            // by Matrix_MLM_Icons::svg_string_map() via
+            // wp_localize_script. Reading it once here means the JS
+            // poll path emits identical markup to what the server
+            // renders for the initial dropdown state, so a polled-in
+            // row can't visibly disagree with a server-rendered one.
+            // Empty-object fallback keeps iconSvgFor() safe on
+            // installs where the localize call hasn't fired (e.g.
+            // an asset optimizer stripped it).
+            icons:    (cfg.icons && typeof cfg.icons === 'object') ? cfg.icons : {},
             l10n: cfg.l10n || {}
         };
     }
@@ -69,47 +79,69 @@
 
     /**
      * Server-mirror of the icon registry in
-     * Matrix_MLM_User_Dashboard::notification_icon_class(). Both
+     * Matrix_MLM_User_Dashboard::notification_icon_name(). Both
      * surfaces have to render the same icon for the same type slug
      * so polled updates don't visibly disagree with server-rendered
      * rows.
+     *
+     * Returns the BARE icon name (e.g. 'money-alt'), not a CSS class.
+     * Convert to renderable SVG via iconSvgFor().
      */
-    function iconClassFor(type) {
+    function iconNameFor(type) {
         var map = {
-            transfer_received:            'dashicons-money-alt',
-            transfer_sent:                'dashicons-share',
-            commission_referral:          'dashicons-groups',
-            commission_level:             'dashicons-chart-area',
-            commission_matrix_completion: 'dashicons-awards',
-            commission:                   'dashicons-chart-area',
-            level_completion:             'dashicons-awards',
-            deposit:                      'dashicons-download',
-            withdrawal_approved:          'dashicons-yes-alt',
-            withdrawal_rejected:          'dashicons-no-alt',
-            withdrawal_completed:         'dashicons-yes-alt',
-            withdrawal:                   'dashicons-bank',
-            bank_payout:                  'dashicons-bank',
-            bank_payout_failed:           'dashicons-warning',
-            bill_payment:                 'dashicons-smartphone',
-            bill_payment_airtime:         'dashicons-smartphone',
-            bill_payment_data:            'dashicons-smartphone',
-            bill_payment_cable:           'dashicons-format-video',
-            bill_payment_electricity:     'dashicons-lightbulb',
-            bill_refund:                  'dashicons-image-rotate',
-            card_status:                  'dashicons-id-alt',
-            epin_redeemed:                'dashicons-tickets-alt',
-            subscription:                 'dashicons-calendar-alt',
-            subscription_deactivation:    'dashicons-warning',
-            password_changed:             'dashicons-shield',
-            loan_approved:                'dashicons-yes-alt',
-            loan_rejected:                'dashicons-no-alt',
-            loan:                         'dashicons-money-alt',
-            healthcare_approved:          'dashicons-heart',
-            healthcare_rejected:          'dashicons-no-alt',
-            healthcare:                   'dashicons-heart',
-            admin_announcement:           'dashicons-megaphone'
+            transfer_received:            'money-alt',
+            transfer_sent:                'share',
+            commission_referral:          'groups',
+            commission_level:             'chart-area',
+            commission_matrix_completion: 'awards',
+            commission:                   'chart-area',
+            level_completion:             'awards',
+            deposit:                      'download',
+            withdrawal_approved:          'yes-alt',
+            withdrawal_rejected:          'no-alt',
+            withdrawal_completed:         'yes-alt',
+            withdrawal:                   'bank',
+            bank_payout:                  'bank',
+            bank_payout_failed:           'warning',
+            bill_payment:                 'smartphone',
+            bill_payment_airtime:         'smartphone',
+            bill_payment_data:            'smartphone',
+            bill_payment_cable:           'format-video',
+            bill_payment_electricity:     'lightbulb',
+            bill_refund:                  'image-rotate',
+            card_status:                  'id-alt',
+            epin_redeemed:                'tickets-alt',
+            subscription:                 'calendar-alt',
+            subscription_deactivation:    'warning',
+            password_changed:             'shield',
+            loan_approved:                'yes-alt',
+            loan_rejected:                'no-alt',
+            loan:                         'money-alt',
+            healthcare_approved:          'heart',
+            healthcare_rejected:          'no-alt',
+            healthcare:                   'heart',
+            admin_announcement:           'megaphone'
         };
-        return map[type] || 'dashicons-info-outline';
+        return map[type] || 'info-outline';
+    }
+
+    /**
+     * Resolve an icon name to ready-to-inject SVG markup pulled
+     * from the server-rendered registry. Returns an empty string
+     * for unknown names so the template can no-op the icon slot
+     * cleanly.
+     *
+     * Why server-resolved instead of inlined here: the SVG path
+     * data lives in PHP (class-matrix-icons.php) so a future icon
+     * swap on the server doesn't require a JS code change. The
+     * cost is a one-time payload increase on the localize blob
+     * (~3 KB gzipped for the notifications surface), paid only
+     * on dashboard pages where the bell is rendered.
+     */
+    function iconSvgFor(type) {
+        var name = iconNameFor(type);
+        var icons = getConfig().icons;
+        return (icons && typeof icons[name] === 'string') ? icons[name] : '';
     }
 
     /**
@@ -241,7 +273,7 @@
 
         var html = rows.map(function (row) {
             var isRead = !!row.is_read;
-            var icon = iconClassFor(row.type);
+            var iconSvg = iconSvgFor(row.type);
             var link = safeLink(row.link_url);
             var bodyHtml = '';
             if (row.body) {
@@ -252,11 +284,18 @@
                 if (b.length > 140) b = b.substring(0, 137) + '…';
                 bodyHtml = '<div class="matrix-notif-text">' + esc(b) + '</div>';
             }
+            // iconSvg is server-rendered SVG markup pulled from the
+            // localized matrixNotifConfig.icons registry — already
+            // safe (no user-controlled input flows into it). Every
+            // user-supplied field (id, title, body, time_ago, link)
+            // still goes through esc(). Wrapped in the
+            // .matrix-notif-icon span (the coloured-bubble badge)
+            // to match the server-rendered shape.
             return '<li class="matrix-notif-item ' + (isRead ? 'is-read' : 'is-unread') + '"'
                 + ' data-matrix-notif-item'
                 + ' data-id="' + esc(row.id) + '"'
                 + ' data-link="' + esc(link) + '">'
-                +   '<span class="matrix-notif-icon dashicons ' + esc(icon) + '" aria-hidden="true"></span>'
+                +   '<span class="matrix-notif-icon" aria-hidden="true">' + iconSvg + '</span>'
                 +   '<div class="matrix-notif-body">'
                 +     '<div class="matrix-notif-title">' + esc(row.title) + '</div>'
                 +     bodyHtml

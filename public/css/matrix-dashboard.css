@@ -92,6 +92,43 @@
     line-height: 1;
 }
 
+/* Inline-SVG icons (.matrix-icon) replaced the dashicons spans on
+   every nav/notification surface where theme cascade fights were
+   making the icon font unreliable. Sized to match the previous
+   16x16 dashicon footprint exactly so the swap is layout-neutral.
+   `flex-shrink: 0` keeps the icon from collapsing when the nav
+   item label wraps, `vertical-align: middle` aligns the SVG with
+   the label baseline (SVG default alignment is `baseline`, which
+   sits the icon below the text mid-line on most line-heights).
+   See includes/class-matrix-icons.php for the registry and the
+   commit message for the full theme-cascade rationale. */
+.matrix-dashboard-nav a .matrix-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    vertical-align: middle;
+}
+
+/* The notifications bell trigger is a button with an icon + label
+   stacked horizontally; the icon is slightly larger than sidebar
+   nav icons (20px) per the previous .dashicons-bell spec. */
+.matrix-notif-bell-btn .matrix-notif-bell-icon {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+}
+
+/* Notification dropdown / Notifications page rows: the
+   .matrix-notif-icon span is the coloured-bubble badge (32x32);
+   the inline SVG inside it sits at 18px so the bubble's padding
+   is visible around the glyph. See matrix-notifications.css for
+   the bubble's background/colour rules. */
+.matrix-notif-icon svg {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+}
+
 .matrix-nav-logout {
     margin-top: 16px;
     border-top: 1px solid rgba(255,255,255,0.1);

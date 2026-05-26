@@ -46,11 +46,11 @@
     color: #4f46e5;
     outline: none;
 }
-.matrix-notif-bell-btn .dashicons {
-    font-size: 20px;
+.matrix-notif-bell-btn .matrix-notif-bell-icon {
     width: 20px;
     height: 20px;
     color: inherit;
+    flex-shrink: 0;
 }
 .matrix-notif-bell-label {
     flex: 1 1 auto;
@@ -193,7 +193,15 @@
     display: flex !important;
     align-items: center;
     justify-content: center;
-    font-size: 18px !important;
+}
+/* Inline SVG inside the .matrix-notif-icon bubble. SVG fill
+   inherits the bubble's `color`, so unread (#4f46e5) and read
+   (#6b7280, set via .is-read .matrix-notif-icon below) propagate
+   into the icon automatically. */
+.matrix-notif-icon svg {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
 }
 .matrix-notif-item.is-read .matrix-notif-icon {
     background: #f3f4f6;
