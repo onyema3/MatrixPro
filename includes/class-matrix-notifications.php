@@ -1460,9 +1460,23 @@ class Matrix_MLM_Notifications {
     }
 
     private static function send_termii_sms($phone, $message, $api_key, $sender_id) {
+        // wp_json_encode (rather than the raw json_encode this used
+        // to call) for consistency with send_bulksmsnigeria_sms below
+        // and the rest of the plugin's JSON encoding sites. wp_json_encode
+        // adds two things on top of json_encode: it bumps the recursion
+        // depth to a higher default and it normalises the output via
+        // _wp_json_sanity_check + _wp_json_convert_string for any
+        // values that arrive as non-UTF-8 byte sequences. The Termii
+        // payload is built from operator-supplied $sender_id, the
+        // recipient $phone, and the operator-templated $message —
+        // none of those are likely to be malformed UTF-8 in practice,
+        // but a wp_json_encode failure (returns false) at least gets
+        // the wp_remote_post body slot populated with false rather
+        // than a partially-encoded JSON string with embedded invalid
+        // bytes that the upstream API would reject opaquely.
         $response = wp_remote_post('https://api.ng.termii.com/api/sms/send', [
             'headers' => ['Content-Type' => 'application/json'],
-            'body' => json_encode([
+            'body' => wp_json_encode([
                 'api_key' => $api_key,
                 'to' => $phone,
                 'from' => $sender_id,
