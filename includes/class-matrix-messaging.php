@@ -933,8 +933,36 @@ class Matrix_MLM_Messaging {
         // HTTP 500 the JS submit handler now alerts on (since PR #384
         // wired the .fail() handler that exposes status-coded
         // failures to the user).
+        //
+        // Two layered windows, mirroring the per-user / per-IP pair
+        // in Matrix_MLM_Transaction_Pin::verify and the
+        // matrix_mlm_messaging_settings shape itself, which has
+        // carried both rate_limit_per_minute (default 20) and
+        // rate_limit_per_hour (default 200) since the feature
+        // shipped:
+        //
+        //   - Minute window: caps a fast-typing burst. 20/min is the
+        //     fastest a real human composes, so an attacker scripting
+        //     sends gets cut off here within 3 seconds of sustained
+        //     load.
+        //
+        //   - Hour window: caps the slow-drip case the minute window
+        //     can't see. An attacker pacing exactly at-cap inside the
+        //     minute window would otherwise pass 1200 messages/hour;
+        //     the hour cap brings that to 200 and turns "free spam
+        //     channel" into "operationally bounded one".
+        //
+        // Distinct action slugs ('messaging_send_min' vs
+        // 'messaging_send_hour') keep the two counters independent
+        // — same throttle helper, different transient namespaces.
+        // Distinct WP_Error codes let the UI tell the two refusals
+        // apart if it ever wants to render a different toast (it
+        // doesn't today, but a future "you're at the hourly cap,
+        // try again at HH:MM" copy can branch on the code without a
+        // server change).
         $settings = self::get_settings();
         $per_min  = max(1, (int) $settings['rate_limit_per_minute']);
+        $per_hour = max(1, (int) $settings['rate_limit_per_hour']);
         if (class_exists('Matrix_MLM_Rate_Limiter')) {
             $rl_key = Matrix_MLM_Rate_Limiter::key_for_request();
             // Authenticated send is gated per-user via key_for_request(),
@@ -948,6 +976,24 @@ class Matrix_MLM_Messaging {
                 return new WP_Error(
                     'matrix_messaging_rate',
                     __('Slow down — too many messages this minute.', 'matrix-mlm')
+                );
+            }
+            // Hour window. Bumps regardless of whether the minute
+            // window also bumped — that's the same shape the
+            // transaction-PIN per-user / per-IP pair uses, and means
+            // the two counters stay independently honest. A user who
+            // sends one message every five minutes will exhaust the
+            // hour budget in ~17 hours of continuous sending; that's
+            // never a real human, so refusing them here is the right
+            // outcome.
+            if (Matrix_MLM_Rate_Limiter::throttle(
+                'messaging_send_hour',
+                $rl_key,
+                ['max_attempts' => $per_hour, 'window_seconds' => HOUR_IN_SECONDS]
+            )) {
+                return new WP_Error(
+                    'matrix_messaging_rate_hour',
+                    __('You\'ve hit the hourly send limit. Please wait a while before sending more messages.', 'matrix-mlm')
                 );
             }
         }
