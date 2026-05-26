@@ -148,6 +148,20 @@ class Matrix_MLM_Messaging {
      *     long enough that a genuine "are you there?" follow-up
      *     ten minutes later does re-trigger the email.
      */
+    /**
+     * Default cap on the number of attachments a single send may
+     * carry (DB 1.0.23). Four matches the WhatsApp / Slack
+     * convention and keeps the rendered grid tidy (1 = full bubble,
+     * 2 = side-by-side, 3-4 = 2x2). Operators can widen via the
+     * matrix_messaging_settings.max_attachments_per_message key or
+     * the matrix_messaging_max_attachments_per_message filter.
+     * Anything beyond 8 is refused at the model layer to keep the
+     * thumbnail fanout bounded — bigger payloads are the file-
+     * sharing surface, not the chat surface.
+     */
+    const MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT = 4;
+    const MAX_ATTACHMENTS_PER_MESSAGE_HARD    = 8;
+
     public static function default_settings() {
         return [
             'enabled'                       => 1,
@@ -156,6 +170,9 @@ class Matrix_MLM_Messaging {
             'strip_off_platform_contacts'   => 1,
             'allow_attachments'             => 1,
             'max_attachment_bytes'          => 5 * 1024 * 1024,
+            // Multi-attachment cap (DB 1.0.23). See
+            // MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT for rationale.
+            'max_attachments_per_message'   => self::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
             'team_rooms_auto_create'        => 1,
             'polling_interval_ms'           => 10000,
             // Sender-side edit / self-delete time window. See
@@ -679,12 +696,30 @@ class Matrix_MLM_Messaging {
      *   5. Off-platform contact stripping (if enabled).
      *
      * Returns the inserted message row id, or WP_Error.
+     *
+     * Multi-attachment (DB 1.0.23): the canonical input is
+     * $attachment_ids (array of WP attachment post ids in display
+     * order). Legacy single-attachment callers can still pass an
+     * int (or null) to $attachment_ids; it's coerced to a
+     * one-element array. The first validated id is also written
+     * to matrix_messages.attachment_id so legacy readers keep
+     * working without a backfill.
      */
-    public static function send_message($thread_id, $sender_id, $body, $attachment_id = null) {
+    public static function send_message($thread_id, $sender_id, $body, $attachment_ids = null) {
         global $wpdb;
         $thread_id  = (int) $thread_id;
         $sender_id  = (int) $sender_id;
         $body       = trim((string) $body);
+
+        // Coerce legacy single-int callers to the array shape so
+        // the rest of the function only branches once. NULL stays
+        // NULL (= "no attachments"), 0 / "" fall through to NULL,
+        // a real int becomes [int].
+        if ($attachment_ids === null || $attachment_ids === '' || $attachment_ids === 0 || $attachment_ids === '0') {
+            $attachment_ids = [];
+        } elseif (!is_array($attachment_ids)) {
+            $attachment_ids = [(int) $attachment_ids];
+        }
 
         if (!self::is_messaging_enabled()) {
             return new WP_Error('matrix_messaging_disabled', __('Messaging is currently disabled.', 'matrix-mlm'));
@@ -692,7 +727,7 @@ class Matrix_MLM_Messaging {
         if ($thread_id <= 0 || $sender_id <= 0) {
             return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
         }
-        if ($body === '' && !$attachment_id) {
+        if ($body === '' && empty($attachment_ids)) {
             return new WP_Error('matrix_messaging_empty', __('Message body required.', 'matrix-mlm'));
         }
         if (self::is_user_banned($sender_id)) {
@@ -740,29 +775,69 @@ class Matrix_MLM_Messaging {
             }
         }
 
-        $attachment_id = $attachment_id ? (int) $attachment_id : null;
-        if ($attachment_id) {
-            // Attachment must be a real WP attachment owned by the sender.
-            // Anything else gets dropped silently — failing the whole send
-            // would let an attacker probe attachment ids by error message.
-            $att_post = get_post($attachment_id);
-            if (!$att_post || $att_post->post_type !== 'attachment' || (int) $att_post->post_author !== $sender_id) {
-                $attachment_id = null;
-            } elseif (empty($settings['allow_attachments'])) {
-                $attachment_id = null;
+        // Per-attachment validation. Each id must be a real WP
+        // attachment owned by the sender; mismatches are dropped
+        // silently rather than failing the whole send because
+        // (a) failing would let an attacker probe attachment ids
+        // by error message and (b) the typical mismatch in the
+        // wild is a stale composer state, not a malicious one.
+        //
+        // Cap the array length BEFORE validation so a payload of
+        // 1000 ids doesn't fan into 1000 get_post() calls before
+        // we refuse.
+        $max_attachments = self::get_max_attachments_per_message();
+        $validated_attachment_ids = [];
+        if (!empty($attachment_ids) && !empty($settings['allow_attachments'])) {
+            // Normalize, dedupe, drop zeroes.
+            $normalized = [];
+            foreach ($attachment_ids as $aid) {
+                $aid = (int) $aid;
+                if ($aid > 0 && !in_array($aid, $normalized, true)) {
+                    $normalized[] = $aid;
+                }
+            }
+            // Hard cap at MAX_ATTACHMENTS_PER_MESSAGE_HARD even if
+            // an operator filter widens the runtime cap above it.
+            $cap = min($max_attachments, self::MAX_ATTACHMENTS_PER_MESSAGE_HARD);
+            if (count($normalized) > $cap) {
+                $normalized = array_slice($normalized, 0, $cap);
+            }
+            foreach ($normalized as $aid) {
+                $att_post = get_post($aid);
+                if (!$att_post || $att_post->post_type !== 'attachment') {
+                    continue;
+                }
+                if ((int) $att_post->post_author !== $sender_id) {
+                    continue;
+                }
+                $validated_attachment_ids[] = $aid;
             }
         }
 
+        // Body still required if every attachment failed validation.
+        // Without this, a malformed multi-upload pass could land an
+        // empty-body row in storage.
+        if ($body === '' && empty($validated_attachment_ids)) {
+            return new WP_Error('matrix_messaging_empty', __('Message body required.', 'matrix-mlm'));
+        }
+
+        // Legacy single-attachment column gets the first validated
+        // id. NULL when there are no attachments. Reads prefer the
+        // new matrix_message_attachments rows when present and
+        // fall back to this column otherwise.
+        $legacy_attachment_id = !empty($validated_attachment_ids) ? (int) $validated_attachment_ids[0] : null;
+
         $now = current_time('mysql', true);
-        $messages_t = $wpdb->prefix . 'matrix_messages';
-        $threads_t  = $wpdb->prefix . 'matrix_message_threads';
+        $messages_t    = $wpdb->prefix . 'matrix_messages';
+        $threads_t     = $wpdb->prefix . 'matrix_message_threads';
+        $attachments_t = $wpdb->prefix . 'matrix_message_attachments';
 
         $wpdb->insert($messages_t, [
             'thread_id'     => $thread_id,
             'sender_id'     => $sender_id,
             'body'          => $body,
             'body_stripped' => $body_stripped,
-            'attachment_id' => $attachment_id,
+            'attachment_id' => $legacy_attachment_id,
             'created_at'    => $now,
             'deleted_at'    => null,
             'deleted_by'    => null,
@@ -770,6 +845,21 @@ class Matrix_MLM_Messaging {
         $message_id = (int) $wpdb->insert_id;
         if (!$message_id) {
             return new WP_Error('matrix_messaging_db_error', __('Could not store message.', 'matrix-mlm'));
+        }
+
+        // Persist every validated attachment to the new table —
+        // including the first one, which is intentionally also
+        // present in the legacy attachment_id column. This keeps
+        // hydrate_message_rows on a single code path: read the
+        // new table; only fall back to the legacy column for
+        // pre-1.0.23 messages that have no rows here.
+        foreach ($validated_attachment_ids as $position => $aid) {
+            $wpdb->insert($attachments_t, [
+                'message_id'    => $message_id,
+                'attachment_id' => (int) $aid,
+                'position'      => (int) $position,
+                'created_at'    => $now,
+            ]);
         }
 
         $wpdb->update($threads_t, ['last_message_at' => $now], ['id' => $thread_id]);
@@ -792,7 +882,7 @@ class Matrix_MLM_Messaging {
                 $sender_id,
                 $message_id,
                 $body,
-                $attachment_id
+                $legacy_attachment_id
             );
         } catch (Exception $e) {
             if (function_exists('error_log')) {
@@ -805,6 +895,34 @@ class Matrix_MLM_Messaging {
         }
 
         return $message_id;
+    }
+
+    /**
+     * Effective per-message attachment cap. Reads the operator
+     * setting, applies a sane floor (1) and ceiling
+     * (MAX_ATTACHMENTS_PER_MESSAGE_HARD), then runs the operator
+     * filter for callers who want to override at code level
+     * without touching the option blob.
+     */
+    public static function get_max_attachments_per_message() {
+        $settings = self::get_settings();
+        $val = isset($settings['max_attachments_per_message'])
+            ? (int) $settings['max_attachments_per_message']
+            : self::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT;
+        if ($val < 1) {
+            $val = 1;
+        }
+        if ($val > self::MAX_ATTACHMENTS_PER_MESSAGE_HARD) {
+            $val = self::MAX_ATTACHMENTS_PER_MESSAGE_HARD;
+        }
+        $filtered = (int) apply_filters('matrix_messaging_max_attachments_per_message', $val);
+        if ($filtered < 1) {
+            $filtered = 1;
+        }
+        if ($filtered > self::MAX_ATTACHMENTS_PER_MESSAGE_HARD) {
+            $filtered = self::MAX_ATTACHMENTS_PER_MESSAGE_HARD;
+        }
+        return $filtered;
     }
 
     public static function get_thread($thread_id) {
@@ -931,15 +1049,80 @@ class Matrix_MLM_Messaging {
             return;
         }
         $window = self::get_edit_window_seconds();
+
+        // Multi-attachment hydration (DB 1.0.23). Pull every
+        // matrix_message_attachments row whose message_id is in
+        // the visible page in one indexed query, then group in
+        // PHP. Falls back to the legacy attachment_id column for
+        // any pre-1.0.23 message that has no rows in the new
+        // table — we explicitly do NOT lazy-migrate on read,
+        // because a write-on-read pattern would create surprising
+        // contention on a busy thread (every reader racing to
+        // backfill the same rows).
+        global $wpdb;
+        $message_ids = [];
         foreach ($rows as $r) {
-            $r->attachment_url = null;
-            if (!empty($r->attachment_id) && empty($r->deleted_at)) {
-                $url = wp_get_attachment_url((int) $r->attachment_id);
-                if ($url) {
-                    $thumb = wp_get_attachment_image_url((int) $r->attachment_id, 'medium');
-                    $r->attachment_url = $thumb ?: $url;
+            $mid = (int) $r->id;
+            if ($mid > 0) {
+                $message_ids[$mid] = $mid;
+            }
+        }
+        $attachments_by_message = [];
+        if (!empty($message_ids)) {
+            $placeholders = implode(',', array_fill(0, count($message_ids), '%d'));
+            $att_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT message_id, attachment_id, position
+                   FROM {$wpdb->prefix}matrix_message_attachments
+                  WHERE message_id IN ($placeholders)
+                  ORDER BY message_id ASC, position ASC",
+                array_values($message_ids)
+            ));
+            foreach ((array) $att_rows as $ar) {
+                $mid = (int) $ar->message_id;
+                if (!isset($attachments_by_message[$mid])) {
+                    $attachments_by_message[$mid] = [];
+                }
+                $attachments_by_message[$mid][] = (int) $ar->attachment_id;
+            }
+        }
+
+        foreach ($rows as $r) {
+            // Build the attachments[] array for this row. Prefer
+            // the new-table list when present (covers messages
+            // sent on or after DB 1.0.23). Otherwise fall back to
+            // the legacy single attachment_id column. Either path
+            // produces an ordered list of {id, url} objects so the
+            // client doesn't branch on storage version.
+            $atts_out = [];
+            $att_ids  = [];
+            $mid_int  = (int) $r->id;
+            if (!empty($attachments_by_message[$mid_int])) {
+                $att_ids = $attachments_by_message[$mid_int];
+            } elseif (!empty($r->attachment_id)) {
+                $att_ids = [(int) $r->attachment_id];
+            }
+
+            if (!empty($att_ids) && empty($r->deleted_at)) {
+                foreach ($att_ids as $aid) {
+                    $url = wp_get_attachment_url($aid);
+                    if (!$url) {
+                        continue;
+                    }
+                    $thumb = wp_get_attachment_image_url($aid, 'medium');
+                    $atts_out[] = (object) [
+                        'id'        => (int) $aid,
+                        'url'       => $url,
+                        'thumb_url' => $thumb ?: $url,
+                    ];
                 }
             }
+            $r->attachments = $atts_out;
+
+            // Legacy single-attachment field. Kept on the wire so
+            // any cached / older client copy still renders the
+            // first attachment without code changes; new clients
+            // read the attachments[] array and ignore this.
+            $r->attachment_url = !empty($atts_out) ? $atts_out[0]->thumb_url : null;
             $r->is_deleted = !empty($r->deleted_at) ? 1 : 0;
             $r->is_edited  = !empty($r->edited_at) ? 1 : 0;
 
@@ -2430,11 +2613,24 @@ class Matrix_MLM_Messaging {
 
     public static function ajax_send() {
         $uid = self::ajax_guard();
-        $thread_id     = (int) ($_POST['thread_id'] ?? 0);
-        $body          = (string) ($_POST['body'] ?? '');
-        $attachment_id = isset($_POST['attachment_id']) ? (int) $_POST['attachment_id'] : null;
+        $thread_id = (int) ($_POST['thread_id'] ?? 0);
+        $body      = (string) ($_POST['body'] ?? '');
 
-        $result = self::send_message($thread_id, $uid, $body, $attachment_id);
+        // Multi-attachment intake (DB 1.0.23). Prefer the new
+        // attachment_ids[] shape; fall back to the legacy single
+        // attachment_id field for any client that hasn't been
+        // updated yet (and for the ajax_edit / dispatch tests
+        // that still compose with the old key). Sanitize at the
+        // edge so the model only ever sees clean ints.
+        $attachment_ids = null;
+        if (isset($_POST['attachment_ids']) && is_array($_POST['attachment_ids'])) {
+            $attachment_ids = array_map('intval', $_POST['attachment_ids']);
+        } elseif (isset($_POST['attachment_id'])) {
+            $aid = (int) $_POST['attachment_id'];
+            $attachment_ids = $aid > 0 ? [$aid] : [];
+        }
+
+        $result = self::send_message($thread_id, $uid, $body, $attachment_ids);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }

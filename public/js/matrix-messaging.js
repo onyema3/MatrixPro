@@ -131,7 +131,7 @@
     function renderPane(threadLabel, threadType) {
         var attachBtn = cfg.allowAttachments
             ? '<label class="matrix-messaging__attach-btn" title="' + escapeHtml(cfg.i18n.attach || 'Attach image') + '">' +
-                  '<input type="file" name="attachment" accept="image/*" style="display:none">' +
+                  '<input type="file" name="attachment" accept="image/*" multiple style="display:none">' +
                   '<span class="dashicons dashicons-format-image"></span>' +
               '</label>'
             : '';
@@ -222,16 +222,19 @@
                 '</button>' +
             '</div>' +
             '<form class="matrix-messaging__composer" id="matrix-messaging-composer" enctype="multipart/form-data">' +
-                '<div class="matrix-messaging__composer-preview" id="matrix-messaging-preview" style="display:none">' +
-                    '<img src="" alt="preview">' +
-                    '<button type="button" class="matrix-messaging__preview-remove">&times;</button>' +
-                '</div>' +
+                '<div class="matrix-messaging__composer-preview matrix-messaging__composer-preview--multi" id="matrix-messaging-preview" style="display:none"></div>' +
                 '<div class="matrix-messaging__composer-row">' +
                     attachBtn +
                     '<textarea name="body" placeholder="' + escapeHtml(cfg.i18n.reply_placeholder) + '"></textarea>' +
                     '<button type="submit" class="matrix-btn matrix-btn-primary">' + escapeHtml(cfg.i18n.send) + '</button>' +
                 '</div>' +
-                '<input type="hidden" name="attachment_id" value="">' +
+                // Multi-attachment slot (DB 1.0.23). Each successful
+                // upload pushes an <input type="hidden" name="attachment_ids[]" value="N">
+                // into this container; submit serializes them all.
+                // The legacy single attachment_id input is no longer
+                // emitted — the server still accepts it as a
+                // fallback, but we always go through the array shape.
+                '<div class="matrix-messaging__composer-attachments" id="matrix-messaging-attachment-inputs"></div>' +
             '</form>'
         );
     }
@@ -251,11 +254,34 @@
             : escapeHtml(msg.body || '').replace(/\n/g, '<br>');
 
         var attachHtml = '';
-        if (!deleted && msg.attachment_url) {
-            attachHtml = '<div class="matrix-messaging__message-attachment">' +
-                '<a href="' + escapeHtml(msg.attachment_url) + '" target="_blank" rel="noopener">' +
-                '<img src="' + escapeHtml(msg.attachment_url) + '" alt="attachment" loading="lazy">' +
-                '</a></div>';
+        // Multi-attachment render (DB 1.0.23). Prefer the new
+        // attachments[] array; fall back to legacy attachment_url
+        // for any cached / stale message row that still uses the
+        // single-slot wire shape. The grid auto-sizes from the
+        // count via .matrix-messaging__message-attachments--N
+        // modifier classes — the CSS does the actual layout.
+        if (!deleted) {
+            var atts = (msg.attachments && msg.attachments.length) ? msg.attachments : null;
+            if (!atts && msg.attachment_url) {
+                atts = [{ url: msg.attachment_url, thumb_url: msg.attachment_url, id: msg.attachment_id || 0 }];
+            }
+            if (atts && atts.length) {
+                var count = atts.length;
+                var modifier = count >= 4 ? 4 : count;
+                var inner = '';
+                atts.forEach(function (a) {
+                    var fullUrl = a.url || a.thumb_url || '';
+                    var thumb   = a.thumb_url || a.url || '';
+                    inner +=
+                        '<a class="matrix-messaging__message-attachment" href="' + escapeHtml(fullUrl) + '" target="_blank" rel="noopener">' +
+                            '<img src="' + escapeHtml(thumb) + '" alt="attachment" loading="lazy">' +
+                        '</a>';
+                });
+                attachHtml =
+                    '<div class="matrix-messaging__message-attachments matrix-messaging__message-attachments--' + modifier + '">' +
+                        inner +
+                    '</div>';
+            }
         }
 
         var strippedFlag = (!deleted && parseInt(msg.body_stripped, 10) === 1)
@@ -678,14 +704,31 @@
         if (!activeThreadId) { return; }
         var $form = $(this);
         var body = ($form.find('textarea[name="body"]').val() || '').trim();
-        var attachmentId = $form.find('input[name="attachment_id"]').val() || '';
-        if (!body && !attachmentId) { return; }
+        // Collect all attachment ids that finished uploading. The
+        // hidden inputs are appended one-per-success in the upload
+        // change handler, so reading them here gives us the final
+        // ordered list. Pending uploads (still showing the spinner
+        // tile) have not landed in the inputs container yet, so a
+        // user who clicks Send mid-upload will simply send without
+        // them — the right behaviour, because we'd otherwise have
+        // to either block the UI or race-on-finish.
+        var attachmentIds = $form.find('input[name="attachment_ids[]"]').map(function () {
+            return parseInt(this.value, 10) || 0;
+        }).get().filter(function (n) { return n > 0; });
+
+        if (!body && !attachmentIds.length) { return; }
         var $btn = $form.find('button[type="submit"]').prop('disabled', true);
-        api('send', { thread_id: activeThreadId, body: body, attachment_id: attachmentId }).done(function (resp) {
+        var payload = { thread_id: activeThreadId, body: body };
+        // Send the array shape ($_POST['attachment_ids'] = [..ints..]).
+        // jQuery serializes arrays under name[]= when the key ends
+        // with []; we explicitly use that form for clarity.
+        if (attachmentIds.length) {
+            payload['attachment_ids[]'] = attachmentIds;
+        }
+        api('send', payload).done(function (resp) {
             if (resp && resp.success) {
                 $form.find('textarea[name="body"]').val('');
-                $form.find('input[name="attachment_id"]').val('');
-                $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+                clearAttachmentTiles();
             } else {
                 alert((resp && resp.data && resp.data.message) || 'Send failed.');
             }
@@ -1141,54 +1184,136 @@
         }
     });
 
-    // --- Attachment upload via async WP media upload ---
+    // --- Attachment upload via async WP media upload (DB 1.0.23 multi) ---
+    //
+    // Multi-pick is allowed; each picked file uploads independently and
+    // appends a thumbnail tile + a hidden attachment_ids[] input to the
+    // composer once it succeeds. The hard cap mirrors the server's
+    // MAX_ATTACHMENTS_PER_MESSAGE_HARD (8) so a malformed pick can't
+    // queue a hundred uploads — we trim before iterating. Per-file
+    // size guard still uses the 5 MB ceiling baked into the plugin
+    // settings; a client-side validator that knows the server cap
+    // would be strictly better but the upload endpoint will refuse
+    // anything larger anyway, so this is a soft early-fail for UX.
+    var MAX_COMPOSER_ATTACHMENTS = 8;
+    var MAX_COMPOSER_BYTES = 5 * 1024 * 1024;
+
+    function appendAttachmentTile(attachmentId, thumbDataUrl) {
+        var $strip = $('#matrix-messaging-preview');
+        $strip.show();
+        var tile = '<div class="matrix-messaging__preview-tile" data-attachment-id="' + (parseInt(attachmentId, 10) || 0) + '">' +
+                       '<img src="' + escapeHtml(thumbDataUrl) + '" alt="preview">' +
+                       '<button type="button" class="matrix-messaging__preview-remove" aria-label="Remove">&times;</button>' +
+                   '</div>';
+        $strip.append(tile);
+        $('#matrix-messaging-attachment-inputs').append(
+            '<input type="hidden" name="attachment_ids[]" value="' + (parseInt(attachmentId, 10) || 0) + '">'
+        );
+    }
+
+    function clearAttachmentTiles() {
+        $('#matrix-messaging-preview').hide().empty();
+        $('#matrix-messaging-attachment-inputs').empty();
+    }
+
+    function currentAttachmentCount() {
+        return $('#matrix-messaging-attachment-inputs input[name="attachment_ids[]"]').length;
+    }
+
     $pane.on('change', '.matrix-messaging__attach-btn input[type="file"]', function () {
-        var file = this.files && this.files[0];
-        if (!file) { return; }
+        var files = this.files ? Array.prototype.slice.call(this.files) : [];
+        if (!files.length) { return; }
         var $input = $(this);
-        // Client-side size guard (matches server's max_attachment_bytes default 5 MB)
-        if (file.size > 5 * 1024 * 1024) {
-            alert('File too large. Maximum 5 MB.');
+
+        var slotsLeft = MAX_COMPOSER_ATTACHMENTS - currentAttachmentCount();
+        if (slotsLeft <= 0) {
+            alert((cfg.i18n.attach_too_many || 'Maximum %d attachments per message.').replace('%d', MAX_COMPOSER_ATTACHMENTS));
             $input.val('');
             return;
         }
-        // Show local preview immediately
-        var reader = new FileReader();
-        reader.onload = function (ev) {
-            $('#matrix-messaging-preview').show().find('img').attr('src', ev.target.result);
-        };
-        reader.readAsDataURL(file);
+        if (files.length > slotsLeft) {
+            files = files.slice(0, slotsLeft);
+        }
 
-        // Upload via WP's async-upload.php (same mechanism wp.media uses)
-        var fd = new FormData();
-        fd.append('action', 'upload-attachment');
-        fd.append('_wpnonce', cfg.uploadNonce);
-        fd.append('async-upload', file);
-        $.ajax({
-            url: cfg.ajaxUrl,
-            method: 'POST',
-            data: fd,
-            processData: false,
-            contentType: false,
-            dataType: 'json'
-        }).done(function (resp) {
-            if (resp && resp.success && resp.data && resp.data.id) {
-                $('#matrix-messaging-composer').find('input[name="attachment_id"]').val(resp.data.id);
-            } else {
-                alert((resp && resp.data && resp.data.message) || 'Upload failed.');
-                $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+        files.forEach(function (file) {
+            if (file.size > MAX_COMPOSER_BYTES) {
+                alert((cfg.i18n.attach_too_large || 'File too large. Maximum %s MB.').replace('%s', '5'));
+                return;
             }
-        }).fail(function () {
-            alert('Upload failed. Please try again.');
-            $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+
+            // Local-preview thumbnail goes in immediately at a
+            // synthetic id slot (data-pending) so the user sees
+            // it before the upload finishes. On upload success we
+            // resolve the slot to the real attachment id; on
+            // failure we tear the slot back out. Per-file slot
+            // tracking keeps multiple in-flight uploads from
+            // racing each other for the same DOM tile.
+            var pendingId = 'pending-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+            var $strip = $('#matrix-messaging-preview').show();
+            var tileHtml = '<div class="matrix-messaging__preview-tile is-uploading" data-pending-id="' + pendingId + '">' +
+                               '<img src="" alt="preview">' +
+                               '<span class="matrix-messaging__preview-spinner" aria-hidden="true"></span>' +
+                               '<button type="button" class="matrix-messaging__preview-remove" aria-label="Cancel">&times;</button>' +
+                           '</div>';
+            $strip.append(tileHtml);
+            var $tile = $strip.children('[data-pending-id="' + pendingId + '"]');
+
+            var reader = new FileReader();
+            reader.onload = function (ev) {
+                $tile.find('img').attr('src', ev.target.result);
+            };
+            reader.readAsDataURL(file);
+
+            var fd = new FormData();
+            fd.append('action', 'upload-attachment');
+            fd.append('_wpnonce', cfg.uploadNonce);
+            fd.append('async-upload', file);
+            $.ajax({
+                url: cfg.ajaxUrl,
+                method: 'POST',
+                data: fd,
+                processData: false,
+                contentType: false,
+                dataType: 'json'
+            }).done(function (resp) {
+                if (resp && resp.success && resp.data && resp.data.id) {
+                    // Promote the pending tile to a real one.
+                    var realId = parseInt(resp.data.id, 10) || 0;
+                    $tile.removeClass('is-uploading')
+                         .attr('data-attachment-id', realId)
+                         .removeAttr('data-pending-id')
+                         .find('.matrix-messaging__preview-spinner').remove();
+                    $('#matrix-messaging-attachment-inputs').append(
+                        '<input type="hidden" name="attachment_ids[]" value="' + realId + '">'
+                    );
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.upload_failed || 'Upload failed.'));
+                    $tile.remove();
+                    if (!$strip.children().length) { $strip.hide(); }
+                }
+            }).fail(function () {
+                alert(cfg.i18n.upload_failed || 'Upload failed. Please try again.');
+                $tile.remove();
+                if (!$strip.children().length) { $strip.hide(); }
+            });
         });
+
+        // Reset the file input so picking the same file again
+        // (after a remove) re-fires the change event.
         $input.val('');
     });
 
-    // Remove attachment preview
+    // Remove a single tile (works for both pending and uploaded
+    // tiles). For uploaded tiles, drop the matching hidden input.
     $pane.on('click', '.matrix-messaging__preview-remove', function () {
-        $('#matrix-messaging-preview').hide().find('img').attr('src', '');
-        $('#matrix-messaging-composer').find('input[name="attachment_id"]').val('');
+        var $tile = $(this).closest('.matrix-messaging__preview-tile');
+        var aid = parseInt($tile.attr('data-attachment-id'), 10) || 0;
+        $tile.remove();
+        if (aid > 0) {
+            $('#matrix-messaging-attachment-inputs input[name="attachment_ids[]"][value="' + aid + '"]').remove();
+        }
+        var $strip = $('#matrix-messaging-preview');
+        if (!$strip.children().length) { $strip.hide(); }
     });
 
     $newDmBtn.on('click', function () {
