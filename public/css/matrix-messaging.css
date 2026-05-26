@@ -1,0 +1,134 @@
+/* Matrix Messaging — minimal layout. Intentionally light on visual chrome
+ * so it inherits the dashboard's theme primary/secondary colors via the
+ * matrix-* utility classes already defined in matrix-dashboard.css.
+ */
+
+.matrix-messaging {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 16px;
+    min-height: 480px;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #fff;
+}
+
+.matrix-messaging__sidebar {
+    border-right: 1px solid #e5e7eb;
+    background: #f9fafb;
+    display: flex;
+    flex-direction: column;
+}
+
+.matrix-messaging__sidebar-header {
+    padding: 12px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.matrix-messaging__threads {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.matrix-messaging__thread {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px;
+    border-bottom: 1px solid #eef2f7;
+    cursor: pointer;
+}
+
+.matrix-messaging__thread:hover { background: #eef2ff; }
+.matrix-messaging__thread.is-active { background: #e0e7ff; }
+.matrix-messaging__thread-label { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.matrix-messaging__thread-label strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 160px;
+}
+.matrix-messaging__thread-meta { display: flex; align-items: center; gap: 6px; }
+
+.matrix-messaging__empty,
+.matrix-messaging__placeholder {
+    padding: 24px;
+    color: #6b7280;
+    text-align: center;
+}
+
+.matrix-messaging__pane {
+    display: flex;
+    flex-direction: column;
+    min-height: 480px;
+}
+
+.matrix-messaging__pane-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #fff;
+}
+
+.matrix-messaging__messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #fff;
+}
+
+.matrix-messaging__message {
+    max-width: 70%;
+    padding: 8px 12px;
+    border-radius: 12px;
+    background: #f3f4f6;
+    word-wrap: break-word;
+}
+.matrix-messaging__message.is-own {
+    align-self: flex-end;
+    background: #4f46e5;
+    color: #fff;
+}
+.matrix-messaging__message.is-deleted {
+    opacity: 0.6;
+    font-style: italic;
+}
+.matrix-messaging__message-meta {
+    font-size: 11px;
+    opacity: 0.7;
+    margin-top: 4px;
+}
+.matrix-messaging__message-stripped-flag {
+    font-size: 10px;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-left: 6px;
+}
+
+.matrix-messaging__composer {
+    border-top: 1px solid #e5e7eb;
+    padding: 12px;
+    display: flex;
+    gap: 8px;
+    background: #f9fafb;
+}
+.matrix-messaging__composer textarea {
+    flex: 1;
+    min-height: 40px;
+    max-height: 120px;
+    resize: vertical;
+}
+
+@media (max-width: 720px) {
+    .matrix-messaging { grid-template-columns: 1fr; }
+    .matrix-messaging__sidebar { border-right: none; border-bottom: 1px solid #e5e7eb; max-height: 240px; }
+}

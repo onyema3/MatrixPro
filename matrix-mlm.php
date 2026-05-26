@@ -24,7 +24,7 @@ define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);
 define('MATRIX_MLM_PLUGIN_BASENAME', plugin_basename(__FILE__));
-define('MATRIX_MLM_DB_VERSION', '1.0.18');
+define('MATRIX_MLM_DB_VERSION', '1.0.19');
 
 /**
  * GitHub-driven auto-updates.
@@ -116,6 +116,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-wallet.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-support.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-notifications.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-in-app-notifications.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-messaging.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-crypto.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-qr-svg.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/class-matrix-two-factor.php';
@@ -179,6 +180,7 @@ if (is_admin()) {
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-deposits.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-withdrawals.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-tickets.php';
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-messaging.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-reports.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-settings.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-frontend.php';
@@ -227,6 +229,7 @@ require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-profile.ph
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-epin.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-transfer.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-tickets.php';
+require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-messaging.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-bank-payout.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-zebra-payout.php';
 require_once MATRIX_MLM_PLUGIN_DIR . 'includes/user/class-matrix-user-virtual-wallet.php';

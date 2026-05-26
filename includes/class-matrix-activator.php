@@ -101,6 +101,7 @@ class Matrix_MLM_Activator {
             $admin_role->add_cap('manage_matrix_deposits');
             $admin_role->add_cap('manage_matrix_withdrawals');
             $admin_role->add_cap('manage_matrix_tickets');
+            $admin_role->add_cap('manage_matrix_messaging');
             $admin_role->add_cap('manage_matrix_settings');
         }
     }

@@ -100,6 +100,16 @@ class Matrix_MLM_Core {
         // run-time bootstraps above.
         Matrix_MLM_In_App_Notifications::register_hooks();
 
+        // Register member-to-member messaging hooks (DB 1.0.19). Wires
+        // the matrix_messaging_* AJAX endpoints, the user_register
+        // hook that populates team-room membership, and the daily
+        // cron callback that hard-deletes soft-deleted rows + clears
+        // expired mutes. Static, idempotent — same shape as the
+        // in-app-notifications register_hooks above.
+        if (class_exists('Matrix_MLM_Messaging')) {
+            Matrix_MLM_Messaging::register_hooks();
+        }
+
         // Register the Zebra Wallet user-facing payout AJAX hook.
         // Static so we don't pay the cost of constructing the
         // gateway just to register a single endpoint — the
