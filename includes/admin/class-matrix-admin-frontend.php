@@ -78,7 +78,7 @@ class Matrix_MLM_Admin_Frontend {
             <thead><tr><th><?php _e('Page', 'matrix-mlm'); ?></th><th><?php _e('Shortcode', 'matrix-mlm'); ?></th><th><?php _e('Status', 'matrix-mlm'); ?></th><th><?php _e('Action', 'matrix-mlm'); ?></th></tr></thead>
             <tbody>
                 <?php
-                $pages = ['matrix-dashboard' => '[matrix_dashboard]', 'matrix-login' => '[matrix_login]', 'matrix' => '[matrix_register]', 'matrix-plans' => '[matrix_plans]'];
+                $pages = ['matrix-dashboard' => '[matrix_dashboard]', 'matrix' => '[matrix_login]', 'signup' => '[matrix_register]', 'matrix-plans' => '[matrix_plans]'];
                 foreach ($pages as $slug => $shortcode):
                     $page = get_page_by_path($slug);
                 ?>

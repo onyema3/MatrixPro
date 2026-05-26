@@ -44,7 +44,7 @@
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Login', 'matrix-mlm'); ?></button>
         </form>
         <div class="matrix-auth-footer">
-            <p><?php _e("Don't have an account?", 'matrix-mlm'); ?> <a href="<?php echo home_url('/matrix'); ?>"><?php _e('Register', 'matrix-mlm'); ?></a></p>
+            <p><?php _e("Don't have an account?", 'matrix-mlm'); ?> <a href="<?php echo home_url('/signup'); ?>"><?php _e('Register', 'matrix-mlm'); ?></a></p>
             <p><a href="<?php echo wp_lostpassword_url(); ?>"><?php _e('Forgot Password?', 'matrix-mlm'); ?></a></p>
         </div>
     </div>
