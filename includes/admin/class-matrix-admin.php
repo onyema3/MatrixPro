@@ -72,6 +72,14 @@ class Matrix_MLM_Admin {
         // manage_options because issuing a refund moves money.
         add_submenu_page('matrix-mlm', __('Bill Payments History', 'matrix-mlm'), __('Bill Payments', 'matrix-mlm'), 'manage_matrix_mlm', 'matrix-mlm-billing-history', [new Matrix_MLM_Admin_Billing_History(), 'render']);
         add_submenu_page('matrix-mlm', __('Support Tickets', 'matrix-mlm'), __('Tickets', 'matrix-mlm'), 'manage_matrix_tickets', 'matrix-mlm-tickets', [new Matrix_MLM_Admin_Tickets(), 'render']);
+        // Member-to-member messaging moderation queue (DB 1.0.19).
+        // Capability `manage_matrix_messaging` is granted to the
+        // administrator role on activation; staff who already hold
+        // `manage_matrix_tickets` do not automatically get it,
+        // because messaging moderation is a higher-trust action
+        // (it can permanently ban a member, whereas ticket reply
+        // is reversible).
+        add_submenu_page('matrix-mlm', __('Messaging', 'matrix-mlm'), __('Messaging', 'matrix-mlm'), 'manage_matrix_messaging', 'matrix-mlm-messaging', [new Matrix_MLM_Admin_Messaging(), 'render']);
         // Announcements — broadcast composer for in-app notifications
         // pushed to every member. Sits next to Tickets because the
         // two are the platform's outbound + inbound member-comms

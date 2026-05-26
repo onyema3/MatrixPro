@@ -69,6 +69,7 @@ class Matrix_MLM_User_Dashboard {
         'card',
         'billing',
         'tickets',
+        'messages',
         'profile',
         'security',
         'benefits',
@@ -155,6 +156,7 @@ class Matrix_MLM_User_Dashboard {
             ['slug' => 'billing',         'label' => __('Bill Payments',    'matrix-mlm'), 'icon' => 'dashicons-smartphone'],
             ['slug' => 'benefits',        'label' => __('Benefits',         'matrix-mlm'), 'icon' => 'dashicons-awards'],
             ['slug' => 'tickets',         'label' => __('Support',          'matrix-mlm'), 'icon' => 'dashicons-sos'],
+            ['slug' => 'messages',        'label' => __('Messages',         'matrix-mlm'), 'icon' => 'dashicons-email-alt'],
             ['slug' => 'profile',         'label' => __('Profile',          'matrix-mlm'), 'icon' => 'dashicons-admin-users'],
             ['slug' => 'security',        'label' => __('2FA Security',     'matrix-mlm'), 'icon' => 'dashicons-shield'],
         ];
@@ -1020,6 +1022,9 @@ class Matrix_MLM_User_Dashboard {
                 break;
             case 'tickets':
                 (new Matrix_MLM_User_Tickets())->render($user_id);
+                break;
+            case 'messages':
+                (new Matrix_MLM_User_Messaging())->render($user_id);
                 break;
             case 'profile':
                 (new Matrix_MLM_User_Profile())->render($user_id);

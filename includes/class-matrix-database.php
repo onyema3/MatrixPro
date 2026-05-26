@@ -73,8 +73,7 @@ class Matrix_MLM_Database {
         // matrix_positions rows. Powers the genealogy "time
         // machine" view (date slider that reconstructs past tree
         // state). One row per significant event (create / move /
-        // status change), plus a one-time backfill row per
-        // existing position dated at joined_at so snapshots from
+        // status change), plus a one-time backfill row per        // existing position dated at joined_at so snapshots from
         // before the audit table existed still work. Read by
         // Matrix_MLM_Plan_Engine::build_tree_at_snapshot();
         // written by Matrix_MLM_Position_History::record_event().
@@ -103,6 +102,26 @@ class Matrix_MLM_Database {
         // page can deep-link back to the matrix_deposits or
         // matrix_withdrawals row Bibimoney is disputing.
         'matrix_zebra_notifications',
+        // Member-to-member messaging (DB version 1.0.19).
+        // Five tables forming the messaging system:
+        //   - matrix_message_threads:      thread metadata (dm | team_room)
+        //   - matrix_message_participants: N:M users <-> threads, with
+        //                                  per-participant read/mute state
+        //   - matrix_messages:             the actual message rows
+        //   - matrix_message_blocks:       per-user block list (asymmetric
+        //                                  storage, symmetric enforcement
+        //                                  at model layer — see
+        //                                  Matrix_MLM_Messaging::is_blocked_either_way)
+        //   - matrix_message_reports:      admin moderation queue rows
+        // Created by self::create_tables(); listed here so the schema
+        // status probe and the "Repair Database Schema" admin tool
+        // surface drift on these tables the same way they do for the
+        // tickets/notifications/zebra-notifications surface.
+        'matrix_message_threads',
+        'matrix_message_participants',
+        'matrix_messages',
+        'matrix_message_blocks',
+        'matrix_message_reports',
     ];
 
     /**
@@ -1532,6 +1551,102 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_zebra_notifications);
 
+        // ----------------------------------------------------------------
+        // Member-to-member messaging (DB version 1.0.19).
+        //
+        // Five tables, all dbDelta-compatible. Conventions follow the
+        // matrix_tickets / matrix_ticket_messages pair already established
+        // in this file: prefix-aware table names, $charset_collate suffix,
+        // ON UPDATE CURRENT_TIMESTAMP only where the column needs touch
+        // tracking, indexes only where the runtime queries need them.
+        //
+        // Pair semantics for matrix_message_blocks:
+        //   UNIQUE (blocker_id, blocked_id) is intentionally directional —
+        //   it lets the same pair exist twice (A blocks B AND B blocks A),
+        //   and Matrix_MLM_Messaging::is_blocked_either_way() handles the
+        //   symmetric refusal at the model layer. A symmetric UNIQUE
+        //   would force one side's second block to silently fail, which
+        //   would degrade the moderation queue's signal.
+        // ----------------------------------------------------------------
+
+        $table_message_threads = $wpdb->prefix . 'matrix_message_threads';
+        $sql_message_threads = "CREATE TABLE $table_message_threads (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            type enum('dm','team_room') NOT NULL DEFAULT 'dm',
+            team_owner_id bigint(20) UNSIGNED DEFAULT NULL,
+            title varchar(190) DEFAULT NULL,
+            status enum('active','archived') NOT NULL DEFAULT 'active',
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_message_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY type_owner (type, team_owner_id),
+            KEY last_message_at (last_message_at)
+        ) $charset_collate;";
+        dbDelta($sql_message_threads);
+
+        $table_message_participants = $wpdb->prefix . 'matrix_message_participants';
+        $sql_message_participants = "CREATE TABLE $table_message_participants (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            thread_id bigint(20) UNSIGNED NOT NULL,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            role enum('owner','member') NOT NULL DEFAULT 'member',
+            joined_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_read_at datetime DEFAULT NULL,
+            muted_until datetime DEFAULT NULL,
+            removed_at datetime DEFAULT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY thread_user (thread_id, user_id),
+            KEY user_id (user_id)
+        ) $charset_collate;";
+        dbDelta($sql_message_participants);
+
+        $table_messages = $wpdb->prefix . 'matrix_messages';
+        $sql_messages = "CREATE TABLE $table_messages (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            thread_id bigint(20) UNSIGNED NOT NULL,
+            sender_id bigint(20) UNSIGNED NOT NULL,
+            body longtext NOT NULL,
+            body_stripped tinyint(1) NOT NULL DEFAULT 0,
+            attachment_id bigint(20) UNSIGNED DEFAULT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            deleted_at datetime DEFAULT NULL,
+            deleted_by bigint(20) UNSIGNED DEFAULT NULL,
+            PRIMARY KEY (id),
+            KEY thread_id (thread_id, id),
+            KEY sender_id (sender_id),
+            KEY deleted_at (deleted_at)
+        ) $charset_collate;";
+        dbDelta($sql_messages);
+
+        $table_message_blocks = $wpdb->prefix . 'matrix_message_blocks';
+        $sql_message_blocks = "CREATE TABLE $table_message_blocks (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            blocker_id bigint(20) UNSIGNED NOT NULL,
+            blocked_id bigint(20) UNSIGNED NOT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY blocker_blocked (blocker_id, blocked_id),
+            KEY blocked_id (blocked_id)
+        ) $charset_collate;";
+        dbDelta($sql_message_blocks);
+
+        $table_message_reports = $wpdb->prefix . 'matrix_message_reports';
+        $sql_message_reports = "CREATE TABLE $table_message_reports (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            message_id bigint(20) UNSIGNED NOT NULL,
+            reporter_id bigint(20) UNSIGNED NOT NULL,
+            reason varchar(32) NOT NULL DEFAULT 'other',
+            note varchar(1000) DEFAULT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            resolved_at datetime DEFAULT NULL,
+            resolved_by bigint(20) UNSIGNED DEFAULT NULL,
+            resolution varchar(32) DEFAULT NULL,
+            PRIMARY KEY (id),
+            KEY message_id (message_id),
+            KEY resolved_at (resolved_at)
+        ) $charset_collate;";
+        dbDelta($sql_message_reports);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -1556,6 +1671,15 @@ class Matrix_MLM_Database {
             'matrix_position_history',
             'matrix_notifications',
             'matrix_zebra_notifications',
+            // Messaging tables (DB version 1.0.19) — included in the
+            // uninstall drop-list so a clean uninstall removes the
+            // whole module's footprint, matching the convention used
+            // by every other plugin-owned table above.
+            'matrix_message_threads',
+            'matrix_message_participants',
+            'matrix_messages',
+            'matrix_message_blocks',
+            'matrix_message_reports',
         ];
 
         foreach ($tables as $table) {

@@ -1,0 +1,103 @@
+<?php
+/**
+ * User-facing Messaging tab.
+ *
+ * Render-only: all state changes go through Matrix_MLM_Messaging's AJAX
+ * surface. Mirrors the user/Tickets render layout so the visual rhythm of
+ * the dashboard stays consistent.
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Matrix_MLM_User_Messaging {
+
+    public function render($user_id) {
+        if (!Matrix_MLM_Messaging::is_messaging_enabled()) {
+            echo '<div class="matrix-alert matrix-alert-info">' . esc_html__('Messaging is currently disabled by the administrator.', 'matrix-mlm') . '</div>';
+            return;
+        }
+        if ($banned = Matrix_MLM_Messaging::is_user_banned($user_id)) {
+            echo '<div class="matrix-alert matrix-alert-danger">' . esc_html__('Your messaging access is suspended.', 'matrix-mlm') . '</div>';
+            return;
+        }
+
+        // Lazy team-room self-heal (skeleton: cheap idempotent walk).
+        Matrix_MLM_Messaging::self_heal_membership($user_id);
+
+        $threads = Matrix_MLM_Messaging::list_threads_for_user($user_id);
+        $settings = Matrix_MLM_Messaging::get_settings();
+
+        wp_enqueue_style(
+            'matrix-messaging',
+            MATRIX_MLM_PLUGIN_URL . 'public/css/matrix-messaging.css',
+            ['matrix-mlm-dashboard'],
+            MATRIX_MLM_VERSION
+        );
+        wp_enqueue_script(
+            'matrix-messaging',
+            MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-messaging.js',
+            ['jquery'],
+            MATRIX_MLM_VERSION,
+            true
+        );
+        wp_localize_script('matrix-messaging', 'MatrixMessaging', [
+            'ajaxUrl'           => admin_url('admin-ajax.php'),
+            'nonce'             => wp_create_nonce('matrix_messaging'),
+            'currentUserId'     => (int) $user_id,
+            'pollingIntervalMs' => (int) $settings['polling_interval_ms'],
+            'allowAttachments'  => !empty($settings['allow_attachments']),
+            'i18n'              => [
+                'new_dm_prompt' => __('Username or referral code:', 'matrix-mlm'),
+                'send'          => __('Send', 'matrix-mlm'),
+                'reply_placeholder' => __('Write a message...', 'matrix-mlm'),
+                'no_threads'    => __('No conversations yet. Start one with the New Message button.', 'matrix-mlm'),
+                'select_thread' => __('Select a conversation, or start a new one.', 'matrix-mlm'),
+            ],
+        ]);
+        ?>
+        <h2><?php esc_html_e('Messages', 'matrix-mlm'); ?></h2>
+
+        <div class="matrix-messaging" data-current-user="<?php echo (int) $user_id; ?>">
+            <aside class="matrix-messaging__sidebar">
+                <div class="matrix-messaging__sidebar-header">
+                    <button type="button" class="matrix-btn matrix-btn-primary matrix-btn-sm" id="matrix-messaging-new-dm">
+                        <?php esc_html_e('New Message', 'matrix-mlm'); ?>
+                    </button>
+                </div>
+                <ul class="matrix-messaging__threads" id="matrix-messaging-threads">
+                    <?php if (empty($threads)): ?>
+                        <li class="matrix-messaging__empty"><?php esc_html_e('No conversations yet.', 'matrix-mlm'); ?></li>
+                    <?php else: foreach ($threads as $t): ?>
+                        <li class="matrix-messaging__thread" data-thread-id="<?php echo (int) $t->id; ?>" data-type="<?php echo esc_attr($t->type); ?>">
+                            <div class="matrix-messaging__thread-label">
+                                <?php if ($t->type === 'team_room'): ?>
+                                    <span class="dashicons dashicons-groups"></span>
+                                <?php else: ?>
+                                    <span class="dashicons dashicons-admin-users"></span>
+                                <?php endif; ?>
+                                <strong><?php echo esc_html($t->display_label); ?></strong>
+                            </div>
+                            <div class="matrix-messaging__thread-meta">
+                                <?php if ((int) $t->unread_count > 0): ?>
+                                    <span class="matrix-badge matrix-badge-info"><?php echo (int) $t->unread_count; ?></span>
+                                <?php endif; ?>
+                                <?php if (!empty($t->muted_until)): ?>
+                                    <span class="dashicons dashicons-bell" title="<?php esc_attr_e('Muted', 'matrix-mlm'); ?>"></span>
+                                <?php endif; ?>
+                            </div>
+                        </li>
+                    <?php endforeach; endif; ?>
+                </ul>
+            </aside>
+
+            <section class="matrix-messaging__pane" id="matrix-messaging-pane">
+                <div class="matrix-messaging__placeholder">
+                    <?php esc_html_e('Select a conversation, or start a new one.', 'matrix-mlm'); ?>
+                </div>
+            </section>
+        </div>
+        <?php
+    }
+}
