@@ -127,6 +127,7 @@ class Matrix_MLM_Database {
         'matrix_message_blocks',
         'matrix_message_reports',
         'matrix_message_reactions',
+        'matrix_message_attachments',
     ];
 
     /**
@@ -716,6 +717,35 @@ class Matrix_MLM_Database {
                        AFTER removed_at"
                 );
             }
+        }
+
+        // 1.0.23 — new matrix_message_attachments table for the
+        // multi-attachment surface. Same shape as the dbDelta block
+        // in create_tables(); this idempotent probe handles
+        // upgraded installs whose create_tables() may have run
+        // before the schema existed. Direct CREATE TABLE IF NOT
+        // EXISTS rather than dbDelta because we want a
+        // deterministic single-statement create when the slow path
+        // is the one that lands the schema.
+        $message_attachments_table = $wpdb->prefix . 'matrix_message_attachments';
+        $message_attachments_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $message_attachments_table
+        ));
+        if ($message_attachments_exists === 0) {
+            $charset = $wpdb->get_charset_collate();
+            $wpdb->query("CREATE TABLE IF NOT EXISTS {$message_attachments_table} (
+                id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+                message_id bigint(20) UNSIGNED NOT NULL,
+                attachment_id bigint(20) UNSIGNED NOT NULL,
+                position tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+                created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY message_position (message_id, position),
+                KEY message_id (message_id),
+                KEY attachment_id (attachment_id)
+            ) {$charset};");
         }
 
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
@@ -1766,6 +1796,36 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_message_reactions);
 
+        // Message attachments (DB 1.0.23). One row per (message,
+        // attachment) pair, allowing multiple attachments per message
+        // — the matrix_messages.attachment_id column is preserved as
+        // a legacy single-attachment slot so old rows render without
+        // a backfill, and new sends populate BOTH the legacy column
+        // (with the first attachment) AND this table (with every
+        // attachment in display order). Reads prefer this table when
+        // any rows exist for the message; otherwise they fall back to
+        // the legacy column. Either path produces the same wire
+        // shape (an `attachments` array on the message row) so the
+        // client doesn't branch on which storage was hit.
+        //
+        // Position is a small uint encoding display order (0..N-1)
+        // so the JS can render thumbnails in the order the sender
+        // attached them. UNIQUE(message_id, position) catches
+        // accidental duplicate inserts at the storage layer.
+        $table_message_attachments = $wpdb->prefix . 'matrix_message_attachments';
+        $sql_message_attachments = "CREATE TABLE $table_message_attachments (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            message_id bigint(20) UNSIGNED NOT NULL,
+            attachment_id bigint(20) UNSIGNED NOT NULL,
+            position tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY message_position (message_id, position),
+            KEY message_id (message_id),
+            KEY attachment_id (attachment_id)
+        ) $charset_collate;";
+        dbDelta($sql_message_attachments);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -1800,6 +1860,7 @@ class Matrix_MLM_Database {
             'matrix_message_blocks',
             'matrix_message_reports',
             'matrix_message_reactions',
+            'matrix_message_attachments',
         ];
 
         foreach ($tables as $table) {

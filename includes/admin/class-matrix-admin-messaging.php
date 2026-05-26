@@ -347,6 +347,25 @@ class Matrix_MLM_Admin_Messaging {
                 } else {
                     $new['max_attachment_bytes'] = max(0, (int) ($_POST['max_attachment_bytes'] ?? $defaults['max_attachment_bytes']));
                 }
+                // Multi-attachment cap (DB 1.0.23). Clamp to the
+                // 1..MAX_ATTACHMENTS_PER_MESSAGE_HARD range that
+                // get_max_attachments_per_message() enforces at
+                // runtime, so the form layer agrees with the
+                // runtime instead of accepting a wider range that
+                // the runtime will silently downgrade. Operators
+                // can still raise the runtime ceiling through the
+                // matrix_messaging_max_attachments_per_message
+                // filter, which is intentional — the filter is
+                // for code-level overrides, the form is for
+                // on-call operator self-service.
+                $new['max_attachments_per_message'] = max(
+                    1,
+                    min(
+                        Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_HARD,
+                        (int) ($_POST['max_attachments_per_message']
+                            ?? $defaults['max_attachments_per_message'])
+                    )
+                );
                 $new['team_rooms_auto_create']      = !empty($_POST['team_rooms_auto_create']) ? 1 : 0;
                 $new['polling_interval_ms']        = max(2000, min(120000, (int) ($_POST['polling_interval_ms'] ?? $defaults['polling_interval_ms'])));
                 // Sender-side edit / self-delete window. Clamped
@@ -1110,6 +1129,25 @@ class Matrix_MLM_Admin_Messaging {
                                 /* translators: %s: byte count of the current cap, formatted with thousand separators. */
                                 esc_html__('Per-attachment ceiling. The runtime checks against the byte value (currently %s bytes). Range 0–100 MB; the typical PHP upload_max_filesize on shared hosting is the practical lower limit.', 'matrix-mlm'),
                                 '<code>' . esc_html(number_format_i18n((int) $s['max_attachment_bytes'])) . '</code>'
+                            );
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="matrix-msg-attach-max-count"><?php esc_html_e('Max attachments per message', 'matrix-mlm'); ?></label></th>
+                    <td>
+                        <input type="number" id="matrix-msg-attach-max-count" name="max_attachments_per_message"
+                               min="1"
+                               max="<?php echo (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_HARD; ?>"
+                               value="<?php echo (int) $s['max_attachments_per_message']; ?>">
+                        <p class="description">
+                            <?php
+                            printf(
+                                /* translators: 1: default cap, 2: hard ceiling. */
+                                esc_html__('How many image attachments a member can include in a single message. Range 1–%2$d. Default %1$d. Operators can raise the ceiling beyond %2$d in code via the matrix_messaging_max_attachments_per_message filter, but values typed here are clamped to the documented range.', 'matrix-mlm'),
+                                (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
+                                (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_HARD
                             );
                             ?>
                         </p>

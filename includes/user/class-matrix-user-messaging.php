@@ -103,6 +103,9 @@ class Matrix_MLM_User_Messaging {
                 'reaction_add'     => __('Add this reaction', 'matrix-mlm'),
                 'reaction_remove'  => __('Remove your reaction', 'matrix-mlm'),
                 'attach'           => __('Attach image', 'matrix-mlm'),
+                'attach_too_large' => __('File too large. Maximum %s MB.', 'matrix-mlm'),
+                'attach_too_many'  => __('Maximum %d attachments per message.', 'matrix-mlm'),
+                'upload_failed'    => __('Upload failed. Please try again.', 'matrix-mlm'),
                 // Older-message pagination.
                 'load_older'       => __('Load older messages', 'matrix-mlm'),
                 // Mute / block popovers.
