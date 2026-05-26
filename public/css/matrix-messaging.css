@@ -842,3 +842,45 @@
     max-height: 320px;
     object-fit: contain;
 }
+
+
+/* -----------------------------------------------------------------
+ * Typing indicator (DB 1.0.23 — transient-backed)
+ *
+ * Lives between the messages list and the composer. Three
+ * staggered-bouncing dots + a label. Hidden via [hidden] until
+ * applyTypingState reveals it. Subtle gray — the indicator is
+ * informative, not alarm-grade, so it shouldn't compete with
+ * unread badges or the message list itself for attention.
+ * ----------------------------------------------------------------- */
+
+.matrix-messaging__typing {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #646970;
+    min-height: 24px;
+    border-top: 1px solid #f0f0f1;
+    background: #fff;
+}
+.matrix-messaging__typing[hidden] { display: none; }
+.matrix-messaging__typing-text {
+    margin-left: 6px;
+    font-style: italic;
+}
+.matrix-messaging__typing-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #8c8f94;
+    display: inline-block;
+    animation: matrix-msg-typing-bounce 1.2s infinite ease-in-out;
+}
+.matrix-messaging__typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.matrix-messaging__typing-dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes matrix-msg-typing-bounce {
+    0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
+    40%           { transform: scale(1);   opacity: 1;   }
+}

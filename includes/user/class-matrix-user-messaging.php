@@ -62,6 +62,12 @@ class Matrix_MLM_User_Messaging {
             // picker stays in sync if an operator filters the
             // palette via matrix_messaging_allowed_reactions.
             'reactionPalette'   => Matrix_MLM_Messaging::ALLOWED_REACTION_EMOJIS,
+            // Typing-beacon cadence (DB 1.0.23). Mirrors the
+            // server's TYPING_BEACON_INTERVAL_MS so the
+            // throttle window matches; keeping it in localized
+            // config lets an operator change one place to
+            // re-tune both ends.
+            'typingBeaconMs'    => (int) Matrix_MLM_Messaging::TYPING_BEACON_INTERVAL_MS,
             'i18n'              => [
                 'new_dm_prompt' => __('Username or referral code:', 'matrix-mlm'),
                 'send'          => __('Send', 'matrix-mlm'),
@@ -136,6 +142,15 @@ class Matrix_MLM_User_Messaging {
                 'leave_thread'        => __('Leave thread', 'matrix-mlm'),
                 'confirm_leave'       => __('Leave this team room? You will stop receiving messages here. Your sponsor will not be able to add you back automatically — you would have to be re-invited.', 'matrix-mlm'),
                 'leave_failed'        => __('Could not leave the thread.', 'matrix-mlm'),
+                // Typing indicators (DB 1.0.23 — transient-backed).
+                /* translators: %s: display name of the single user typing. */
+                'typing_one'          => __('%s is typing…', 'matrix-mlm'),
+                /* translators: 1: first display name, 2: second display name. */
+                'typing_two'          => __('%1$s and %2$s are typing…', 'matrix-mlm'),
+                /* translators: 1: first display name, 2: second display name, 3: third display name. */
+                'typing_three'        => __('%1$s, %2$s, and %3$s are typing…', 'matrix-mlm'),
+                /* translators: %s: number of users typing (4 or more). */
+                'typing_many'         => __('%s people are typing…', 'matrix-mlm'),
             ],
         ]);
         ?>

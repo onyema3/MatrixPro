@@ -221,6 +221,19 @@
                     escapeHtml(cfg.i18n.load_older || 'Load older messages') +
                 '</button>' +
             '</div>' +
+            // Typing indicator slot. Lives between the messages
+            // list and the composer so it doesn't get scrolled
+            // out of view by new incoming messages, and stays
+            // visible while the user composes their reply.
+            // Hidden by default until applyTypingState flips it
+            // via .toggle(); .matrix-messaging__typing-text gets
+            // its label rewritten on every poll.
+            '<div class="matrix-messaging__typing" id="matrix-messaging-typing" aria-live="polite" hidden>' +
+                '<span class="matrix-messaging__typing-dot"></span>' +
+                '<span class="matrix-messaging__typing-dot"></span>' +
+                '<span class="matrix-messaging__typing-dot"></span>' +
+                '<span class="matrix-messaging__typing-text" id="matrix-messaging-typing-text"></span>' +
+            '</div>' +
             '<form class="matrix-messaging__composer" id="matrix-messaging-composer" enctype="multipart/form-data">' +
                 '<div class="matrix-messaging__composer-preview matrix-messaging__composer-preview--multi" id="matrix-messaging-preview" style="display:none"></div>' +
                 '<div class="matrix-messaging__composer-row">' +
@@ -399,6 +412,14 @@
     function loadThread(threadId, label) {
         stopPolling();
         stopEditWindowSweep();
+        // Stop any in-flight typing beacon for the previous
+        // thread; we do NOT notify the server because the
+        // outgoing AJAX races with the navigation away from the
+        // thread and the server-side TTL will expire it within
+        // one window anyway. A beacon with notify=true would
+        // also be wasted since the user is no longer composing
+        // there.
+        stopTypingBeacon(false);
         activeThreadId = threadId;
         renderedIds = Object.create(null);
         lastId = 0;
@@ -434,6 +455,7 @@
             applyReceipts(data.receipts, activeThreadType);
             applyReactions(data.reactions);
             applyThreadState(data.thread_state);
+            applyTypingState(data.typing);
             // hasMoreOlder defaults to true; the first
             // fetch_older click resolves it. If the initial
             // page came back with fewer than 50 rows we know
@@ -477,6 +499,7 @@
                 applyReceipts(data.receipts, activeThreadType);
                 applyReactions(data.reactions);
                 applyThreadState(data.thread_state);
+                applyTypingState(data.typing);
             });
         }, Math.max(2000, parseInt(cfg.pollingIntervalMs, 10) || 10000));
     }
@@ -649,6 +672,55 @@
     }
 
     /**
+     * Render the typing indicator from the server's typing[]
+     * field on every fetch_thread response. Empty array (or
+     * missing key) hides the indicator.
+     *
+     * Wording follows the WhatsApp / Slack pattern:
+     *   1 typer  — "Alice is typing…"
+     *   2 typers — "Alice and Bob are typing…"
+     *   3 typers — "Alice, Bob, and Carol are typing…"
+     *   4+       — "4 people are typing…"
+     *
+     * The cap matches the moderator-bandwidth pattern: surfacing
+     * every typer's name in a 50-member team room would be
+     * visual noise, so past 3 we collapse to a count. The
+     * boundary is locale-fragile (English-only with hardcoded
+     * separators) — a future i18n pass will likely thread this
+     * through wp_localize_script's typing strings; for now we
+     * keep it inline so the feature ships without blocking on
+     * a translator round-trip.
+     */
+    function applyTypingState(typers) {
+        var $bar = $('#matrix-messaging-typing');
+        if (!$bar.length) { return; }
+        if (!typers || !typers.length) {
+            $bar.prop('hidden', true);
+            $('#matrix-messaging-typing-text').text('');
+            return;
+        }
+        var names = [];
+        for (var i = 0; i < typers.length && i < 3; i++) {
+            names.push(String(typers[i].display_name || ''));
+        }
+        var label;
+        if (typers.length === 1) {
+            label = formatString(cfg.i18n.typing_one || '%s is typing…', names[0]);
+        } else if (typers.length === 2) {
+            label = formatString(cfg.i18n.typing_two || '%1$s and %2$s are typing…', names[0], names[1]);
+        } else if (typers.length === 3) {
+            label = (cfg.i18n.typing_three || '%1$s, %2$s, and %3$s are typing…')
+                .replace('%1$s', names[0])
+                .replace('%2$s', names[1])
+                .replace('%3$s', names[2]);
+        } else {
+            label = formatString(cfg.i18n.typing_many || '%s people are typing…', String(typers.length));
+        }
+        $('#matrix-messaging-typing-text').text(label);
+        $bar.prop('hidden', false);
+    }
+
+    /**
      * Show / hide the "Load older" button based on the most
      * recent answer from fetch_older / fetch_thread.
      */
@@ -699,9 +771,93 @@
         loadThread(parseInt($li.data('thread-id'), 10), $li.find('strong').text());
     });
 
+    // Typing-beacon machinery (DB 1.0.23 — transient-backed).
+    //
+    // The textarea fires an 'input' event on every keystroke; we
+    // throttle that into one beacon every TYPING_BEACON_INTERVAL_MS
+    // (advertised by wp_localize_script under cfg.typingBeaconMs,
+    // matching the server's TYPING_BEACON_INTERVAL_MS). The
+    // beacon stamps a short-TTL transient server-side; peers read
+    // it back via ajax_fetch_thread on their next poll. A user
+    // who clears the textarea, blurs it, sends, or switches
+    // threads triggers a final is_typing=0 to clear immediately
+    // — without that, the indicator would linger for one TTL
+    // window after the typer walked away.
+    var typingBeaconLastSentAt = 0;    // ms timestamp of last sent beacon
+    var typingBeaconScheduled  = null; // setTimeout handle for the next pulse
+    var typingBeaconActive     = false; // whether server currently thinks we're typing
+
+    function typingBeaconIntervalMs() {
+        var v = parseInt(cfg.typingBeaconMs, 10);
+        return (v && v >= 1000) ? v : 3000;
+    }
+
+    function sendTypingBeacon(isTyping) {
+        if (!activeThreadId) { return; }
+        api('typing', { thread_id: activeThreadId, is_typing: isTyping ? 1 : 0 });
+    }
+
+    function startTypingBeacon() {
+        if (!activeThreadId) { return; }
+        var now = Date.now();
+        // First pulse fires immediately so peers see the
+        // indicator within one poll tick rather than waiting a
+        // full beacon interval. Subsequent pulses honor the
+        // throttle window.
+        if (!typingBeaconActive || (now - typingBeaconLastSentAt) >= typingBeaconIntervalMs()) {
+            typingBeaconActive = true;
+            typingBeaconLastSentAt = now;
+            sendTypingBeacon(true);
+        }
+        // Schedule a tail-end "stop" beacon. Cancels any earlier
+        // pending one so the timing converges on the most recent
+        // input. If the user keeps typing, this gets rescheduled;
+        // if they go quiet, it fires and clears the indicator.
+        if (typingBeaconScheduled) { clearTimeout(typingBeaconScheduled); }
+        typingBeaconScheduled = setTimeout(function () {
+            stopTypingBeacon(true);
+        }, typingBeaconIntervalMs() + 500);
+    }
+
+    function stopTypingBeacon(notifyServer) {
+        if (typingBeaconScheduled) {
+            clearTimeout(typingBeaconScheduled);
+            typingBeaconScheduled = null;
+        }
+        if (typingBeaconActive && notifyServer) {
+            sendTypingBeacon(false);
+        }
+        typingBeaconActive = false;
+        typingBeaconLastSentAt = 0;
+    }
+
+    $pane.on('input', '#matrix-messaging-composer textarea[name="body"]', function () {
+        var hasContent = ($(this).val() || '').length > 0;
+        if (hasContent) {
+            startTypingBeacon();
+        } else {
+            // Empty textarea = user cleared what they were
+            // composing. Drop the beacon immediately so peers
+            // don't see "typing…" linger over a blank composer.
+            stopTypingBeacon(true);
+        }
+    });
+
+    $pane.on('blur', '#matrix-messaging-composer textarea[name="body"]', function () {
+        // Blurring out of the composer (e.g. clicking elsewhere
+        // on the page) ends the typing session. Same clear-
+        // immediately rationale as the empty-textarea path.
+        stopTypingBeacon(true);
+    });
+
     $pane.on('submit', '#matrix-messaging-composer', function (e) {
         e.preventDefault();
         if (!activeThreadId) { return; }
+        // Send fires the leading-edge of "user just stopped
+        // typing" because the message is now sent — clear any
+        // outstanding beacon and tell the server we're done so
+        // peers see the indicator drop in their next poll.
+        stopTypingBeacon(true);
         var $form = $(this);
         var body = ($form.find('textarea[name="body"]').val() || '').trim();
         // Collect all attachment ids that finished uploading. The

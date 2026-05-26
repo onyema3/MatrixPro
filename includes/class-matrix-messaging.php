@@ -162,6 +162,35 @@ class Matrix_MLM_Messaging {
     const MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT = 4;
     const MAX_ATTACHMENTS_PER_MESSAGE_HARD    = 8;
 
+    /**
+     * Typing-indicator timing (DB 1.0.23 — no schema, transient-backed).
+     *
+     * TYPING_TTL_SECONDS — how long a typing beacon counts as
+     * "still typing" before falling off. Slightly longer than the
+     * client beacon interval so a single dropped HTTP request
+     * doesn't make the indicator flicker, but short enough that a
+     * user who closes their tab mid-compose stops looking like
+     * they're typing within a couple of seconds.
+     *
+     * TYPING_BEACON_INTERVAL_MS — advisory cadence the JS uses to
+     * refresh the beacon while the user is actively typing.
+     * Surfaced via wp_localize_script so an operator who wants a
+     * different cadence can patch one place.
+     *
+     * Storage is a per-(thread, user) WP transient with a 6-second
+     * TTL, so an idle keyboard auto-clears without a cleanup cron
+     * and we never accumulate stale rows in the DB. Reads probe
+     * one transient per active participant of a thread on every
+     * fetch_thread call — N participants worth of cache get()s,
+     * which is cheap on object-cached hosts (where transients
+     * land in memcached / Redis) and acceptable on the database-
+     * fallback path because the same query gets dropped on the
+     * 6-second expiration anyway.
+     */
+    const TYPING_TTL_SECONDS         = 6;
+    const TYPING_BEACON_INTERVAL_MS  = 3000;
+    const TYPING_TRANSIENT_PREFIX    = 'matrix_msg_typing_';
+
     public static function default_settings() {
         return [
             'enabled'                       => 1,
@@ -239,6 +268,13 @@ class Matrix_MLM_Messaging {
         // can only list / leave a thread they're already in.
         add_action('wp_ajax_matrix_messaging_list_members',  [__CLASS__, 'ajax_list_members']);
         add_action('wp_ajax_matrix_messaging_leave_thread',  [__CLASS__, 'ajax_leave_thread']);
+
+        // Typing indicator beacon (DB 1.0.23 — transient-backed,
+        // no schema). The client pings this on a slow cadence
+        // while the user is composing; the server stamps a
+        // short-TTL transient that ajax_fetch_thread reads back
+        // to populate the typing[] field on the poll response.
+        add_action('wp_ajax_matrix_messaging_typing',        [__CLASS__, 'ajax_typing']);
 
         // Self-healing team-room membership: when a new user is created,
         // ensure their sponsor's team room exists and add the new user as
@@ -1670,6 +1706,137 @@ class Matrix_MLM_Messaging {
         return $out;
     }
 
+    // ---------------------------------------------------------------
+    // Typing indicators (transient-backed, no schema)
+    //
+    // One transient per (thread, user) with TTL TYPING_TTL_SECONDS.
+    // The client pings set_typing_state() on a slow cadence while
+    // the user is composing; ajax_fetch_thread calls
+    // get_typing_users() on every poll to populate the typing[]
+    // wire field. A user who closes their tab mid-compose stops
+    // looking like they're typing within TYPING_TTL_SECONDS — no
+    // cleanup cron, no stored rows, no admin tooling. Reads scale
+    // with active-participant count per thread, not with site
+    // user count, so even a 50-member team room runs at ~50
+    // transient-get()s per poll, dominated entirely by network
+    // round-trip not by storage layer cost.
+    //
+    // This is intentionally a coarse "typing yes / no" signal,
+    // not a per-keystroke broadcast — every-keystroke would be
+    // both expensive on the network and a privacy concern (typing
+    // bursts can reveal more than the eventual sent message).
+    // ---------------------------------------------------------------
+
+    /**
+     * Stamp or clear a typing transient for the (thread, user) pair.
+     *
+     * Transient key shape: {prefix}{thread_id}_{user_id}, scoped to
+     * the message thread so probing one user's typing state in
+     * thread A doesn't leak their typing state in thread B.
+     *
+     * Stored value is the GMT unix timestamp of the most recent
+     * beacon. Reads compare this against TYPING_TTL_SECONDS to
+     * decide whether the user still counts as typing — strictly
+     * redundant with the transient's own TTL, but keeps the read
+     * path tolerant to object caches that don't honor expirations
+     * tightly (e.g. some external memcached configs evict on
+     * pressure rather than on TTL exactly).
+     *
+     * Visibility-gated on user_can_view_thread so a stranger
+     * cannot inject typing pulses into a thread they don't
+     * participate in.
+     */
+    public static function set_typing_state($thread_id, $user_id, $is_typing) {
+        $thread_id = (int) $thread_id;
+        $user_id   = (int) $user_id;
+        if ($thread_id <= 0 || $user_id <= 0) {
+            return false;
+        }
+        if (!self::user_can_view_thread($thread_id, $user_id)) {
+            return false;
+        }
+        $key = self::TYPING_TRANSIENT_PREFIX . $thread_id . '_' . $user_id;
+        if ($is_typing) {
+            // Set TTL slightly longer than the documented
+            // TYPING_TTL_SECONDS so a clock-skewed reader still
+            // sees a fresh row; the read-side filter
+            // ($age <= TTL) is the authoritative cutoff.
+            set_transient($key, time(), self::TYPING_TTL_SECONDS + 2);
+        } else {
+            delete_transient($key);
+        }
+        return true;
+    }
+
+    /**
+     * Return active participants who are currently typing in a
+     * thread, excluding $exclude_user_id (the viewer — you don't
+     * want to see "you are typing" alongside your own composer).
+     *
+     * Walks the participants table with the same
+     * removed_at IS NULL filter user_can_view_thread uses, then
+     * probes one transient per non-excluded participant. Each row
+     * is shaped for direct rendering (display_name fallback chain
+     * matches list_thread_members).
+     *
+     * Hard cap at 16 typers in the response. Real-world rooms top
+     * out at a handful of simultaneous typers; the cap is here so
+     * a freak edge case (every member of a large team room
+     * pulsing at once) doesn't bloat the poll response. Anything
+     * beyond is silently truncated — the UI renders "5 people are
+     * typing…" past 3 anyway, so the missing names are never
+     * surfaced individually.
+     */
+    public static function get_typing_users($thread_id, $exclude_user_id) {
+        global $wpdb;
+        $thread_id        = (int) $thread_id;
+        $exclude_user_id  = (int) $exclude_user_id;
+        if ($thread_id <= 0) {
+            return [];
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT p.user_id, u.user_login, u.display_name
+               FROM {$wpdb->prefix}matrix_message_participants p
+               LEFT JOIN {$wpdb->users} u ON u.ID = p.user_id
+              WHERE p.thread_id = %d
+                AND p.removed_at IS NULL
+                AND p.user_id <> %d
+              LIMIT 200",
+            $thread_id, $exclude_user_id
+        ));
+
+        $now    = time();
+        $ttl    = self::TYPING_TTL_SECONDS;
+        $typers = [];
+        foreach ((array) $rows as $r) {
+            $uid = (int) $r->user_id;
+            if ($uid <= 0) {
+                continue;
+            }
+            $key = self::TYPING_TRANSIENT_PREFIX . $thread_id . '_' . $uid;
+            $stamp = get_transient($key);
+            if ($stamp === false) {
+                continue;
+            }
+            $stamp = (int) $stamp;
+            if (($now - $stamp) > $ttl) {
+                continue;
+            }
+            $name = !empty($r->display_name)
+                ? (string) $r->display_name
+                : (!empty($r->user_login) ? (string) $r->user_login : '#' . $uid);
+            $typers[] = (object) [
+                'user_id'      => $uid,
+                'display_name' => $name,
+            ];
+            if (count($typers) >= 16) {
+                break;
+            }
+        }
+        return $typers;
+    }
+
     public static function report_message($message_id, $reporter_id, $reason, $note = '') {
         global $wpdb;
         if (!in_array($reason, self::ALLOWED_REPORT_REASONS, true)) {
@@ -2582,6 +2749,12 @@ class Matrix_MLM_Messaging {
                 'other_user_id' => $other_user_id,
                 'is_blocked'    => $is_blocked,
             ],
+            // Currently-typing peers in this thread (excluding
+            // self). Ephemeral wire field — populated from
+            // short-TTL transients, not from any stored row.
+            // Empty array when nobody is typing; stable shape so
+            // the JS doesn't branch on presence/absence.
+            'typing' => self::get_typing_users($thread_id, $uid),
         ]);
     }
 
@@ -2861,5 +3034,25 @@ class Matrix_MLM_Messaging {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
         wp_send_json_success(['thread_id' => $thread_id]);
+    }
+
+    /**
+     * POST action=matrix_messaging_typing with thread_id + is_typing
+     * flag. Stamps or clears a transient that ajax_fetch_thread
+     * reads back to populate the typing[] field on the next poll.
+     *
+     * No-op (returns success) when set_typing_state refuses for
+     * policy reasons (not a participant, bad ids) — the
+     * indicator is best-effort UX, not an authorization-bearing
+     * surface. The visibility gate inside set_typing_state still
+     * prevents a stranger from injecting fake typing pulses
+     * into a thread they don't belong to.
+     */
+    public static function ajax_typing() {
+        $uid = self::ajax_guard();
+        $thread_id  = (int) ($_POST['thread_id'] ?? 0);
+        $is_typing  = !empty($_POST['is_typing']) && $_POST['is_typing'] !== '0';
+        self::set_typing_state($thread_id, $uid, $is_typing);
+        wp_send_json_success(['ts' => time()]);
     }
 }
