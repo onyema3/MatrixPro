@@ -2576,6 +2576,43 @@ class Matrix_MLM_User_Wallet {
                                 ownBalance = Math.max(0, ownBalance - total);
                             }
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
+                            // Auto-refresh the page so the Matrix
+                            // Wallet balance card at the top of the
+                            // Wallet pane and the "Recent Transfers
+                            // (Matrix → Virtual)" ledger at the
+                            // bottom both pick up the new debit.
+                            // Without this the server-rendered
+                            // "Matrix Wallet Balance: ₦X" header
+                            // keeps showing the pre-debit balance
+                            // even though the database row was
+                            // already updated by
+                            // Matrix_MLM_Fintava::ajax_transfer_matrix_to_virtual,
+                            // which reads to the user as "the
+                            // matrix wallet was not debited" — the
+                            // exact symptom that drove this fix.
+                            // 1500 ms is long enough for the inline
+                            // success toast to register visually
+                            // before the reload kicks in (matches
+                            // the e-pin / ticket flows in
+                            // matrix-public.js, and the W2W form's
+                            // matching block below from PR #330).
+                            // The local form-reset / balance-cache
+                            // update above are kept as a graceful
+                            // fallback for the rare case where
+                            // matrixMLMReload() is unavailable
+                            // (e.g. matrix-public.js failed to
+                            // load) — without that fallback the
+                            // form would stay in its pre-submit
+                            // state forever. PR #328 already
+                            // bypasses LiteSpeed page caching on
+                            // dashboard pages, so the reload
+                            // returns fresh data, not the
+                            // pre-debit cached snapshot.
+                            if (typeof window.matrixMLMReload === 'function') {
+                                setTimeout(window.matrixMLMReload, 1500);
+                            } else {
+                                setTimeout(function() { window.location.reload(); }, 1500);
+                            }
                         } else {
                             window.matrixWalletShowNotice('#matrix-transfer-to-own-wallet-form', 'error', (res && res.data && res.data.message) || '<?php echo esc_js(__('Transfer failed.', 'matrix-mlm')); ?>');
                             $btn.prop('disabled', false).text('<?php echo esc_js(__('Transfer to Own Wallet', 'matrix-mlm')); ?>');
