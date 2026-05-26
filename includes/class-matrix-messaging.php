@@ -510,7 +510,7 @@ class Matrix_MLM_Messaging {
             return [];
         }
         $limit = max(1, min(200, (int) $limit));
-        return $wpdb->get_results($wpdb->prepare(
+        $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT id, thread_id, sender_id, body, body_stripped, attachment_id, created_at, deleted_at
              FROM {$wpdb->prefix}matrix_messages
              WHERE thread_id = %d AND id > %d
@@ -518,6 +518,21 @@ class Matrix_MLM_Messaging {
              LIMIT %d",
             (int) $thread_id, (int) $after_id, $limit
         ));
+
+        // Hydrate attachment_url so the JS can render inline images
+        // without an extra round-trip per message.
+        foreach ($rows as $r) {
+            $r->attachment_url = null;
+            if (!empty($r->attachment_id) && empty($r->deleted_at)) {
+                $url = wp_get_attachment_url((int) $r->attachment_id);
+                if ($url) {
+                    // Use a medium-size thumbnail for inline display
+                    $thumb = wp_get_attachment_image_url((int) $r->attachment_id, 'medium');
+                    $r->attachment_url = $thumb ?: $url;
+                }
+            }
+        }
+        return $rows;
     }
 
     /**

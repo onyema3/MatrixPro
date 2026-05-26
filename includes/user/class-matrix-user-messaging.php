@@ -45,6 +45,7 @@ class Matrix_MLM_User_Messaging {
         wp_localize_script('matrix-messaging', 'MatrixMessaging', [
             'ajaxUrl'           => admin_url('admin-ajax.php'),
             'nonce'             => wp_create_nonce('matrix_messaging'),
+            'uploadNonce'       => wp_create_nonce('media-form'),
             'currentUserId'     => (int) $user_id,
             'pollingIntervalMs' => (int) $settings['polling_interval_ms'],
             'allowAttachments'  => !empty($settings['allow_attachments']),

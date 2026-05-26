@@ -117,18 +117,86 @@
 .matrix-messaging__composer {
     border-top: 1px solid #e5e7eb;
     padding: 12px;
-    display: flex;
-    gap: 8px;
     background: #f9fafb;
-}
-.matrix-messaging__composer textarea {
-    flex: 1;
-    min-height: 40px;
-    max-height: 120px;
-    resize: vertical;
 }
 
 @media (max-width: 720px) {
     .matrix-messaging { grid-template-columns: 1fr; }
     .matrix-messaging__sidebar { border-right: none; border-bottom: 1px solid #e5e7eb; max-height: 240px; }
+}
+
+
+/* Attachment upload UI */
+.matrix-messaging__composer-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+.matrix-messaging__composer-row textarea {
+    flex: 1;
+    min-height: 40px;
+    max-height: 120px;
+    resize: vertical;
+}
+.matrix-messaging__attach-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    cursor: pointer;
+    border-radius: 6px;
+    background: #f3f4f6;
+    color: #6b7280;
+    transition: background .15s;
+    flex-shrink: 0;
+}
+.matrix-messaging__attach-btn:hover { background: #e5e7eb; color: #374151; }
+.matrix-messaging__attach-btn .dashicons { font-size: 18px; width: 18px; height: 18px; }
+
+.matrix-messaging__composer-preview {
+    padding: 8px;
+    border-bottom: 1px solid #e5e7eb;
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+.matrix-messaging__composer-preview img {
+    max-height: 80px;
+    max-width: 160px;
+    border-radius: 6px;
+    object-fit: cover;
+}
+.matrix-messaging__preview-remove {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 22px;
+    height: 22px;
+    border: 0;
+    background: rgba(0,0,0,0.5);
+    color: #fff;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.matrix-messaging__preview-remove:hover { background: rgba(0,0,0,0.7); }
+
+/* Inline image in messages */
+.matrix-messaging__message-attachment {
+    margin-bottom: 6px;
+}
+.matrix-messaging__message-attachment img {
+    max-width: 240px;
+    max-height: 180px;
+    border-radius: 8px;
+    object-fit: cover;
+    display: block;
+}
+.matrix-messaging__message.is-own .matrix-messaging__message-attachment img {
+    margin-left: auto;
 }

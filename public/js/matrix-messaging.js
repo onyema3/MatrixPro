@@ -44,15 +44,30 @@
     }
 
     function renderPane(threadLabel) {
+        var attachBtn = cfg.allowAttachments
+            ? '<label class="matrix-messaging__attach-btn" title="Attach image">' +
+                  '<input type="file" name="attachment" accept="image/*" style="display:none">' +
+                  '<span class="dashicons dashicons-format-image"></span>' +
+              '</label>'
+            : '';
+
         $pane.html(
             '<div class="matrix-messaging__pane-header">' +
                 '<strong>' + escapeHtml(threadLabel) + '</strong>' +
                 '<button type="button" class="button button-small" id="matrix-messaging-mute"><span class="dashicons dashicons-bell"></span></button>' +
             '</div>' +
             '<div class="matrix-messaging__messages" id="matrix-messaging-messages"></div>' +
-            '<form class="matrix-messaging__composer" id="matrix-messaging-composer">' +
-                '<textarea name="body" placeholder="' + escapeHtml(cfg.i18n.reply_placeholder) + '" required></textarea>' +
-                '<button type="submit" class="matrix-btn matrix-btn-primary">' + escapeHtml(cfg.i18n.send) + '</button>' +
+            '<form class="matrix-messaging__composer" id="matrix-messaging-composer" enctype="multipart/form-data">' +
+                '<div class="matrix-messaging__composer-preview" id="matrix-messaging-preview" style="display:none">' +
+                    '<img src="" alt="preview">' +
+                    '<button type="button" class="matrix-messaging__preview-remove">&times;</button>' +
+                '</div>' +
+                '<div class="matrix-messaging__composer-row">' +
+                    attachBtn +
+                    '<textarea name="body" placeholder="' + escapeHtml(cfg.i18n.reply_placeholder) + '"></textarea>' +
+                    '<button type="submit" class="matrix-btn matrix-btn-primary">' + escapeHtml(cfg.i18n.send) + '</button>' +
+                '</div>' +
+                '<input type="hidden" name="attachment_id" value="">' +
             '</form>'
         );
     }
@@ -72,12 +87,22 @@
             ? '<em>(message deleted by moderator)</em>'
             : escapeHtml(msg.body || '').replace(/\n/g, '<br>');
 
+        // Render attached image if present and not deleted.
+        var attachHtml = '';
+        if (!deleted && msg.attachment_url) {
+            attachHtml = '<div class="matrix-messaging__message-attachment">' +
+                '<a href="' + escapeHtml(msg.attachment_url) + '" target="_blank" rel="noopener">' +
+                '<img src="' + escapeHtml(msg.attachment_url) + '" alt="attachment" loading="lazy">' +
+                '</a></div>';
+        }
+
         var strippedFlag = (!deleted && parseInt(msg.body_stripped, 10) === 1)
             ? ' <span class="matrix-messaging__message-stripped-flag">' + 'stripped' + '</span>'
             : '';
 
         $container.append(
             '<div class="' + classes.join(' ') + '" data-id="' + parseInt(msg.id, 10) + '">' +
+                attachHtml +
                 '<div class="matrix-messaging__message-body">' + bodyHtml + '</div>' +
                 '<div class="matrix-messaging__message-meta">' +
                     escapeHtml(msg.created_at || '') + strippedFlag +
@@ -136,16 +161,68 @@
         if (!activeThreadId) { return; }
         var $form = $(this);
         var body = ($form.find('textarea[name="body"]').val() || '').trim();
-        if (!body) { return; }
+        var attachmentId = $form.find('input[name="attachment_id"]').val() || '';
+        if (!body && !attachmentId) { return; }
         var $btn = $form.find('button[type="submit"]').prop('disabled', true);
-        api('send', { thread_id: activeThreadId, body: body }).done(function (resp) {
+        api('send', { thread_id: activeThreadId, body: body, attachment_id: attachmentId }).done(function (resp) {
             if (resp && resp.success) {
                 $form.find('textarea[name="body"]').val('');
-                // Next poll tick will canonicalize.
+                $form.find('input[name="attachment_id"]').val('');
+                $('#matrix-messaging-preview').hide().find('img').attr('src', '');
             } else {
                 alert((resp && resp.data && resp.data.message) || 'Send failed.');
             }
         }).always(function () { $btn.prop('disabled', false); });
+    });
+
+    // --- Attachment upload via async WP media upload ---
+    $pane.on('change', '.matrix-messaging__attach-btn input[type="file"]', function () {
+        var file = this.files && this.files[0];
+        if (!file) { return; }
+        var $input = $(this);
+        // Client-side size guard (matches server's max_attachment_bytes default 5 MB)
+        if (file.size > 5 * 1024 * 1024) {
+            alert('File too large. Maximum 5 MB.');
+            $input.val('');
+            return;
+        }
+        // Show local preview immediately
+        var reader = new FileReader();
+        reader.onload = function (ev) {
+            $('#matrix-messaging-preview').show().find('img').attr('src', ev.target.result);
+        };
+        reader.readAsDataURL(file);
+
+        // Upload via WP's async-upload.php (same mechanism wp.media uses)
+        var fd = new FormData();
+        fd.append('action', 'upload-attachment');
+        fd.append('_wpnonce', cfg.uploadNonce);
+        fd.append('async-upload', file);
+        $.ajax({
+            url: cfg.ajaxUrl,
+            method: 'POST',
+            data: fd,
+            processData: false,
+            contentType: false,
+            dataType: 'json'
+        }).done(function (resp) {
+            if (resp && resp.success && resp.data && resp.data.id) {
+                $('#matrix-messaging-composer').find('input[name="attachment_id"]').val(resp.data.id);
+            } else {
+                alert((resp && resp.data && resp.data.message) || 'Upload failed.');
+                $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+            }
+        }).fail(function () {
+            alert('Upload failed. Please try again.');
+            $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+        });
+        $input.val('');
+    });
+
+    // Remove attachment preview
+    $pane.on('click', '.matrix-messaging__preview-remove', function () {
+        $('#matrix-messaging-preview').hide().find('img').attr('src', '');
+        $('#matrix-messaging-composer').find('input[name="attachment_id"]').val('');
     });
 
     $newDmBtn.on('click', function () {
