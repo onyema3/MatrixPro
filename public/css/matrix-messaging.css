@@ -364,3 +364,209 @@
 .matrix-messaging__message.is-own .matrix-messaging__message-receipt {
     color: rgba(255, 255, 255, 0.85);
 }
+
+
+
+/* -------------------------------------------------------------------
+ * Sender-side edit / self-delete + older-message pagination +
+ * mute/block surfaces (DB 1.0.20 / plugin 2.0.3).
+ *
+ * Visual rhythm follows the existing message bubble: the per-row
+ * action icons live in the bubble's top-right corner and only
+ * surface on hover so the chat itself stays uncluttered. The
+ * "Load older" pill sits above the message list, centred so it
+ * reads as a separator rather than another message. The mute
+ * popover and DM kebab menu use the same dropdown shell so a
+ * future moderation control (e.g. report from the kebab) can
+ * reuse the styling.
+ * ----------------------------------------------------------------- */
+
+.matrix-messaging__pane-controls {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+/* Per-message edit/delete buttons. Hidden by default; revealed on
+ * row hover so the chat surface stays quiet at rest. Position
+ * absolutely top-right of the bubble and lift above the body so a
+ * long message doesn't push the icons out of reach. */
+.matrix-messaging__message {
+    position: relative;
+}
+.matrix-messaging__message-actions {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    display: flex;
+    gap: 2px;
+    opacity: 0;
+    transition: opacity 0.15s ease-in-out;
+    z-index: 1;
+}
+.matrix-messaging__message:hover .matrix-messaging__message-actions,
+.matrix-messaging__message.is-editing .matrix-messaging__message-actions {
+    opacity: 1;
+}
+.matrix-messaging__msg-action {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.2);
+    color: rgba(255, 255, 255, 0.95);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.matrix-messaging__msg-action:hover { background: rgba(0, 0, 0, 0.4); }
+.matrix-messaging__msg-action .dashicons {
+    font-size: 14px;
+    width: 14px;
+    height: 14px;
+    line-height: 1;
+}
+/* On non-own (light grey) bubbles the actions never render, but
+ * if a future feature adds them we want a contrasting style. */
+.matrix-messaging__message:not(.is-own) .matrix-messaging__msg-action {
+    background: rgba(0, 0, 0, 0.08);
+    color: #4b5563;
+}
+.matrix-messaging__message:not(.is-own) .matrix-messaging__msg-action:hover {
+    background: rgba(0, 0, 0, 0.18);
+}
+
+/* "(edited)" marker on edited messages. Inherits opacity from the
+ * meta line so it reads as supporting metadata rather than
+ * shouting at the user. */
+.matrix-messaging__message-edited-flag {
+    font-size: 10px;
+    text-transform: lowercase;
+    opacity: 0.85;
+    margin-left: 4px;
+    font-style: italic;
+}
+
+/* Inline edit form. The textarea fills the bubble and the action
+ * row sits below it. Background tweaked to a slightly lighter
+ * variant of the bubble so the user can tell at a glance that
+ * the row is in an interactive state. */
+.matrix-messaging__message.is-editing {
+    box-shadow: 0 0 0 2px #fde68a;
+}
+.matrix-messaging__edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+}
+.matrix-messaging__edit-textarea {
+    width: 100%;
+    min-height: 60px;
+    max-height: 180px;
+    resize: vertical;
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    box-sizing: border-box;
+    background: rgba(255, 255, 255, 0.95);
+    color: #1f2937;
+    font-family: inherit;
+}
+.matrix-messaging__edit-textarea:focus {
+    outline: none;
+    border-color: #4f46e5;
+    box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.25);
+}
+.matrix-messaging__edit-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+}
+.matrix-messaging__edit-actions .matrix-btn-sm {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+/* "Load older messages" pill. Centred above the message list so
+ * it reads as a separator. Hidden until the client knows the
+ * thread has older history (oldestId > 0 + has_more = true). */
+.matrix-messaging__load-older {
+    display: block;
+    margin: 4px auto 8px;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #4f46e5;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 999px;
+    cursor: pointer;
+}
+.matrix-messaging__load-older:hover { background: #e0e7ff; }
+.matrix-messaging__load-older:disabled,
+.matrix-messaging__load-older.is-loading {
+    opacity: 0.6;
+    cursor: progress;
+}
+.matrix-messaging__load-older[hidden] { display: none; }
+
+/* Mute / kebab dropdown shell. Both menus use the same skeleton —
+ * a button anchor + an absolutely-positioned ul that opens
+ * directly under the button. Hidden by default via the [hidden]
+ * attribute, which the JS toggles. */
+.matrix-messaging__menu-wrap {
+    position: relative;
+    display: inline-block;
+}
+.matrix-messaging__menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    list-style: none;
+    margin: 0;
+    padding: 4px 0;
+    min-width: 180px;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+    z-index: 50;
+}
+.matrix-messaging__menu[hidden] { display: none; }
+.matrix-messaging__menu-header {
+    padding: 6px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6b7280;
+    border-bottom: 1px solid #f3f4f6;
+}
+.matrix-messaging__menu-item {
+    padding: 8px 12px;
+    font-size: 13px;
+    color: #1f2937;
+    cursor: pointer;
+}
+.matrix-messaging__menu-item:hover { background: #eef2ff; }
+.matrix-messaging__menu-item--unmute {
+    border-top: 1px solid #f3f4f6;
+    color: #b91c1c;
+}
+
+/* Active-mute indicator on the bell button. */
+.matrix-messaging__mute-btn.is-active {
+    background: #fde68a;
+    color: #92400e;
+}
+.matrix-messaging__mute-btn.is-active .dashicons {
+    color: inherit;
+}
+.matrix-messaging__kebab .dashicons,
+.matrix-messaging__mute-btn .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+}

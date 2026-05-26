@@ -632,6 +632,42 @@ class Matrix_MLM_Database {
             ) {$charset};");
         }
 
+        // 1.0.20 — sender-side edit support on matrix_messages.
+        // Adds edited_at DATETIME so the UI can render an "(edited)"
+        // marker next to a message whose body has been changed
+        // through Matrix_MLM_Messaging::edit_message(). dbDelta in
+        // create_tables() will add the column on a fresh CREATE
+        // TABLE pass; the probe here heals upgraded installs whose
+        // matrix_messages table already exists. Idempotent: the
+        // COLUMN_NAME existence check skips the ALTER once the
+        // column is present.
+        //
+        // No KEY on edited_at — it's a one-way pointer the UI reads
+        // alongside the row, never a query predicate. Adding an
+        // index would just cost write throughput on every send /
+        // edit.
+        $messages_table = $wpdb->prefix . 'matrix_messages';
+        $messages_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $messages_table
+        ));
+        if ($messages_exists > 0) {
+            $edited_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'edited_at'",
+                DB_NAME, $messages_table
+            ));
+            if ($edited_col_exists === 0) {
+                $wpdb->query(
+                    "ALTER TABLE {$messages_table}
+                       ADD COLUMN edited_at DATETIME DEFAULT NULL
+                       AFTER created_at"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -1609,6 +1645,7 @@ class Matrix_MLM_Database {
             body_stripped tinyint(1) NOT NULL DEFAULT 0,
             attachment_id bigint(20) UNSIGNED DEFAULT NULL,
             created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            edited_at datetime DEFAULT NULL,
             deleted_at datetime DEFAULT NULL,
             deleted_by bigint(20) UNSIGNED DEFAULT NULL,
             PRIMARY KEY (id),
@@ -1616,6 +1653,7 @@ class Matrix_MLM_Database {
             KEY sender_id (sender_id),
             KEY deleted_at (deleted_at)
         ) $charset_collate;";
+        dbDelta($sql_messages);
         dbDelta($sql_messages);
 
         $table_message_blocks = $wpdb->prefix . 'matrix_message_blocks';
