@@ -55,6 +55,18 @@ class Matrix_MLM_User_Messaging {
                 'reply_placeholder' => __('Write a message...', 'matrix-mlm'),
                 'no_threads'    => __('No conversations yet. Start one with the New Message button.', 'matrix-mlm'),
                 'select_thread' => __('Select a conversation, or start a new one.', 'matrix-mlm'),
+                // Read-receipt labels. Surface next to OWN messages
+                // only — the receipt block above the rest of the
+                // conversation tells you whether the other side has
+                // caught up to your last message.
+                'receipt_sent'         => __('Sent', 'matrix-mlm'),
+                'receipt_seen'         => __('Seen', 'matrix-mlm'),
+                /* translators: %s: human-readable read time, e.g. "3m" or "just now" */
+                'receipt_seen_at'      => __('Seen %s', 'matrix-mlm'),
+                /* translators: 1: read count, 2: total recipient count */
+                'receipt_read_partial' => __('Read by %1$s / %2$s', 'matrix-mlm'),
+                'receipt_read_all'     => __('Read', 'matrix-mlm'),
+                'receipt_just_now'     => __('just now', 'matrix-mlm'),
             ],
         ]);
         ?>

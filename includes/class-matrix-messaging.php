@@ -749,6 +749,130 @@ class Matrix_MLM_Messaging {
     }
 
     // ---------------------------------------------------------------
+    // Read receipts
+    //
+    // Computes "who has read which of $user_id's recent messages in
+    // $thread_id" and returns a compact map keyed by message id.
+    // Returned on every ajax_fetch_thread tick so receipt state on
+    // already-rendered messages updates asynchronously: when B reads
+    // a message A sent earlier, A's next poll picks up the new
+    // read_count without A having to refresh.
+    //
+    // Why not embed receipts inside each message row in
+    // get_thread_messages()? Polling tends to return delta-only on
+    // tick (id > after_id), so by the time B reads message #42 a
+    // delta-only response wouldn't surface the receipt change at
+    // all — message #42 isn't in the delta. A standalone receipts
+    // map covers the recent own messages in full on every tick
+    // regardless of message delta state.
+    //
+    // Cap (RECEIPT_LOOKBACK) is the most-recent N own messages.
+    // Older own messages are presumed long-since read by everyone
+    // and the receipt UX cares about "did my recent message get
+    // seen?" not "what was the read state of message I sent two
+    // weeks ago." Keeping the cap small bounds the response size
+    // and the recipient-list query at two queries regardless of
+    // thread length.
+    //
+    // Self is excluded from the recipient list — the user's own
+    // last_read_at is not relevant to their own outgoing receipt
+    // (and including self would always read true since send_message
+    // calls mark_thread_read on the sender, inflating read_count).
+    // ---------------------------------------------------------------
+
+    /**
+     * How many of the user's most recent own messages to include in
+     * the receipts map. 50 is a generous upper bound: the initial
+     * fetch_thread response returns at most 50 messages of which a
+     * fraction will be the user's own.
+     */
+    const RECEIPT_LOOKBACK = 50;
+
+    /**
+     * Compute read receipts for $user_id's recent own messages in
+     * $thread_id.
+     *
+     * @param int $thread_id
+     * @param int $user_id   The viewer — only their own messages get
+     *                       receipts. Receipts on someone else's
+     *                       messages would just leak read state of
+     *                       the other party and aren't useful UX.
+     * @return array<int, array{read_count:int, recipient_count:int, last_read_at:?string}>
+     *         Map: message_id => {read_count, recipient_count, last_read_at}.
+     *         Empty array when the user has no own messages in the
+     *         thread (or the thread is invisible to them — checked
+     *         by the caller).
+     */
+    public static function compute_thread_read_receipts($thread_id, $user_id) {
+        global $wpdb;
+        $thread_id = (int) $thread_id;
+        $user_id   = (int) $user_id;
+        if ($thread_id <= 0 || $user_id <= 0) {
+            return [];
+        }
+
+        $messages_t     = $wpdb->prefix . 'matrix_messages';
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+
+        // 1) Pull the lookback window of own messages, oldest-first
+        //    inside the window so the JS can apply receipts in
+        //    natural order.
+        $own = $wpdb->get_results($wpdb->prepare("
+            SELECT id, created_at
+              FROM $messages_t
+             WHERE thread_id = %d
+               AND sender_id = %d
+               AND deleted_at IS NULL
+             ORDER BY id DESC
+             LIMIT %d
+        ", $thread_id, $user_id, self::RECEIPT_LOOKBACK));
+
+        if (empty($own)) {
+            return [];
+        }
+
+        // 2) Pull every OTHER active participant's last_read_at on
+        //    this thread. Bounded by the participant count, which
+        //    for DMs is 1 and for team rooms is sponsor + direct
+        //    referrals — comfortably small for an in-memory walk.
+        $others = $wpdb->get_results($wpdb->prepare("
+            SELECT user_id, last_read_at
+              FROM $participants_t
+             WHERE thread_id = %d
+               AND user_id != %d
+               AND removed_at IS NULL
+        ", $thread_id, $user_id));
+
+        $recipient_count = count($others);
+
+        $receipts = [];
+        foreach ($own as $msg) {
+            // GMT comparison: matrix_messages.created_at and
+            // matrix_message_participants.last_read_at are both
+            // written via current_time('mysql', true), so a string
+            // comparison is correctness-equivalent to a datetime
+            // parse and orders-of-magnitude cheaper inside a
+            // foreach loop.
+            $read_count = 0;
+            $latest_read_at = null;
+            foreach ($others as $p) {
+                if (!empty($p->last_read_at) && $p->last_read_at >= $msg->created_at) {
+                    $read_count++;
+                    if ($latest_read_at === null || $p->last_read_at > $latest_read_at) {
+                        $latest_read_at = $p->last_read_at;
+                    }
+                }
+            }
+            $receipts[(int) $msg->id] = [
+                'read_count'      => $read_count,
+                'recipient_count' => $recipient_count,
+                'last_read_at'    => $latest_read_at,
+            ];
+        }
+        return $receipts;
+    }
+
+    // ---------------------------------------------------------------
     // AJAX handlers — every endpoint is logged-in only.
     // ---------------------------------------------------------------
 
@@ -782,7 +906,23 @@ class Matrix_MLM_Messaging {
         if ($after_id === 0) {
             self::mark_thread_read($thread_id, $uid);
         }
-        wp_send_json_success(['messages' => $rows]);
+
+        // Read receipts. Returned on EVERY fetch (not just the
+        // initial page) because read state on already-rendered
+        // messages changes asynchronously: A renders message #42
+        // at t0, B opens the thread at t1, A's next poll tick at
+        // t2 should reflect the new "Seen" state. The receipts
+        // map carries that delta. Capped to the most recent
+        // own-side messages so a long thread doesn't bloat the
+        // poll response.
+        $thread = self::get_thread($thread_id);
+        $thread_type = $thread && isset($thread->type) ? (string) $thread->type : 'dm';
+
+        wp_send_json_success([
+            'messages'    => $rows,
+            'thread_type' => $thread_type,
+            'receipts'    => self::compute_thread_read_receipts($thread_id, $uid),
+        ]);
     }
 
     public static function ajax_send() {

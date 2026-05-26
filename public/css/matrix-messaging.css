@@ -200,3 +200,27 @@
 .matrix-messaging__message.is-own .matrix-messaging__message-attachment img {
     margin-left: auto;
 }
+
+
+
+/* Read receipts.
+ *
+ * Rendered only on own messages (the JS adds the slot inside
+ * `.matrix-messaging__message.is-own`). Right-aligned to ride
+ * under the existing meta line, sized down so it reads as
+ * supporting metadata rather than message body.
+ */
+.matrix-messaging__message-receipt {
+    font-size: 11px;
+    margin-top: 2px;
+    text-align: right;
+    opacity: 0.85;
+    line-height: 1.2;
+    /* Hidden until the first fetch_thread response populates it
+     * via .text() + .toggle(). Avoids a blank gap in the meta
+     * area before the receipts arrive. */
+    display: none;
+}
+.matrix-messaging__message.is-own .matrix-messaging__message-receipt {
+    color: rgba(255, 255, 255, 0.85);
+}
