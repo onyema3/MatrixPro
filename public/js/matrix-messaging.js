@@ -593,21 +593,43 @@
         stopPolling();
         pollTimer = setInterval(function () {
             if (!activeThreadId || document.hidden) { return; }
-            api('fetch_thread', { thread_id: activeThreadId, after_id: lastId }).done(function (resp) {
-                if (!resp || !resp.success) { return; }
-                var data = resp.data || {};
-                if (typeof data.edit_window_seconds !== 'undefined') {
-                    editWindowSeconds = parseInt(data.edit_window_seconds, 10) || 300;
-                }
-                if (data.thread_type) { activeThreadType = data.thread_type; }
-                var $msgs = $('#matrix-messaging-messages');
-                (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
-                applyReceipts(data.receipts, activeThreadType);
-                applyReactions(data.reactions);
-                applyThreadState(data.thread_state);
-                applyTypingState(data.typing);
-            });
+            pollOnce();
         }, Math.max(2000, parseInt(cfg.pollingIntervalMs, 10) || 10000));
+    }
+
+    /**
+     * Single fetch_thread tick. Extracted from startPolling so
+     * the send-success handler can also call it to render the
+     * just-sent message immediately, instead of waiting up to
+     * pollingIntervalMs for the next setInterval tick. Without
+     * this, on a slow polling cadence (the default is 10s) a
+     * user who clicks Send sees their textarea clear but no new
+     * bubble appear for several seconds, which reads as
+     * "send didn't work" — exactly the symptom this fix
+     * addresses.
+     *
+     * Returns the jQuery jqXHR so callers can chain .always() if
+     * they need to coordinate UI state (e.g. the send handler
+     * uses this to confirm the bubble landed before re-enabling
+     * the send button — though the immediate clear already gives
+     * the right perceived UX).
+     */
+    function pollOnce() {
+        if (!activeThreadId) { return $.Deferred().resolve().promise(); }
+        return api('fetch_thread', { thread_id: activeThreadId, after_id: lastId }).done(function (resp) {
+            if (!resp || !resp.success) { return; }
+            var data = resp.data || {};
+            if (typeof data.edit_window_seconds !== 'undefined') {
+                editWindowSeconds = parseInt(data.edit_window_seconds, 10) || 300;
+            }
+            if (data.thread_type) { activeThreadType = data.thread_type; }
+            var $msgs = $('#matrix-messaging-messages');
+            (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
+            applyReceipts(data.receipts, activeThreadType);
+            applyReactions(data.reactions);
+            applyThreadState(data.thread_state);
+            applyTypingState(data.typing);
+        });
     }
 
     function stopPolling() {
@@ -991,9 +1013,58 @@
             if (resp && resp.success) {
                 $form.find('textarea[name="body"]').val('');
                 clearAttachmentTiles();
+                // Pull the just-sent message in immediately rather
+                // than waiting for the next setInterval tick. With
+                // the default 10s poll cadence the user otherwise
+                // sees their textarea clear and nothing happen for
+                // up to 10 seconds — visually identical to "send
+                // didn't work" — even though the message is on the
+                // server. Calling pollOnce here closes that gap to
+                // ~one round-trip.
+                pollOnce();
             } else {
+                // Application-level rejection — wp_send_json_error
+                // without an HTTP status (the WP_Error path in
+                // ajax_send: rate-limited, banned, blocked,
+                // forbidden, archived, disabled, empty, etc.).
+                // Server-supplied message is already localised, so
+                // surface it verbatim.
                 alert((resp && resp.data && resp.data.message) || 'Send failed.');
             }
+        }).fail(function (xhr) {
+            // HTTP-level failure path. Before this addition the
+            // submit handler had only .done() + .always(), so
+            // every status-coded failure (401 from the
+            // logged-out branch in ajax_guard, 403 from
+            // check_ajax_referer's wp_die('-1', 403), 0 from a
+            // dropped network connection, 500 from a fatal in
+            // send_message) hit jQuery's failure path with no
+            // listener and was silently swallowed. The button
+            // re-enabled, the textarea kept its content, no
+            // toast appeared — exactly the user-reported "Send
+            // button doesn't work, message doesn't go" symptom.
+            //
+            // Surface a status-aware message so the user knows
+            // WHY it failed and what to do. The 401/403 branch
+            // is the most common in production: WordPress page
+            // caches (LiteSpeed, WP Rocket, server-side Varnish)
+            // can serve a stale page where wp_create_nonce
+            // produced a token that's already been rotated by
+            // the time the user submits, OR the user's session
+            // expired while they were sitting on the messages
+            // tab. Recommending a refresh resolves both.
+            var msg;
+            var status = xhr ? xhr.status : 0;
+            if (status === 401 || status === 403) {
+                msg = 'Send failed: your session has expired or the security token is stale. Please refresh the page and sign in again if needed.';
+            } else if (status === 0) {
+                msg = 'Send failed: network error. Check your connection and try again.';
+            } else if (status >= 500) {
+                msg = 'Send failed: the server returned an error (HTTP ' + status + '). Please try again in a moment.';
+            } else {
+                msg = 'Send failed (HTTP ' + status + '). Please refresh the page and try again.';
+            }
+            alert(msg);
         }).always(function () { $btn.prop('disabled', false); });
     });
 
