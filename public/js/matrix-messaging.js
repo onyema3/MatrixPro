@@ -137,6 +137,25 @@
               '</label>'
             : '';
 
+        // Voice-note mic button (DB 1.0.25). Rendered next to the
+        // image attach button when (a) the operator has voice
+        // notes enabled and (b) this browser exposes both
+        // MediaRecorder and getUserMedia. The MediaRecorder check
+        // here is a UX decision rather than a security one — the
+        // server still rejects unsupported MIMEs — but rendering
+        // the mic button on a browser that can't record would
+        // produce a broken affordance the user can't make sense of.
+        var voiceUiSupported = !!(window.MediaRecorder
+            && window.navigator
+            && window.navigator.mediaDevices
+            && typeof window.navigator.mediaDevices.getUserMedia === 'function'
+            && window.MatrixVoiceRecorder);
+        var voiceBtn = (cfg.voiceEnabled && voiceUiSupported)
+            ? '<button type="button" class="matrix-messaging__voice-btn" id="matrix-messaging-voice-btn" title="' + escapeHtml(cfg.i18n.voice_record || 'Record a voice note') + '" aria-label="' + escapeHtml(cfg.i18n.voice_record || 'Record a voice note') + '">' +
+                  '<span class="dashicons dashicons-microphone"></span>' +
+              '</button>'
+            : '';
+
         // Kebab dropdown is DM-only. Team-room block / unblock
         // doesn't make sense (the membership comes from sponsor
         // graph; blocking a teammate would mute the whole room
@@ -242,8 +261,32 @@
                 '<div class="matrix-messaging__composer-preview matrix-messaging__composer-preview--multi" id="matrix-messaging-preview" style="display:none"></div>' +
                 '<div class="matrix-messaging__composer-row">' +
                     attachBtn +
+                    voiceBtn +
                     '<textarea name="body" placeholder="' + escapeHtml(cfg.i18n.reply_placeholder) + '"></textarea>' +
                     '<button type="submit" class="matrix-btn matrix-btn-primary">' + escapeHtml(cfg.i18n.send) + '</button>' +
+                    // Recorder strip — display:none until the mic
+                    // button toggles .is-recording onto it. Lives
+                    // inside the same row so the layout box (and
+                    // therefore the chat list height above) doesn't
+                    // shift when the user enters/leaves recording.
+                    '<div class="matrix-messaging__voice-recorder" id="matrix-messaging-voice-recorder" role="status" aria-live="polite">' +
+                        '<span class="matrix-messaging__voice-recorder-dot" aria-hidden="true"></span>' +
+                        '<span class="matrix-messaging__voice-recorder-time" id="matrix-messaging-voice-time">0:00</span>' +
+                        '<div class="matrix-messaging__voice-recorder-meter" aria-hidden="true">' +
+                            '<div class="matrix-messaging__voice-recorder-meter-fill" id="matrix-messaging-voice-meter"></div>' +
+                        '</div>' +
+                        '<div class="matrix-messaging__voice-recorder-actions">' +
+                            '<button type="button" class="matrix-messaging__voice-recorder-cancel" id="matrix-messaging-voice-cancel" title="' + escapeHtml(cfg.i18n.voice_cancel || 'Cancel recording') + '" aria-label="' + escapeHtml(cfg.i18n.voice_cancel || 'Cancel recording') + '">' +
+                                '<span class="dashicons dashicons-no-alt"></span>' +
+                            '</button>' +
+                            '<button type="button" class="matrix-messaging__voice-recorder-stop" id="matrix-messaging-voice-stop" title="' + escapeHtml(cfg.i18n.voice_stop || 'Stop and send') + '" aria-label="' + escapeHtml(cfg.i18n.voice_stop || 'Stop and send') + '">' +
+                                '<span class="dashicons dashicons-yes"></span>' +
+                            '</button>' +
+                        '</div>' +
+                        '<div class="matrix-messaging__voice-recorder-progress" aria-hidden="true">' +
+                            '<div class="matrix-messaging__voice-recorder-progress-fill" id="matrix-messaging-voice-progress"></div>' +
+                        '</div>' +
+                    '</div>' +
                 '</div>' +
                 // Multi-attachment slot (DB 1.0.23). Each successful
                 // upload pushes an <input type="hidden" name="attachment_ids[]" value="N">
@@ -277,27 +320,63 @@
         // single-slot wire shape. The grid auto-sizes from the
         // count via .matrix-messaging__message-attachments--N
         // modifier classes — the CSS does the actual layout.
+        //
+        // Voice attachments (DB 1.0.25): rows whose `kind` is
+        // 'voice' render a <matrix-voice-player> instead of an
+        // image. We branch on the first attachment's kind and
+        // render that branch exclusively — voice + image in the
+        // same message is a model-layer possibility but a UX
+        // anti-pattern (the player and image grid would fight for
+        // bubble width), and the composer ships them in distinct
+        // sends, so we don't try to support the mix here.
+        var voiceOnly = false;
         if (!deleted) {
             var atts = (msg.attachments && msg.attachments.length) ? msg.attachments : null;
             if (!atts && msg.attachment_url) {
                 atts = [{ url: msg.attachment_url, thumb_url: msg.attachment_url, id: msg.attachment_id || 0 }];
             }
             if (atts && atts.length) {
-                var count = atts.length;
-                var modifier = count >= 4 ? 4 : count;
-                var inner = '';
-                atts.forEach(function (a) {
-                    var fullUrl = a.url || a.thumb_url || '';
-                    var thumb   = a.thumb_url || a.url || '';
-                    inner +=
-                        '<a class="matrix-messaging__message-attachment" href="' + escapeHtml(fullUrl) + '" target="_blank" rel="noopener">' +
-                            '<img src="' + escapeHtml(thumb) + '" alt="attachment" loading="lazy">' +
-                        '</a>';
-                });
-                attachHtml =
-                    '<div class="matrix-messaging__message-attachments matrix-messaging__message-attachments--' + modifier + '">' +
-                        inner +
-                    '</div>';
+                if (atts[0].kind === 'voice') {
+                    voiceOnly = true;
+                    var v = atts[0];
+                    var vSrc      = v.url || '';
+                    var vDuration = parseInt(v.duration_ms, 10) || 0;
+                    // peaks ride as a real array on the wire; the
+                    // custom element's attribute parser wants a
+                    // JSON string, so we re-encode here. Length is
+                    // already capped server-side at
+                    // VOICE_WAVEFORM_PEAKS so the attribute stays
+                    // small.
+                    var vPeaksAttr = '';
+                    if (v.peaks && v.peaks.length) {
+                        try { vPeaksAttr = JSON.stringify(v.peaks); }
+                        catch (e) { vPeaksAttr = ''; }
+                    }
+                    attachHtml =
+                        '<div class="matrix-messaging__message-attachments matrix-messaging__message-attachments--voice">' +
+                            '<matrix-voice-player' +
+                                ' src="' + escapeHtml(vSrc) + '"' +
+                                ' duration-ms="' + vDuration + '"' +
+                                (vPeaksAttr ? ' peaks="' + escapeHtml(vPeaksAttr) + '"' : '') +
+                            '></matrix-voice-player>' +
+                        '</div>';
+                } else {
+                    var count = atts.length;
+                    var modifier = count >= 4 ? 4 : count;
+                    var inner = '';
+                    atts.forEach(function (a) {
+                        var fullUrl = a.url || a.thumb_url || '';
+                        var thumb   = a.thumb_url || a.url || '';
+                        inner +=
+                            '<a class="matrix-messaging__message-attachment" href="' + escapeHtml(fullUrl) + '" target="_blank" rel="noopener">' +
+                                '<img src="' + escapeHtml(thumb) + '" alt="attachment" loading="lazy">' +
+                            '</a>';
+                    });
+                    attachHtml =
+                        '<div class="matrix-messaging__message-attachments matrix-messaging__message-attachments--' + modifier + '">' +
+                            inner +
+                        '</div>';
+                }
             }
         }
 
@@ -315,20 +394,43 @@
         // flash for messages that arrive in a fetch_thread
         // response after their window has already expired (e.g.
         // re-opening a thread with stale messages).
+        //
+        // Voice notes (DB 1.0.25) substitute a "Re-record"
+        // affordance for the pencil-edit. There is no in-place
+        // text edit semantics for an audio recording — the
+        // member-facing UX is "delete the old one and record a
+        // new one", so we skip the pencil and surface only a
+        // single mic-shaped button. Clicking it triggers a
+        // confirmed delete of the current voice message followed
+        // by an automatic open of the recorder, scoped to this
+        // thread. Trash button is preserved alongside so the
+        // user can also just delete without re-recording.
         var actionsHtml = '';
         if (own && !deleted) {
             var until = parseServerDateUtc(msg.editable_until);
             var inWindow = until && until.getTime() > Date.now();
             if (inWindow) {
-                actionsHtml =
-                    '<div class="matrix-messaging__message-actions">' +
-                        '<button type="button" class="matrix-messaging__msg-action" data-msg-action="edit" title="' + escapeHtml(cfg.i18n.edit || 'Edit') + '" aria-label="' + escapeHtml(cfg.i18n.edit || 'Edit') + '">' +
-                            '<span class="dashicons dashicons-edit"></span>' +
-                        '</button>' +
-                        '<button type="button" class="matrix-messaging__msg-action" data-msg-action="delete" title="' + escapeHtml(cfg.i18n.delete || 'Delete') + '" aria-label="' + escapeHtml(cfg.i18n.delete || 'Delete') + '">' +
-                            '<span class="dashicons dashicons-trash"></span>' +
-                        '</button>' +
-                    '</div>';
+                if (voiceOnly) {
+                    actionsHtml =
+                        '<div class="matrix-messaging__message-actions">' +
+                            '<button type="button" class="matrix-messaging__msg-action matrix-messaging__msg-action--voice-rerecord" data-msg-action="rerecord" title="' + escapeHtml(cfg.i18n.voice_rerecord || 'Delete and re-record') + '" aria-label="' + escapeHtml(cfg.i18n.voice_rerecord || 'Delete and re-record') + '">' +
+                                '<span class="dashicons dashicons-microphone"></span>' +
+                            '</button>' +
+                            '<button type="button" class="matrix-messaging__msg-action" data-msg-action="delete" title="' + escapeHtml(cfg.i18n.delete || 'Delete') + '" aria-label="' + escapeHtml(cfg.i18n.delete || 'Delete') + '">' +
+                                '<span class="dashicons dashicons-trash"></span>' +
+                            '</button>' +
+                        '</div>';
+                } else {
+                    actionsHtml =
+                        '<div class="matrix-messaging__message-actions">' +
+                            '<button type="button" class="matrix-messaging__msg-action" data-msg-action="edit" title="' + escapeHtml(cfg.i18n.edit || 'Edit') + '" aria-label="' + escapeHtml(cfg.i18n.edit || 'Edit') + '">' +
+                                '<span class="dashicons dashicons-edit"></span>' +
+                            '</button>' +
+                            '<button type="button" class="matrix-messaging__msg-action" data-msg-action="delete" title="' + escapeHtml(cfg.i18n.delete || 'Delete') + '" aria-label="' + escapeHtml(cfg.i18n.delete || 'Delete') + '">' +
+                                '<span class="dashicons dashicons-trash"></span>' +
+                            '</button>' +
+                        '</div>';
+                }
             }
         }
 
@@ -955,6 +1057,34 @@
 
         if (action === 'edit') {
             enterEditMode($wrap);
+        } else if (action === 'rerecord') {
+            // Voice "delete and re-record" path. Confirm the
+            // delete first (mirrors the plain-delete confirm so
+            // the destructive step has parity), POST delete,
+            // then auto-open the recorder. We don't try to
+            // chain the new send to the old message id — the
+            // new voice note posts as a fresh row in the same
+            // thread, which keeps the receipts / reactions /
+            // edit-window state per-row simple and matches the
+            // post-PR-#370 model expectation that voice notes
+            // are append-only after their edit window closes.
+            if (!window.confirm(cfg.i18n.voice_confirm_rerecord || 'Delete this voice note and record a new one?')) {
+                return;
+            }
+            api('delete', { message_id: messageId }).done(function (resp) {
+                if (resp && resp.success && resp.data && resp.data.message) {
+                    rerenderMessage($wrap, resp.data.message);
+                    // Open the recorder with a hint so the
+                    // composer can surface "Re-recording…" and
+                    // skip the textarea-focus side effect of a
+                    // normal mic-button click.
+                    startVoiceRecording({ rerecord: true });
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.delete_failed || 'Delete failed.'));
+                }
+            }).fail(function () {
+                alert(cfg.i18n.delete_failed || 'Delete failed.');
+            });
         } else if (action === 'delete') {
             if (!window.confirm(cfg.i18n.confirm_delete || 'Delete this message? This cannot be undone.')) {
                 return;
@@ -1622,6 +1752,262 @@
             });
         });
     }
+
+    // --- Voice-note recorder + upload (DB 1.0.25) ---
+    //
+    // Wires the composer's mic button to MatrixVoiceRecorder. The recorder
+    // class itself is self-contained (see matrix-voice-recorder.js); this
+    // block is everything between the user clicking mic and a real
+    // attachment_ids[] hidden input landing in the composer.
+    //
+    // Flow:
+    //   1. Mic-click swaps the composer into recording state and starts
+    //      the recorder. While active the level meter and elapsed-time
+    //      readout tick from MatrixVoiceRecorder's onLevel /
+    //      onDurationTick callbacks.
+    //   2. Stop-click (or auto-stop on hitting the duration cap) finalises
+    //      the recorder. onComplete delivers a Blob plus the peaks array.
+    //   3. We POST the Blob to the same async-upload endpoint that the
+    //      image picker uses, then submit the message via api('send', ...)
+    //      with attachment_meta[<id>][peaks][] carrying the peaks. The
+    //      message-send is fire-and-forget on success — we don't wait for
+    //      the next poll tick because the optimistic append would race the
+    //      authoritative server row, and voice notes have no body field
+    //      to optimistically render anyway.
+    //   4. Cancel-click calls recorder.cancel() and resets composer chrome
+    //      without uploading anything.
+    //
+    // Re-record path: startVoiceRecording({ rerecord: true }) is called by
+    // the msg-action delegate after the original voice note is deleted.
+    // Same flow as a fresh recording; the only behavioural difference is
+    // a slightly different toast on completion.
+
+    var activeVoiceRecorder = null;
+    var voiceRecorderRerecord = false;
+
+    function setComposerRecordingState(isRecording) {
+        var $form = $('#matrix-messaging-composer');
+        $form.toggleClass('is-recording-voice', !!isRecording);
+        $('#matrix-messaging-voice-recorder').toggleClass('is-recording', !!isRecording);
+        if (!isRecording) {
+            // Reset chrome so the next recording starts from zero.
+            $('#matrix-messaging-voice-time').text('0:00');
+            $('#matrix-messaging-voice-meter').css('width', '0');
+            $('#matrix-messaging-voice-progress').css('width', '0');
+        }
+    }
+
+    function formatRecorderTime(ms) {
+        var s = Math.floor(ms / 1000);
+        var m = Math.floor(s / 60);
+        s = s % 60;
+        return m + ':' + (s < 10 ? '0' + s : s);
+    }
+
+    function startVoiceRecording(opts) {
+        opts = opts || {};
+        if (!cfg.voiceEnabled) { return; }
+        if (!window.MatrixVoiceRecorder || !window.MediaRecorder) {
+            alert(cfg.i18n.voice_unsupported || 'Your browser does not support voice recording.');
+            return;
+        }
+        if (activeVoiceRecorder) {
+            // A previous recorder is still mid-teardown; refuse to
+            // start a new one to avoid two parallel mic streams.
+            return;
+        }
+        if (!activeThreadId) { return; }
+
+        voiceRecorderRerecord = !!opts.rerecord;
+
+        var maxDurationMs = (parseInt(cfg.voiceMaxDurationSec, 10) || 120) * 1000;
+        var maxBytes      = parseInt(cfg.voiceMaxBytes, 10) || (2 * 1024 * 1024);
+        var peakBuckets   = parseInt(cfg.voiceWaveformPeaks, 10) || 64;
+        var allowedMime   = (cfg.voiceAllowedMime && cfg.voiceAllowedMime.length)
+            ? cfg.voiceAllowedMime
+            : ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg'];
+
+        var rec = new window.MatrixVoiceRecorder({
+            allowedMime:    allowedMime,
+            maxDurationMs:  maxDurationMs,
+            maxBytes:       maxBytes,
+            peakBuckets:    peakBuckets,
+            onLevel: function (rms01) {
+                $('#matrix-messaging-voice-meter').css('width', Math.round(rms01 * 100) + '%');
+            },
+            onDurationTick: function (elapsedMs) {
+                $('#matrix-messaging-voice-time').text(formatRecorderTime(elapsedMs));
+                var pct = Math.min(100, Math.round((elapsedMs / maxDurationMs) * 100));
+                $('#matrix-messaging-voice-progress').css('width', pct + '%');
+            },
+            onComplete: function (result) {
+                activeVoiceRecorder = null;
+                setComposerRecordingState(false);
+                uploadAndSendVoiceNote(result, voiceRecorderRerecord);
+            },
+            onError: function (err) {
+                activeVoiceRecorder = null;
+                setComposerRecordingState(false);
+                var msgKey = 'voice_record_failed';
+                if (err && err.code === 'mic_blocked')   { msgKey = 'voice_mic_blocked'; }
+                else if (err && err.code === 'mic_missing') { msgKey = 'voice_mic_missing'; }
+                else if (err && err.code === 'mic_busy')    { msgKey = 'voice_mic_busy'; }
+                else if (err && err.code === 'byte_cap')    { msgKey = 'voice_too_large'; }
+                else if (err && err.code === 'no_codec')    { msgKey = 'voice_no_codec'; }
+                else if (err && err.code === 'unsupported') { msgKey = 'voice_unsupported'; }
+                alert((cfg.i18n[msgKey] || (err && err.message)) || 'Voice recording failed.');
+            }
+        });
+        activeVoiceRecorder = rec;
+        setComposerRecordingState(true);
+        rec.start().catch(function () {
+            // start() rejection is also surfaced via onError above;
+            // the catch here just swallows the rejected promise so
+            // it doesn't show as an unhandled rejection in dev tools.
+        });
+    }
+
+    function stopVoiceRecording() {
+        if (!activeVoiceRecorder) { return; }
+        // Tell the recorder to stop; onComplete fires asynchronously
+        // once the encoder flushes, then triggers the upload.
+        activeVoiceRecorder.stop('user');
+    }
+
+    function cancelVoiceRecording() {
+        if (!activeVoiceRecorder) { return; }
+        activeVoiceRecorder.cancel();
+        activeVoiceRecorder = null;
+        voiceRecorderRerecord = false;
+        setComposerRecordingState(false);
+    }
+
+    function uploadAndSendVoiceNote(result, wasRerecord) {
+        if (!activeThreadId) { return; }
+        if (!result || !result.blob || !result.blob.size) { return; }
+
+        // Append a temporary "uploading" tile to the preview strip
+        // so the user has a visible cue between the stop click and
+        // the eventual send. Removed on either success (because the
+        // send call replaces the composer state on a fresh poll) or
+        // failure (we tear down and restore).
+        var $strip = $('#matrix-messaging-preview').show();
+        var pendingId = 'voice-' + Date.now();
+        var $tile = $(
+            '<div class="matrix-messaging__preview-tile matrix-messaging__preview-tile--voice is-uploading" data-pending-id="' + pendingId + '">' +
+                '<span class="matrix-messaging__preview-spinner" aria-hidden="true"></span>' +
+                '<span class="matrix-messaging__preview-voice-label">' + escapeHtml(cfg.i18n.voice_uploading || 'Uploading voice note…') + '</span>' +
+            '</div>'
+        );
+        $strip.append($tile);
+
+        // Build the upload FormData. The async-upload endpoint
+        // (action=upload-attachment, _wpnonce=cfg.uploadNonce) is
+        // the same one the image picker uses; it goes through
+        // wp_handle_upload + wp_check_filetype and ends up calling
+        // wp_insert_attachment, which is exactly what
+        // Matrix_MLM_Messaging::send_message expects. wp_check_filetype
+        // is filename-driven, so we synthesise a filename with the
+        // extension matching the chosen MIME so the upload survives.
+        var fd = new FormData();
+        fd.append('action', 'upload-attachment');
+        fd.append('_wpnonce', cfg.uploadNonce);
+        var filename = 'voice-' + Date.now() + '.' + (result.extension || 'webm');
+        // FormData/Blob: setting the third arg gives us the filename
+        // hint without having to wrap the blob in a File constructor
+        // (which is missing on some legacy browsers).
+        fd.append('async-upload', result.blob, filename);
+
+        $.ajax({
+            url: cfg.ajaxUrl,
+            method: 'POST',
+            data: fd,
+            processData: false,
+            contentType: false,
+            dataType: 'json'
+        }).done(function (resp) {
+            if (!resp || !resp.success || !resp.data || !resp.data.id) {
+                $tile.remove();
+                if (!$strip.children().length) { $strip.hide(); }
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.upload_failed || 'Upload failed.'));
+                return;
+            }
+            var attachmentId = parseInt(resp.data.id, 10) || 0;
+            if (!attachmentId) {
+                $tile.remove();
+                if (!$strip.children().length) { $strip.hide(); }
+                alert(cfg.i18n.upload_failed || 'Upload failed.');
+                return;
+            }
+            sendVoiceMessage(attachmentId, result.peaks, wasRerecord, $tile, $strip);
+        }).fail(function () {
+            $tile.remove();
+            if (!$strip.children().length) { $strip.hide(); }
+            alert(cfg.i18n.upload_failed || 'Upload failed. Please try again.');
+        });
+    }
+
+    function sendVoiceMessage(attachmentId, peaks, wasRerecord, $tile, $strip) {
+        var payload = {
+            thread_id:        activeThreadId,
+            body:             '',
+            'attachment_ids[]': [attachmentId]
+        };
+        // Peaks ride under attachment_meta[<id>][peaks][]. The
+        // server normalises the array shape (clamps to 0..1, length-
+        // bounds to VOICE_WAVEFORM_PEAKS, drops malformed input),
+        // so we don't pre-validate here — we just hand off whatever
+        // the recorder produced. jQuery's $.ajax serialises an array
+        // value under a key ending in `[]` as repeated key[]=v
+        // pairs, which is exactly what PHP's array shape expects.
+        if (peaks && peaks.length) {
+            payload['attachment_meta[' + attachmentId + '][peaks][]'] = peaks;
+        }
+        api('send', payload).done(function (resp) {
+            $tile.remove();
+            if (!$strip.children().length) { $strip.hide(); }
+            if (!resp || !resp.success) {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.voice_send_failed || 'Could not send voice note.'));
+                return;
+            }
+            voiceRecorderRerecord = false;
+            // The next poll tick brings the canonical message row,
+            // including the signed URL the player needs. No
+            // optimistic append — voice attachments are not safe
+            // to render from a local Blob URL because the rest of
+            // the messaging chrome (receipts, reactions, edit
+            // window) keys off the server-assigned message id.
+        }).fail(function () {
+            $tile.remove();
+            if (!$strip.children().length) { $strip.hide(); }
+            alert(cfg.i18n.voice_send_failed || 'Could not send voice note.');
+        });
+    }
+
+    $pane.on('click', '#matrix-messaging-voice-btn', function (e) {
+        e.preventDefault();
+        startVoiceRecording({ rerecord: false });
+    });
+    $pane.on('click', '#matrix-messaging-voice-stop', function (e) {
+        e.preventDefault();
+        stopVoiceRecording();
+    });
+    $pane.on('click', '#matrix-messaging-voice-cancel', function (e) {
+        e.preventDefault();
+        cancelVoiceRecording();
+    });
+
+    // Cancel any in-flight recording when the user navigates away
+    // from the thread or the page itself unloads. Without this the
+    // mic stays "on" (red recording indicator in the browser tab)
+    // until the GC closes the MediaStream — which can be tens of
+    // seconds on Firefox.
+    $threadsList.on('click', '.matrix-messaging__thread', function () {
+        if (activeVoiceRecorder) { cancelVoiceRecording(); }
+    });
+    $(window).on('beforeunload.matrixVoice', function () {
+        if (activeVoiceRecorder) { activeVoiceRecorder.cancel(); activeVoiceRecorder = null; }
+    });
 
     // --- Cross-thread search ---
     //

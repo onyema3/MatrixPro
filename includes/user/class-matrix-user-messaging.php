@@ -43,10 +43,50 @@ class Matrix_MLM_User_Messaging {
             ['matrix-mlm-dashboard'],
             MATRIX_MLM_VERSION
         );
+        // Voice-notes UI styles (DB 1.0.25). Loaded as a separate
+        // stylesheet rather than inlined into matrix-messaging.css
+        // so the recorder + waveform-player styling has a clear
+        // owner and the moderation surface in PR 3 can pull this
+        // file alone for its inline player without dragging the
+        // entire messaging chrome.
+        wp_enqueue_style(
+            'matrix-voice-notes',
+            MATRIX_MLM_PLUGIN_URL . 'public/css/matrix-voice-notes.css',
+            ['matrix-messaging'],
+            MATRIX_MLM_VERSION
+        );
         wp_enqueue_script(
             'matrix-messaging',
             MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-messaging.js',
             ['jquery'],
+            MATRIX_MLM_VERSION,
+            true
+        );
+        // Voice-notes recorder (no external deps — vanilla JS
+        // class on window.MatrixVoiceRecorder). matrix-messaging's
+        // composer code reads window.MatrixVoiceRecorder, so the
+        // recorder must be evaluated before matrix-messaging
+        // runs. Listing it as a dep on the script handle below
+        // would require restating the dep on every messaging
+        // enqueue site, so we instead enqueue it ahead of
+        // matrix-messaging and rely on WP's load order — both
+        // load in the footer with no async/defer so the order is
+        // deterministic.
+        wp_enqueue_script(
+            'matrix-voice-recorder',
+            MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-voice-recorder.js',
+            [],
+            MATRIX_MLM_VERSION,
+            true
+        );
+        // <matrix-voice-player> custom element. No deps; the
+        // element registration is idempotent (guarded against
+        // double-define) so re-evaluating it on a re-mount of
+        // the messaging tab is safe.
+        wp_enqueue_script(
+            'matrix-voice-player',
+            MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-voice-player.js',
+            [],
             MATRIX_MLM_VERSION,
             true
         );
@@ -68,6 +108,25 @@ class Matrix_MLM_User_Messaging {
             // config lets an operator change one place to
             // re-tune both ends.
             'typingBeaconMs'    => (int) Matrix_MLM_Messaging::TYPING_BEACON_INTERVAL_MS,
+            // Voice-notes config (DB 1.0.25). Mirrors the
+            // server-side resolvers so the composer's recorder
+            // doesn't have to make a probe round-trip just to
+            // know the cap, and so a feature toggle in the
+            // operator settings card (PR 4) takes effect on the
+            // next page load without a manual cache bust on the
+            // JS bundle.
+            //
+            // The peakBuckets value is the class constant rather
+            // than a settings field — the server will only
+            // accept exactly that many peaks regardless of what
+            // the recorder produces, so exposing a different
+            // value on the wire would just produce a discarded
+            // peak array and a flat-bar fallback.
+            'voiceEnabled'         => Matrix_MLM_Messaging::is_voice_enabled(),
+            'voiceMaxDurationSec'  => (int) Matrix_MLM_Messaging::get_voice_max_duration_seconds(),
+            'voiceMaxBytes'        => (int) Matrix_MLM_Messaging::get_voice_max_bytes(),
+            'voiceWaveformPeaks'   => (int) Matrix_MLM_Messaging::VOICE_WAVEFORM_PEAKS,
+            'voiceAllowedMime'     => array_values(Matrix_MLM_Messaging::voice_allowed_mime()),
             'i18n'              => [
                 'new_dm_prompt' => __('Username or referral code:', 'matrix-mlm'),
                 'send'          => __('Send', 'matrix-mlm'),
@@ -112,6 +171,28 @@ class Matrix_MLM_User_Messaging {
                 'attach_too_large' => __('File too large. Maximum %s MB.', 'matrix-mlm'),
                 'attach_too_many'  => __('Maximum %d attachments per message.', 'matrix-mlm'),
                 'upload_failed'    => __('Upload failed. Please try again.', 'matrix-mlm'),
+                // Voice notes (DB 1.0.25 — recorder + player UX
+                // strings). Keep the wording action-oriented
+                // rather than describing internal state ("Stop
+                // and send" rather than "Stop"; "Cancel
+                // recording" rather than "Cancel"), because the
+                // affordances live in a row that already has a
+                // generic "Cancel" / "Stop" pair from the
+                // adjacent edit-message form.
+                'voice_record'         => __('Record a voice note', 'matrix-mlm'),
+                'voice_stop'           => __('Stop and send', 'matrix-mlm'),
+                'voice_cancel'         => __('Cancel recording', 'matrix-mlm'),
+                'voice_uploading'      => __('Uploading voice note…', 'matrix-mlm'),
+                'voice_send_failed'    => __('Could not send voice note.', 'matrix-mlm'),
+                'voice_record_failed'  => __('Voice recording failed. Please try again.', 'matrix-mlm'),
+                'voice_mic_blocked'    => __('Microphone access was blocked. Allow it in your browser to record voice notes.', 'matrix-mlm'),
+                'voice_mic_missing'    => __('No microphone was found on this device.', 'matrix-mlm'),
+                'voice_mic_busy'       => __('Your microphone is in use by another application.', 'matrix-mlm'),
+                'voice_too_large'      => __('Recording is larger than the allowed size limit. Try a shorter clip.', 'matrix-mlm'),
+                'voice_no_codec'       => __('Your browser does not support any of the allowed voice formats.', 'matrix-mlm'),
+                'voice_unsupported'    => __('Your browser does not support voice recording.', 'matrix-mlm'),
+                'voice_rerecord'       => __('Delete and re-record', 'matrix-mlm'),
+                'voice_confirm_rerecord' => __('Delete this voice note and record a new one?', 'matrix-mlm'),
                 // Older-message pagination.
                 'load_older'       => __('Load older messages', 'matrix-mlm'),
                 // Mute / block popovers.
