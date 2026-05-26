@@ -55,6 +55,22 @@ class Matrix_MLM_Messaging {
 
     const BAN_META_UNTIL  = 'matrix_messaging_banned_until';   // 'permanent' | 'YYYY-mm-dd HH:ii:ss'
     const BAN_META_REASON = 'matrix_messaging_ban_reason';
+    /**
+     * Accountability metadata written alongside the ban itself so the
+     * Bans admin tab can surface "who banned whom and when" without
+     * grepping audit logs. Cleared by unban_user() in lockstep with
+     * the ban_until / ban_reason pair so a stale row is impossible.
+     *
+     * BAN_META_AT  — GMT mysql datetime string at which ban_user()
+     *                committed. Distinct from `created_at` on any
+     *                originating report row because the same report
+     *                can be revisited and a fresh ban placed later.
+     * BAN_META_BY  — User id of the admin who triggered the ban.
+     *                Zero when the ban was placed by a non-user
+     *                context (cron, WP-CLI, automated trigger).
+     */
+    const BAN_META_AT     = 'matrix_messaging_banned_at';
+    const BAN_META_BY     = 'matrix_messaging_banned_by';
 
     /**
      * Presence + offline-push metadata keys.
@@ -259,12 +275,153 @@ class Matrix_MLM_Messaging {
         // between cron callbacks (which run in UTC) and admin UI (site tz).
         $expires_ts = strtotime($until . ' UTC');
         if ($expires_ts === false || $expires_ts <= time()) {
-            // Expired — clear the meta so the gate stops triggering.
+            // Expired — clear all four ban-meta keys in lockstep so
+            // the Bans admin tab does not surface stale banned_at /
+            // banned_by rows for users whose temp ban has timed out.
+            // Done inline rather than via unban_user() because this
+            // is a passive expiry, not an explicit moderator action,
+            // and we do not want to fire matrix_messaging_user_unbanned
+            // on every is_user_banned() call past the expiry second.
             delete_user_meta((int) $user_id, self::BAN_META_UNTIL);
             delete_user_meta((int) $user_id, self::BAN_META_REASON);
+            delete_user_meta((int) $user_id, self::BAN_META_AT);
+            delete_user_meta((int) $user_id, self::BAN_META_BY);
             return false;
         }
         return $until;
+    }
+
+    /**
+     * Place a messaging ban on a user. Centralises the four user_meta
+     * writes (until / reason / banned_at / banned_by) and emits the
+     * matrix_messaging_user_banned action so audit-log and notification
+     * subscribers can react without observing wp_usermeta directly.
+     *
+     * Two valid forms for $until:
+     *   - 'permanent'                    — never expires unless lifted
+     *   - GMT mysql datetime in future   — expires automatically on next
+     *                                      is_user_banned() call past
+     *                                      that timestamp
+     *
+     * Anything else (past timestamp, malformed string, empty) is rejected
+     * with a WP_Error and writes nothing — refusing silently is the
+     * worst possible outcome here because a misconfigured admin form
+     * would result in a phantom "ban placed" toast with no enforcement.
+     *
+     * @param int    $user_id The member to ban.
+     * @param string $until   'permanent' OR a strtotime-parseable GMT
+     *                        timestamp in the future.
+     * @param string $reason  Free-form reason string, truncated to 255
+     *                        chars to fit comfortably in any audit
+     *                        export and to bound the row's storage cost.
+     * @param array  $context Optional structured context (e.g.
+     *                        ['source' => 'report', 'report_id' => 42])
+     *                        passed through to the action verbatim so
+     *                        subscribers can attribute the ban without
+     *                        a back-reference query.
+     * @return true|WP_Error
+     */
+    public static function ban_user($user_id, $until, $reason = '', array $context = []) {
+        $user_id = (int) $user_id;
+        if ($user_id <= 0) {
+            return new WP_Error(
+                'matrix_messaging_invalid_user',
+                __('Invalid user.', 'matrix-mlm')
+            );
+        }
+        $until = (string) $until;
+        if ($until !== 'permanent') {
+            $expires_ts = strtotime($until . ' UTC');
+            if ($expires_ts === false || $expires_ts <= time()) {
+                return new WP_Error(
+                    'matrix_messaging_invalid_until',
+                    __('Ban expiry must be in the future, or "permanent".', 'matrix-mlm')
+                );
+            }
+            // Re-canonicalise to GMT mysql format so a caller passing
+            // a slightly different string ("2030-01-02T03:04:05Z",
+            // "tomorrow noon", etc.) is normalised in one place.
+            $until = gmdate('Y-m-d H:i:s', $expires_ts);
+        }
+        $reason = mb_substr((string) $reason, 0, 255);
+
+        update_user_meta($user_id, self::BAN_META_UNTIL,  $until);
+        update_user_meta($user_id, self::BAN_META_REASON, $reason);
+        update_user_meta($user_id, self::BAN_META_AT,     current_time('mysql', true));
+        update_user_meta($user_id, self::BAN_META_BY,     (int) get_current_user_id());
+
+        /**
+         * Fires after a messaging ban is committed. Lets audit-log /
+         * notification / Slack-ping subscribers react without polling
+         * wp_usermeta, and lets a downstream report-resolver attribute
+         * the ban to a specific moderation row via the $context array.
+         *
+         * @param int    $user_id Banned member's user id.
+         * @param string $until   'permanent' or a GMT mysql datetime string.
+         * @param string $reason  Truncated reason string (<= 255 chars).
+         * @param array  $context Free-form context handed in by the caller.
+         */
+        do_action('matrix_messaging_user_banned', $user_id, $until, $reason, $context);
+
+        return true;
+    }
+
+    /**
+     * Lift a messaging ban. Mirror of ban_user() — clears every
+     * meta key the helper writes, in lockstep, so a partial-cleanup
+     * race can't leave a stale BAN_META_AT pointing to a user who
+     * is no longer banned.
+     *
+     * Always returns true for nonexistent / never-banned users so
+     * a defensive caller can call this idempotently without first
+     * checking is_user_banned().
+     *
+     * @param int   $user_id The member to unban.
+     * @param array $context Optional context for the action subscribers.
+     * @return true|WP_Error
+     */
+    public static function unban_user($user_id, array $context = []) {
+        $user_id = (int) $user_id;
+        if ($user_id <= 0) {
+            return new WP_Error(
+                'matrix_messaging_invalid_user',
+                __('Invalid user.', 'matrix-mlm')
+            );
+        }
+        delete_user_meta($user_id, self::BAN_META_UNTIL);
+        delete_user_meta($user_id, self::BAN_META_REASON);
+        delete_user_meta($user_id, self::BAN_META_AT);
+        delete_user_meta($user_id, self::BAN_META_BY);
+
+        /**
+         * Fires after a messaging ban is lifted. Counterpart to
+         * matrix_messaging_user_banned — same shape minus the
+         * (until, reason) pair which no longer apply.
+         *
+         * @param int   $user_id Unbanned member's user id.
+         * @param array $context Free-form context.
+         */
+        do_action('matrix_messaging_user_unbanned', $user_id, $context);
+
+        return true;
+    }
+
+    /**
+     * Count of open (unresolved) message reports. Cheap — uses the
+     * `resolved_at` index added in DB 1.0.19. Called by the admin
+     * menu builder to render the awaiting-mod badge next to the
+     * Messaging submenu label, mirroring the WP core comments
+     * awaiting-mod count pattern. Wrap-cached at the call site
+     * via a short transient when needed; this method itself is
+     * uncached so a fresh report shows on the next admin page load.
+     *
+     * @return int
+     */
+    public static function count_open_reports() {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$wpdb->prefix}matrix_message_reports WHERE resolved_at IS NULL"
+        );
     }
 
     /**
