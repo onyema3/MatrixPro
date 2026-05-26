@@ -155,6 +155,18 @@ class Matrix_MLM_Core {
         add_action('init', [$this, 'add_rewrite_rules']);
         add_filter('query_vars', [$this, 'add_query_vars']);
 
+        // Backward-compat 301 from /matrix-register/?ref=X to
+        // /matrix/?ref=X. The public page slug for the registration
+        // form was renamed in 2026 (see
+        // Matrix_MLM_Activator::migrate_register_page_slug() for the
+        // server-side rename) so referral links members shared on
+        // social media, in emails, on flyers, on business cards
+        // before the rename keep working — a 404 there would
+        // silently erase the conversion path for every prior
+        // promotion campaign, which for an MLM is the entire
+        // business model.
+        add_action('template_redirect', [$this, 'redirect_legacy_register_url']);
+
         // Email verification handler
         add_action('init', [$this, 'handle_email_verification']);
 
@@ -3969,6 +3981,107 @@ class Matrix_MLM_Core {
     public function add_query_vars($vars) {
         $vars[] = 'matrix_tab';
         return $vars;
+    }
+
+    /**
+     * 301 redirect from the legacy /matrix-register/ URL to the
+     * current /matrix/ URL, preserving any query string.
+     *
+     * The page slug was renamed in 2026 — see
+     * Matrix_MLM_Activator::migrate_register_page_slug() for the
+     * in-place wp_posts rename that runs on activation. After the
+     * rename the legacy slug 404s on installs where the migration
+     * succeeded, which would silently erase the conversion path
+     * for every referral link members shared on social media, in
+     * emails, on flyers, etc. before the rename. This redirect
+     * catches those requests and forwards them to the new URL with
+     * `?ref=X` intact, so old links keep crediting the right
+     * referrer.
+     *
+     * Implementation notes:
+     *
+     *   - Hooked on `template_redirect` (not `init`) so this runs
+     *     after WordPress has finished routing the request and we
+     *     know the request really is for the legacy slug, not for
+     *     a different post that happens to live in a similar URL
+     *     space. Running this on `init` would force every request
+     *     on the entire site through the regex check; gating it on
+     *     `template_redirect` fires it only on real page-render
+     *     requests where the cost is negligible.
+     *
+     *   - The match path is parsed from REQUEST_URI rather than
+     *     read from $wp_query->query because on a clean install
+     *     where /matrix-register/ no longer exists in wp_posts,
+     *     WordPress routes the URL straight to its 404 handler
+     *     and there's no usable WP_Query state to inspect. Using
+     *     parse_url(REQUEST_URI) sidesteps that by working at the
+     *     raw HTTP layer.
+     *
+     *   - The trailing-slash variants (/matrix-register and
+     *     /matrix-register/) are both matched; rtrim normalises
+     *     them before comparison so we don't have to maintain two
+     *     branches.
+     *
+     *   - Whole-path comparison against home_url('/matrix-register')
+     *     handles WordPress installs in subdirectories correctly
+     *     (e.g. site at example.com/blog/, the legacy URL is
+     *     /blog/matrix-register/ and home_url returns
+     *     https://example.com/blog/matrix-register). A naive
+     *     substring check would also catch unrelated paths like
+     *     /admin/matrix-register/ on operator-customised sites,
+     *     so the strict equality is the right call.
+     *
+     *   - The query string is preserved verbatim. A link like
+     *     /matrix-register/?ref=ABC123&utm_source=whatsapp keeps
+     *     both the ref code (which the registration handler in
+     *     handle_registration() reads from $_POST['referral_code']
+     *     after the form submits — the form's hidden field is
+     *     populated client-side from window.location.search) and
+     *     any analytics tags the operator shared in promo links.
+     *
+     *   - Uses 301 (permanent) so search engines and referrer-link
+     *     consumers (Facebook scraper, WhatsApp link preview,
+     *     Twitter card crawler) update their cached resolution to
+     *     the new URL on the next refresh. A 302 here would leave
+     *     them re-resolving the legacy URL forever.
+     *
+     *   - Idempotent: if /matrix-register/ never existed on this
+     *     install (fresh activation post-rename), the redirect
+     *     never fires because no request ever reaches it (the URL
+     *     is 404 at WP routing time, but the 404 still routes
+     *     through template_redirect, which is exactly when we
+     *     intercept).
+     */
+    public function redirect_legacy_register_url() {
+        $request_uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        if ($request_uri === '') {
+            return;
+        }
+
+        $request_path = parse_url($request_uri, PHP_URL_PATH);
+        if (!is_string($request_path) || $request_path === '') {
+            return;
+        }
+
+        // Build the canonical legacy path including any subdirectory
+        // prefix WordPress is installed under, then compare with the
+        // request path after both have been rtrim'd of any trailing
+        // slash (so /matrix-register and /matrix-register/ both
+        // match the same comparison target).
+        $expected_path = parse_url(home_url('/matrix-register'), PHP_URL_PATH);
+        if (!is_string($expected_path) || $expected_path === '') {
+            return;
+        }
+
+        if (rtrim($request_path, '/') !== rtrim($expected_path, '/')) {
+            return;
+        }
+
+        $query = parse_url($request_uri, PHP_URL_QUERY);
+        $target = home_url('/matrix/' . (is_string($query) && $query !== '' ? '?' . $query : ''));
+
+        wp_safe_redirect($target, 301);
+        exit;
     }
 
     public function daily_cron() {

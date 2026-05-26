@@ -43,7 +43,7 @@ $currency = get_option('matrix_mlm_currency_symbol', '₦');
                 <?php if (is_user_logged_in()): ?>
                 <button class="matrix-btn matrix-btn-primary matrix-btn-block" onclick="matrixJoinPlan(<?php echo $plan->id; ?>)"><?php _e('Join Now', 'matrix-mlm'); ?></button>
                 <?php else: ?>
-                <a href="<?php echo home_url('/matrix-register'); ?>" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Register & Join', 'matrix-mlm'); ?></a>
+                <a href="<?php echo home_url('/matrix'); ?>" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Register & Join', 'matrix-mlm'); ?></a>
                 <?php endif; ?>
             </div>
         </div>

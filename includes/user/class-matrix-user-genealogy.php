@@ -333,7 +333,7 @@ class Matrix_MLM_User_Genealogy {
         $referral_url = '';
         if (class_exists('Matrix_MLM_User')) {
             $maybe = (string) Matrix_MLM_User::get_referral_link((int) $user_id);
-            // get_referral_link returns ".../matrix-register/?ref=" with
+            // get_referral_link returns ".../matrix/?ref=" with
             // an empty code if the row is missing — guard against
             // shipping a useless URL.
             if ($maybe !== '' && substr($maybe, -4) !== 'ref=') {
