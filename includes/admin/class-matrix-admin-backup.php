@@ -922,7 +922,21 @@ class Matrix_MLM_Admin_Backup {
             // Restrict accepted extensions to what create_backup()
             // produces. Anything else is almost certainly a mistake
             // (e.g. an admin trying to restore a wp_users.csv export).
-            if (!preg_match('/\.(sql|sql\.gz|gz)$/i', $original)) {
+            //
+            // Tightened to refuse plain '.gz'. The previous regex —
+            // /\.(sql|sql\.gz|gz)$/i — accepted any '.gz' file
+            // because the alternation pattern listed 'gz' as its
+            // own branch alongside 'sql.gz'. A .gz file that wasn't
+            // a SQL dump (a tar.gz, a log.gz, an arbitrary .gz blob)
+            // would land on disk inside the private backup directory
+            // and the downstream restore parser would fail opaquely.
+            // Admin-only path with capability + nonce gates so the
+            // blast radius was already minimal — but accepting only
+            // '.sql' and '.sql.gz' is the strictly tighter input
+            // contract that matches what create_backup() actually
+            // produces, so this is purely a refusal-of-malformed-input
+            // hardening rather than a security fix.
+            if (!preg_match('/\.sql(\.gz)?$/i', $original)) {
                 self::redirect_with_notice('error', __('Only .sql or .sql.gz files can be restored.', 'matrix-mlm'));
             }
 
