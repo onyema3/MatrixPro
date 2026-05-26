@@ -312,6 +312,7 @@ class Matrix_MLM_User_Dashboard {
                     <div class="matrix-avatar"><?php echo get_avatar($user_id, 60); ?></div>
                     <h4><?php echo esc_html(wp_get_current_user()->display_name); ?></h4>
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
+                    <?php echo $this->build_subscription_status_badge($user_id); ?>
                 </div>
                 <div class="matrix-dashboard-nav" role="navigation" aria-label="<?php esc_attr_e('Dashboard navigation', 'matrix-mlm'); ?>">
                     <?php
@@ -645,6 +646,205 @@ class Matrix_MLM_User_Dashboard {
         <?php endif; ?>
         <?php
         return ob_get_clean();
+    }
+
+    /**
+     * Build the inline subscription status badge rendered under
+     * the avatar/balance block in the dashboard sidebar. Returns
+     * an empty string when subscriptions are disabled for the
+     * install — keeps the sidebar visually identical for operators
+     * who haven't turned the feature on.
+     *
+     * Four visual states, each with its own copy and accent colour:
+     *
+     *   - 'active'    (green) — balance covers the upcoming bill
+     *                 OR the bill is more than reminder_window
+     *                 days away. Subtitle shows the next billing
+     *                 date so users always know where they stand.
+     *
+     *   - 'reminder'  (amber) — bill is due within the reminder
+     *                 window AND the wallet balance is short.
+     *                 Subtitle quotes the shortfall so the user
+     *                 knows exactly how much more to top up.
+     *
+     *   - 'shortfall' (red)   — bill is due today or overdue AND
+     *                 the wallet balance is short. Same shape as
+     *                 'reminder' but the urgency wording is harder
+     *                 ("due today / overdue") because the next
+     *                 cron run could trip the deactivation sweep.
+     *
+     *   - 'inactive'  (red)   — never rendered here in practice
+     *                 (render_dashboard short-circuits to
+     *                 render_inactive_account_view before this
+     *                 method runs), but defensively handled so
+     *                 a future code path that surfaces this badge
+     *                 from outside the dashboard render still
+     *                 displays sensible copy.
+     *
+     * Reads come from Matrix_MLM_Subscription::get_user_subscription_status,
+     * which takes care of the option-key plumbing, the wallet
+     * balance read, and the days-until-billing arithmetic — this
+     * method is purely the rendering shell.
+     *
+     * @param int $user_id Current user id.
+     * @return string HTML to inline inside .matrix-user-info, or
+     *                '' when the feature is disabled.
+     */
+    private function build_subscription_status_badge($user_id) {
+        if (!class_exists('Matrix_MLM_Subscription')) {
+            return '';
+        }
+        $info = Matrix_MLM_Subscription::get_user_subscription_status($user_id);
+        if (empty($info['enabled']) || $info['amount'] <= 0) {
+            // Subscription feature is off for this install — surface
+            // a plain "Active" pill (no billing-cycle subtitle) so
+            // members still see an account-status indicator. The
+            // legacy dashboard had no badge at all here, so this is
+            // an additive change either way.
+            return $this->render_status_badge_html('active', __('Active', 'matrix-mlm'), '');
+        }
+
+        $currency = (string) get_option('matrix_mlm_currency_symbol', '₦');
+        $next     = (string) ($info['next_billing_date'] ?? '');
+        $days     = (int) ($info['days_until'] ?? 0);
+        $shortfall_str = $currency . number_format((float) $info['shortfall'], 2);
+
+        $next_label = $next;
+        if ($next !== '') {
+            $ts = strtotime($next);
+            if ($ts) {
+                $next_label = date_i18n(get_option('date_format', 'F j, Y'), $ts);
+            }
+        }
+
+        switch ($info['status']) {
+            case 'inactive':
+                return $this->render_status_badge_html(
+                    'inactive',
+                    __('Inactive', 'matrix-mlm'),
+                    __('Subscription unpaid', 'matrix-mlm')
+                );
+
+            case 'shortfall':
+                $subtitle = $next !== ''
+                    ? sprintf(
+                        /* translators: 1: shortfall amount, 2: billing date label */
+                        __('%1$s short — due %2$s', 'matrix-mlm'),
+                        $shortfall_str,
+                        $next_label
+                    )
+                    : sprintf(
+                        /* translators: %s: shortfall amount */
+                        __('%s short — due now', 'matrix-mlm'),
+                        $shortfall_str
+                    );
+                return $this->render_status_badge_html('shortfall', __('Action Needed', 'matrix-mlm'), $subtitle);
+
+            case 'reminder':
+                $subtitle = sprintf(
+                    /* translators: 1: shortfall amount, 2: number of days */
+                    _n(
+                        '%1$s short — bill in %2$d day',
+                        '%1$s short — bill in %2$d days',
+                        max(1, $days),
+                        'matrix-mlm'
+                    ),
+                    $shortfall_str,
+                    max(1, $days)
+                );
+                return $this->render_status_badge_html('reminder', __('Top Up Soon', 'matrix-mlm'), $subtitle);
+
+            case 'active':
+            default:
+                if ($next !== '') {
+                    if ($days > 0) {
+                        $subtitle = sprintf(
+                            /* translators: 1: number of days, 2: billing date label */
+                            _n(
+                                'Next bill in %1$d day (%2$s)',
+                                'Next bill in %1$d days (%2$s)',
+                                $days,
+                                'matrix-mlm'
+                            ),
+                            $days,
+                            $next_label
+                        );
+                    } else {
+                        $subtitle = sprintf(
+                            /* translators: %s: billing date label */
+                            __('Next bill due %s', 'matrix-mlm'),
+                            $next_label
+                        );
+                    }
+                } else {
+                    $subtitle = '';
+                }
+                return $this->render_status_badge_html('active', __('Active', 'matrix-mlm'), $subtitle);
+        }
+    }
+
+    /**
+     * Render the actual badge HTML. Self-contained <style> block
+     * so the badge displays correctly even on installs where a
+     * caching plugin has stripped the bundled admin CSS — same
+     * defensive idiom as build_level_completion_toasts() and
+     * build_pin_enrolment_banner() (both of which carry their own
+     * <style> for the same reason).
+     *
+     * Emits the <style> only on the first call per request via a
+     * static guard, so the dashboard sidebar isn't polluted with
+     * three identical style blocks if a future caller renders the
+     * badge in multiple places.
+     *
+     * @param string $variant   One of 'active' | 'reminder' | 'shortfall' | 'inactive'.
+     * @param string $label     Pill text (already translated).
+     * @param string $subtitle  Optional grey subtitle line below the pill.
+     * @return string HTML.
+     */
+    private function render_status_badge_html($variant, $label, $subtitle) {
+        static $style_emitted = false;
+
+        $css = '';
+        if (!$style_emitted) {
+            $style_emitted = true;
+            $css = '<style>
+                .matrix-account-status-wrap {
+                    margin-top: 10px; display: flex; flex-direction: column;
+                    align-items: center; gap: 4px;
+                }
+                .matrix-account-status-pill {
+                    display: inline-flex; align-items: center; gap: 6px;
+                    padding: 4px 10px; border-radius: 999px;
+                    font-size: 11px; font-weight: 700; letter-spacing: .03em;
+                    text-transform: uppercase; line-height: 1;
+                }
+                .matrix-account-status-pill::before {
+                    content: ""; width: 6px; height: 6px; border-radius: 50%;
+                    background: currentColor; box-shadow: 0 0 0 3px rgba(255,255,255,.18);
+                }
+                .matrix-account-status-pill.is-active   { color: #047857; background: #d1fae5; }
+                .matrix-account-status-pill.is-reminder { color: #92400e; background: #fef3c7; }
+                .matrix-account-status-pill.is-shortfall,
+                .matrix-account-status-pill.is-inactive { color: #991b1b; background: #fee2e2; }
+                .matrix-account-status-sub {
+                    font-size: 11px; color: #6b7280; line-height: 1.3;
+                    text-align: center; padding: 0 4px;
+                }
+            </style>';
+        }
+
+        $variant_class = 'is-' . preg_replace('/[^a-z]/', '', strtolower((string) $variant));
+
+        $html  = '<div class="matrix-account-status-wrap">';
+        $html .= '<span class="matrix-account-status-pill ' . esc_attr($variant_class) . '">'
+              .  esc_html($label)
+              .  '</span>';
+        if ($subtitle !== '') {
+            $html .= '<span class="matrix-account-status-sub">' . esc_html($subtitle) . '</span>';
+        }
+        $html .= '</div>';
+
+        return $css . $html;
     }
 
     /**

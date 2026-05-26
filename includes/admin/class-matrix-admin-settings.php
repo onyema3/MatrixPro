@@ -799,7 +799,16 @@ class Matrix_MLM_Admin_Settings {
                 <th><?php _e('Billing Day', 'matrix-mlm'); ?></th>
                 <td>
                     <input type="number" name="matrix_mlm_subscription_billing_day" min="1" max="28" value="<?php echo esc_attr(get_option('matrix_mlm_subscription_billing_day', 1)); ?>" class="small-text">
-                    <p class="description"><?php _e('Day of the month when subscriptions are charged (1-28). Using 28 or lower ensures consistency across all months.', 'matrix-mlm'); ?></p>
+                    <p class="description">
+                        <?php _e('<strong>Seed value only.</strong> Used once on the first activation to anchor every existing user\'s billing anniversary, and again as the day-of-month for any new user whose signup arrives on this exact day. After that, each user is billed on their own monthly anniversary (matrix_user_meta.next_billing_date), so changing this value will not shift existing users.', 'matrix-mlm'); ?>
+                    </p>
+                </td>
+            </tr>
+            <tr>
+                <th><?php _e('Pre-Billing Reminder (Days)', 'matrix-mlm'); ?></th>
+                <td>
+                    <input type="number" name="matrix_mlm_subscription_reminder_days" min="1" max="15" value="<?php echo esc_attr(get_option('matrix_mlm_subscription_reminder_days', 3)); ?>" class="small-text">
+                    <p class="description"><?php _e('Number of days before a user\'s billing date to send a low-balance reminder when their Matrix wallet is short of the amount. The reminder fires only when there is a real shortfall — users whose wallets already cover the bill are not notified. Set between 1 and 15.', 'matrix-mlm'); ?></p>
                 </td>
             </tr>
             <tr>
@@ -1197,7 +1206,7 @@ class Matrix_MLM_Admin_Settings {
                 $settings = ['matrix_mlm_livechat_enabled', 'matrix_mlm_livechat_code', 'matrix_mlm_whatsapp_enabled', 'matrix_mlm_whatsapp_number', 'matrix_mlm_whatsapp_message'];
                 break;
             case 'subscription':
-                $settings = ['matrix_mlm_subscription_enabled', 'matrix_mlm_subscription_amount', 'matrix_mlm_subscription_billing_day', 'matrix_mlm_subscription_grace_days'];
+                $settings = ['matrix_mlm_subscription_enabled', 'matrix_mlm_subscription_amount', 'matrix_mlm_subscription_billing_day', 'matrix_mlm_subscription_grace_days', 'matrix_mlm_subscription_reminder_days'];
                 // Create subscriptions table if it doesn't exist
                 Matrix_MLM_Subscription::create_table();
                 // Schedule or unschedule cron based on enabled status

@@ -10,6 +10,151 @@ if (!defined('ABSPATH')) {
 class Matrix_MLM_Notifications {
 
     /**
+     * Send a pre-billing reminder to a user whose Matrix wallet is
+     * short of the configured monthly subscription amount and whose
+     * next_billing_date falls inside the configured reminder window.
+     * Fired from Matrix_MLM_Subscription::send_pending_reminders()
+     * once per upcoming period — the cron stamps the period it
+     * reminded for in user_meta so the message doesn't repeat day
+     * after day inside the same window.
+     *
+     * Distinct from send_subscription_deactivation_notification():
+     *
+     *   - Reminder fires BEFORE billing day, while there's still
+     *     time for the user to top up. Tone is helpful, not alarmed.
+     *   - Deactivation fires AFTER the grace deadline, when the
+     *     account has already been locked. Tone is corrective.
+     *
+     * Same channel mix as the deactivation helper: email always,
+     * SMS when matrix_mlm_sms_verification is on and the user has
+     * a phone on file, in-app notification (1.0.15) so the bell
+     * dropdown also surfaces the nudge.
+     *
+     * @param int    $user_id           Recipient.
+     * @param float  $amount            Monthly fee that will be debited.
+     * @param string $next_billing_date YYYY-MM-DD when the cron will charge.
+     * @param float  $current_balance   Current Matrix wallet balance, so the
+     *                                  email can name the exact shortfall
+     *                                  rather than asking the user to do
+     *                                  the arithmetic.
+     * @return void
+     */
+    public static function send_subscription_reminder_notification($user_id, $amount, $next_billing_date, $current_balance) {
+        $user = get_userdata((int) $user_id);
+        if (!$user) {
+            return;
+        }
+
+        $currency       = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount_str     = $currency . number_format((float) $amount, 2);
+        $balance_str    = $currency . number_format((float) $current_balance, 2);
+        $shortfall      = max(0.0, (float) $amount - (float) $current_balance);
+        $shortfall_str  = $currency . number_format($shortfall, 2);
+
+        $billing_label = $next_billing_date;
+        $ts = strtotime((string) $next_billing_date);
+        if ($ts) {
+            $billing_label = date_i18n(get_option('date_format', 'F j, Y'), $ts);
+        }
+
+        // days_until is always >= 1 because the cron only emits the
+        // reminder for dates strictly in the future. We still floor at
+        // 1 here as belt-and-braces against a clock-skewed install
+        // where current_time and the stored date drift by an hour
+        // either side of midnight.
+        $days_until = 1;
+        if ($ts) {
+            $today_ts = strtotime(current_time('Y-m-d'));
+            if ($today_ts !== false) {
+                $days_until = max(1, (int) round(($ts - $today_ts) / DAY_IN_SECONDS));
+            }
+        }
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: amount, 3: number of days */
+            _n(
+                '[%1$s] Heads up: %2$s subscription due in %3$d day',
+                '[%1$s] Heads up: %2$s subscription due in %3$d days',
+                $days_until,
+                'matrix-mlm'
+            ),
+            get_bloginfo('name'),
+            $amount_str,
+            $days_until
+        );
+
+        $dashboard_url = home_url('/matrix-dashboard/');
+        $deposit_url   = home_url('/matrix-dashboard/deposits/');
+
+        $message = self::get_email_template('subscription-reminder', [
+            'username'       => $user->user_login,
+            'amount'         => $amount_str,
+            'balance'        => $balance_str,
+            'shortfall'      => $shortfall_str,
+            'billing_label'  => $billing_label,
+            'days_until'     => $days_until,
+            'dashboard_url'  => $dashboard_url,
+            'deposit_url'    => $deposit_url,
+            'site_name'      => get_bloginfo('name'),
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+
+        // SMS twin — same gating pattern as deactivation / commission
+        // notifications. Short copy because reminder SMS that wraps
+        // across two segments costs operators twice as much per send
+        // and the actionable bit ("top up before X") is the only thing
+        // that has to fit.
+        if (get_option('matrix_mlm_sms_verification')) {
+            $phone = self::get_user_phone((int) $user_id);
+            if ($phone) {
+                self::send_sms($phone, sprintf(
+                    /* translators: 1: amount, 2: shortfall, 3: billing date label */
+                    __('Reminder: %1$s subscription due %3$s. Your wallet is short by %2$s. Top up to avoid deactivation.', 'matrix-mlm'),
+                    $amount_str,
+                    $shortfall_str,
+                    $billing_label
+                ));
+            }
+        }
+
+        // In-app notification (1.0.15). Surfaces in the dashboard
+        // bell so a user who logs in mid-window sees the nudge
+        // without having to check their email — same pattern as
+        // the deactivation in-app entry.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'subscription_reminder',
+                sprintf(
+                    /* translators: 1: amount, 2: billing date label */
+                    __('Subscription due %2$s — %1$s', 'matrix-mlm'),
+                    $amount_str,
+                    $billing_label
+                ),
+                sprintf(
+                    /* translators: 1: shortfall amount, 2: number of days */
+                    _n(
+                        'Your wallet is short %1$s. Top up within %2$d day to keep your account active.',
+                        'Your wallet is short %1$s. Top up within %2$d days to keep your account active.',
+                        $days_until,
+                        'matrix-mlm'
+                    ),
+                    $shortfall_str,
+                    $days_until
+                ),
+                '/matrix-dashboard/deposits/',
+                [
+                    'amount'            => (float) $amount,
+                    'balance'           => (float) $current_balance,
+                    'shortfall'         => $shortfall,
+                    'next_billing_date' => (string) $next_billing_date,
+                ]
+            );
+        }
+    }
+
+    /**
      * Send a "your account has been deactivated for non-payment of the
      * monthly subscription" notification to the user. Fired from
      * Matrix_MLM_Subscription::deactivate_unpaid_users() the moment the
@@ -1465,6 +1610,38 @@ class Matrix_MLM_Notifications {
                 if (!empty($vars['dashboard_url'])) {
                     $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('View Your Genealogy', 'matrix-mlm') . '</a></p>';
                 }
+                break;
+            case 'subscription-reminder':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/subscription-reminder.php
+                // on disk. Same shape as subscription-deactivation
+                // below — short paragraph stating the upcoming bill
+                // + shortfall, then a clear CTA to top up. Tone is
+                // helpful, not alarmed: this is a "heads up", not
+                // an "you've been locked out".
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), esc_html($vars['username'] ?? '')) . '</p>';
+                $content .= '<p>' . sprintf(
+                    /* translators: 1: amount, 2: billing date label, 3: number of days */
+                    _n(
+                        'Your monthly subscription of <strong>%1$s</strong> is due on <strong>%2$s</strong> (in %3$d day).',
+                        'Your monthly subscription of <strong>%1$s</strong> is due on <strong>%2$s</strong> (in %3$d days).',
+                        (int) ($vars['days_until'] ?? 1),
+                        'matrix-mlm'
+                    ),
+                    esc_html($vars['amount'] ?? ''),
+                    esc_html($vars['billing_label'] ?? ''),
+                    (int) ($vars['days_until'] ?? 1)
+                ) . '</p>';
+                $content .= '<p>' . sprintf(
+                    /* translators: 1: current balance, 2: shortfall amount */
+                    __('Your Matrix wallet currently holds <strong>%1$s</strong>, which is <strong>%2$s</strong> short of the amount needed. Top up your wallet before the billing date so the subscription debits cleanly and your account stays active.', 'matrix-mlm'),
+                    esc_html($vars['balance'] ?? ''),
+                    esc_html($vars['shortfall'] ?? '')
+                ) . '</p>';
+                if (!empty($vars['deposit_url'])) {
+                    $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['deposit_url']) . '" style="background: #ea580c; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('Top Up Wallet', 'matrix-mlm') . '</a></p>';
+                }
+                $content .= '<p style="font-size: 12px; color: #6b7280; margin-top: 20px;">' . __('You can also wait for downline commissions to land in your wallet — the system will automatically charge from those funds when the billing date arrives. This reminder is a courtesy nudge in case the balance is still short on the day.', 'matrix-mlm') . '</p>';
                 break;
             case 'subscription-deactivation':
                 // Inline fallback for installs without a dedicated
