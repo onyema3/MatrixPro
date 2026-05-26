@@ -188,11 +188,8 @@ class Matrix_MLM_Admin_Messaging {
                 // present.
                 $report_id    = (int) ($_POST['report_id'] ?? 0);
                 $message_id   = (int) ($_POST['message_id'] ?? 0);
-                $resolution   = sanitize_key($_POST['resolution'] ?? 'no_action');
+                $resolution   = self::sanitize_resolution($_POST['resolution'] ?? 'no_action');
                 $ban_duration = sanitize_key($_POST['ban_duration'] ?? 'permanent');
-                if (!in_array($resolution, ['no_action', 'message_deleted', 'user_banned'], true)) {
-                    $resolution = 'no_action';
-                }
                 if ($report_id <= 0 && $message_id <= 0) {
                     break;
                 }
@@ -209,70 +206,67 @@ class Matrix_MLM_Admin_Messaging {
                     break;
                 }
 
-                $msg = $wpdb->get_row($wpdb->prepare(
-                    "SELECT id, sender_id, deleted_at FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
-                    $message_id
-                ));
-
-                // Side effects: delete + ban. Apply only if the
-                // underlying message still exists. If the message
-                // row is gone (hard-deleted by cron cleanup) we
-                // still mark the report rows resolved below so the
-                // queue can clear — keeping a stale report in the
-                // open queue forever because its target message
-                // expired is worse than losing the audit shape.
-                if ($msg && in_array($resolution, ['message_deleted', 'user_banned'], true) && empty($msg->deleted_at)) {
-                    $wpdb->update(
-                        $wpdb->prefix . 'matrix_messages',
-                        ['deleted_at' => current_time('mysql', true), 'deleted_by' => get_current_user_id()],
-                        ['id' => (int) $msg->id]
-                    );
-                }
-                if ($msg && $resolution === 'user_banned' && (int) $msg->sender_id > 0) {
-                    $until_value = self::ban_duration_to_until($ban_duration);
-                    $reason = sprintf(
-                        /* translators: %d: message id */
-                        __('Admin moderation action on message #%d', 'matrix-mlm'),
-                        (int) $msg->id
-                    );
-                    Matrix_MLM_Messaging::ban_user(
-                        (int) $msg->sender_id,
-                        $until_value,
-                        $reason,
-                        [
-                            'source'     => 'report_resolution',
-                            'message_id' => (int) $msg->id,
-                            'report_id'  => $report_id ?: null,
-                        ]
-                    );
-                }
-
-                // Mark the actual report row(s) resolved. If
-                // report_id was supplied we resolve only that one;
-                // otherwise we close every open report for the
-                // message. Always-resolve-all matches the grouped
-                // view's mental model — clicking "Resolve" on a row
-                // that says "12 reports" had better clear all 12.
-                $now = current_time('mysql', true);
-                $by  = (int) get_current_user_id();
-                if ($report_id > 0) {
-                    $wpdb->update(
-                        $wpdb->prefix . 'matrix_message_reports',
-                        ['resolved_at' => $now, 'resolved_by' => $by, 'resolution' => $resolution],
-                        ['id' => $report_id]
-                    );
-                } else {
-                    $wpdb->query($wpdb->prepare(
-                        "UPDATE {$wpdb->prefix}matrix_message_reports
-                            SET resolved_at = %s, resolved_by = %d, resolution = %s
-                          WHERE message_id = %d AND resolved_at IS NULL",
-                        $now,
-                        $by,
-                        $resolution,
-                        $message_id
-                    ));
-                }
+                self::apply_resolution_to_message($message_id, $resolution, $ban_duration, $report_id ?: null);
                 add_settings_error('matrix_messaging', 'resolved', __('Report resolved.', 'matrix-mlm'), 'updated');
+                break;
+
+            case 'bulk_resolve_reports':
+                // Bulk action from the open-reports table. The
+                // open queue is grouped by message_id (see the
+                // GROUP BY in render_reports), so bulk selection
+                // is naturally over message_ids — one checkbox
+                // per visible row, one row per message no matter
+                // how many distinct reporters flagged it. We
+                // loop the same per-message helper that single
+                // resolve uses so the audit shape (delete +
+                // optional ban + matrix_messaging_user_banned
+                // hook) is identical.
+                //
+                // Hard cap at the page size (25). The form only
+                // ever surfaces 25 checkboxes per page anyway, so
+                // a request claiming to resolve 500 in one POST
+                // is either a malformed retry or a curl probe —
+                // either way clamping is safer than honoring it.
+                $resolution   = self::sanitize_resolution($_POST['bulk_resolution'] ?? 'no_action');
+                $ban_duration = sanitize_key($_POST['bulk_ban_duration'] ?? 'permanent');
+                $raw_ids      = isset($_POST['report_message_ids']) && is_array($_POST['report_message_ids'])
+                    ? (array) $_POST['report_message_ids']
+                    : [];
+                $message_ids  = [];
+                foreach ($raw_ids as $rid) {
+                    $rid = (int) $rid;
+                    if ($rid > 0) {
+                        $message_ids[$rid] = $rid; // dedupe
+                    }
+                }
+                $message_ids = array_values($message_ids);
+                if (count($message_ids) > 25) {
+                    $message_ids = array_slice($message_ids, 0, 25);
+                }
+                if (empty($message_ids)) {
+                    add_settings_error(
+                        'matrix_messaging',
+                        'bulk_none',
+                        __('Select at least one report to resolve.', 'matrix-mlm')
+                    );
+                    break;
+                }
+
+                $count = 0;
+                foreach ($message_ids as $mid) {
+                    self::apply_resolution_to_message($mid, $resolution, $ban_duration, null);
+                    $count++;
+                }
+                add_settings_error(
+                    'matrix_messaging',
+                    'bulk_resolved',
+                    sprintf(
+                        /* translators: %d: number of grouped report rows resolved in one bulk action. */
+                        _n('%d report resolved.', '%d reports resolved.', $count, 'matrix-mlm'),
+                        (int) $count
+                    ),
+                    'updated'
+                );
                 break;
 
             case 'lift_ban':
@@ -408,6 +402,119 @@ class Matrix_MLM_Admin_Messaging {
                 do_action('matrix_messaging_settings_saved', Matrix_MLM_Messaging::default_settings(), $old);
                 add_settings_error('matrix_messaging', 'reset', __('Settings reset to defaults.', 'matrix-mlm'), 'updated');
                 break;
+        }
+    }
+
+    /**
+     * Whitelist a resolution value posted from any of the resolve
+     * forms (single or bulk). Anything not on the whitelist falls
+     * back to no_action — the safest default because it has no
+     * side effects on the message or the sender.
+     *
+     * Centralised so single-resolve and bulk-resolve cannot
+     * silently drift apart on what counts as a valid resolution
+     * (a future fourth value, e.g. "shadow_ban", only needs to
+     * land here once and both code paths pick it up).
+     */
+    private static function sanitize_resolution($raw) {
+        $val = sanitize_key((string) $raw);
+        return in_array($val, ['no_action', 'message_deleted', 'user_banned'], true)
+            ? $val
+            : 'no_action';
+    }
+
+    /**
+     * Apply a single message-scoped resolution. Replicates the
+     * exact behaviour the per-row "Resolve" button has always
+     * had:
+     *   - If the message still exists and resolution implies
+     *     deletion, soft-delete it (deleted_at + deleted_by).
+     *   - If resolution is user_banned and the sender is
+     *     known, route through Matrix_MLM_Messaging::ban_user
+     *     so the matrix_messaging_user_banned hook fires and
+     *     audit subscribers see one ban event per resolved
+     *     message — bulk-resolving five messages from one user
+     *     is FIVE bans worth of audit signal, which matches
+     *     reality (each message was a separate moderator
+     *     decision, even if they were grouped on screen).
+     *   - Mark every open report for that message resolved.
+     *     If $report_id is supplied (single-row legacy path),
+     *     resolve ONLY that report row and leave any siblings
+     *     open for separate review. Otherwise close them all,
+     *     matching the grouped view's mental model where one
+     *     "Resolve" click on a row that says "12 reports" had
+     *     better clear all 12.
+     *
+     * Side-effect free if the message has already been hard-
+     * deleted by the cleanup cron — the report rows are still
+     * marked resolved so the queue can drain rather than
+     * accumulating zombie entries forever.
+     *
+     * @param int      $message_id   Target message id.
+     * @param string   $resolution   Pre-sanitised resolution slug.
+     * @param string   $ban_duration Duration slug; consulted only
+     *                                when $resolution is user_banned.
+     * @param int|null $report_id    Optional single-report scope.
+     *                                When set, only that report row
+     *                                is resolved; otherwise every
+     *                                open report for the message is.
+     */
+    private static function apply_resolution_to_message($message_id, $resolution, $ban_duration, $report_id = null) {
+        global $wpdb;
+        $message_id = (int) $message_id;
+        if ($message_id <= 0) {
+            return;
+        }
+
+        $msg = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, sender_id, deleted_at FROM {$wpdb->prefix}matrix_messages WHERE id = %d",
+            $message_id
+        ));
+
+        if ($msg && in_array($resolution, ['message_deleted', 'user_banned'], true) && empty($msg->deleted_at)) {
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_messages',
+                ['deleted_at' => current_time('mysql', true), 'deleted_by' => get_current_user_id()],
+                ['id' => (int) $msg->id]
+            );
+        }
+        if ($msg && $resolution === 'user_banned' && (int) $msg->sender_id > 0) {
+            $until_value = self::ban_duration_to_until($ban_duration);
+            $reason = sprintf(
+                /* translators: %d: message id */
+                __('Admin moderation action on message #%d', 'matrix-mlm'),
+                (int) $msg->id
+            );
+            Matrix_MLM_Messaging::ban_user(
+                (int) $msg->sender_id,
+                $until_value,
+                $reason,
+                [
+                    'source'     => 'report_resolution',
+                    'message_id' => (int) $msg->id,
+                    'report_id'  => $report_id ?: null,
+                ]
+            );
+        }
+
+        $now = current_time('mysql', true);
+        $by  = (int) get_current_user_id();
+        if ($report_id !== null && (int) $report_id > 0) {
+            $wpdb->update(
+                $wpdb->prefix . 'matrix_message_reports',
+                ['resolved_at' => $now, 'resolved_by' => $by, 'resolution' => $resolution],
+                ['id' => (int) $report_id]
+            );
+        } else {
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->prefix}matrix_message_reports
+                    SET resolved_at = %s, resolved_by = %d, resolution = %s
+                  WHERE message_id = %d AND resolved_at IS NULL",
+                $now,
+                $by,
+                $resolution,
+                $message_id
+            ));
         }
     }
 
@@ -572,8 +679,66 @@ class Matrix_MLM_Admin_Messaging {
         </p>
 
         <?php if ($status === 'open'): ?>
-            <table class="wp-list-table widefat fixed striped" style="margin-top:14px;">
+            <?php
+            // Bulk-resolve plumbing.
+            //
+            // The toolbar lives in its own <form id="matrix-bulk-resolve-form">
+            // ABOVE the table; per-row checkboxes use the HTML5
+            // form="matrix-bulk-resolve-form" attribute to associate
+            // with it without nesting a form inside the table (which
+            // would collide with the existing per-row "Resolve"
+            // forms). Same nonce action as single-resolve so the
+            // CSRF model is unchanged; bulk-specific field names
+            // (bulk_resolution / bulk_ban_duration) avoid colliding
+            // with the per-row form inputs that share the table.
+            //
+            // Pagination + filter state is round-tripped through
+            // hidden inputs so a bulk action submitted from page 3
+            // of "reason=spam" returns the operator to page 3 of
+            // "reason=spam" rather than dumping them at page 1 of
+            // an unfiltered queue.
+            ?>
+            <form id="matrix-bulk-resolve-form" method="post" class="matrix-messaging-bulk-toolbar"
+                  style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:14px;padding:10px;background:#f6f7f7;border:1px solid #dcdcde;border-bottom:0;">
+                <?php wp_nonce_field('matrix_messaging_admin', '_matrix_messaging_admin_nonce'); ?>
+                <input type="hidden" name="matrix_messaging_admin_action" value="bulk_resolve_reports">
+                <input type="hidden" name="status" value="<?php echo esc_attr($status); ?>">
+                <?php if ($reason_f !== ''): ?>
+                    <input type="hidden" name="reason" value="<?php echo esc_attr($reason_f); ?>">
+                <?php endif; ?>
+                <?php if ($sender_f !== ''): ?>
+                    <input type="hidden" name="sender" value="<?php echo esc_attr($sender_f); ?>">
+                <?php endif; ?>
+                <input type="hidden" name="paged" value="<?php echo (int) $paged; ?>">
+
+                <strong style="margin-right:4px;"><?php esc_html_e('Bulk action:', 'matrix-mlm'); ?></strong>
+                <fieldset style="margin:0;padding:0;border:0;">
+                    <label style="margin-right:8px;"><input type="radio" name="bulk_resolution" value="no_action" checked> <?php esc_html_e('Dismiss', 'matrix-mlm'); ?></label>
+                    <label style="margin-right:8px;"><input type="radio" name="bulk_resolution" value="message_deleted"> <?php esc_html_e('Delete', 'matrix-mlm'); ?></label>
+                    <label><input type="radio" name="bulk_resolution" value="user_banned"> <?php esc_html_e('Delete + Ban', 'matrix-mlm'); ?></label>
+                </fieldset>
+                <select name="bulk_ban_duration" title="<?php esc_attr_e('Applied only when "Delete + Ban" is selected', 'matrix-mlm'); ?>">
+                    <?php foreach (self::allowed_ban_durations() as $slug => $label): ?>
+                        <option value="<?php echo esc_attr($slug); ?>" <?php selected($slug === 'permanent'); ?>><?php echo esc_html($label); ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <button type="submit" class="button button-primary"
+                        onclick="return confirm(<?php echo wp_json_encode(__('Apply this bulk action to all selected reports? Selecting Delete + Ban will issue one ban per resolved message.', 'matrix-mlm')); ?>);">
+                    <?php esc_html_e('Apply to selected', 'matrix-mlm'); ?>
+                </button>
+                <span class="description" style="flex-basis:100%;margin:0;color:#646970;font-size:12px;">
+                    <?php esc_html_e('Tick the rows below to apply this action to multiple reports at once. Each resolved message produces one ban event when "Delete + Ban" is chosen.', 'matrix-mlm'); ?>
+                </span>
+            </form>
+
+            <table class="wp-list-table widefat fixed striped" style="margin-top:0;">
                 <thead><tr>
+                    <td class="manage-column column-cb check-column" style="width:2.2em;">
+                        <label class="screen-reader-text" for="matrix-bulk-select-all-top"><?php esc_html_e('Select All', 'matrix-mlm'); ?></label>
+                        <input id="matrix-bulk-select-all-top" type="checkbox"
+                               form="matrix-bulk-resolve-form"
+                               onclick="(function(src){var b=document.querySelectorAll('.matrix-bulk-select');for(var i=0;i&lt;b.length;i++){b[i].checked=src.checked;}var o=document.getElementById('matrix-bulk-select-all-bottom');if(o){o.checked=src.checked;}})(this);">
+                    </td>
                     <th style="width:90px;"><?php esc_html_e('Reports', 'matrix-mlm'); ?></th>
                     <th><?php esc_html_e('Sender', 'matrix-mlm'); ?></th>
                     <th><?php esc_html_e('Reasons', 'matrix-mlm'); ?></th>
@@ -583,12 +748,26 @@ class Matrix_MLM_Admin_Messaging {
                 </tr></thead>
                 <tbody>
                     <?php if (empty($rows)): ?>
-                        <tr><td colspan="6"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
+                        <tr><td colspan="7"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
                     <?php else: foreach ($rows as $r):
                         $sender_id = (int) $r->sender_id;
                         $sender_ban = $sender_id > 0 ? Matrix_MLM_Messaging::is_user_banned($sender_id) : false;
                         ?>
                         <tr>
+                            <th scope="row" class="check-column" style="width:2.2em;padding-top:14px;">
+                                <label class="screen-reader-text" for="matrix-bulk-cb-<?php echo (int) $r->message_id; ?>">
+                                    <?php
+                                    /* translators: %d: message id of a flagged message in the moderation queue. */
+                                    printf(esc_html__('Select report for message #%d', 'matrix-mlm'), (int) $r->message_id);
+                                    ?>
+                                </label>
+                                <input id="matrix-bulk-cb-<?php echo (int) $r->message_id; ?>"
+                                       class="matrix-bulk-select"
+                                       form="matrix-bulk-resolve-form"
+                                       type="checkbox"
+                                       name="report_message_ids[]"
+                                       value="<?php echo (int) $r->message_id; ?>">
+                            </th>
                             <td><span class="matrix-badge matrix-badge-warn" title="<?php esc_attr_e('Distinct reporters for this message', 'matrix-mlm'); ?>"><?php echo (int) $r->report_count; ?>&times;</span></td>
                             <td>
                                 <?php echo esc_html($r->sender_login ?: '#' . $sender_id); ?>
