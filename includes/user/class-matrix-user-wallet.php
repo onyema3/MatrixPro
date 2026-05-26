@@ -215,9 +215,24 @@ class Matrix_MLM_User_Wallet {
                 $wallet->customer_id ?? null
             );
             if (is_wp_error($result)) {
+                // Two-track error surfacing — see the matching block in
+                // class-matrix-user-virtual-wallet.php for the full
+                // rationale. Member sees the clean copy from
+                // Matrix_MLM_Fintava::user_facing_error_message();
+                // operator gets the verbose chained diagnostic in
+                // error_log for triage.
+                error_log(sprintf(
+                    '[Matrix Fintava] consolidated wallet balance fetch failed for user_id=%d wallet_id=%s: %s',
+                    (int) $user_id,
+                    (string) $wallet->wallet_id,
+                    Matrix_MLM_Fintava::normalize_api_message(
+                        $result->get_error_message(),
+                        '(empty)'
+                    )
+                ));
                 $balance_error  = Matrix_MLM_Fintava::normalize_api_message(
-                    $result->get_error_message(),
-                    __('Balance is unavailable.', 'matrix-mlm')
+                    Matrix_MLM_Fintava::user_facing_error_message($result),
+                    __('Wallet balance is temporarily unavailable. Please refresh in a moment.', 'matrix-mlm')
                 );
                 $balance_reason = 'api_error';
             } else {

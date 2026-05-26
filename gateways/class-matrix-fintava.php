@@ -4993,14 +4993,42 @@ class Matrix_MLM_Fintava {
 
                 $path_style_error = $attempt;
                 $msg              = strtolower(is_array($attempt->get_error_message()) ? implode(' ', $attempt->get_error_message()) : (string) $attempt->get_error_message());
-                // Only keep trying alternates on "not found" / "cannot get"
-                // style 404s. For real failures (auth, rate-limit, network,
-                // or Fintava's own JSON-formatted "wallet not found") bail
-                // out immediately so callers see the actual cause.
-                if (strpos($msg, 'cannot get') === false
-                    && strpos($msg, 'not found') === false
-                    && strpos($msg, 'http 404') === false
-                    && strpos($msg, '(http 404)') === false) {
+                // Only keep trying alternates on errors that signal "this
+                // endpoint cannot resolve this wallet UUID — try a
+                // different lookup path." For real failures (auth,
+                // rate-limit, network) we still bail out immediately so
+                // the surfaced error names the actual cause.
+                //
+                // Recoverable categories:
+                //
+                //   - HTTP 404 / "not found" / "cannot get" — endpoint
+                //     simply doesn't exist on this Fintava merchant tier.
+                //
+                //   - HTTP 400 + a generic upstream body ("Http Exception",
+                //     "Bad Request", "Cannot convert undefined or null to
+                //     object", validator rejections of the wallet id
+                //     shape) — Fintava's server-side null-deref against
+                //     this particular wallet UUID. Mirrors the same
+                //     recovery list the fast-path balance probe already
+                //     uses in get_virtual_wallet_balance() — see the
+                //     comment block there for the symptom that drove
+                //     this. Without this branch a single 400 from the
+                //     first prefix bails out of the whole probe, the
+                //     fallback chain (/wallet/details?accountNumber=… →
+                //     /customers/{id}) never runs even though it can
+                //     answer the question, and the user sees the chained
+                //     400 in their Fintava balance card.
+                $is_endpoint_unusable =
+                       strpos($msg, 'cannot get') !== false
+                    || strpos($msg, 'not found') !== false
+                    || strpos($msg, 'http 404') !== false
+                    || strpos($msg, '(http 404)') !== false
+                    || strpos($msg, 'http 400') !== false
+                    || strpos($msg, '(http 400)') !== false
+                    || strpos($msg, 'http exception') !== false
+                    || strpos($msg, 'bad request') !== false
+                    || strpos($msg, 'cannot convert undefined') !== false;
+                if (!$is_endpoint_unusable) {
                     return $attempt;
                 }
             }
@@ -5288,7 +5316,22 @@ class Matrix_MLM_Fintava {
                 /* translators: %s: bullet-list of which fallbacks were tried and how each one failed */
                 __('Could not retrieve wallet details from Fintava. %s', 'matrix-mlm'),
                 implode(' | ', $parts)
-            )
+            ),
+            [
+                // Clean member-facing copy. The verbose chained
+                // diagnostic is intentionally kept on the message slot
+                // because it lands in matrix_fintava_payouts.failure_reason,
+                // error_log diagnostics, and admin-facing payout retry
+                // screens — losing the bullet list there would erase the
+                // operator's ability to triage which Fintava endpoints
+                // are alive on their tier. End users meanwhile only
+                // need to know "we couldn't fetch this right now"; show
+                // them the bullet list and they hit support with no
+                // useful action they can take. user_facing_error_message()
+                // pulls this clean copy on the wallet card / dropdown
+                // surfaces.
+                'user_message' => __('Wallet balance is temporarily unavailable. Please refresh in a moment.', 'matrix-mlm'),
+            ]
         );
     }
 
@@ -5394,7 +5437,18 @@ class Matrix_MLM_Fintava {
                         __('%1$s | /customer/wallet/balance/{walletId} failed (%2$s)', 'matrix-mlm'),
                         $details->get_error_message(),
                         $balance_endpoint_error->get_error_message()
-                    )
+                    ),
+                    [
+                        // Mirror build_wallet_lookup_error()'s rationale:
+                        // the verbose chained string stays on the message
+                        // slot for failure_reason columns and error_log
+                        // triage; user-facing surfaces pluck this clean
+                        // copy via Matrix_MLM_Fintava::user_facing_error_message().
+                        // Without this dict the wallet card renders the
+                        // chained 400 verbatim — the exact noise that
+                        // drove this fix.
+                        'user_message' => __('Wallet balance is temporarily unavailable. Please refresh in a moment.', 'matrix-mlm'),
+                    ]
                 );
             }
             return $details;
@@ -5404,7 +5458,10 @@ class Matrix_MLM_Fintava {
         if ($normalized === null) {
             return new WP_Error(
                 'fintava_balance_unavailable',
-                __('Fintava did not return a balance for this wallet.', 'matrix-mlm')
+                __('Fintava did not return a balance for this wallet.', 'matrix-mlm'),
+                [
+                    'user_message' => __('Wallet balance is temporarily unavailable. Please refresh in a moment.', 'matrix-mlm'),
+                ]
             );
         }
         return $normalized;
