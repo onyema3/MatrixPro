@@ -242,6 +242,21 @@ class Matrix_MLM_Core {
         // their own state machines and we want those settled before
         // we fan out.
         add_action('init', [$this, 'maybe_purge_caches_after_upgrade'], 99);
+
+        // Self-heal the /matrix/ registration page on installs that
+        // upgraded past PR #339 (the matrix-register → matrix slug
+        // rename) without reactivating the plugin. See
+        // maybe_self_heal_register_page() for the full rationale —
+        // short version: the in-place slug rename only runs on
+        // Matrix_MLM_Activator::activate(), and operators who
+        // deploy by `git pull` or via the GitHub auto-update
+        // checker (PR #326) never trigger that hook, so /matrix/
+        // never lands on disk and every internal "Register" link
+        // in the plugin (login footer, plans page, referral links
+        // from get_referral_link()) 404s. Same `init` priority 99
+        // as the cache purge above so the textdomain bootstrap
+        // has already run.
+        add_action('init', [$this, 'maybe_self_heal_register_page'], 99);
     }
 
     public function enqueue_public_assets() {
@@ -603,6 +618,151 @@ class Matrix_MLM_Core {
         if (function_exists('wp_cache_clear_cache')) {
             wp_cache_clear_cache();                   // WP Super Cache
         }
+    }
+
+    /**
+     * Self-heal the registration page slug on installs that upgraded
+     * past PR #339 without reactivating the plugin.
+     *
+     * Why this is needed
+     * ------------------
+     *
+     * PR #339 renamed the public registration slug from
+     * /matrix-register/ to /matrix/. Three things changed in concert:
+     *
+     *   1. Matrix_MLM_Activator::create_pages() now seeds the page at
+     *      slug `matrix` instead of `matrix-register`.
+     *   2. Matrix_MLM_Activator::migrate_register_page_slug() does an
+     *      in-place wp_update_post() rename of any existing
+     *      `matrix-register` page so the same post ID survives.
+     *   3. Matrix_MLM_Core::redirect_legacy_register_url() 301s the
+     *      legacy URL to the new one.
+     *
+     * Both seed and migration live on the activator, which fires
+     * exclusively from the WP `register_activation_hook`. That hook
+     * runs ONLY when an admin clicks Activate on the Plugins screen.
+     * Operators who deploy by `git pull` (or via the GitHub auto-
+     * update checker introduced in PR #326) never trigger it, so the
+     * `/matrix/` page never lands on disk for them.
+     *
+     * The downstream symptom on those installs:
+     *
+     *   - The legacy `/matrix-register/` page still exists in
+     *     wp_posts (untouched by the upgrade), so direct visits to
+     *     that URL render the registration form fine.
+     *
+     *   - But every internal link the plugin emits now points at
+     *     `/matrix/` — see Matrix_MLM_User::get_referral_link(),
+     *     templates/login.php (footer), templates/plans.php
+     *     (Register & Join CTA), Matrix_MLM_Admin_Frontend's Page
+     *     Setup tool. Those all 404 because no page lives at
+     *     `/matrix/` on disk.
+     *
+     *   - And the legacy-URL redirect at line ~4055 sends
+     *     `/matrix-register/?ref=X` to `/matrix/?ref=X`, which then
+     *     also 404s. Members following old shared referral links
+     *     hit a dead page and the referrer never gets credited.
+     *
+     * "Registration page is not loading" reports from operators
+     * who deployed PR #339 without the documented Deactivate→Activate
+     * step trace back to exactly this gap.
+     *
+     * What this method does
+     * ---------------------
+     *
+     * Three branches, picked first-match-wins:
+     *
+     *   1. `/matrix/` already exists → no-op. Stamp the version and
+     *      return. Covers fresh installs where create_pages() ran
+     *      under the new code, AND pre-existing installs where the
+     *      operator did remember to reactivate.
+     *
+     *   2. `/matrix-register/` exists, `/matrix/` does NOT → in-place
+     *      rename via wp_update_post(post_name='matrix'). Same
+     *      semantics as Matrix_MLM_Activator::migrate_register_page_slug
+     *      — the post ID survives so saved nav menus, embedded
+     *      shortcodes, page-builder widgets, redirect-plugin rules
+     *      keyed on post_id all keep pointing at the right page,
+     *      and any operator customisations to the page (hero image,
+     *      intro copy, embedded video) are preserved.
+     *
+     *   3. Neither exists → wp_insert_post a fresh `/matrix/` page
+     *      with the canonical `[matrix_register]` shortcode. Covers
+     *      the rare case where an operator deleted both pages by
+     *      hand and now needs to re-bootstrap the registration
+     *      surface.
+     *
+     * Stamp pattern
+     * -------------
+     *
+     * Mirrors maybe_purge_caches_after_upgrade exactly: write the
+     * stamp BEFORE doing any work, so a fatal in wp_update_post or
+     * wp_insert_post (e.g. a misbehaving filter on `wp_insert_post_data`
+     * from another plugin) doesn't cause the heal to retry on every
+     * subsequent request and re-trigger the same fault. The
+     * autoload=false flag keeps the option out of the alloptions
+     * cache.
+     *
+     * The stamp is keyed by MATRIX_MLM_VERSION rather than a
+     * boolean, so each forward version movement re-runs the heal
+     * exactly once. That gives us a recovery path if a future
+     * release ships a bug that wipes the page — operators need
+     * only bump the constant to trigger another heal pass.
+     *
+     * Hook timing
+     * -----------
+     *
+     * Bound to `init` priority 99 (see define_hooks). Same priority
+     * the cache-purge fan-out uses, for the same reason: WordPress
+     * 6.7 raises a `_doing_it_wrong` notice when any textdomain
+     * loads before `init`, and wp_update_post / wp_insert_post can
+     * trigger plugin filters that translate strings via __(). Init
+     * priority 1 has bootstrapped textdomains by the time we run,
+     * so no notice fires and no headers-already-sent cascade can
+     * spill into wp-admin/admin-header.php redirects on the first
+     * post-upgrade page load.
+     */
+    public function maybe_self_heal_register_page() {
+        $last_run = (string) get_option('matrix_mlm_register_page_self_heal_version', '0.0.0');
+        if (!version_compare($last_run, MATRIX_MLM_VERSION, '<')) {
+            return;
+        }
+
+        // Stamp BEFORE doing the work. See the docblock for why —
+        // a misbehaving wp_insert_post filter that fatals must not
+        // cause the heal to retry on every page load forever.
+        update_option('matrix_mlm_register_page_self_heal_version', MATRIX_MLM_VERSION, false);
+
+        // Branch 1: the canonical page already exists. The most
+        // common case on every install that ran activate() under
+        // the new code OR was self-healed on an earlier release.
+        $new = get_page_by_path('matrix', OBJECT, 'page');
+        if ($new) {
+            return;
+        }
+
+        // Branch 2: legacy slug exists, new slug does not. In-place
+        // rename so post ID, content, and operator customisations
+        // all survive. Mirrors Matrix_MLM_Activator::migrate_register_page_slug.
+        $legacy = get_page_by_path('matrix-register', OBJECT, 'page');
+        if ($legacy) {
+            wp_update_post([
+                'ID'        => $legacy->ID,
+                'post_name' => 'matrix',
+            ]);
+            return;
+        }
+
+        // Branch 3: neither page exists. Create a fresh /matrix/
+        // page with the registration shortcode. Mirrors the
+        // 'matrix' entry in Matrix_MLM_Activator::create_pages().
+        wp_insert_post([
+            'post_title'   => 'Register',
+            'post_content' => '[matrix_register]',
+            'post_status'  => 'publish',
+            'post_type'    => 'page',
+            'post_name'    => 'matrix',
+        ]);
     }
 
     /**
