@@ -582,11 +582,35 @@ class Matrix_MLM_Messaging {
 
     public static function mark_thread_read($thread_id, $user_id) {
         global $wpdb;
+        $thread_id = (int) $thread_id;
+        $user_id   = (int) $user_id;
         $wpdb->update(
             $wpdb->prefix . 'matrix_message_participants',
             ['last_read_at' => current_time('mysql', true)],
-            ['thread_id' => (int) $thread_id, 'user_id' => (int) $user_id]
+            ['thread_id' => $thread_id, 'user_id' => $user_id]
         );
+
+        // Also clear the bell-icon entries the messaging dispatch
+        // enqueued for this thread so the badge reflects the user's
+        // actual unread state. Without this, a recipient who opens
+        // a thread and reads it still sees the "new message" bell
+        // badge until they manually clear it — which created the
+        // exact "messages don't disappear from the bell" complaint
+        // the dispatch fanout was trying to solve in the first
+        // place. mark_thread_messages_read filters by
+        // type='message_received' so unrelated bell rows for this
+        // user (commissions, deposits, etc.) are unaffected.
+        //
+        // class_exists / method_exists guarded so older deployments
+        // that don't have the in-app notifications module loaded —
+        // or future minor versions that drop the helper — fall
+        // through cleanly. mark_thread_read is on the read path;
+        // a soft-fail here is the right call, the participant
+        // pointer update has already committed.
+        if (class_exists('Matrix_MLM_In_App_Notifications')
+            && method_exists('Matrix_MLM_In_App_Notifications', 'mark_thread_messages_read')) {
+            Matrix_MLM_In_App_Notifications::mark_thread_messages_read($user_id, $thread_id);
+        }
     }
 
     // ---------------------------------------------------------------

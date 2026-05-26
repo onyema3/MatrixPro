@@ -319,6 +319,79 @@ class Matrix_MLM_In_App_Notifications {
         ));
     }
 
+    /**
+     * Mark every unread "message_received" bell row tied to a given
+     * thread as read for $user_id.
+     *
+     * Called from Matrix_MLM_Messaging::mark_thread_read() so that
+     * opening a conversation also clears the bell badge entries the
+     * messaging fanout enqueued for that thread. Without this hook,
+     * a user who opens the messages tab and reads a thread still
+     * sees the bell badge from those notifications until they hit
+     * "Mark all as read" or click each row individually — which is
+     * the same UX gap the bell originally fixed for commissions /
+     * deposits / withdrawals (those don't auto-clear either, but
+     * the user generally takes a single read pass on the
+     * Notifications tab; messaging is different because the
+     * "natural" read action is opening the thread itself).
+     *
+     * Filtering shape: (user_id, type, read_at IS NULL) is cheap
+     * even without a dedicated index because in-app notifications
+     * already index on user_id + read_at for the badge query
+     * (matrix_notifications.user_id, read_at). The meta LIKE filter
+     * is the per-thread narrow.
+     *
+     * Meta lookup: the messaging dispatch serialises the meta JSON
+     * with thread_id as the FIRST key, followed by message_id /
+     * sender_id / thread_type — so the value is always followed by
+     * a comma. We anchor on `"thread_id":<id>,` to prevent prefix
+     * matching (thread_id 1234 must not match thread_id 12345). A
+     * second pattern with a closing brace covers the defensive
+     * case where a future serialiser change pushes thread_id to
+     * the last position; cheaper than a regex and survives one
+     * round of unrelated edits to dispatch_post_send_notifications.
+     *
+     * No-op pre-PR-#354 (and pre-rollout): rows with
+     * type='message_received' don't exist on this install yet, so
+     * the UPDATE finds zero rows and returns 0. Once the messaging
+     * push fanout starts enqueuing them, this method becomes the
+     * companion that clears them on read.
+     *
+     * @param int $user_id   Owner of the bell rows.
+     * @param int $thread_id Messaging thread.
+     * @return int Rows updated (always 0 if the user has no
+     *             matching bell rows; never bubbles a DB error).
+     */
+    public static function mark_thread_messages_read($user_id, $thread_id) {
+        global $wpdb;
+        $user_id   = (int) $user_id;
+        $thread_id = (int) $thread_id;
+        if ($user_id <= 0 || $thread_id <= 0) {
+            return 0;
+        }
+        $table = $wpdb->prefix . 'matrix_notifications';
+
+        // esc_like is a defensive no-op here (thread_id is a coerced
+        // int, the surrounding chars are JSON-fixed) but keeping it
+        // means the function survives a future caller passing a
+        // string-typed id by mistake.
+        $needle_comma = '%' . $wpdb->esc_like('"thread_id":' . $thread_id . ',') . '%';
+        $needle_close = '%' . $wpdb->esc_like('"thread_id":' . $thread_id . '}') . '%';
+
+        return (int) $wpdb->query($wpdb->prepare(
+            "UPDATE {$table}
+                SET read_at = %s
+              WHERE user_id = %d
+                AND type = 'message_received'
+                AND read_at IS NULL
+                AND (meta LIKE %s OR meta LIKE %s)",
+            current_time('mysql'),
+            $user_id,
+            $needle_comma,
+            $needle_close
+        ));
+    }
+
     /* ------------------------------------------------------------------
      * AJAX endpoints
      * ----------------------------------------------------------------*/
