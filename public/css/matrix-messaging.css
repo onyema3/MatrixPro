@@ -884,3 +884,48 @@
     0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
     40%           { transform: scale(1);   opacity: 1;   }
 }
+
+
+/* -----------------------------------------------------------------
+ * Group rooms (DB 1.0.24)
+ *
+ * Two surfaces here:
+ *   1. The "New Room" button in the sidebar header — sized to sit
+ *      next to "New Message" without crowding the search box on
+ *      narrow viewports.
+ *   2. Owner-only Invite / per-row Remove affordances on the
+ *      members panel. The Invite button shares the panel header
+ *      with the existing Leave button via flex-wrap; the per-row
+ *      X is positioned at the right of the row so it lines up
+ *      with the role tags it follows.
+ * ----------------------------------------------------------------- */
+
+.matrix-messaging__sidebar-header #matrix-messaging-new-room {
+    margin-left: 6px;
+}
+.matrix-messaging__members-panel-header {
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.matrix-messaging__members-panel-header strong {
+    flex: 1 1 auto;
+    min-width: 80px;
+}
+.matrix-messaging__invite-btn,
+.matrix-messaging__leave-btn {
+    flex: 0 0 auto;
+}
+.matrix-messaging__members-row {
+    position: relative;
+}
+.matrix-messaging__members-remove {
+    margin-left: 6px;
+    padding: 0 6px;
+    line-height: 18px;
+    min-height: 0;
+    color: #d63638;
+}
+.matrix-messaging__members-remove:hover {
+    color: #fff;
+    background: #d63638;
+}

@@ -151,6 +151,24 @@ class Matrix_MLM_User_Messaging {
                 'typing_three'        => __('%1$s, %2$s, and %3$s are typing…', 'matrix-mlm'),
                 /* translators: %s: number of users typing (4 or more). */
                 'typing_many'         => __('%s people are typing…', 'matrix-mlm'),
+                // Group room creation + management (DB 1.0.24).
+                'new_room'            => __('New Room', 'matrix-mlm'),
+                'new_room_title'      => __('Create a group room', 'matrix-mlm'),
+                'new_room_label'      => __('Room name', 'matrix-mlm'),
+                'new_room_members'    => __('Members (usernames or referral codes, separated by commas or spaces)', 'matrix-mlm'),
+                'new_room_create'     => __('Create', 'matrix-mlm'),
+                'new_room_cancel'     => __('Cancel', 'matrix-mlm'),
+                'new_room_no_title'   => __('Please give the room a name.', 'matrix-mlm'),
+                'new_room_no_members' => __('Add at least one member.', 'matrix-mlm'),
+                'new_room_failed'     => __('Could not create the room.', 'matrix-mlm'),
+                'invite_members'      => __('Invite members', 'matrix-mlm'),
+                'invite_prompt'       => __('Usernames or referral codes (comma-separated):', 'matrix-mlm'),
+                'invite_failed'       => __('Could not invite members.', 'matrix-mlm'),
+                /* translators: 1: number added, 2: number skipped because already in room, 3: number denied (sticky self-leave). */
+                'invite_summary'      => __('Added %1$d. Skipped %2$d already in the room. %3$d previously left and cannot be auto-re-added.', 'matrix-mlm'),
+                'remove_member'       => __('Remove from room', 'matrix-mlm'),
+                'confirm_remove'      => __('Remove this member from the room?', 'matrix-mlm'),
+                'remove_failed'       => __('Could not remove the member.', 'matrix-mlm'),
             ],
         ]);
         ?>
@@ -161,6 +179,9 @@ class Matrix_MLM_User_Messaging {
                 <div class="matrix-messaging__sidebar-header">
                     <button type="button" class="matrix-btn matrix-btn-primary matrix-btn-sm" id="matrix-messaging-new-dm">
                         <?php esc_html_e('New Message', 'matrix-mlm'); ?>
+                    </button>
+                    <button type="button" class="matrix-btn matrix-btn-sm" id="matrix-messaging-new-room">
+                        <?php esc_html_e('New Room', 'matrix-mlm'); ?>
                     </button>
                     <div class="matrix-messaging__search">
                         <input
@@ -186,6 +207,8 @@ class Matrix_MLM_User_Messaging {
                             <div class="matrix-messaging__thread-label">
                                 <?php if ($t->type === 'team_room'): ?>
                                     <span class="dashicons dashicons-groups"></span>
+                                <?php elseif ($t->type === 'group_room'): ?>
+                                    <span class="dashicons dashicons-buddicons-buddypress-logo"></span>
                                 <?php else: ?>
                                     <span class="dashicons dashicons-admin-users"></span>
                                 <?php endif; ?>

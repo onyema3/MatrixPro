@@ -366,6 +366,28 @@ class Matrix_MLM_Admin_Messaging {
                             ?? $defaults['max_attachments_per_message'])
                     )
                 );
+                // Group-room caps (DB 1.0.24). Same clamp pattern
+                // as the attachment cap above — the runtime layer
+                // (get_max_group_rooms_per_user / get_max_members_per_group_room)
+                // re-clamps independently so a settings option
+                // imported from a config file or a wp-cli call
+                // can't slip past the documented hard ceiling.
+                $new['max_group_rooms_per_user'] = max(
+                    1,
+                    min(
+                        Matrix_MLM_Messaging::MAX_GROUP_ROOMS_PER_USER_HARD,
+                        (int) ($_POST['max_group_rooms_per_user']
+                            ?? $defaults['max_group_rooms_per_user'])
+                    )
+                );
+                $new['max_members_per_group_room'] = max(
+                    2,
+                    min(
+                        Matrix_MLM_Messaging::MAX_MEMBERS_PER_GROUP_ROOM_HARD,
+                        (int) ($_POST['max_members_per_group_room']
+                            ?? $defaults['max_members_per_group_room'])
+                    )
+                );
                 $new['team_rooms_auto_create']      = !empty($_POST['team_rooms_auto_create']) ? 1 : 0;
                 $new['polling_interval_ms']        = max(2000, min(120000, (int) ($_POST['polling_interval_ms'] ?? $defaults['polling_interval_ms'])));
                 // Sender-side edit / self-delete window. Clamped
@@ -1148,6 +1170,48 @@ class Matrix_MLM_Admin_Messaging {
                                 esc_html__('How many image attachments a member can include in a single message. Range 1–%2$d. Default %1$d. Operators can raise the ceiling beyond %2$d in code via the matrix_messaging_max_attachments_per_message filter, but values typed here are clamped to the documented range.', 'matrix-mlm'),
                                 (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
                                 (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_HARD
+                            );
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+            </table>
+
+            <h2 class="title" style="margin-top:30px;"><?php esc_html_e('Group Rooms', 'matrix-mlm'); ?></h2>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><label for="matrix-msg-group-rooms-per-user"><?php esc_html_e('Max group rooms per user', 'matrix-mlm'); ?></label></th>
+                    <td>
+                        <input type="number" id="matrix-msg-group-rooms-per-user" name="max_group_rooms_per_user"
+                               min="1"
+                               max="<?php echo (int) Matrix_MLM_Messaging::MAX_GROUP_ROOMS_PER_USER_HARD; ?>"
+                               value="<?php echo (int) $s['max_group_rooms_per_user']; ?>">
+                        <p class="description">
+                            <?php
+                            printf(
+                                /* translators: 1: default, 2: hard ceiling. */
+                                esc_html__('How many group rooms a single user may OWN at once (membership in someone else\'s room does not count). Range 1–%2$d. Default %1$d. Operators can override at code level via the matrix_messaging_max_group_rooms_per_user filter.', 'matrix-mlm'),
+                                (int) Matrix_MLM_Messaging::MAX_GROUP_ROOMS_PER_USER_DEFAULT,
+                                (int) Matrix_MLM_Messaging::MAX_GROUP_ROOMS_PER_USER_HARD
+                            );
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="matrix-msg-group-room-members"><?php esc_html_e('Max members per group room', 'matrix-mlm'); ?></label></th>
+                    <td>
+                        <input type="number" id="matrix-msg-group-room-members" name="max_members_per_group_room"
+                               min="2"
+                               max="<?php echo (int) Matrix_MLM_Messaging::MAX_MEMBERS_PER_GROUP_ROOM_HARD; ?>"
+                               value="<?php echo (int) $s['max_members_per_group_room']; ?>">
+                        <p class="description">
+                            <?php
+                            printf(
+                                /* translators: 1: default, 2: hard ceiling. */
+                                esc_html__('Total members per group room, including the owner. Range 2–%2$d. Default %1$d. Operators can override at code level via the matrix_messaging_max_members_per_group_room filter.', 'matrix-mlm'),
+                                (int) Matrix_MLM_Messaging::MAX_MEMBERS_PER_GROUP_ROOM_DEFAULT,
+                                (int) Matrix_MLM_Messaging::MAX_MEMBERS_PER_GROUP_ROOM_HARD
                             );
                             ?>
                         </p>
