@@ -570,3 +570,100 @@
     width: 16px;
     height: 16px;
 }
+
+
+
+/* ---------------------------------------------------------------
+ * Emoji reactions on individual messages (DB 1.0.21)
+ *
+ * The reaction strip lives at the bottom of every non-deleted
+ * bubble; the +🙂 trigger sits top-right and surfaces only on
+ * hover so it doesn't compete visually with the bubble's
+ * always-on edit/delete affordances. The picker pops as a
+ * floating div positioned by JS adjacent to the trigger.
+ * --------------------------------------------------------------- */
+
+.matrix-messaging__message {
+    position: relative;
+}
+
+.matrix-messaging__msg-react-trigger {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    border: 1px solid #dcdcde;
+    background: #fff;
+    border-radius: 14px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s ease-in-out;
+}
+
+.matrix-messaging__message:hover .matrix-messaging__msg-react-trigger {
+    opacity: 1;
+}
+
+.matrix-messaging__msg-react-trigger:hover {
+    background: #f6f7f7;
+}
+
+.matrix-messaging__message-reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.matrix-messaging__message-reactions:empty {
+    display: none;
+}
+
+.matrix-messaging__reaction-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid #dcdcde;
+    background: #f6f7f7;
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.matrix-messaging__reaction-chip:hover {
+    background: #ececef;
+}
+
+.matrix-messaging__reaction-chip.is-mine {
+    background: #e0e7ff;
+    border-color: #a5b4fc;
+    color: #3730a3;
+}
+
+.matrix-messaging__react-picker {
+    z-index: 999;
+    background: #fff;
+    border: 1px solid #dcdcde;
+    border-radius: 18px;
+    padding: 4px 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    display: flex;
+    gap: 2px;
+}
+
+.matrix-messaging__react-picker-btn {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px 6px;
+    border-radius: 12px;
+    line-height: 1;
+}
+
+.matrix-messaging__react-picker-btn:hover {
+    background: #f6f7f7;
+}
