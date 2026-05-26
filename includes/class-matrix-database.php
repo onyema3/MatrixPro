@@ -413,6 +413,103 @@ class Matrix_MLM_Database {
             }
         }
 
+        // 1.0.26: per-user billing anniversary column on
+        // matrix_user_meta. The legacy subscription cron used a
+        // single shared matrix_mlm_subscription_billing_day option
+        // for every user, which caused two operational problems:
+        //
+        //   - A user signing up on the 28th of the month, with the
+        //     shared billing day set to the 1st, paid four days
+        //     after joining; a user signing up on the 2nd of the
+        //     month paid 30 days after joining. Same fee, hugely
+        //     different first-month value.
+        //
+        //   - A "shift the billing day for everyone" operator
+        //     decision either re-billed users mid-cycle (if forward)
+        //     or skipped a cycle entirely (if backward), with no
+        //     per-user audit of which periods were paid for which
+        //     calendar months.
+        //
+        // The column is the foundation for the per-user-anniversary
+        // model in Matrix_MLM_Subscription. NULL means the user is
+        // not currently enrolled in the subscription program (either
+        // the master toggle is off, or this is a pre-existing user
+        // on an install where the operator never enabled it). When
+        // the toggle flips on, the backfill below stamps a date for
+        // every active user so the cron has something to compare
+        // against on the next tick.
+        if ($um_exists > 0) {
+            $nbd_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'next_billing_date'",
+                DB_NAME, $um_table
+            ));
+            if ($nbd_col_exists === 0) {
+                $wpdb->query(
+                    "ALTER TABLE {$um_table}
+                       ADD COLUMN next_billing_date DATE DEFAULT NULL
+                       AFTER last_login,
+                       ADD KEY next_billing_date (next_billing_date)"
+                );
+            }
+
+            // One-time backfill for installs upgrading from the
+            // shared-billing-day model. Gated by a one-shot option
+            // flag (matrix_mlm_subscription_anniversary_backfilled)
+            // rather than by DB_VERSION stamp so:
+            //
+            //   - A future schema bump doesn't re-run the backfill
+            //     and overwrite hand-edited next_billing_date values
+            //     (operator support cases sometimes ask us to nudge
+            //     a specific user's billing date by a day or two —
+            //     those edits would be silently reverted).
+            //
+            //   - An operator can manually reset by deleting the
+            //     option, which is a useful escape hatch on installs
+            //     that ran the migration before flipping the
+            //     master toggle on.
+            //
+            // For each user with status='active', set next_billing_date
+            // to the next occurrence (today or future) of the legacy
+            // matrix_mlm_subscription_billing_day option. Inactive /
+            // banned / pending users are left at NULL — they're not
+            // currently being billed, and the next manual_pay() or
+            // status flip will give them a fresh anniversary.
+            if ((int) get_option('matrix_mlm_subscription_anniversary_backfilled', 0) !== 1) {
+                $billing_day = (int) get_option('matrix_mlm_subscription_billing_day', 1);
+                if ($billing_day < 1) { $billing_day = 1; }
+                if ($billing_day > 28) { $billing_day = 28; }
+
+                $today_day  = (int) current_time('j');
+                $today_month = (int) current_time('n');
+                $today_year  = (int) current_time('Y');
+
+                if ($today_day <= $billing_day) {
+                    $year  = $today_year;
+                    $month = $today_month;
+                } else {
+                    $month = $today_month + 1;
+                    $year  = $today_year;
+                    if ($month > 12) {
+                        $month = 1;
+                        $year++;
+                    }
+                }
+                $seed_date = sprintf('%04d-%02d-%02d', $year, $month, $billing_day);
+
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE {$um_table}
+                        SET next_billing_date = %s
+                      WHERE status = 'active'
+                        AND next_billing_date IS NULL",
+                    $seed_date
+                ));
+
+                update_option('matrix_mlm_subscription_anniversary_backfilled', 1, false);
+            }
+        }
+
         // 1.0.11: one-time backfill of matrix_position_history with
         // a 'backfilled' row per existing position, dated at the
         // position's joined_at column. Without this, the genealogy
@@ -1185,6 +1282,7 @@ class Matrix_MLM_Database {
             kyc_verified tinyint(1) NOT NULL DEFAULT 0,
             status enum('active','banned','pending','inactive') NOT NULL DEFAULT 'active',
             last_login datetime DEFAULT NULL,
+            next_billing_date date DEFAULT NULL,
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             UNIQUE KEY user_id (user_id),

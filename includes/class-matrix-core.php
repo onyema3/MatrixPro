@@ -1694,13 +1694,31 @@ class Matrix_MLM_Core {
         // three paths share one algorithm and one uniqueness story.
         $ref_code = Matrix_MLM_User::generate_unique_referral_code($user_id);
 
+        // Per-user billing anniversary: stamp next_billing_date at
+        // signup so the user's first bill lands exactly one month
+        // from today, not on whatever calendar day the (legacy)
+        // shared billing-day option happens to be set to. The
+        // matrix_user_meta column was added in DB version 1.0.26 —
+        // see the lazy ALTER block in Matrix_MLM_Database::
+        // maybe_upgrade(). Stamped only when subscriptions are
+        // enabled; otherwise the column stays NULL and the cron
+        // skips this user until an operator turns the feature on
+        // (the same maybe_upgrade backfill seeds active users at
+        // that point).
+        $next_billing_date = null;
+        if ((int) get_option('matrix_mlm_subscription_enabled', 0) === 1
+            && class_exists('Matrix_MLM_Subscription')) {
+            $next_billing_date = Matrix_MLM_Subscription::compute_initial_next_billing_date();
+        }
+
         $wpdb->insert($wpdb->prefix . 'matrix_user_meta', [
             'user_id' => $user_id,
             'referral_code' => $ref_code,
             'referred_by' => $referrer->user_id,
             'phone' => $phone,
             'balance' => 0.00,
-            'status' => 'active'
+            'status' => 'active',
+            'next_billing_date' => $next_billing_date,
         ]);
 
         // Send verification email
