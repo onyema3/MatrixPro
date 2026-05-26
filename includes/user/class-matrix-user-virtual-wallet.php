@@ -132,14 +132,43 @@ class Matrix_MLM_User_Virtual_Wallet {
         if (!empty($wallet->wallet_id)) {
             $balance_result = $fintava->get_virtual_wallet_balance($wallet->wallet_id, $wallet->account_number, $wallet->customer_id ?? null);
             if (is_wp_error($balance_result)) {
-                // Defense-in-depth: although Matrix_MLM_Fintava already normalizes
-                // API messages to strings before storing them in WP_Error, a
-                // third-party plugin or filter could still inject an array here.
-                // Run the message through the same normalizer so we never hand an
-                // array to esc_attr() / sprintf() downstream.
+                // Two-track error surfacing:
+                //
+                //   - Member sees the clean string from
+                //     Matrix_MLM_Fintava::user_facing_error_message()
+                //     ("Wallet balance is temporarily unavailable...")
+                //     instead of the chained "API Error (HTTP 400)
+                //     calling /virtual-wallet/{id}: Cannot convert
+                //     undefined or null to object | …" diagnostic
+                //     that means nothing to them and prompts a
+                //     support ticket.
+                //
+                //   - Operator still gets the verbose chained form
+                //     in error_log so support can triage which
+                //     Fintava endpoints are alive on this tier
+                //     when a member does report a stuck balance.
+                //
+                // The clean copy is plumbed from
+                // Matrix_MLM_Fintava::make_request() and from the
+                // composite WP_Errors built inside
+                // get_virtual_wallet_balance() / build_wallet_lookup_error,
+                // both of which now attach a user_message on the
+                // data dict. user_facing_error_message() pulls it
+                // out and falls through to get_error_message() if
+                // none is set (e.g. errors from older callsites)
+                // so the helper is safe to call unconditionally.
+                error_log(sprintf(
+                    '[Matrix Fintava] virtual-wallet balance fetch failed for user_id=%d wallet_id=%s: %s',
+                    (int) $user_id,
+                    (string) $wallet->wallet_id,
+                    Matrix_MLM_Fintava::normalize_api_message(
+                        $balance_result->get_error_message(),
+                        '(empty)'
+                    )
+                ));
                 $fintava_balance_error  = Matrix_MLM_Fintava::normalize_api_message(
-                    $balance_result->get_error_message(),
-                    __('Balance is unavailable.', 'matrix-mlm')
+                    Matrix_MLM_Fintava::user_facing_error_message($balance_result),
+                    __('Wallet balance is temporarily unavailable. Please refresh in a moment.', 'matrix-mlm')
                 );
                 $fintava_balance_reason = 'api_error';
             } else {
