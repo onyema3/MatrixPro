@@ -3208,6 +3208,17 @@ class Matrix_MLM_Core {
             wp_send_json_error(['message' => __('Invalid file type. Allowed: JPG, PNG, GIF, WebP', 'matrix-mlm')]);
         }
 
+        // Capture the previous avatar URL BEFORE the new upload so
+        // we can clean the orphan file from disk after the meta
+        // pointer has moved. Without this, every re-upload leaves
+        // its predecessor in wp-content/uploads/ — wp_handle_upload
+        // emits a fresh filename on every call (WP core appends
+        // -1, -2, … on basename collision) and the previous file
+        // is referenced by nothing once update_user_meta below
+        // overwrites the pointer. Read here, delete after the
+        // success path is committed.
+        $previous_avatar_url = (string) get_user_meta($user_id, 'matrix_avatar_url', true);
+
         $upload = wp_handle_upload($file, [
             'test_form' => false,
             'mimes'     => $allowed_mimes,
@@ -3217,7 +3228,111 @@ class Matrix_MLM_Core {
         }
 
         update_user_meta($user_id, 'matrix_avatar_url', $upload['url']);
+
+        // Best-effort orphan cleanup. Runs AFTER update_user_meta
+        // so a delete-hook filter that misbehaves can't strand the
+        // user with a meta pointer to a freshly-deleted file.
+        // Failure modes are all silent — the success response below
+        // is the user-visible contract and a leftover file on disk
+        // is never worth surfacing as an error to them. See
+        // delete_avatar_file_safely() for the path-safety envelope
+        // (string-prefix + realpath containment + uploads-only
+        // gate) that prevents this from becoming an arbitrary-file
+        // delete primitive on any user_meta value.
+        if ($previous_avatar_url !== '' && $previous_avatar_url !== $upload['url']) {
+            $this->delete_avatar_file_safely($previous_avatar_url);
+        }
+
         wp_send_json_success(['message' => __('Avatar updated', 'matrix-mlm'), 'url' => $upload['url']]);
+    }
+
+    /**
+     * Delete a previously-stored avatar file from disk.
+     *
+     * Called only from process_upload_avatar() after a fresh
+     * upload has succeeded and user_meta['matrix_avatar_url']
+     * has moved to the new file. Best-effort: every guard
+     * returns silently rather than emitting an error, because
+     * the user-facing flow has already completed by the time we
+     * run and a leftover file on disk is preferable to spurious
+     * "upload failed" messaging.
+     *
+     * Safety envelope (defence in depth — the only caller is
+     * the user's own avatar meta, but treating user_meta as
+     * untrusted lets this helper stay safe if it's ever reused
+     * from a less-locked-down surface):
+     *
+     *   1. The URL must sit under wp_upload_dir()['baseurl']
+     *      after scheme normalisation. External avatars
+     *      (gravatars, CDN-rewritten URLs an operator wrote
+     *      into user_meta by hand) are left alone.
+     *
+     *   2. The relative path is rejected if it contains '..'
+     *      or resolves to an empty string. Belt to the realpath
+     *      check below.
+     *
+     *   3. The resolved on-disk path must, after realpath(),
+     *      be a strict descendant of wp_upload_dir()['basedir'].
+     *      Defends against any symlink, percent-encoding, or
+     *      normalisation surprise that could let a crafted URL
+     *      escape the uploads tree even after the string-prefix
+     *      check passes.
+     *
+     *   4. realpath() returning false means the file is already
+     *      gone — we no-op rather than complaining, since the
+     *      cleanup goal is satisfied by the file's absence.
+     *
+     *   5. The delete itself goes through wp_delete_file() so
+     *      other plugins' wp_delete_file-hook filters fire
+     *      normally; falls back to a suppressed unlink() on the
+     *      vanishingly unlikely path where wp_delete_file isn't
+     *      defined.
+     *
+     * Scheme normalisation note: set_url_scheme() on both ends
+     * lets the prefix check survive a protocol migration since
+     * the previous upload (e.g. an install that switched from
+     * http to https — pre-migration meta still carries http://
+     * even though wp_upload_dir()['baseurl'] now reports
+     * https://). Without this, every legacy avatar would fall
+     * through the gate and orphan forever.
+     */
+    private function delete_avatar_file_safely($url) {
+        if (!is_string($url) || $url === '') {
+            return;
+        }
+
+        $upload_dir = wp_upload_dir();
+        if (empty($upload_dir['basedir']) || empty($upload_dir['baseurl'])) {
+            return;
+        }
+
+        $url_norm     = set_url_scheme((string) $url, 'https');
+        $baseurl_norm = set_url_scheme((string) $upload_dir['baseurl'], 'https');
+
+        if (strpos($url_norm, $baseurl_norm) !== 0) {
+            return;
+        }
+
+        $relative = ltrim(substr($url_norm, strlen($baseurl_norm)), '/');
+        if ($relative === '' || strpos($relative, '..') !== false) {
+            return;
+        }
+
+        $abs_path     = trailingslashit($upload_dir['basedir']) . $relative;
+        $real_basedir = realpath($upload_dir['basedir']);
+        $real_path    = realpath($abs_path);
+        if ($real_basedir === false || $real_path === false) {
+            return;
+        }
+        if (strpos($real_path, rtrim($real_basedir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0) {
+            return;
+        }
+
+        if (function_exists('wp_delete_file')) {
+            wp_delete_file($real_path);
+        } else {
+            @unlink($real_path);
+        }
     }
 
     /**
