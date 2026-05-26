@@ -311,8 +311,44 @@ class Matrix_MLM_User_Dashboard {
                     <h4><?php echo esc_html(wp_get_current_user()->display_name); ?></h4>
                     <p class="matrix-balance"><?php echo get_option('matrix_mlm_currency_symbol', '₦'); ?><?php echo number_format((new Matrix_MLM_Wallet())->get_balance($user_id), 2); ?></p>
                 </div>
-                <nav class="matrix-dashboard-nav">
+                <div class="matrix-dashboard-nav" role="navigation" aria-label="<?php esc_attr_e('Dashboard navigation', 'matrix-mlm'); ?>">
                     <?php
+                    // The wrapper used to be a <nav> element. It was
+                    // demoted to a <div role="navigation"> after PRs
+                    // #334 / #335 / #336 / #337 fought a cascade of
+                    // theme rules targeting `nav a` and `nav a > *`
+                    // descendants on the production deploy. Each
+                    // round, the theme escalated:
+                    //
+                    //   PR #334  enqueued dashicons globally — the
+                    //            stylesheet loaded, but the icon
+                    //            font still didn't render here
+                    //   PR #335  added .matrix-dashboard-nav a
+                    //            .dashicons { font-family: dashicons
+                    //            !important } — beaten on cascade
+                    //   PR #336  added inline style="font-family:
+                    //            dashicons!important" — also beaten
+                    //   PR #337  swapped to inline SVG, bypassing
+                    //            the font path entirely
+                    //
+                    // After PR #337 the icons rendered correctly in
+                    // isolation, but production reported the labels
+                    // were now underlined and the SVGs invisible —
+                    // i.e. the theme had moved on to clobbering
+                    // `nav a { text-decoration }` and `nav a > *
+                    // { display / fill / visibility }`. Rather than
+                    // continue the !important arms race, this PR
+                    // takes the structural escape hatch: rename the
+                    // wrapper element. The class .matrix-dashboard-nav
+                    // and every plugin CSS rule keyed off it stay
+                    // identical (verified — no plugin selector uses
+                    // `nav.matrix-dashboard-nav` or `nav
+                    // .matrix-dashboard-nav`), so the layout and
+                    // styling are pixel-identical. The accessibility
+                    // landmark is preserved via role="navigation"
+                    // + aria-label, which screen readers and
+                    // assistive tech treat as equivalent to <nav>.
+                    //
                     // Render only menu items the admin hasn't explicitly
                     // hidden via the Dashboard Menus settings tab. Locked
                     // slugs (overview / profile / security) always pass
@@ -336,7 +372,7 @@ class Matrix_MLM_User_Dashboard {
                     ?>
                     <?php echo $this->build_notification_bell($user_id); ?>
                     <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><?php echo Matrix_MLM_Icons::svg('exit'); ?> <?php _e('Logout', 'matrix-mlm'); ?></a>
-                </nav>
+                </div><!-- /.matrix-dashboard-nav (was <nav>; demoted to <div role="navigation"> to escape theme `nav a` cascade — see open tag above) -->
             </div>
             <div class="matrix-dashboard-content">
                 <?php $this->render_tab($tab, $user_id); ?>
