@@ -110,6 +110,53 @@ class Matrix_MLM_Admin_Messaging {
         return ['1d' => '1 day', '7d' => '7 days', '30d' => '30 days', 'permanent' => 'Permanent'];
     }
 
+    /**
+     * Pull the last $limit messages in $thread_id whose id is <=
+     * $around_message_id, ordered oldest-first for natural reading.
+     *
+     * Used by the "View thread context" expander in the open report
+     * row. Lets a moderator see the conversational lead-up to the
+     * reported message — distinguishes "out-of-the-blue spam" from
+     * "the recipient just provoked them" in a way the single-row
+     * 200-char body excerpt cannot. Capped at 10 messages by
+     * default (the operator can always click into the dashboard
+     * thread for the full history) so the LIMIT-10 query stays
+     * sub-millisecond on the (thread_id, id) covering index even
+     * across very long team rooms.
+     *
+     * Each row gets joined to wp_users for the sender_login so
+     * the rendered context doesn't fan into N user lookups in the
+     * loop.
+     *
+     * @param int $thread_id
+     * @param int $around_message_id The reported message id; the
+     *                               window includes this id and the
+     *                               $limit-1 messages immediately
+     *                               before it.
+     * @param int $limit
+     * @return array
+     */
+    private function fetch_thread_context($thread_id, $around_message_id, $limit = 10) {
+        global $wpdb;
+        $thread_id         = (int) $thread_id;
+        $around_message_id = (int) $around_message_id;
+        $limit             = max(1, min(50, (int) $limit));
+        if ($thread_id <= 0 || $around_message_id <= 0) {
+            return [];
+        }
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT m.id, m.body, m.created_at, m.deleted_at, m.sender_id, u.user_login AS sender_login
+               FROM {$wpdb->prefix}matrix_messages m
+               LEFT JOIN {$wpdb->users} u ON u.ID = m.sender_id
+              WHERE m.thread_id = %d
+                AND m.id <= %d
+              ORDER BY m.id DESC
+              LIMIT %d",
+            $thread_id, $around_message_id, $limit
+        ));
+        return array_reverse($rows ?: []);
+    }
+
     private function maybe_handle_post() {
         if (empty($_POST['_matrix_messaging_admin_nonce'])
             || !wp_verify_nonce($_POST['_matrix_messaging_admin_nonce'], 'matrix_messaging_admin')) {
@@ -563,6 +610,48 @@ class Matrix_MLM_Admin_Messaging {
                                 <?php else: ?>
                                     <?php echo esc_html(mb_substr((string) $r->body, 0, 200)); ?>
                                     <?php if (mb_strlen((string) $r->body) > 200): ?><span aria-hidden="true">…</span><?php endif; ?>
+                                <?php endif; ?>
+                                <?php
+                                // View thread context expander. Closed
+                                // by default — the moderator opts into
+                                // reading the surrounding messages,
+                                // matching the "we look at flagged
+                                // content, not at every conversation"
+                                // privacy posture. Hidden DOM still
+                                // pre-renders, so each row pays one
+                                // small indexed query at page-render
+                                // time regardless of expansion state;
+                                // 25 rows per page × 1 query = ~25 ms
+                                // on a healthy server, acceptable.
+                                $context_rows = $this->fetch_thread_context((int) $r->thread_id, (int) $r->message_id, 10);
+                                if (!empty($context_rows)): ?>
+                                    <details style="margin-top:8px;">
+                                        <summary style="cursor:pointer;font-size:12px;color:#2271b1;"><?php esc_html_e('View thread context', 'matrix-mlm'); ?></summary>
+                                        <div style="margin-top:6px;padding:8px;border:1px solid #dcdcde;background:#f6f7f7;font-size:12px;max-height:320px;overflow:auto;">
+                                            <?php foreach ($context_rows as $cm):
+                                                $is_focus = ((int) $cm->id === (int) $r->message_id);
+                                                $row_style = $is_focus
+                                                    ? 'background:#fff3cd;border-left:3px solid #f59e0b;padding:5px 8px;margin-bottom:4px;'
+                                                    : 'padding:4px 8px;margin-bottom:4px;border-left:3px solid transparent;';
+                                                ?>
+                                                <div style="<?php echo esc_attr($row_style); ?>">
+                                                    <strong><?php echo esc_html($cm->sender_login ?: '#' . (int) $cm->sender_id); ?></strong>
+                                                    <span style="color:#666;margin-left:6px;"><?php echo esc_html((string) $cm->created_at); ?></span>
+                                                    <?php if ($is_focus): ?>
+                                                        <span style="color:#b45309;font-weight:bold;margin-left:6px;">[<?php esc_html_e('reported', 'matrix-mlm'); ?>]</span>
+                                                    <?php endif; ?>
+                                                    <div style="margin-top:2px;">
+                                                        <?php if ($cm->deleted_at): ?>
+                                                            <em><?php esc_html_e('(deleted)', 'matrix-mlm'); ?></em>
+                                                        <?php else: ?>
+                                                            <?php echo esc_html(mb_substr((string) $cm->body, 0, 300)); ?>
+                                                            <?php if (mb_strlen((string) $cm->body) > 300): ?><span aria-hidden="true">…</span><?php endif; ?>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    </details>
                                 <?php endif; ?>
                             </td>
                             <td><?php echo esc_html((string) $r->last_reported_at); ?></td>
