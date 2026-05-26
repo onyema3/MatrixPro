@@ -1,5 +1,56 @@
-<?php if (!defined('ABSPATH')) exit; 
-$referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
+<?php if (!defined('ABSPATH')) exit;
+
+// Resolve the referral code in priority order:
+//
+//   1. ?ref=CODE in the current URL (a fresh click on a share-link).
+//   2. matrix_mlm_ref cookie set by Matrix_MLM_Core::capture_referral_cookie
+//      on a previous click within the last 7 days.
+//
+// The URL form is treated as locked (readonly input) — current click
+// intent is unambiguous. The cookie form is rendered editable so a
+// member who happens to visit /signup/ in their own browser, having
+// previously clicked someone else's share-link, can still type their
+// own sponsor's code without having to clear cookies first.
+//
+// The cookie value is validated against matrix_user_meta.referral_code
+// before being trusted: a stale cookie pointing at a deleted sponsor
+// or a code that never existed gets dropped on the spot, so the
+// prospect doesn't see a pre-filled field that the server is going
+// to reject seconds later with "Invalid referral code".
+
+$referral_code = '';
+$ref_locked    = false;
+
+if (isset($_GET['ref']) && $_GET['ref'] !== '') {
+    $referral_code = sanitize_text_field((string) wp_unslash($_GET['ref']));
+    $ref_locked    = true;
+} elseif (!empty($_COOKIE['matrix_mlm_ref'])) {
+    $candidate = sanitize_text_field((string) wp_unslash($_COOKIE['matrix_mlm_ref']));
+    if ($candidate !== '') {
+        global $wpdb;
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT 1 FROM {$wpdb->prefix}matrix_user_meta WHERE referral_code = %s LIMIT 1",
+            $candidate
+        ));
+        if ($exists) {
+            $referral_code = $candidate;
+        } elseif (!headers_sent()) {
+            // Self-heal: the cookie points at a non-existent code
+            // (sponsor account deleted, code regenerated, attacker-
+            // injected bogus value, etc.). Drop it so subsequent
+            // visits don't keep replaying the same dead value.
+            setcookie('matrix_mlm_ref', '', [
+                'expires'  => time() - HOUR_IN_SECONDS,
+                'path'     => COOKIEPATH ?: '/',
+                'domain'   => COOKIE_DOMAIN ?: '',
+                'secure'   => is_ssl(),
+                'httponly' => true,
+                'samesite' => 'Lax',
+            ]);
+            unset($_COOKIE['matrix_mlm_ref']);
+        }
+    }
+}
 ?>
 <div class="matrix-auth-wrapper">
     <div class="matrix-auth-card">
@@ -40,7 +91,7 @@ $referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
             </div>
             <div class="matrix-form-group">
                 <label><?php _e('Referral Code', 'matrix-mlm'); ?> <span class="matrix-required">*</span></label>
-                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $referral_code ? 'readonly' : ''; ?> required placeholder="<?php echo esc_attr(get_option('matrix_mlm_default_referral_code', '')); ?>">
+                <input type="text" name="referral_code" value="<?php echo esc_attr($referral_code); ?>" <?php echo $ref_locked ? 'readonly' : ''; ?> required placeholder="<?php echo esc_attr(get_option('matrix_mlm_default_referral_code', '')); ?>">
                 <small class="matrix-form-hint"><?php _e('Enter the referral code of the person who invited you.', 'matrix-mlm'); ?></small>
             </div>
             <?php if (get_option('matrix_mlm_captcha_enabled')): ?>

@@ -176,6 +176,21 @@ class Matrix_MLM_Core {
         // call, AJAX request, REST hit, or admin-bar render.
         add_action('template_redirect', [$this, 'redirect_legacy_auth_urls']);
 
+        // First-touch referral cookie. Persists ?ref=CODE for 7 days
+        // so a prospect who clicks a share-link, gets distracted, and
+        // returns later via a bare /signup/ URL still has the inviter
+        // attributed instead of being blocked by the mandatory
+        // referral_code gate in process_registration(). See
+        // capture_referral_cookie() for full rationale and semantics.
+        //
+        // Priority 9 (earlier than redirect_legacy_auth_urls' default
+        // priority 10) is deliberate: on /matrix-register/?ref= and
+        // /matrix/?ref= URLs the redirect issues a 301-and-exit, and
+        // we want our Set-Cookie header to ride along in that 301
+        // response so the cookie applies before the browser follows
+        // the Location header to /signup/.
+        add_action('template_redirect', [$this, 'capture_referral_cookie'], 9);
+
         // Email verification handler
         add_action('init', [$this, 'handle_email_verification']);
 
@@ -1686,6 +1701,13 @@ class Matrix_MLM_Core {
         // mint from one IP per window, even when their POSTs are
         // syntactically valid.
         $this->record_registration_attempt($ip);
+
+        // Drop the first-touch referral cookie now that this
+        // browser has completed signup. Prevents a different
+        // prospect on a shared device from inheriting the same
+        // sponsor on their next visit. Set in
+        // capture_referral_cookie() at template_redirect time.
+        $this->clear_referral_cookie();
 
         // Email-verification gate. Set the pending flag now; cleared
         // by Matrix_MLM_Core::handle_email_verification on a valid
@@ -4436,6 +4458,144 @@ class Matrix_MLM_Core {
             wp_safe_redirect(home_url('/signup/' . $query_suffix), 301);
             exit;
         }
+    }
+
+    /**
+     * Persist a referral code from ?ref= into a 7-day first-touch
+     * cookie so the inviter still gets credited when a prospect
+     * returns to /signup/ without the query param.
+     *
+     * Why this exists
+     * ---------------
+     * Registration is hard-gated on referral_code being non-empty
+     * AND matching matrix_user_meta.referral_code (see
+     * process_registration). Before this hook the ?ref= value was
+     * only read at the moment /signup/ rendered — so a prospect
+     * who clicked /signup/?ref=ALICE, got distracted, and returned
+     * later via a bare /signup/ URL hit "Referral code is required"
+     * and was blocked outright. Sponsors complained because their
+     * share-link traffic was bouncing without ever crediting them.
+     *
+     * The cookie persists the first ?ref= value seen on this
+     * browser. public/templates/register.php falls back to it when
+     * the URL has no ?ref=, and process_registration() clears it on
+     * successful signup so a different prospect on a shared device
+     * doesn't inherit the same sponsor next visit.
+     *
+     * Semantics
+     * ---------
+     *   - First-touch: an existing cookie wins. A competing
+     *     affiliate sending a fresh ?ref= can't steal attribution
+     *     mid-funnel.
+     *   - 7-day TTL: long enough for "saw it, came back over the
+     *     weekend" funnels, short enough that a code shared once
+     *     years ago doesn't credit a sponsor on a revisit.
+     *   - HttpOnly: PHP reads $_COOKIE server-side; no client JS
+     *     needs to see it.
+     *   - SameSite=Lax: lets the cookie ride along on top-level
+     *     navigations from external sites (Facebook, WhatsApp,
+     *     SMS, Twitter), which is the entire entry path the
+     *     feature targets.
+     *   - Secure flag mirrors is_ssl() so http-only dev/staging
+     *     installs still get a cookie.
+     *
+     * Hook order
+     * ----------
+     * Registered on template_redirect priority 9, earlier than
+     * redirect_legacy_auth_urls (default priority 10). On legacy
+     * /matrix-register/?ref= and /matrix/?ref= URLs the redirect
+     * fires `wp_safe_redirect(...); exit;` — running our hook
+     * first means Set-Cookie is emitted in the same 301 response
+     * as Location, so the browser stores the cookie before
+     * following the redirect to /signup/.
+     *
+     * Defence in depth
+     * ----------------
+     * template_redirect doesn't fire on admin / AJAX / REST /
+     * cron requests, but we re-check those gates explicitly so
+     * a future hook-time refactor can't silently start emitting
+     * referral cookies on AJAX endpoints.
+     */
+    public function capture_referral_cookie() {
+        if (is_admin() || wp_doing_ajax()
+            || (defined('REST_REQUEST') && REST_REQUEST)
+            || (defined('DOING_CRON') && DOING_CRON)) {
+            return;
+        }
+
+        if (empty($_GET['ref'])) {
+            return;
+        }
+
+        // First-touch: existing cookie wins.
+        if (!empty($_COOKIE['matrix_mlm_ref'])) {
+            return;
+        }
+
+        $ref = sanitize_text_field((string) wp_unslash($_GET['ref']));
+        // matrix_user_meta.referral_code is varchar(50). Clip
+        // defensively before persisting so a malformed query
+        // string can't bloat the cookie or get a value that the
+        // DB lookup in process_registration would later reject
+        // as too long.
+        if (strlen($ref) > 50) {
+            $ref = substr($ref, 0, 50);
+        }
+        if ($ref === '') {
+            return;
+        }
+
+        // If headers already went out (a misbehaving plugin that
+        // prints output during init) PHP would warn and the
+        // cookie wouldn't stick anyway — bail quietly.
+        if (headers_sent()) {
+            return;
+        }
+
+        setcookie('matrix_mlm_ref', $ref, [
+            'expires'  => time() + (7 * DAY_IN_SECONDS),
+            'path'     => COOKIEPATH ?: '/',
+            'domain'   => COOKIE_DOMAIN ?: '',
+            'secure'   => is_ssl(),
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+
+        // Mirror into $_COOKIE so the same request sees the value
+        // if it continues past this hook (e.g. the prospect
+        // landed directly on /signup/?ref=X — the template
+        // renders inline after this and now reads the cookie
+        // fallback path consistently).
+        $_COOKIE['matrix_mlm_ref'] = $ref;
+    }
+
+    /**
+     * Clear the first-touch referral cookie.
+     *
+     * Called from process_registration() on successful signup so
+     * a shared-device prospect doesn't inherit the previous
+     * registrant's sponsor on their next visit. Idempotent: if no
+     * cookie is set, this is a no-op. Mirrors the path / domain /
+     * secure / samesite attributes used in capture_referral_cookie
+     * so the browser actually evicts the right cookie rather than
+     * setting a sibling on a different scope.
+     */
+    private function clear_referral_cookie() {
+        if (headers_sent()) {
+            return;
+        }
+        if (empty($_COOKIE['matrix_mlm_ref'])) {
+            return;
+        }
+        setcookie('matrix_mlm_ref', '', [
+            'expires'  => time() - HOUR_IN_SECONDS,
+            'path'     => COOKIEPATH ?: '/',
+            'domain'   => COOKIE_DOMAIN ?: '',
+            'secure'   => is_ssl(),
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+        unset($_COOKIE['matrix_mlm_ref']);
     }
 
     public function daily_cron() {
