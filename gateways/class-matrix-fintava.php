@@ -2511,6 +2511,14 @@ class Matrix_MLM_Fintava {
             // mark the payout row failed and surface Fintava's error to
             // the user. (Common cause now: insufficient balance on the
             // user's own Fintava virtual wallet, surfaced verbatim.)
+            //
+            // failure_reason keeps the verbose form (HTTP code + endpoint
+            // + upstream + body details) because that column is the audit
+            // trail — admins triaging a stuck payout need to see exactly
+            // what Fintava rejected. The toast picked up by the member
+            // takes the clean upstream-only string from
+            // user_facing_error_message() so they aren't shown developer
+            // chrome wrapped around the actionable bit.
             $wpdb->update(
                 $payouts_table,
                 ['status' => 'failed', 'failure_reason' => $result->get_error_message(), 'updated_at' => current_time('mysql')],
@@ -2519,7 +2527,7 @@ class Matrix_MLM_Fintava {
                 ['%d']
             );
 
-            wp_send_json_error(['message' => $result->get_error_message()]);
+            wp_send_json_error(['message' => self::user_facing_error_message($result)]);
             return;
         }
 
@@ -2913,7 +2921,7 @@ class Matrix_MLM_Fintava {
                 ['%d']
             );
 
-            $message = $result->get_error_message();
+            $message = self::user_facing_error_message($result);
             if ($refund === false) {
                 $message .= ' ' . __('Note: your Matrix wallet refund did not apply automatically — please contact support with reference', 'matrix-mlm') . ' ' . $reference . '.';
             }
@@ -6556,7 +6564,7 @@ class Matrix_MLM_Fintava {
 
         $balance = $this->get_virtual_wallet_balance($wallet->wallet_id, $wallet->account_number, $wallet->customer_id ?? null);
         if (is_wp_error($balance)) {
-            wp_send_json_error(['message' => $balance->get_error_message()]);
+            wp_send_json_error(['message' => self::user_facing_error_message($balance)]);
         }
 
         $currency_symbol = get_option('matrix_mlm_currency_symbol', '₦');
@@ -7078,7 +7086,45 @@ class Matrix_MLM_Fintava {
             if ($status_code >= 500 && is_array($body) && !empty($body)) {
                 $error_message .= sprintf(' [sent_keys=%s]', implode(',', array_keys($body)));
             }
-            return new WP_Error('fintava_api_error', $error_message);
+
+            // Build a clean user-facing message in parallel with the
+            // verbose diagnostic above.
+            //
+            // The verbose form ("API Error (HTTP 400) calling /endpoint:
+            // <upstream>") is intentionally kept on $error_message
+            // because it's the value that ends up in:
+            //   - error_log() lines emitted by every callsite that
+            //     surfaces gateway failures
+            //   - the failure_reason column on matrix_fintava_payouts /
+            //     matrix_fintava_card_orders / etc. (audit trail)
+            //   - admin-facing surfaces (Manual Refund button on Bill
+            //     History, payout retry pages) where the HTTP status +
+            //     endpoint is the primary triage signal
+            //
+            // For end users the same string just reads as developer
+            // noise wrapped around an upstream message they can already
+            // act on (e.g. "Insufficient balance for this transaction.
+            // You need ₦1015 to proceed."). Stash a clean version in
+            // the WP_Error data dict so the user-facing AJAX handlers
+            // can pluck it via Matrix_MLM_Fintava::user_facing_error_message()
+            // without forcing every callsite to know how to strip the
+            // prefix.
+            //
+            // When upstream gives us nothing usable (empty body, "Http
+            // Exception", generic 500 page), fall back to a friendly
+            // generic — showing literally nothing or the bare word
+            // "Http Exception" to a member is worse than a deliberate
+            // we-know-it-failed copy.
+            $user_message = $upstream_str;
+            if ($user_message === '' || strcasecmp(trim($user_message), 'Http Exception') === 0) {
+                $user_message = __('We could not complete this request. Please try again, or contact support if the problem persists.', 'matrix-mlm');
+            }
+
+            return new WP_Error('fintava_api_error', $error_message, [
+                'user_message' => $user_message,
+                'status_code'  => $status_code,
+                'endpoint'     => $endpoint,
+            ]);
         }
 
         return $body_decoded;
@@ -7163,6 +7209,50 @@ class Matrix_MLM_Fintava {
             }
         }
         return (string) $default;
+    }
+
+    /**
+     * Pull the member-friendly version of a Fintava WP_Error.
+     *
+     * make_request() now returns errors as
+     *
+     *     new WP_Error(
+     *         'fintava_api_error',
+     *         "API Error (HTTP 400) calling /endpoint: <upstream> [details]",
+     *         ['user_message' => '<upstream-only string>', ...]
+     *     )
+     *
+     * The verbose form on the message slot is kept on purpose: it's the
+     * value that lands in matrix_fintava_payouts.failure_reason, in
+     * error_log diagnostics, and on admin-facing screens (Manual Refund
+     * on Bill History, payout retry, etc.) where the HTTP status +
+     * endpoint is the primary triage signal. Member-facing surfaces, on
+     * the other hand, just want the upstream sentence — "Insufficient
+     * balance for this transaction. You need ₦1015 to proceed." reads
+     * cleanly without the developer-noise prefix.
+     *
+     * Accepts any WP_Error so AJAX handlers can call it unconditionally.
+     * If the error didn't come from make_request() (no user_message in
+     * the data dict), the helper falls through to get_error_message()
+     * verbatim — caller-side validators like
+     * Matrix_MLM_Fintava_Billing::validate_amount() that already produce
+     * member-friendly strings ("Maximum airtime is …") therefore keep
+     * working unchanged.
+     *
+     * Non-WP_Error inputs return ''.
+     *
+     * @param mixed $error A WP_Error from any Fintava call path.
+     * @return string Member-facing message; empty string for non-errors.
+     */
+    public static function user_facing_error_message($error) {
+        if (!is_wp_error($error)) {
+            return '';
+        }
+        $data = $error->get_error_data();
+        if (is_array($data) && isset($data['user_message']) && $data['user_message'] !== '') {
+            return (string) $data['user_message'];
+        }
+        return (string) $error->get_error_message();
     }
 
     private function generate_reference() {
