@@ -214,6 +214,15 @@ if (is_admin()) {
     // in class-matrix-admin.php is the only wiring required.
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-announcements.php';
     require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-zebra-notifications.php';
+
+    // Operator-triggered maintenance tools (avatar orphan cleanup
+    // for now; designed as a generic landing for similar one-off
+    // utilities). The class registers an admin-post.php handler
+    // for its delete form, which runs inside admin context, so
+    // loading it under is_admin() is sufficient — no front-end
+    // surface to wire up.
+    require_once MATRIX_MLM_PLUGIN_DIR . 'includes/admin/class-matrix-admin-tools.php';
+    Matrix_MLM_Admin_Tools::init();
 }
 
 // User Dashboard

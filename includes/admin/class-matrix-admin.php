@@ -160,6 +160,15 @@ class Matrix_MLM_Admin {
         // as Backup because committing an import overwrites live user
         // and tree data on the destination.
         add_submenu_page('matrix-mlm', __('Import from Laravel', 'matrix-mlm'), __('Import', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-import', ['Matrix_MLM_Admin_Import', 'render']);
+        // Operator maintenance utilities. Currently hosts the
+        // avatar orphan-cleanup tool — same manage_matrix_settings
+        // capability as Backup/Import because clicking through this
+        // page can unlink files from disk. A reviewer-tier admin
+        // who can triage tickets/deposits should not be able to
+        // touch the filesystem; that gate is enforced both here at
+        // the menu boundary and again inside the class's render +
+        // form-handler methods.
+        add_submenu_page('matrix-mlm', __('Tools', 'matrix-mlm'), __('Tools', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-tools', [new Matrix_MLM_Admin_Tools(), 'render']);
         add_submenu_page('matrix-mlm', __('Settings', 'matrix-mlm'), __('Settings', 'matrix-mlm'), 'manage_matrix_settings', 'matrix-mlm-settings', [new Matrix_MLM_Admin_Settings(), 'render']);
     }
 
