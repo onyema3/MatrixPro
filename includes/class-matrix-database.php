@@ -673,6 +673,51 @@ class Matrix_MLM_Database {
             }
         }
 
+        // 1.0.22 — sticky self-leave on matrix_message_participants.
+        // New column removed_by BIGINT NULL records WHO ended the
+        // membership: the user themselves (sticky — self-heal must
+        // not re-add them on the next sponsor-graph walk) versus
+        // an admin or sponsor (legacy behaviour — re-add on the
+        // next sponsor-graph walk, mirroring how reparenting has
+        // always healed membership state).
+        //
+        // Without this distinction, a downline who clicks "Leave
+        // thread" on their sponsor's team room would walk back in
+        // on their next dashboard load (self_heal_membership runs
+        // unconditionally on every messages-tab render), and the
+        // leave UI would feel broken — clicking the button does
+        // nothing visible by the time the page next renders.
+        //
+        // dbDelta would attempt to MODIFY existing rows on every
+        // upgrade pass and we don't need that overhead, so we
+        // probe the column directly. Idempotent: a fresh install
+        // gets removed_by from the wider CREATE TABLE in
+        // create_tables(); an existing install gets the ADD
+        // COLUMN exactly once and skips it on subsequent loads.
+        // No index — removed_by is read alongside the row, never
+        // as a query predicate.
+        $participants_table = $wpdb->prefix . 'matrix_message_participants';
+        $participants_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $participants_table
+        ));
+        if ($participants_exists > 0) {
+            $removed_by_col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'removed_by'",
+                DB_NAME, $participants_table
+            ));
+            if ($removed_by_col_exists === 0) {
+                $wpdb->query(
+                    "ALTER TABLE {$participants_table}
+                       ADD COLUMN removed_by BIGINT(20) UNSIGNED DEFAULT NULL
+                       AFTER removed_at"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -1626,6 +1671,14 @@ class Matrix_MLM_Database {
         dbDelta($sql_message_threads);
 
         $table_message_participants = $wpdb->prefix . 'matrix_message_participants';
+        // removed_by (DB 1.0.22): records WHO triggered the
+        // removal so self-heal can distinguish self-leave (sticky;
+        // do not re-add on next page render) from admin / sponsor
+        // removal (re-add on the next sponsor-graph walk, matching
+        // the existing reparenting story). NULL on legacy rows
+        // and on owner / member rows that have never been removed
+        // — read together with removed_at, never as a standalone
+        // query predicate, so no index is needed.
         $sql_message_participants = "CREATE TABLE $table_message_participants (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             thread_id bigint(20) UNSIGNED NOT NULL,
@@ -1635,6 +1688,7 @@ class Matrix_MLM_Database {
             last_read_at datetime DEFAULT NULL,
             muted_until datetime DEFAULT NULL,
             removed_at datetime DEFAULT NULL,
+            removed_by bigint(20) UNSIGNED DEFAULT NULL,
             PRIMARY KEY (id),
             UNIQUE KEY thread_user (thread_id, user_id),
             KEY user_id (user_id)

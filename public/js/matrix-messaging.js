@@ -176,10 +176,42 @@
                 '</ul>' +
             '</div>';
 
+        // Members affordance is team-room only. Renders as a
+        // separate button (not a kebab entry) because the panel
+        // is richer than the existing menu items — it pulls a
+        // roster on click and shows a Leave button at the top.
+        // Hidden DOM is rendered alongside the trigger; the
+        // panel is populated lazily on first open and refreshed
+        // each subsequent open so a sponsor / admin add-or-
+        // remove from another tab is reflected next time the
+        // user opens the panel.
+        var membersHtml = '';
+        if (threadType === 'team_room') {
+            membersHtml =
+                '<div class="matrix-messaging__menu-wrap">' +
+                    '<button type="button" class="button button-small matrix-messaging__members-btn" id="matrix-messaging-members" aria-haspopup="true" aria-expanded="false" title="' + escapeHtml(cfg.i18n.members_panel_title || 'Members') + '">' +
+                        '<span class="dashicons dashicons-groups"></span>' +
+                        '<span class="matrix-messaging__members-label">' + escapeHtml(cfg.i18n.members_button || 'Members') + '</span>' +
+                    '</button>' +
+                    '<div class="matrix-messaging__menu matrix-messaging__members-panel" id="matrix-messaging-members-panel" role="dialog" aria-label="' + escapeHtml(cfg.i18n.members_panel_title || 'Members') + '" hidden>' +
+                        '<div class="matrix-messaging__members-panel-header">' +
+                            '<strong>' + escapeHtml(cfg.i18n.members_panel_title || 'Members') + '</strong>' +
+                            '<button type="button" class="button button-small button-link-delete matrix-messaging__leave-btn" id="matrix-messaging-leave">' +
+                                escapeHtml(cfg.i18n.leave_thread || 'Leave thread') +
+                            '</button>' +
+                        '</div>' +
+                        '<ul class="matrix-messaging__members-list" id="matrix-messaging-members-list" aria-live="polite">' +
+                            '<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_loading || 'Loading members…') + '</li>' +
+                        '</ul>' +
+                    '</div>' +
+                '</div>';
+        }
+
         $pane.html(
             '<div class="matrix-messaging__pane-header">' +
                 '<strong>' + escapeHtml(threadLabel) + '</strong>' +
                 '<div class="matrix-messaging__pane-controls">' +
+                    membersHtml +
                     mutePopoverHtml +
                     kebabHtml +
                 '</div>' +
@@ -965,6 +997,119 @@
         }
     });
 
+    // --- Members panel + self-leave (team rooms only) ---
+
+    /**
+     * Render the members list inside the open panel. Each row
+     * shows display_name, an "(owner)" / "(member)" role tag,
+     * and an "(you)" tag for the current user. Owner rows are
+     * pinned to the top server-side via the ORDER BY in
+     * list_thread_members.
+     */
+    function renderMembersList(members) {
+        var $list = $('#matrix-messaging-members-list');
+        if (!$list.length) { return; }
+        if (!members || !members.length) {
+            $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_load_failed || 'Could not load members.') + '</li>');
+            return;
+        }
+        var html = '';
+        members.forEach(function (m) {
+            var roleLabel = (m.role === 'owner')
+                ? (cfg.i18n.members_role_owner || 'owner')
+                : (cfg.i18n.members_role_member || 'member');
+            var tags = '<span class="matrix-messaging__members-role">' + escapeHtml(roleLabel) + '</span>';
+            if (m.is_self) {
+                tags += ' <span class="matrix-messaging__members-self">(' + escapeHtml(cfg.i18n.members_you || 'you') + ')</span>';
+            }
+            html += '<li class="matrix-messaging__members-row" data-user-id="' + (parseInt(m.user_id, 10) || 0) + '">' +
+                        '<span class="matrix-messaging__members-name">' + escapeHtml(m.display_name || '') + '</span> ' +
+                        tags +
+                    '</li>';
+        });
+        $list.html(html);
+    }
+
+    /**
+     * Lazy-load the members roster on each panel open. We
+     * deliberately re-fetch every time (rather than caching the
+     * first response) so a sponsor / admin who added or removed
+     * a member from another tab is reflected the next time the
+     * panel opens — at the cost of one small AJAX round-trip per
+     * open, which is fine for an explicitly-opened popover.
+     */
+    function loadMembers() {
+        if (!activeThreadId) { return; }
+        var $list = $('#matrix-messaging-members-list');
+        if (!$list.length) { return; }
+        $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_loading || 'Loading members…') + '</li>');
+        api('list_members', { thread_id: activeThreadId }).done(function (resp) {
+            if (resp && resp.success && resp.data && resp.data.members) {
+                renderMembersList(resp.data.members);
+            } else {
+                $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_load_failed || 'Could not load members.') + '</li>');
+            }
+        }).fail(function () {
+            $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_load_failed || 'Could not load members.') + '</li>');
+        });
+    }
+
+    $pane.on('click', '#matrix-messaging-members', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var $panel = $('#matrix-messaging-members-panel');
+        var willOpen = $panel.prop('hidden');
+        toggleMenu('#matrix-messaging-members-panel', $(this));
+        if (willOpen) {
+            loadMembers();
+        }
+    });
+
+    // Stop clicks inside the panel from bubbling up to the
+    // document-level closeAllMenus handler — the user is
+    // interacting with the panel, not dismissing it. The Leave
+    // button still gets its own click handler below.
+    $pane.on('click', '#matrix-messaging-members-panel', function (e) {
+        e.stopPropagation();
+    });
+
+    $pane.on('click', '#matrix-messaging-leave', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!activeThreadId) { return; }
+        if (!window.confirm(cfg.i18n.confirm_leave || 'Leave this team room?')) { return; }
+        var leftThreadId = activeThreadId;
+        api('leave_thread', { thread_id: leftThreadId }).done(function (resp) {
+            if (!(resp && resp.success)) {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.leave_failed || 'Could not leave the thread.'));
+                return;
+            }
+            // Stop polling and tear down the active pane so the
+            // next render uses fresh state. Then refresh the
+            // sidebar — the server-side list_threads_for_user
+            // gates on removed_at IS NULL so the just-left thread
+            // naturally drops off.
+            closeAllMenus();
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            if (editWindowSweepTimer) { clearInterval(editWindowSweepTimer); editWindowSweepTimer = null; }
+            activeThreadId = null;
+            activeThreadType = 'dm';
+            renderedIds = Object.create(null);
+            lastId = 0;
+            oldestId = 0;
+            hasMoreOlder = true;
+            $pane.html('<div class="matrix-messaging__placeholder">' + escapeHtml(cfg.i18n.select_thread || 'Select a conversation, or start a new one.') + '</div>');
+            // Optimistically remove the row from the sidebar. The
+            // server's list_threads_for_user already gates on
+            // removed_at IS NULL, so the next page load won't show
+            // it either — this just keeps the visible state in
+            // sync without an extra round-trip.
+            $threadsList.find('.matrix-messaging__thread[data-thread-id="' + leftThreadId + '"]').remove();
+        }).fail(function () {
+            alert(cfg.i18n.leave_failed || 'Could not leave the thread.');
+        });
+    });
+
     /**
      * Generic open-one-menu / close-the-rest helper. Both menus
      * mount inside the pane so a single document-level click
@@ -983,7 +1128,7 @@
     }
     function closeAllMenus() {
         $('.matrix-messaging__menu').prop('hidden', true);
-        $('.matrix-messaging__mute-btn, .matrix-messaging__kebab').attr('aria-expanded', 'false');
+        $('.matrix-messaging__mute-btn, .matrix-messaging__kebab, .matrix-messaging__members-btn').attr('aria-expanded', 'false');
     }
     $(document).on('click', function (e) {
         if (!$(e.target).closest('.matrix-messaging__menu-wrap').length) {

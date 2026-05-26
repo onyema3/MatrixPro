@@ -216,6 +216,13 @@ class Matrix_MLM_Messaging {
         // same user_meta via ajax_guard().
         add_action('wp_ajax_matrix_messaging_presence',      [__CLASS__, 'ajax_presence']);
 
+        // Team-room membership management (DB 1.0.22).
+        // Both endpoints are gated by ajax_guard() and additionally
+        // by user_can_view_thread() at the model layer — a member
+        // can only list / leave a thread they're already in.
+        add_action('wp_ajax_matrix_messaging_list_members',  [__CLASS__, 'ajax_list_members']);
+        add_action('wp_ajax_matrix_messaging_leave_thread',  [__CLASS__, 'ajax_leave_thread']);
+
         // Self-healing team-room membership: when a new user is created,
         // ensure their sponsor's team room exists and add the new user as
         // a member. Runs on user_register (WP core) AND on a custom hook
@@ -550,6 +557,13 @@ class Matrix_MLM_Messaging {
      * Add a referral as a `member` of their sponsor's team room. Idempotent
      * — re-running for the same (sponsor, user) pair is a no-op (UNIQUE on
      * thread_id+user_id).
+     *
+     * Sticky self-leave (DB 1.0.22): if the existing row was removed by
+     * the user themselves (removed_by == user_id), DO NOT reactivate. A
+     * member who clicked "Leave thread" stays out — self-heal would
+     * otherwise fight them on every dashboard load. Admin / sponsor
+     * removals (where removed_by is null or differs from user_id) still
+     * reactivate, preserving the historical reparenting behaviour.
      */
     public static function add_user_to_team_room($user_id, $sponsor_id) {
         global $wpdb;
@@ -563,16 +577,30 @@ class Matrix_MLM_Messaging {
             return false;
         }
         $participants_t = $wpdb->prefix . 'matrix_message_participants';
-        $existing = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM $participants_t WHERE thread_id = %d AND user_id = %d",
+        $existing = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, removed_at, removed_by FROM $participants_t
+              WHERE thread_id = %d AND user_id = %d",
             $thread_id, $user_id
         ));
         if ($existing) {
-            // Reactivate if previously removed (admin reparenting).
-            $wpdb->update($participants_t,
-                ['removed_at' => null],
-                ['id' => (int) $existing]
-            );
+            // Sticky self-leave check first. A user whose removed_by
+            // equals their own user_id deliberately walked out; we
+            // refuse to re-admit them via the sponsor-graph walk.
+            // Returning true (not false) because the function's
+            // contract is "ensure the membership state is correct
+            // for this pair" — sticky-out is a correct state.
+            if (!empty($existing->removed_at) && (int) $existing->removed_by === $user_id) {
+                return true;
+            }
+            // Reactivate if previously removed by anyone else
+            // (admin reparenting, sponsor-initiated removal in a
+            // future PR, NULL legacy rows).
+            if (!empty($existing->removed_at)) {
+                $wpdb->update($participants_t,
+                    ['removed_at' => null, 'removed_by' => null],
+                    ['id' => (int) $existing->id]
+                );
+            }
             return true;
         }
         $wpdb->insert($participants_t, [
@@ -583,6 +611,7 @@ class Matrix_MLM_Messaging {
             'last_read_at' => null,
             'muted_until'  => null,
             'removed_at'   => null,
+            'removed_by'   => null,
         ]);
         return true;
     }
@@ -1286,6 +1315,176 @@ class Matrix_MLM_Messaging {
             ['thread_id' => (int) $thread_id, 'user_id' => (int) $user_id]
         );
         return true;
+    }
+
+    /**
+     * Self-leave a thread (DB 1.0.22).
+     *
+     * Soft-removes the caller from the participants table by stamping
+     * removed_at + removed_by. Sets removed_by = user_id specifically
+     * so add_user_to_team_room()'s sticky check refuses to walk this
+     * user back into the same room on the next sponsor-graph self-heal
+     * pass — the membership stays out until either the user is
+     * explicitly re-invited (sponsor-remove flow, future PR) or an
+     * admin clears the removed_by stamp by reparenting them.
+     *
+     * Scope: team_room threads only. DM threads are not "leavable" by
+     * design — there are exactly two participants and either is free
+     * to use Block instead, which is the equivalent silencing tool
+     * with stronger semantics (mutual silence, not just one-way exit).
+     *
+     * Owner protection: the team room's owner cannot leave. Allowing
+     * it would orphan the room (sponsor still walks the sponsor
+     * graph and re-creates / re-attaches their downline on next
+     * self-heal anyway, so the leave would be a UX lie). Sponsors
+     * who want a clean break should ask an admin to reparent their
+     * downline first; until that flow exists, this is the safe gate.
+     *
+     * Returns true on success, WP_Error on policy refusal. Idempotent
+     * for already-removed rows (returns true without re-stamping —
+     * preserves the original removed_at timestamp for the audit
+     * trail).
+     */
+    public static function leave_thread($thread_id, $user_id) {
+        global $wpdb;
+        $thread_id = (int) $thread_id;
+        $user_id   = (int) $user_id;
+        if ($thread_id <= 0 || $user_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+
+        // Pull the participant row + thread type in two cheap reads.
+        // Ordering: participant first because most refusals happen
+        // on this row (not a participant, already removed). If the
+        // participant row exists, the thread row almost certainly
+        // does too.
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+        $threads_t      = $wpdb->prefix . 'matrix_message_threads';
+
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, role, removed_at FROM $participants_t
+              WHERE thread_id = %d AND user_id = %d",
+            $thread_id, $user_id
+        ));
+        if (!$row) {
+            return new WP_Error('matrix_messaging_forbidden', __('You are not a member of this thread.', 'matrix-mlm'));
+        }
+        if (!empty($row->removed_at)) {
+            // Already left — return true so a double-click on the
+            // Leave button doesn't surface an error toast on the
+            // second click. The first click did the work; the
+            // second is a confirming no-op.
+            return true;
+        }
+
+        $thread_type = (string) $wpdb->get_var($wpdb->prepare(
+            "SELECT type FROM $threads_t WHERE id = %d",
+            $thread_id
+        ));
+        if ($thread_type !== 'team_room') {
+            return new WP_Error(
+                'matrix_messaging_not_leavable',
+                __('Only team rooms can be left. Use Block to silence a direct message.', 'matrix-mlm')
+            );
+        }
+        if ($row->role === 'owner') {
+            return new WP_Error(
+                'matrix_messaging_owner_cannot_leave',
+                __('The team room owner cannot leave their own room.', 'matrix-mlm')
+            );
+        }
+
+        $wpdb->update(
+            $participants_t,
+            [
+                'removed_at' => current_time('mysql', true),
+                'removed_by' => $user_id,
+            ],
+            ['id' => (int) $row->id]
+        );
+
+        /**
+         * Fires after a member self-leaves a team room. Lets audit-
+         * log subscribers record the event without observing the
+         * participants table directly. Symmetric with the
+         * matrix_messaging_user_banned / unbanned hooks.
+         *
+         * @param int $thread_id
+         * @param int $user_id
+         */
+        do_action('matrix_messaging_thread_left', $thread_id, $user_id);
+
+        return true;
+    }
+
+    /**
+     * List the active members of a thread (DB 1.0.22).
+     *
+     * Returns an array of plain stdClass rows shaped for direct
+     * rendering: user_id, display_name (display_name fallback to
+     * user_login fallback to '#<id>'), role, joined_at, is_self.
+     * Excludes removed members — the panel shows "who's currently
+     * here", not "who has ever been here". Soft-removed rows stay
+     * in storage for the audit story but never reach the UI.
+     *
+     * Visibility gate: the viewer must be a non-removed participant
+     * themselves. We refuse to leak the membership of a thread to
+     * a stranger, even though display names are public on the
+     * dashboard — composing a member roster from a thread the
+     * viewer doesn't belong to is its own privacy escalation
+     * (e.g. mapping a sponsor's full downline by probing thread
+     * ids one at a time).
+     *
+     * Hard cap at 200 rows. Real-world team rooms top out at the
+     * sponsor's direct-referral count, which is bounded by the
+     * matrix shape (small per node — usually <50 directs across
+     * the whole plan), so 200 is comfortably above any plausible
+     * legitimate count and the cap is here only to defend
+     * against a malformed thread that somehow has thousands of
+     * participants.
+     */
+    public static function list_thread_members($thread_id, $viewer_id) {
+        global $wpdb;
+        $thread_id = (int) $thread_id;
+        $viewer_id = (int) $viewer_id;
+        if ($thread_id <= 0 || $viewer_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+        if (!self::user_can_view_thread($thread_id, $viewer_id)) {
+            return new WP_Error('matrix_messaging_forbidden', __('You are not a participant of this thread.', 'matrix-mlm'));
+        }
+
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+        $rows = $wpdb->get_results($wpdb->prepare("
+            SELECT p.user_id, p.role, p.joined_at,
+                   u.user_login, u.display_name
+              FROM $participants_t p
+              LEFT JOIN {$wpdb->users} u ON u.ID = p.user_id
+             WHERE p.thread_id = %d
+               AND p.removed_at IS NULL
+             ORDER BY (p.role = 'owner') DESC, p.joined_at ASC, p.user_id ASC
+             LIMIT 200
+        ", $thread_id));
+
+        $out = [];
+        foreach ((array) $rows as $r) {
+            $name = '';
+            if (!empty($r->display_name)) {
+                $name = (string) $r->display_name;
+            } elseif (!empty($r->user_login)) {
+                $name = (string) $r->user_login;
+            } else {
+                $name = '#' . (int) $r->user_id;
+            }
+            $out[] = (object) [
+                'user_id'      => (int) $r->user_id,
+                'display_name' => $name,
+                'role'         => (string) $r->role,
+                'joined_at'    => (string) $r->joined_at,
+                'is_self'      => ((int) $r->user_id === $viewer_id),
+            ];
+        }
+        return $out;
     }
 
     public static function report_message($message_id, $reporter_id, $reason, $note = '') {
@@ -2429,5 +2628,42 @@ class Matrix_MLM_Messaging {
         $uid = self::ajax_guard();
         // ajax_guard already updated presence; nothing else to do.
         wp_send_json_success(['ts' => time(), 'user_id' => $uid]);
+    }
+
+    /**
+     * POST action=matrix_messaging_list_members with thread_id.
+     *
+     * Returns the active member roster for a thread the caller can
+     * see. Drives the team-room "Members" panel; DM threads can also
+     * call it (it'll simply return the two participants), but the
+     * UI doesn't surface the panel for DMs.
+     */
+    public static function ajax_list_members() {
+        $uid = self::ajax_guard();
+        $thread_id = (int) ($_REQUEST['thread_id'] ?? 0);
+        $rows = self::list_thread_members($thread_id, $uid);
+        if (is_wp_error($rows)) {
+            wp_send_json_error(['message' => $rows->get_error_message()], 403);
+        }
+        wp_send_json_success(['members' => $rows]);
+    }
+
+    /**
+     * POST action=matrix_messaging_leave_thread with thread_id.
+     *
+     * Self-leave only — the model refuses owner / non-team-room
+     * threads. On success the next list_threads_for_user response
+     * will omit the thread because the SQL gates on
+     * removed_at IS NULL, so the JS doesn't need to mutate the
+     * sidebar by hand: a refresh pulls the new state.
+     */
+    public static function ajax_leave_thread() {
+        $uid = self::ajax_guard();
+        $thread_id = (int) ($_POST['thread_id'] ?? 0);
+        $result = self::leave_thread($thread_id, $uid);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        wp_send_json_success(['thread_id' => $thread_id]);
     }
 }
