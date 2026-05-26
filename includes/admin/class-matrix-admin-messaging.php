@@ -50,6 +50,29 @@ class Matrix_MLM_Admin_Messaging {
 
         $this->maybe_handle_post();
 
+        // Voice-notes inline player on the moderation page (DB 1.0.25).
+        // The Reports tab is the only place we render <matrix-voice-player>
+        // server-side, but we enqueue the assets on every tab so a
+        // moderator who toggles tabs without a full page reload (e.g.
+        // an operator with a bookmark to Bans → flips to Reports) still
+        // gets the player wired without us hand-rolling a per-tab
+        // enqueue. Both files are tiny (~10 KB combined, gzipped) and
+        // load in the footer; the cost on tabs that don't render the
+        // element is one parsed-but-unused custom-element registration.
+        wp_enqueue_style(
+            'matrix-voice-notes',
+            MATRIX_MLM_PLUGIN_URL . 'public/css/matrix-voice-notes.css',
+            ['matrix-mlm-admin'],
+            MATRIX_MLM_VERSION
+        );
+        wp_enqueue_script(
+            'matrix-voice-player',
+            MATRIX_MLM_PLUGIN_URL . 'public/js/matrix-voice-player.js',
+            [],
+            MATRIX_MLM_VERSION,
+            true
+        );
+
         ?>
         <div class="wrap matrix-admin-wrap">
             <h1><?php esc_html_e('Messaging Moderation', 'matrix-mlm'); ?></h1>
@@ -155,6 +178,153 @@ class Matrix_MLM_Admin_Messaging {
             $thread_id, $around_message_id, $limit
         ));
         return array_reverse($rows ?: []);
+    }
+
+    /**
+     * Voice-attachment lookup for the moderation queue (DB 1.0.25).
+     *
+     * Returns a map of message_id => array of voice-attachment
+     * descriptors:
+     *
+     *   [
+     *     <message_id> => [
+     *       [ 'attachment_id' => 123,
+     *         'signed_url'    => 'https://.../wp-json/.../signed?...',
+     *         'duration_ms'   => 42180,
+     *         'peaks'         => [0.04, 0.12, ...]  // or null
+     *       ],
+     *       ...
+     *     ],
+     *     ...
+     *   ]
+     *
+     * Single batched SELECT so a 25-row open queue with ~10 context
+     * rows each (250 message ids worst case) costs one query rather
+     * than per-row fan-out. Empty input returns an empty map without
+     * touching the DB.
+     *
+     * The signed URL is minted via Matrix_MLM_Attachment_Signer using
+     * exactly the same code path the recipient-side
+     * hydrate_message_rows() uses. Admins pass the signer's auth gate
+     * by capability, so a moderator can play a reported voice note
+     * even when the message has been soft-deleted (the file lives on
+     * disk for 30 days post-delete; cron_cleanup hard-deletes after).
+     *
+     * Empty / unsignable URLs are SKIPPED rather than rendered with a
+     * raw /uploads/ URL — the moderation surface follows the same "no
+     * raw URL ever" invariant as the user surface from PR #370.
+     *
+     * Voice-only by design. Image attachments don't show in the
+     * moderation queue because the existing 200-char text excerpt is
+     * what moderators screen against; an inline image preview would
+     * be a separate UX decision and is explicitly out-of-scope for
+     * the voice-notes spec.
+     *
+     * @param int[] $message_ids Distinct message ids to look up.
+     * @return array<int, array<int, array<string, mixed>>>
+     */
+    private function voice_attachments_for_messages($message_ids) {
+        global $wpdb;
+        $message_ids = array_values(array_unique(array_filter(array_map('intval', (array) $message_ids))));
+        if (empty($message_ids)) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($message_ids), '%d'));
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT message_id, attachment_id, duration_ms, waveform_peaks_json
+               FROM {$wpdb->prefix}matrix_message_attachments
+              WHERE kind = 'voice'
+                AND message_id IN ($placeholders)
+              ORDER BY message_id ASC, position ASC, id ASC",
+            $message_ids
+        ));
+
+        $out = [];
+        if (empty($rows)) {
+            return $out;
+        }
+
+        foreach ($rows as $r) {
+            $aid      = (int) $r->attachment_id;
+            $msg_id   = (int) $r->message_id;
+            if ($aid <= 0 || $msg_id <= 0) {
+                continue;
+            }
+            $public = wp_get_attachment_url($aid);
+            $signed = '';
+            if ($public && class_exists('Matrix_MLM_Attachment_Signer')) {
+                $signed = Matrix_MLM_Attachment_Signer::sign_url_from_public($public);
+            }
+            // Refuse to surface anything that didn't successfully
+            // sign — the moderation page must never leak a raw
+            // /uploads/ URL to a member's voice file. The bubble
+            // for that one attachment renders as the placeholder
+            // text only ("(message deleted)" or the body text);
+            // the moderator can fall back to the dashboard
+            // thread view if they need to investigate further.
+            if (!$signed || $signed === $public) {
+                continue;
+            }
+            $peaks = null;
+            if (!empty($r->waveform_peaks_json)) {
+                $decoded = json_decode($r->waveform_peaks_json, true);
+                if (is_array($decoded)) {
+                    $peaks = $decoded;
+                }
+            }
+            if (!isset($out[$msg_id])) {
+                $out[$msg_id] = [];
+            }
+            $out[$msg_id][] = [
+                'attachment_id' => $aid,
+                'signed_url'    => $signed,
+                'duration_ms'   => isset($r->duration_ms) ? (int) $r->duration_ms : null,
+                'peaks'         => $peaks,
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Render zero or more <matrix-voice-player> elements for a
+     * single message's voice attachments. Pure echo helper — used
+     * inside the open-queue body cell and the thread-context
+     * expander so the player markup stays in one place.
+     *
+     * Wraps each player in a moderation-styled container so the
+     * player can sit inline with the body excerpt without bleeding
+     * the user-facing bubble chrome.
+     *
+     * @param array $atts Output of voice_attachments_for_messages()
+     *                    for one message_id, i.e. an array of
+     *                    descriptor arrays. Empty means render nothing.
+     */
+    private function render_voice_players($atts) {
+        if (empty($atts) || !is_array($atts)) {
+            return;
+        }
+        echo '<div class="matrix-messaging-mod-voice" style="margin-top:8px;">';
+        foreach ($atts as $a) {
+            $duration = isset($a['duration_ms']) ? (int) $a['duration_ms'] : 0;
+            $peaks_attr = '';
+            if (!empty($a['peaks']) && is_array($a['peaks'])) {
+                // wp_json_encode + esc_attr so the JSON survives the
+                // attribute boundary intact. The custom-element
+                // attribute parser handles the JSON.parse on the
+                // other side.
+                $encoded = wp_json_encode(array_values($a['peaks']));
+                if (is_string($encoded)) {
+                    $peaks_attr = ' peaks="' . esc_attr($encoded) . '"';
+                }
+            }
+            echo '<matrix-voice-player'
+                . ' src="' . esc_url($a['signed_url']) . '"'
+                . ' duration-ms="' . esc_attr((string) $duration) . '"'
+                . $peaks_attr
+                . '></matrix-voice-player>';
+        }
+        echo '</div>';
     }
 
     private function maybe_handle_post() {
@@ -790,7 +960,31 @@ class Matrix_MLM_Admin_Messaging {
                 <tbody>
                     <?php if (empty($rows)): ?>
                         <tr><td colspan="7"><?php esc_html_e('No reports.', 'matrix-mlm'); ?></td></tr>
-                    <?php else: foreach ($rows as $r):
+                    <?php else:
+                        // Pre-fetch the thread-context window for every
+                        // open-queue row, then batch the voice-attachment
+                        // lookup across the union of (open-queue ids,
+                        // every context-row id). One trip to
+                        // matrix_message_attachments serves the whole
+                        // page render — vs. up to 250 trips if we left
+                        // the lookup inside the per-row loop.
+                        //
+                        // Cached map keys are message ids; rendering
+                        // dereferences voice_attachments_for_messages()
+                        // output by id without further queries.
+                        $context_by_msg = [];
+                        $voice_lookup_ids = [];
+                        foreach ($rows as $pre_r) {
+                            $context_by_msg[(int) $pre_r->message_id] = $this->fetch_thread_context(
+                                (int) $pre_r->thread_id, (int) $pre_r->message_id, 10
+                            );
+                            $voice_lookup_ids[] = (int) $pre_r->message_id;
+                            foreach ($context_by_msg[(int) $pre_r->message_id] as $cm) {
+                                $voice_lookup_ids[] = (int) $cm->id;
+                            }
+                        }
+                        $voice_atts_map = $this->voice_attachments_for_messages($voice_lookup_ids);
+                        foreach ($rows as $r):
                         $sender_id = (int) $r->sender_id;
                         $sender_ban = $sender_id > 0 ? Matrix_MLM_Messaging::is_user_banned($sender_id) : false;
                         ?>
@@ -832,6 +1026,24 @@ class Matrix_MLM_Admin_Messaging {
                                     <?php if (mb_strlen((string) $r->body) > 200): ?><span aria-hidden="true">…</span><?php endif; ?>
                                 <?php endif; ?>
                                 <?php
+                                // Inline moderation player (DB 1.0.25).
+                                // Renders REGARDLESS of $r->deleted_at —
+                                // a recipient sees "(message deleted)"
+                                // and no audio, but a moderator can
+                                // still play the voice for the 30-day
+                                // post-delete window before
+                                // cron_cleanup hard-deletes the file.
+                                // After the GC pass, the signer call
+                                // returns empty (file gone) and the
+                                // helper renders nothing, so this
+                                // becomes a no-op without any extra
+                                // gating here.
+                                $msg_voice_atts = isset($voice_atts_map[(int) $r->message_id])
+                                    ? $voice_atts_map[(int) $r->message_id]
+                                    : [];
+                                $this->render_voice_players($msg_voice_atts);
+                                ?>
+                                <?php
                                 // View thread context expander. Closed
                                 // by default — the moderator opts into
                                 // reading the surrounding messages,
@@ -843,7 +1055,9 @@ class Matrix_MLM_Admin_Messaging {
                                 // time regardless of expansion state;
                                 // 25 rows per page × 1 query = ~25 ms
                                 // on a healthy server, acceptable.
-                                $context_rows = $this->fetch_thread_context((int) $r->thread_id, (int) $r->message_id, 10);
+                                $context_rows = isset($context_by_msg[(int) $r->message_id])
+                                    ? $context_by_msg[(int) $r->message_id]
+                                    : [];
                                 if (!empty($context_rows)): ?>
                                     <details style="margin-top:8px;">
                                         <summary style="cursor:pointer;font-size:12px;color:#2271b1;"><?php esc_html_e('View thread context', 'matrix-mlm'); ?></summary>
@@ -868,6 +1082,16 @@ class Matrix_MLM_Admin_Messaging {
                                                             <?php if (mb_strlen((string) $cm->body) > 300): ?><span aria-hidden="true">…</span><?php endif; ?>
                                                         <?php endif; ?>
                                                     </div>
+                                                    <?php
+                                                    // Same player render for context rows.
+                                                    // Lets the moderator hear voice notes
+                                                    // adjacent to the reported message
+                                                    // without leaving the queue.
+                                                    $cm_voice_atts = isset($voice_atts_map[(int) $cm->id])
+                                                        ? $voice_atts_map[(int) $cm->id]
+                                                        : [];
+                                                    $this->render_voice_players($cm_voice_atts);
+                                                    ?>
                                                 </div>
                                             <?php endforeach; ?>
                                         </div>
