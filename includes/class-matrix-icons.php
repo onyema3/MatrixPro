@@ -218,11 +218,48 @@ class Matrix_MLM_Icons {
             $classes .= ' ' . $extra_class;
         }
 
+        // Inline-style defence-in-depth.
+        //
+        // PR #336 established that on the production theme,
+        // class-based !important rules in this plugin's stylesheet
+        // can lose the cascade against tied-or-stronger theme rules
+        // loaded later in the source order. The fix that finally
+        // worked there was inline `style="..."` on the icon span,
+        // because inline-style specificity (1,0,0,0) beats any
+        // class-based selector regardless of source order.
+        //
+        // After PR #337's icon-font -> SVG swap, the very same theme
+        // started clobbering the SVG presentation — sidebar menu
+        // labels rendered as underlined links with no visible icons
+        // beside them, which is consistent with the theme's
+        // `nav a` reset extending to descendants generically. The
+        // SVG element itself can be neutralised by any of:
+        //
+        //   nav a > * { display: none !important }
+        //   nav a svg { width: 0 !important; height: 0 !important }
+        //   nav a svg, nav a svg path { fill: none !important }
+        //   nav a svg { visibility: hidden !important }
+        //
+        // Each property carries `!important` directly in the inline
+        // style. CSS spec allows `!important` inside style="" — the
+        // resulting declaration wins on specificity (1,0,0,0 with
+        // !important) over any class-based theme rule, including
+        // class-based !important rules. The CSS rules in
+        // matrix-dashboard.css remain in place as belt-and-braces
+        // (cheaper to edit if a global size change is needed) but
+        // the inline style is what guarantees the icon renders at
+        // all when the cascade goes hostile.
+        $inline_style = sprintf(
+            'display:inline-block!important;width:%1$dpx!important;height:%1$dpx!important;flex-shrink:0!important;vertical-align:middle!important;fill:currentColor!important;color:inherit!important;visibility:visible!important;opacity:1!important;',
+            $size_attr
+        );
+
         return sprintf(
-            '<svg class="%s" width="%d" height="%d" viewBox="0 0 24 24" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">%s</svg>',
+            '<svg class="%s" width="%d" height="%d" viewBox="0 0 24 24" style="%s" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">%s</svg>',
             esc_attr($classes),
             $size_attr,
             $size_attr,
+            esc_attr($inline_style),
             self::$icons[$key]
         );
     }

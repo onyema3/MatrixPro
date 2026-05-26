@@ -48,13 +48,43 @@
     flex-direction: column;
 }
 
+/* ============================================================
+   SIDEBAR NAV CASCADE ARMOR
+   ------------------------------------------------------------
+   The production theme (libertyhub.ng deploy) ships an
+   aggressive `<nav>` reset that has, across PRs #335, #336,
+   and #337, broken successively:
+     - font-family on dashicon spans (font reset)
+     - inline-style font-family on dashicon spans (specificity
+       beaten by !important class rule loaded later)
+     - SVG icon visibility after the dashicons->SVG swap
+     - text-decoration: none on the <a> elements
+       (every menu label rendered as an underlined link in the
+       most recent screenshot)
+   Primary mitigation is structural: the sidebar wrapper has
+   been demoted from <nav> to <div role="navigation"> in
+   includes/user/class-matrix-user-dashboard.php, so the theme's
+   `nav a` and `nav a > *` selectors no longer match this
+   surface at all. The !important rules below are belt-and-
+   braces in case a future theme escalates to targeting the
+   plugin's own `.matrix-dashboard-nav` class directly (still
+   class-based, but a nominally tied-specificity fight where
+   we'd lose on source order without !important). The inline
+   style="" emitted by Matrix_MLM_Icons::svg() is the third
+   layer — inline `!important` (specificity 1,0,0,0) wins
+   against any class-based theme rule, including class-based
+   !important rules.
+   Every property below MUST stay !important — drop one and
+   a more aggressive theme can break the sidebar in some new
+   way without touching <nav> at all.
+   ============================================================ */
 .matrix-dashboard-nav a {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
     padding: 11px 24px;
-    color: #d1d5db;
-    text-decoration: none;
+    color: #d1d5db !important;
+    text-decoration: none !important;
     font-size: 13px;
     transition: all 0.2s;
     border-left: 3px solid transparent;
@@ -62,29 +92,28 @@
 
 .matrix-dashboard-nav a:hover {
     background: rgba(255,255,255,0.05);
-    color: #fff;
+    color: #fff !important;
+    text-decoration: none !important;
+}
+
+.matrix-dashboard-nav a:focus,
+.matrix-dashboard-nav a:active,
+.matrix-dashboard-nav a:visited {
+    text-decoration: none !important;
 }
 
 .matrix-dashboard-nav a.active {
     background: rgba(79, 70, 229, 0.2);
-    color: #fff;
+    color: #fff !important;
     border-left-color: var(--matrix-primary);
+    text-decoration: none !important;
 }
 
 .matrix-dashboard-nav a .dashicons {
-    /* font-family is set with !important because some themes ship
-       a `nav a span { font-family: inherit !important }` (or
-       similarly worded) reset that wins on the cascade and stops
-       the WP core dashicons font from resolving. Symptom: every
-       sidebar icon renders as an empty 16x16 box (the dashicons
-       span keeps its layout box, but the glyph code points fall
-       back to the theme body font, which has nothing mapped at
-       those Private Use Area positions). The genealogy toolbar's
-       dashicons keep working in that scenario because they're
-       not inside <nav> — only the sidebar is hit. Locking the
-       font-family here makes the rendering theme-independent.
-       Reported on a fresh production deploy onto a new theme
-       after PR #334 enqueued dashicons globally. */
+    /* Legacy dashicons defence kept in place for the two non-nav
+       spans that PR #337 didn't swap (PIN-enrol banner, level
+       toast). Harmless on the SVG-swapped sidebar items because
+       those no longer carry the .dashicons class. */
     font-family: dashicons !important;
     font-size: 16px;
     width: 16px;
@@ -92,41 +121,72 @@
     line-height: 1;
 }
 
-/* Inline-SVG icons (.matrix-icon) replaced the dashicons spans on
-   every nav/notification surface where theme cascade fights were
-   making the icon font unreliable. Sized to match the previous
-   16x16 dashicon footprint exactly so the swap is layout-neutral.
-   `flex-shrink: 0` keeps the icon from collapsing when the nav
-   item label wraps, `vertical-align: middle` aligns the SVG with
-   the label baseline (SVG default alignment is `baseline`, which
-   sits the icon below the text mid-line on most line-heights).
-   See includes/class-matrix-icons.php for the registry and the
-   commit message for the full theme-cascade rationale. */
-.matrix-dashboard-nav a .matrix-icon {
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    vertical-align: middle;
+/* Inline-SVG icons (.matrix-icon) replaced the dashicons spans
+   on every <nav>/notifications surface where theme cascade
+   fights were making the icon font unreliable. Each property
+   is !important because the theme has been observed clobbering
+   nav descendants generically — see the cascade-armor block
+   header above. `fill: currentColor` is reasserted at both the
+   <svg> and inner <path> level because some theme resets target
+   `nav svg, nav svg path { fill: none !important }` to neutralise
+   social-icon kits, which would render our icons invisible
+   even though the SVG element itself is rendering. */
+.matrix-dashboard-nav a .matrix-icon,
+.matrix-dashboard-nav .matrix-icon {
+    display: inline-block !important;
+    width: 16px !important;
+    height: 16px !important;
+    flex-shrink: 0 !important;
+    vertical-align: middle !important;
+    fill: currentColor !important;
+    color: inherit !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* The notifications bell trigger is a button with an icon + label
-   stacked horizontally; the icon is slightly larger than sidebar
-   nav icons (20px) per the previous .dashicons-bell spec. */
-.matrix-notif-bell-btn .matrix-notif-bell-icon {
-    width: 20px;
-    height: 20px;
-    flex-shrink: 0;
+.matrix-dashboard-nav a .matrix-icon path,
+.matrix-dashboard-nav .matrix-icon path {
+    fill: currentColor !important;
+}
+
+/* The notifications bell trigger lives inside the same <nav>
+   so it inherits the same hostile-theme cascade. Slightly
+   larger than sidebar nav icons (20px) per the previous
+   .dashicons-bell spec. */
+.matrix-notif-bell-btn .matrix-notif-bell-icon,
+.matrix-dashboard-nav .matrix-notif-bell-icon {
+    width: 20px !important;
+    height: 20px !important;
+    flex-shrink: 0 !important;
+    display: inline-block !important;
+    fill: currentColor !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+.matrix-notif-bell-btn .matrix-notif-bell-icon path {
+    fill: currentColor !important;
 }
 
 /* Notification dropdown / Notifications page rows: the
    .matrix-notif-icon span is the coloured-bubble badge (32x32);
    the inline SVG inside it sits at 18px so the bubble's padding
    is visible around the glyph. See matrix-notifications.css for
-   the bubble's background/colour rules. */
+   the bubble's background/colour rules. The dropdown is
+   absolutely-positioned inside the bell wrapper, which itself
+   is inside <nav>, so the same cascade armor applies. */
 .matrix-notif-icon svg {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
+    width: 18px !important;
+    height: 18px !important;
+    flex-shrink: 0 !important;
+    display: inline-block !important;
+    fill: currentColor !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+.matrix-notif-icon svg path {
+    fill: currentColor !important;
 }
 
 .matrix-nav-logout {
