@@ -48,8 +48,17 @@ class Matrix_MLM_Messaging {
      * gate so a future caller that forgets to validate cannot land an
      * attacker-controlled string into a column that gets reflected on
      * every reviewer's moderation page.
+     *
+     * Thread types (DB 1.0.24):
+     *   - dm:         1:1 direct message (open model — any active member can DM any other)
+     *   - team_room:  auto-created sponsor room, one per sponsor, sponsor is owner
+     *   - group_room: user-created multi-party room, creator becomes owner
+     *                 and is the only role permitted to invite or remove
+     *                 members in v1. Different from team_room because it
+     *                 has no sponsor-graph dependency: members are added
+     *                 by explicit invite, not by being someone's referral.
      */
-    const THREAD_TYPES         = ['dm', 'team_room'];
+    const THREAD_TYPES         = ['dm', 'team_room', 'group_room'];
     const PARTICIPANT_ROLES    = ['owner', 'member'];
     const ALLOWED_REPORT_REASONS = ['spam', 'harassment', 'off_platform', 'scam', 'other'];
 
@@ -191,6 +200,35 @@ class Matrix_MLM_Messaging {
     const TYPING_BEACON_INTERVAL_MS  = 3000;
     const TYPING_TRANSIENT_PREFIX    = 'matrix_msg_typing_';
 
+    /**
+     * Group-room caps (DB 1.0.24).
+     *
+     * MAX_GROUP_ROOMS_PER_USER_DEFAULT — how many group rooms a single
+     * user can OWN (be the creator of). Members in someone else's
+     * room don't count, only owned rooms. Five matches the WhatsApp
+     * "groups you admin" surface and gives operators a small enough
+     * blast radius if a single user goes spam-creator.
+     *
+     * MAX_MEMBERS_PER_GROUP_ROOM_DEFAULT — including the owner. Fifty
+     * is the WhatsApp default for non-Business groups and is large
+     * enough that almost any legitimate use case fits, while small
+     * enough that a notify-everyone broadcast can't fan out to 1000
+     * recipients per send.
+     *
+     * Hard ceilings are documented in get_max_group_rooms_per_user
+     * and get_max_members_per_group_room — operators can raise the
+     * stored option via the admin settings UI but the runtime still
+     * clamps to the hard ceiling. Filters
+     * matrix_messaging_max_group_rooms_per_user and
+     * matrix_messaging_max_members_per_group_room let code-level
+     * callers override at runtime, again clamped to the hard
+     * ceiling so a typo can't let through 10000-member rooms.
+     */
+    const MAX_GROUP_ROOMS_PER_USER_DEFAULT       = 5;
+    const MAX_GROUP_ROOMS_PER_USER_HARD          = 25;
+    const MAX_MEMBERS_PER_GROUP_ROOM_DEFAULT     = 50;
+    const MAX_MEMBERS_PER_GROUP_ROOM_HARD        = 200;
+
     public static function default_settings() {
         return [
             'enabled'                       => 1,
@@ -202,6 +240,9 @@ class Matrix_MLM_Messaging {
             // Multi-attachment cap (DB 1.0.23). See
             // MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT for rationale.
             'max_attachments_per_message'   => self::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
+            // Group-room caps (DB 1.0.24).
+            'max_group_rooms_per_user'      => self::MAX_GROUP_ROOMS_PER_USER_DEFAULT,
+            'max_members_per_group_room'    => self::MAX_MEMBERS_PER_GROUP_ROOM_DEFAULT,
             'team_rooms_auto_create'        => 1,
             'polling_interval_ms'           => 10000,
             // Sender-side edit / self-delete time window. See
@@ -275,6 +316,14 @@ class Matrix_MLM_Messaging {
         // short-TTL transient that ajax_fetch_thread reads back
         // to populate the typing[] field on the poll response.
         add_action('wp_ajax_matrix_messaging_typing',        [__CLASS__, 'ajax_typing']);
+
+        // Group rooms (DB 1.0.24). Three endpoints behind
+        // ajax_guard(); per-action authorization (creator vs
+        // owner vs participant) lives at the model layer so the
+        // AJAX surface stays a thin pass-through.
+        add_action('wp_ajax_matrix_messaging_create_group_room', [__CLASS__, 'ajax_create_group_room']);
+        add_action('wp_ajax_matrix_messaging_invite_to_group',   [__CLASS__, 'ajax_invite_to_group']);
+        add_action('wp_ajax_matrix_messaging_remove_from_group', [__CLASS__, 'ajax_remove_from_group']);
 
         // Self-healing team-room membership: when a new user is created,
         // ensure their sponsor's team room exists and add the new user as
@@ -1552,6 +1601,14 @@ class Matrix_MLM_Messaging {
      * to use Block instead, which is the equivalent silencing tool
      * with stronger semantics (mutual silence, not just one-way exit).
      *
+     * Group rooms (DB 1.0.24) are also leavable — same model, same
+     * sticky semantics, same owner refusal. The only difference is
+     * the owner of a group room can't recover the room without an
+     * out-of-band re-invite from a member who's still in (and v1
+     * doesn't ship sponsor-style recovery), so leaving a group
+     * room you own would be a one-way trip; we refuse it for the
+     * same reason team_room owners are refused.
+     *
      * Owner protection: the team room's owner cannot leave. Allowing
      * it would orphan the room (sponsor still walks the sponsor
      * graph and re-creates / re-attaches their downline on next
@@ -1600,16 +1657,16 @@ class Matrix_MLM_Messaging {
             "SELECT type FROM $threads_t WHERE id = %d",
             $thread_id
         ));
-        if ($thread_type !== 'team_room') {
+        if ($thread_type !== 'team_room' && $thread_type !== 'group_room') {
             return new WP_Error(
                 'matrix_messaging_not_leavable',
-                __('Only team rooms can be left. Use Block to silence a direct message.', 'matrix-mlm')
+                __('Only team rooms and group rooms can be left. Use Block to silence a direct message.', 'matrix-mlm')
             );
         }
         if ($row->role === 'owner') {
             return new WP_Error(
                 'matrix_messaging_owner_cannot_leave',
-                __('The team room owner cannot leave their own room.', 'matrix-mlm')
+                __('The room owner cannot leave their own room.', 'matrix-mlm')
             );
         }
 
@@ -1835,6 +1892,515 @@ class Matrix_MLM_Messaging {
             }
         }
         return $typers;
+    }
+
+    // ---------------------------------------------------------------
+    // Group rooms (DB 1.0.24)
+    //
+    // User-created multi-party rooms. Distinct from team_rooms in
+    // every interesting way:
+    //   - Membership comes from explicit invite, not from sponsor-
+    //     graph self-heal. team_owner_id on the threads row holds
+    //     the creator's user_id (reusing the existing column rather
+    //     than adding a sibling) — semantically still "the room's
+    //     owner", just no implication of sponsor relationship.
+    //   - Title is operator-supplied at create time, not auto-
+    //     derived from a display_name. Empty title falls back to
+    //     "(Untitled room)" so the sidebar always has something
+    //     to render.
+    //   - Owner-only invite / remove. Members in v1 can self-leave
+    //     (uses the existing leave_thread, widened in this PR) but
+    //     can't add or remove others. Co-owner / member-can-invite
+    //     are deliberate v1 omissions.
+    //   - Owner cannot leave (same gate as team_room owners). The
+    //     escape valve is "create a fresh room and abandon the old
+    //     one"; v1 ships without explicit room deletion or owner
+    //     transfer to keep the policy surface tight.
+    //
+    // Caps: per-user creation cap (default 5, hard 25) and per-
+    // room member cap (default 50, hard 200). Both clamped at the
+    // model layer.
+    // ---------------------------------------------------------------
+
+    /**
+     * Effective per-user group-room creation cap. Reads the option,
+     * applies the documented floor (1) and hard ceiling, then runs
+     * the operator filter so code-level callers can override at
+     * runtime — still clamped to the hard ceiling so a typo can't
+     * raise it past what the storage layer can comfortably support.
+     */
+    public static function get_max_group_rooms_per_user() {
+        $settings = self::get_settings();
+        $val = isset($settings['max_group_rooms_per_user'])
+            ? (int) $settings['max_group_rooms_per_user']
+            : self::MAX_GROUP_ROOMS_PER_USER_DEFAULT;
+        if ($val < 1) {
+            $val = 1;
+        }
+        if ($val > self::MAX_GROUP_ROOMS_PER_USER_HARD) {
+            $val = self::MAX_GROUP_ROOMS_PER_USER_HARD;
+        }
+        $filtered = (int) apply_filters('matrix_messaging_max_group_rooms_per_user', $val);
+        if ($filtered < 1) { $filtered = 1; }
+        if ($filtered > self::MAX_GROUP_ROOMS_PER_USER_HARD) {
+            $filtered = self::MAX_GROUP_ROOMS_PER_USER_HARD;
+        }
+        return $filtered;
+    }
+
+    /**
+     * Effective per-room member cap. Includes the owner. Same
+     * clamp pattern as get_max_group_rooms_per_user.
+     */
+    public static function get_max_members_per_group_room() {
+        $settings = self::get_settings();
+        $val = isset($settings['max_members_per_group_room'])
+            ? (int) $settings['max_members_per_group_room']
+            : self::MAX_MEMBERS_PER_GROUP_ROOM_DEFAULT;
+        if ($val < 2) {
+            // A group room with one member is just a note-to-self;
+            // require at least 2 (owner + 1) so the room is
+            // semantically a group.
+            $val = 2;
+        }
+        if ($val > self::MAX_MEMBERS_PER_GROUP_ROOM_HARD) {
+            $val = self::MAX_MEMBERS_PER_GROUP_ROOM_HARD;
+        }
+        $filtered = (int) apply_filters('matrix_messaging_max_members_per_group_room', $val);
+        if ($filtered < 2) { $filtered = 2; }
+        if ($filtered > self::MAX_MEMBERS_PER_GROUP_ROOM_HARD) {
+            $filtered = self::MAX_MEMBERS_PER_GROUP_ROOM_HARD;
+        }
+        return $filtered;
+    }
+
+    /**
+     * Resolve a list of identifier strings (usernames, referral codes,
+     * or numeric ids) to user_ids. Drops anything that doesn't
+     * resolve to an active user, dedupes, and excludes the caller
+     * themselves (the creator is added separately as owner).
+     *
+     * Used by both create_group_room (to seed initial membership)
+     * and invite_to_group_room (to add later). Centralising means
+     * "is X a real messageable user?" has one definition rather
+     * than two that drift.
+     */
+    private static function resolve_member_identifiers($identifiers, $exclude_user_id) {
+        global $wpdb;
+        $exclude_user_id = (int) $exclude_user_id;
+        $resolved = [];
+        foreach ((array) $identifiers as $raw) {
+            $raw = trim((string) $raw);
+            if ($raw === '') {
+                continue;
+            }
+            $uid = 0;
+            if (ctype_digit($raw)) {
+                $uid = (int) $raw;
+            } elseif (preg_match('/^[A-Z0-9]{3,20}$/', $raw)) {
+                // Looks like a referral code (existing convention
+                // in ajax_open_dm). Try referral code lookup first,
+                // fall back to username if no match.
+                $uid = (int) $wpdb->get_var($wpdb->prepare(
+                    "SELECT user_id FROM {$wpdb->prefix}matrix_user_meta WHERE referral_code = %s",
+                    $raw
+                ));
+                if ($uid <= 0) {
+                    $u = get_user_by('login', sanitize_user($raw));
+                    $uid = $u ? (int) $u->ID : 0;
+                }
+            } else {
+                $u = get_user_by('login', sanitize_user($raw));
+                $uid = $u ? (int) $u->ID : 0;
+            }
+            if ($uid <= 0 || $uid === $exclude_user_id) {
+                continue;
+            }
+            // get_userdata is the cheapest "does this user exist
+            // at all" probe; deleted users return false even if
+            // they once owned the username/referral code. We do
+            // not run a banned-user check here because banning
+            // controls send-side behaviour, not invite-side: the
+            // banned user's send is what gets blocked, not their
+            // ability to receive.
+            $u = get_userdata($uid);
+            if (!$u) {
+                continue;
+            }
+            $resolved[$uid] = $uid;
+        }
+        return array_values($resolved);
+    }
+
+    /**
+     * Create a group room. Owner is $creator_id, initial members are
+     * any users in $member_identifiers that resolve to active
+     * accounts. Title is sanitized + capped at 190 chars (the
+     * column width) with an empty fallback.
+     *
+     * Returns the new thread_id, or WP_Error on policy refusal:
+     *   - matrix_messaging_disabled    : module switched off
+     *   - matrix_messaging_banned      : caller is banned from messaging
+     *   - matrix_messaging_quota       : caller already owns the cap-many group rooms
+     *   - matrix_messaging_too_many    : member list exceeds room cap
+     *   - matrix_messaging_no_members  : zero members resolved (room would be lonely)
+     *   - matrix_messaging_db_error    : storage failure
+     *
+     * Side effects: inserts one threads row + N+1 participants
+     * rows (creator as owner, validated invitees as members),
+     * then fires matrix_messaging_group_room_created so audit-
+     * log subscribers see it.
+     */
+    public static function create_group_room($creator_id, $title, $member_identifiers) {
+        global $wpdb;
+        $creator_id = (int) $creator_id;
+
+        if (!self::is_messaging_enabled()) {
+            return new WP_Error('matrix_messaging_disabled', __('Messaging is currently disabled.', 'matrix-mlm'));
+        }
+        if ($creator_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+        if (self::is_user_banned($creator_id)) {
+            return new WP_Error('matrix_messaging_banned', __('You are banned from messaging.', 'matrix-mlm'));
+        }
+
+        // Per-creator cap: count active group rooms this user
+        // currently owns (owner role, room not archived). The
+        // count is bounded by MAX_GROUP_ROOMS_PER_USER_HARD so a
+        // misconfigured filter can't inflate this query past
+        // O(25).
+        $threads_t      = $wpdb->prefix . 'matrix_message_threads';
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+        $current_owned  = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*)
+               FROM $threads_t t
+               INNER JOIN $participants_t p
+                       ON p.thread_id = t.id
+                      AND p.user_id   = %d
+                      AND p.role      = 'owner'
+                      AND p.removed_at IS NULL
+              WHERE t.type   = 'group_room'
+                AND t.status = 'active'",
+            $creator_id
+        ));
+        $cap_rooms = self::get_max_group_rooms_per_user();
+        if ($current_owned >= $cap_rooms) {
+            return new WP_Error(
+                'matrix_messaging_quota',
+                sprintf(
+                    /* translators: %d: maximum number of group rooms a user may own. */
+                    __('You can own at most %d group rooms. Leave or archive an existing one before creating another.', 'matrix-mlm'),
+                    $cap_rooms
+                )
+            );
+        }
+
+        // Resolve invitees. Exclude the creator (added below as
+        // owner; if they listed themselves in the member array we
+        // silently dedupe rather than reject).
+        $invitee_ids = self::resolve_member_identifiers($member_identifiers, $creator_id);
+
+        // Member cap is total members (including the creator).
+        // We refuse the creation rather than truncating because
+        // a silent truncation is the kind of foot-gun that
+        // surfaces only when the user notices "wait, where's
+        // Alice?" three days later.
+        $cap_members = self::get_max_members_per_group_room();
+        $total_members = count($invitee_ids) + 1; // +1 for owner
+        if ($total_members > $cap_members) {
+            return new WP_Error(
+                'matrix_messaging_too_many',
+                sprintf(
+                    /* translators: %d: maximum number of members per group room. */
+                    __('Group rooms support at most %d members (including the creator). Trim your invite list and try again.', 'matrix-mlm'),
+                    $cap_members
+                )
+            );
+        }
+        if (count($invitee_ids) < 1) {
+            return new WP_Error(
+                'matrix_messaging_no_members',
+                __('Invite at least one other user when creating a group room.', 'matrix-mlm')
+            );
+        }
+
+        // Sanitise title. Empty / whitespace-only falls back to a
+        // generic placeholder so the sidebar always has something
+        // to render. mb_substr at 190 chars matches the column
+        // width and protects against multibyte truncation.
+        $title = trim((string) $title);
+        if ($title === '') {
+            $title = __('(Untitled room)', 'matrix-mlm');
+        }
+        $title = mb_substr(sanitize_text_field($title), 0, 190);
+
+        $now = current_time('mysql', true);
+        $wpdb->insert($threads_t, [
+            'type'             => 'group_room',
+            'team_owner_id'    => $creator_id,
+            'title'            => $title,
+            'status'           => 'active',
+            'created_at'       => $now,
+            'last_message_at'  => $now,
+        ]);
+        $thread_id = (int) $wpdb->insert_id;
+        if (!$thread_id) {
+            return new WP_Error('matrix_messaging_db_error', __('Could not create room.', 'matrix-mlm'));
+        }
+
+        // Owner row first so partial inserts (e.g. a deadlock on
+        // the participants table) leave the room with at least
+        // its creator. The UNIQUE(thread_id, user_id) constraint
+        // makes the inserts safely re-runnable if a retry path
+        // ever lands them again.
+        $wpdb->insert($participants_t, [
+            'thread_id'    => $thread_id,
+            'user_id'      => $creator_id,
+            'role'         => 'owner',
+            'joined_at'    => $now,
+            'last_read_at' => null,
+            'muted_until'  => null,
+            'removed_at'   => null,
+            'removed_by'   => null,
+        ]);
+        foreach ($invitee_ids as $uid) {
+            $wpdb->insert($participants_t, [
+                'thread_id'    => $thread_id,
+                'user_id'      => $uid,
+                'role'         => 'member',
+                'joined_at'    => $now,
+                'last_read_at' => null,
+                'muted_until'  => null,
+                'removed_at'   => null,
+                'removed_by'   => null,
+            ]);
+        }
+
+        /**
+         * Fires after a group room has been created and seeded
+         * with its initial membership. Lets audit log / observability
+         * modules record the event without observing the threads /
+         * participants tables directly.
+         *
+         * @param int   $thread_id   New group room thread id.
+         * @param int   $creator_id  User id of the room creator (now owner).
+         * @param array $invitee_ids Validated initial member ids.
+         */
+        do_action('matrix_messaging_group_room_created', $thread_id, $creator_id, $invitee_ids);
+
+        return $thread_id;
+    }
+
+    /**
+     * Add members to an existing group room. Owner-only in v1.
+     *
+     * Each invitee is validated through resolve_member_identifiers
+     * (see create_group_room) and gated by the same per-room
+     * member cap. Already-active members are silently skipped (no
+     * error — the user wanted them in the room and they already
+     * are). Self-removed members (sticky removed_by == self) are
+     * NOT auto-reactivated by an owner-issued invite; that policy
+     * came in with PR #364 and we honour it here. Owner-removed
+     * members ARE reactivated, mirroring the team_room reparent
+     * story.
+     *
+     * Returns ['added' => N, 'skipped' => N, 'denied' => N] on
+     * success, WP_Error on policy refusal at the room level.
+     */
+    public static function invite_to_group_room($thread_id, $owner_id, $invitee_identifiers) {
+        global $wpdb;
+        $thread_id = (int) $thread_id;
+        $owner_id  = (int) $owner_id;
+        if ($thread_id <= 0 || $owner_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+
+        $threads_t      = $wpdb->prefix . 'matrix_message_threads';
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+
+        $thread = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, type, status FROM $threads_t WHERE id = %d",
+            $thread_id
+        ));
+        if (!$thread || $thread->type !== 'group_room' || $thread->status !== 'active') {
+            return new WP_Error('matrix_messaging_not_found', __('Group room not found or archived.', 'matrix-mlm'));
+        }
+
+        // Owner-only gate. We deliberately don't accept "any
+        // current member" as the invite role: opening the invite
+        // surface to the whole membership multiplies the spam
+        // attack surface (one compromised member can fan out the
+        // room arbitrarily) for very little user-facing
+        // benefit. Owners can promote a co-owner manually by
+        // reading the participant ids out of the database in v1
+        // — there's no UI for it yet, but the model layer
+        // already accepts role='owner' so a future PR has a
+        // clean ramp.
+        $caller_role = $wpdb->get_var($wpdb->prepare(
+            "SELECT role FROM $participants_t
+              WHERE thread_id = %d AND user_id = %d AND removed_at IS NULL",
+            $thread_id, $owner_id
+        ));
+        if ($caller_role !== 'owner') {
+            return new WP_Error('matrix_messaging_forbidden', __('Only the room owner can invite new members.', 'matrix-mlm'));
+        }
+
+        $resolved = self::resolve_member_identifiers($invitee_identifiers, $owner_id);
+        if (empty($resolved)) {
+            return new WP_Error('matrix_messaging_no_members', __('No valid users to invite.', 'matrix-mlm'));
+        }
+
+        // Member-cap check happens against the post-add count.
+        // We probe the current active membership once and refuse
+        // the whole call if applying it would exceed the cap —
+        // partial application would leave the owner uncertain
+        // about who landed and who didn't.
+        $active_now = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $participants_t
+              WHERE thread_id = %d AND removed_at IS NULL",
+            $thread_id
+        ));
+        $cap_members = self::get_max_members_per_group_room();
+        if ($active_now + count($resolved) > $cap_members) {
+            return new WP_Error(
+                'matrix_messaging_too_many',
+                sprintf(
+                    /* translators: %d: per-room member cap. */
+                    __('Adding these members would exceed the %d-member cap for this room.', 'matrix-mlm'),
+                    $cap_members
+                )
+            );
+        }
+
+        $now = current_time('mysql', true);
+        $added = 0; $skipped = 0; $denied = 0;
+        foreach ($resolved as $uid) {
+            $existing = $wpdb->get_row($wpdb->prepare(
+                "SELECT id, removed_at, removed_by FROM $participants_t
+                  WHERE thread_id = %d AND user_id = %d",
+                $thread_id, $uid
+            ));
+            if ($existing && empty($existing->removed_at)) {
+                $skipped++;
+                continue;
+            }
+            if ($existing && (int) $existing->removed_by === (int) $uid) {
+                // Sticky self-leave (PR #364 policy). Owner re-
+                // invite is refused for this user; the user
+                // would have to ask to re-join out-of-band, and
+                // a follow-up PR can ship a "request to rejoin"
+                // surface if the use case shows up. Counted as
+                // denied so the UI can tell the owner.
+                $denied++;
+                continue;
+            }
+            if ($existing) {
+                // Owner-removed (or admin-removed); reactivate.
+                $wpdb->update($participants_t,
+                    ['removed_at' => null, 'removed_by' => null],
+                    ['id' => (int) $existing->id]
+                );
+                $added++;
+            } else {
+                $wpdb->insert($participants_t, [
+                    'thread_id'    => $thread_id,
+                    'user_id'      => $uid,
+                    'role'         => 'member',
+                    'joined_at'    => $now,
+                    'last_read_at' => null,
+                    'muted_until'  => null,
+                    'removed_at'   => null,
+                    'removed_by'   => null,
+                ]);
+                $added++;
+            }
+        }
+
+        do_action('matrix_messaging_group_room_invited', $thread_id, $owner_id, $resolved, $added);
+
+        return [
+            'added'   => $added,
+            'skipped' => $skipped,
+            'denied'  => $denied,
+        ];
+    }
+
+    /**
+     * Remove a member from a group room (owner-only in v1). Soft-
+     * removes by stamping removed_at + removed_by = $owner_id, so
+     * the row stays in storage for the audit trail and the
+     * sticky-self-leave check can distinguish this from a self-
+     * exit on a future re-invite probe.
+     *
+     * Refuses three policy cases:
+     *   - caller isn't owner
+     *   - target isn't an active member
+     *   - target is the owner (owner can't be removed; v1 doesn't
+     *     ship owner-transfer)
+     *
+     * Returns true on success, WP_Error otherwise.
+     */
+    public static function remove_from_group_room($thread_id, $owner_id, $target_user_id) {
+        global $wpdb;
+        $thread_id      = (int) $thread_id;
+        $owner_id       = (int) $owner_id;
+        $target_user_id = (int) $target_user_id;
+        if ($thread_id <= 0 || $owner_id <= 0 || $target_user_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+        if ($owner_id === $target_user_id) {
+            return new WP_Error('matrix_messaging_forbidden', __('Use Leave to exit a room you own (not supported in this version).', 'matrix-mlm'));
+        }
+
+        $threads_t      = $wpdb->prefix . 'matrix_message_threads';
+        $participants_t = $wpdb->prefix . 'matrix_message_participants';
+
+        $thread = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, type, status FROM $threads_t WHERE id = %d",
+            $thread_id
+        ));
+        if (!$thread || $thread->type !== 'group_room' || $thread->status !== 'active') {
+            return new WP_Error('matrix_messaging_not_found', __('Group room not found or archived.', 'matrix-mlm'));
+        }
+
+        $caller_role = $wpdb->get_var($wpdb->prepare(
+            "SELECT role FROM $participants_t
+              WHERE thread_id = %d AND user_id = %d AND removed_at IS NULL",
+            $thread_id, $owner_id
+        ));
+        if ($caller_role !== 'owner') {
+            return new WP_Error('matrix_messaging_forbidden', __('Only the room owner can remove members.', 'matrix-mlm'));
+        }
+
+        $target = $wpdb->get_row($wpdb->prepare(
+            "SELECT id, role, removed_at FROM $participants_t
+              WHERE thread_id = %d AND user_id = %d",
+            $thread_id, $target_user_id
+        ));
+        if (!$target || !empty($target->removed_at)) {
+            return new WP_Error('matrix_messaging_not_member', __('That user is not currently a member of this room.', 'matrix-mlm'));
+        }
+        if ($target->role === 'owner') {
+            // Defence in depth — should already be caught by the
+            // $owner_id === $target_user_id check above, since
+            // there's only one owner role per room, but the
+            // explicit refusal makes the policy obvious.
+            return new WP_Error('matrix_messaging_forbidden', __('The room owner cannot be removed.', 'matrix-mlm'));
+        }
+
+        $wpdb->update(
+            $participants_t,
+            [
+                'removed_at' => current_time('mysql', true),
+                'removed_by' => $owner_id,
+            ],
+            ['id' => (int) $target->id]
+        );
+
+        do_action('matrix_messaging_group_room_member_removed', $thread_id, $owner_id, $target_user_id);
+
+        return true;
     }
 
     public static function report_message($message_id, $reporter_id, $reason, $note = '') {
@@ -3014,7 +3580,25 @@ class Matrix_MLM_Messaging {
         if (is_wp_error($rows)) {
             wp_send_json_error(['message' => $rows->get_error_message()], 403);
         }
-        wp_send_json_success(['members' => $rows]);
+        // Hydrate the panel's chrome state in the same response so
+        // the JS can decide whether to render owner-only Invite /
+        // Remove affordances without a second round-trip. Both
+        // values are derived from the rows we already have, so
+        // this is an in-PHP filter pass with no extra DB hit.
+        $thread = self::get_thread($thread_id);
+        $thread_type = $thread && isset($thread->type) ? (string) $thread->type : '';
+        $viewer_role = '';
+        foreach ($rows as $r) {
+            if (!empty($r->is_self)) {
+                $viewer_role = (string) $r->role;
+                break;
+            }
+        }
+        wp_send_json_success([
+            'members'     => $rows,
+            'thread_type' => $thread_type,
+            'viewer_role' => $viewer_role,
+        ]);
     }
 
     /**
@@ -3054,5 +3638,90 @@ class Matrix_MLM_Messaging {
         $is_typing  = !empty($_POST['is_typing']) && $_POST['is_typing'] !== '0';
         self::set_typing_state($thread_id, $uid, $is_typing);
         wp_send_json_success(['ts' => time()]);
+    }
+
+    /**
+     * POST action=matrix_messaging_create_group_room.
+     *   - title           : string (sanitised, capped at 190 chars)
+     *   - members         : string of comma / newline separated
+     *                       identifiers (usernames, referral codes,
+     *                       or numeric user ids), OR an array of
+     *                       the same.
+     *
+     * Both intake shapes converge on the same array of identifiers
+     * so admin tooling that wants to POST a clean array doesn't
+     * need to round-trip through a string.
+     */
+    public static function ajax_create_group_room() {
+        $uid = self::ajax_guard();
+        $title    = isset($_POST['title']) ? wp_unslash((string) $_POST['title']) : '';
+        $raw_mems = $_POST['members'] ?? '';
+        $identifiers = [];
+        if (is_array($raw_mems)) {
+            foreach ($raw_mems as $m) {
+                $identifiers[] = wp_unslash((string) $m);
+            }
+        } else {
+            // CSV / newline / whitespace-separated. Splits on any
+            // run of comma / whitespace so the user can paste
+            // "alice, bob carol" or "alice\nbob\ncarol" without
+            // worrying about exact delimiter choice.
+            $tokens = preg_split('/[,\s]+/', (string) $raw_mems) ?: [];
+            foreach ($tokens as $t) {
+                if ($t !== '') {
+                    $identifiers[] = $t;
+                }
+            }
+        }
+
+        $result = self::create_group_room($uid, $title, $identifiers);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message(), 'code' => $result->get_error_code()]);
+        }
+        wp_send_json_success(['thread_id' => $result]);
+    }
+
+    /**
+     * POST action=matrix_messaging_invite_to_group with thread_id +
+     * members (same intake shape as ajax_create_group_room). Owner-
+     * only at the model layer.
+     */
+    public static function ajax_invite_to_group() {
+        $uid = self::ajax_guard();
+        $thread_id = (int) ($_POST['thread_id'] ?? 0);
+        $raw_mems  = $_POST['members'] ?? '';
+        $identifiers = [];
+        if (is_array($raw_mems)) {
+            foreach ($raw_mems as $m) {
+                $identifiers[] = wp_unslash((string) $m);
+            }
+        } else {
+            $tokens = preg_split('/[,\s]+/', (string) $raw_mems) ?: [];
+            foreach ($tokens as $t) {
+                if ($t !== '') {
+                    $identifiers[] = $t;
+                }
+            }
+        }
+        $result = self::invite_to_group_room($thread_id, $uid, $identifiers);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message(), 'code' => $result->get_error_code()]);
+        }
+        wp_send_json_success($result);
+    }
+
+    /**
+     * POST action=matrix_messaging_remove_from_group with thread_id +
+     * user_id. Owner-only at the model layer.
+     */
+    public static function ajax_remove_from_group() {
+        $uid = self::ajax_guard();
+        $thread_id      = (int) ($_POST['thread_id'] ?? 0);
+        $target_user_id = (int) ($_POST['user_id'] ?? 0);
+        $result = self::remove_from_group_room($thread_id, $uid, $target_user_id);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message(), 'code' => $result->get_error_code()]);
+        }
+        wp_send_json_success(['thread_id' => $thread_id, 'user_id' => $target_user_id]);
     }
 }

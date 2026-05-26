@@ -53,6 +53,7 @@
     var $threadsList = $('#matrix-messaging-threads');
     var $pane = $('#matrix-messaging-pane');
     var $newDmBtn = $('#matrix-messaging-new-dm');
+    var $newRoomBtn = $('#matrix-messaging-new-room');
     var $searchInput = $('#matrix-messaging-search-input');
     var $searchClear = $('#matrix-messaging-search-clear');
     var $searchResults = $('#matrix-messaging-search-results');
@@ -196,6 +197,9 @@
                     '<div class="matrix-messaging__menu matrix-messaging__members-panel" id="matrix-messaging-members-panel" role="dialog" aria-label="' + escapeHtml(cfg.i18n.members_panel_title || 'Members') + '" hidden>' +
                         '<div class="matrix-messaging__members-panel-header">' +
                             '<strong>' + escapeHtml(cfg.i18n.members_panel_title || 'Members') + '</strong>' +
+                            '<button type="button" class="button button-small matrix-messaging__invite-btn" id="matrix-messaging-invite" style="display:none;">' +
+                                escapeHtml(cfg.i18n.invite_members || 'Invite members') +
+                            '</button>' +
                             '<button type="button" class="button button-small button-link-delete matrix-messaging__leave-btn" id="matrix-messaging-leave">' +
                                 escapeHtml(cfg.i18n.leave_thread || 'Leave thread') +
                             '</button>' +
@@ -1204,8 +1208,16 @@
      * and an "(you)" tag for the current user. Owner rows are
      * pinned to the top server-side via the ORDER BY in
      * list_thread_members.
+     *
+     * For group rooms (DB 1.0.24), the owner sees additional
+     * affordances: an "Invite members" button at the top of the
+     * panel and a "Remove" button next to each non-owner row.
+     * Both are hidden for non-owners and for non-group_room
+     * threads. The viewerCanManage flag arrives on the same
+     * AJAX response as the member rows, so we don't need a
+     * second round-trip.
      */
-    function renderMembersList(members) {
+    function renderMembersList(members, viewerCanManage) {
         var $list = $('#matrix-messaging-members-list');
         if (!$list.length) { return; }
         if (!members || !members.length) {
@@ -1221,12 +1233,27 @@
             if (m.is_self) {
                 tags += ' <span class="matrix-messaging__members-self">(' + escapeHtml(cfg.i18n.members_you || 'you') + ')</span>';
             }
+            // Per-row Remove affordance — owner-only, group_room
+            // only, never on the owner row itself, never on the
+            // viewer's own row (use Leave for that).
+            var removeBtn = '';
+            if (viewerCanManage && !m.is_self && m.role !== 'owner') {
+                removeBtn =
+                    '<button type="button" class="button button-link-delete matrix-messaging__members-remove" ' +
+                            'data-user-id="' + (parseInt(m.user_id, 10) || 0) + '" ' +
+                            'title="' + escapeHtml(cfg.i18n.remove_member || 'Remove from room') + '">' +
+                        '&times;' +
+                    '</button>';
+            }
             html += '<li class="matrix-messaging__members-row" data-user-id="' + (parseInt(m.user_id, 10) || 0) + '">' +
                         '<span class="matrix-messaging__members-name">' + escapeHtml(m.display_name || '') + '</span> ' +
                         tags +
+                        removeBtn +
                     '</li>';
         });
         $list.html(html);
+        // Surface the Invite button when we have permission.
+        $('#matrix-messaging-invite').toggle(!!viewerCanManage);
     }
 
     /**
@@ -1244,7 +1271,15 @@
         $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_loading || 'Loading members…') + '</li>');
         api('list_members', { thread_id: activeThreadId }).done(function (resp) {
             if (resp && resp.success && resp.data && resp.data.members) {
-                renderMembersList(resp.data.members);
+                // Owner-only management surfaces only on group rooms.
+                // team_room owners (sponsors) explicitly do not get
+                // an Invite/Remove UI in v1 — membership in team
+                // rooms comes from the sponsor graph, not from
+                // explicit invites, and adding manual overrides
+                // would create a confusing two-source-of-truth
+                // story for membership state.
+                var canManage = (resp.data.thread_type === 'group_room' && resp.data.viewer_role === 'owner');
+                renderMembersList(resp.data.members, canManage);
             } else {
                 $list.html('<li class="matrix-messaging__members-empty">' + escapeHtml(cfg.i18n.members_load_failed || 'Could not load members.') + '</li>');
             }
@@ -1306,6 +1341,59 @@
             $threadsList.find('.matrix-messaging__thread[data-thread-id="' + leftThreadId + '"]').remove();
         }).fail(function () {
             alert(cfg.i18n.leave_failed || 'Could not leave the thread.');
+        });
+    });
+
+    // Invite-members button (group-room owner only). Routed
+    // through window.prompt for the same UX-consistency reasons
+    // documented on the New Room flow above.
+    $pane.on('click', '#matrix-messaging-invite', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!activeThreadId) { return; }
+        var members = window.prompt(cfg.i18n.invite_prompt || 'Usernames or referral codes (comma-separated):');
+        if (members === null) { return; }
+        members = (members || '').trim();
+        if (members === '') { return; }
+        api('invite_to_group', { thread_id: activeThreadId, members: members }).done(function (resp) {
+            if (resp && resp.success && resp.data) {
+                var added   = parseInt(resp.data.added, 10) || 0;
+                var skipped = parseInt(resp.data.skipped, 10) || 0;
+                var denied  = parseInt(resp.data.denied, 10) || 0;
+                var summary = (cfg.i18n.invite_summary || 'Added %1$d. Skipped %2$d already in the room. %3$d previously left and cannot be auto-re-added.')
+                    .replace('%1$d', String(added))
+                    .replace('%2$d', String(skipped))
+                    .replace('%3$d', String(denied));
+                alert(summary);
+                loadMembers(); // refresh the visible roster
+            } else {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.invite_failed || 'Could not invite members.'));
+            }
+        }).fail(function () {
+            alert(cfg.i18n.invite_failed || 'Could not invite members.');
+        });
+    });
+
+    // Per-row Remove (X) button. Owner-only at the model layer,
+    // and the JS only renders the button for group_room owners,
+    // so a non-owner click can only happen via DevTools — the
+    // server still refuses it and the user sees a generic
+    // remove_failed toast.
+    $pane.on('click', '.matrix-messaging__members-remove', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!activeThreadId) { return; }
+        var targetUserId = parseInt($(this).attr('data-user-id'), 10) || 0;
+        if (targetUserId <= 0) { return; }
+        if (!window.confirm(cfg.i18n.confirm_remove || 'Remove this member from the room?')) { return; }
+        api('remove_from_group', { thread_id: activeThreadId, user_id: targetUserId }).done(function (resp) {
+            if (resp && resp.success) {
+                loadMembers();
+            } else {
+                alert((resp && resp.data && resp.data.message) || (cfg.i18n.remove_failed || 'Could not remove the member.'));
+            }
+        }).fail(function () {
+            alert(cfg.i18n.remove_failed || 'Could not remove the member.');
         });
     });
 
@@ -1488,6 +1576,52 @@
             }
         });
     });
+
+    /**
+     * "New Room" button handler — group room creation flow (DB 1.0.24).
+     *
+     * Two prompts in sequence rather than a custom modal because:
+     *   (a) the existing UI tooling in this file is window.prompt-
+     *       and window.confirm-based; mixing modals would create
+     *       inconsistent affordances mid-feature
+     *   (b) the prompts are intentionally user-correctable — typing
+     *       Cancel on either step backs out cleanly
+     *
+     * On success we reload to ?open=<thread_id> rather than wiring
+     * up an in-place sidebar mutation. The reload pulls the fresh
+     * thread list from the server which already includes the new
+     * room, sidesteps any concern about render races between the
+     * create response and the next poll, and matches the New DM
+     * button's pattern. One extra page load on a relatively rare
+     * action is a fair trade for code we know stays correct.
+     */
+    if ($newRoomBtn.length) {
+        $newRoomBtn.on('click', function () {
+            var title = window.prompt(cfg.i18n.new_room_label || 'Room name');
+            if (title === null) { return; }
+            title = (title || '').trim();
+            if (title === '') {
+                alert(cfg.i18n.new_room_no_title || 'Please give the room a name.');
+                return;
+            }
+            var members = window.prompt(cfg.i18n.new_room_members || 'Members (usernames or referral codes, separated by commas):');
+            if (members === null) { return; }
+            members = (members || '').trim();
+            if (members === '') {
+                alert(cfg.i18n.new_room_no_members || 'Add at least one member.');
+                return;
+            }
+            api('create_group_room', { title: title, members: members }).done(function (resp) {
+                if (resp && resp.success && resp.data && resp.data.thread_id) {
+                    window.location.href = window.location.pathname + '?tab=messages&open=' + resp.data.thread_id;
+                } else {
+                    alert((resp && resp.data && resp.data.message) || (cfg.i18n.new_room_failed || 'Could not create the room.'));
+                }
+            }).fail(function () {
+                alert(cfg.i18n.new_room_failed || 'Could not create the room.');
+            });
+        });
+    }
 
     // --- Cross-thread search ---
     //

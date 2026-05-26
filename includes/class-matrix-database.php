@@ -748,6 +748,42 @@ class Matrix_MLM_Database {
             ) {$charset};");
         }
 
+        // 1.0.24 — widen matrix_message_threads.type ENUM to include
+        // 'group_room' for the user-created multi-party room flow
+        // (PR follows the same pattern as the matrix_deposits.status
+        // 'pending_capture' widening from 1.0.16). Existing 'dm' and
+        // 'team_room' rows are unaffected; the default stays 'dm'.
+        //
+        // dbDelta does not reliably alter ENUM definitions on
+        // existing tables, so we probe COLUMN_TYPE via
+        // INFORMATION_SCHEMA and run the MODIFY only when
+        // 'group_room' is missing. Idempotent — a fresh install
+        // gets the wider enum from the CREATE TABLE in
+        // create_tables() and skips this block; a 1.0.23 install
+        // gets the ALTER once and then skips it on every
+        // subsequent load.
+        $threads_table = $wpdb->prefix . 'matrix_message_threads';
+        $threads_exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            DB_NAME, $threads_table
+        ));
+        if ($threads_exists > 0) {
+            $threads_type_col = (string) $wpdb->get_var($wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND COLUMN_NAME = 'type'",
+                DB_NAME, $threads_table
+            ));
+            if ($threads_type_col !== '' && stripos($threads_type_col, "'group_room'") === false) {
+                $wpdb->query(
+                    "ALTER TABLE {$threads_table}
+                       MODIFY type ENUM('dm','team_room','group_room')
+                              NOT NULL DEFAULT 'dm'"
+                );
+            }
+        }
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
         update_option('matrix_mlm_last_schema_sync', current_time('mysql'));
     }
@@ -1688,7 +1724,7 @@ class Matrix_MLM_Database {
         $table_message_threads = $wpdb->prefix . 'matrix_message_threads';
         $sql_message_threads = "CREATE TABLE $table_message_threads (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            type enum('dm','team_room') NOT NULL DEFAULT 'dm',
+            type enum('dm','team_room','group_room') NOT NULL DEFAULT 'dm',
             team_owner_id bigint(20) UNSIGNED DEFAULT NULL,
             title varchar(190) DEFAULT NULL,
             status enum('active','archived') NOT NULL DEFAULT 'active',
