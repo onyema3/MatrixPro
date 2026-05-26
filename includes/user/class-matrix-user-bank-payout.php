@@ -94,8 +94,16 @@ class Matrix_MLM_User_Bank_Payout {
                     $user_wallet->customer_id ?? null
                 );
                 if (is_wp_error($bal_result)) {
+                    // Pull the clean upstream sentence rather than
+                    // the verbose make_request() chain. Without
+                    // this, a transient Fintava outage rendered raw
+                    // "cURL error 28: Connection timed out
+                    // (url=https://api.fintavapay.com/...)" inline
+                    // under the Available Balance row — pure
+                    // developer noise to a member just trying to
+                    // see why their balance is stale.
                     $balance_unavailable_reason = Matrix_MLM_Fintava::normalize_api_message(
-                        $bal_result->get_error_message(),
+                        Matrix_MLM_Fintava::user_facing_error_message($bal_result),
                         __('Live Fintava balance is unavailable; refresh in a moment.', 'matrix-mlm')
                     );
                 } elseif (is_array($bal_result) && isset($bal_result['available_balance'])) {
@@ -150,7 +158,15 @@ class Matrix_MLM_User_Bank_Payout {
             $banks_result = $fintava->get_banks();
             if (is_wp_error($banks_result)) {
                 $banks_list = Matrix_MLM_Fintava::get_static_banks_fallback();
-                $banks_fallback_reason = $banks_result->get_error_message();
+                // user_facing_error_message() pulls the clean
+                // "Live bank list is temporarily unavailable; using
+                // the built-in Nigerian banks list." copy attached
+                // by get_banks() now, instead of leaking the raw
+                // per-host curl breakdown
+                // ("https://live…fintavapay.com: cURL error 28: …
+                //   | https://api.fintavapay.com/api/v1: …") into
+                // the dropdown's fallback note.
+                $banks_fallback_reason = Matrix_MLM_Fintava::user_facing_error_message($banks_result);
             } elseif (is_array($banks_result)) {
                 $banks_list = $banks_result;
             }
@@ -389,7 +405,20 @@ class Matrix_MLM_User_Bank_Payout {
                             <?php echo ucfirst($payout->status); ?>
                         </span>
                         <?php if (!empty($payout->failure_reason) && in_array($payout->status, ['failed', 'refunded'], true)): ?>
-                        <div class="matrix-payout-reason" title="<?php echo esc_attr($payout->failure_reason); ?>"><?php echo esc_html($payout->failure_reason); ?></div>
+                        <?php
+                        // Render the friendly upstream sentence for
+                        // the user; keep the raw audit string in the
+                        // tooltip (title=) so a power-user / support
+                        // staff can still see the verbose form
+                        // without operators losing the diagnostic
+                        // context the column was originally designed
+                        // around.
+                        $friendly_reason = Matrix_MLM_Fintava::friendly_failure_reason(
+                            $payout->failure_reason,
+                            __('The transfer could not be completed.', 'matrix-mlm')
+                        );
+                        ?>
+                        <div class="matrix-payout-reason" title="<?php echo esc_attr($payout->failure_reason); ?>"><?php echo esc_html($friendly_reason); ?></div>
                         <?php endif; ?>
                     </td>
                     <td><small><code><?php echo esc_html($payout->reference); ?></code></small></td>

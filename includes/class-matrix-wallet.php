@@ -655,7 +655,21 @@ class Matrix_MLM_Wallet {
                     $desc .= ' — ' . $r->narration;
                 }
                 if ($r->status === 'failed' && !empty($r->failure_reason)) {
-                    $desc .= ' (' . $r->failure_reason . ')';
+                    // failure_reason is the verbose audit string
+                    // make_request() emits ("API Error (HTTP 500)
+                    // calling /bank/credit: An unexpected error
+                    // occurred [body=…] [sent_keys=…]"). The audit
+                    // shape is correct for the column, but the
+                    // unified wallet history is a member-facing
+                    // surface — render the friendly upstream
+                    // sentence here. The verbose form is still on
+                    // the underlying matrix_fintava_payouts row for
+                    // operator triage on the admin payout retry
+                    // page.
+                    $desc .= ' (' . Matrix_MLM_Fintava::friendly_failure_reason(
+                        $r->failure_reason,
+                        __('transfer failed', 'matrix-mlm')
+                    ) . ')';
                 }
                 $r->description = $desc;
             }
