@@ -202,6 +202,25 @@
     transform: translateY(-1px);
 }
 
+/*
+ * Auth-page primary buttons (Login, Create Account).
+ *
+ * Scoped to .matrix-auth-card so the green palette only applies to the
+ * sign-in / register CTAs and does NOT recolor every other primary
+ * button in the plugin (deposits, withdrawals, ticket submits, etc.),
+ * which intentionally inherit --matrix-primary.
+ *
+ * Palette: Tailwind green-600 -> green-700 on hover, picked to keep
+ * AA contrast against the white card background and white button text.
+ */
+.matrix-auth-card .matrix-btn-primary {
+    background: #16a34a;
+}
+
+.matrix-auth-card .matrix-btn-primary:hover {
+    background: #15803d;
+}
+
 .matrix-btn-success { background: var(--matrix-success); color: #fff; }
 .matrix-btn-danger { background: var(--matrix-danger); color: #fff; }
 .matrix-btn-warning { background: var(--matrix-warning); color: #fff; }
