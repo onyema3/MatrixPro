@@ -291,6 +291,67 @@ class Matrix_MLM_Core {
         // priority 99 as the cache purge above so the textdomain
         // bootstrap has already run.
         add_action('init', [$this, 'maybe_self_heal_auth_pages'], 99);
+
+        // Bridge uploaded profile pictures into WP's avatar pipeline.
+        // process_upload_avatar() persists the resulting public URL
+        // under user_meta['matrix_avatar_url'], and the profile
+        // settings page reads that key directly. Every other render
+        // site (dashboard sidebar, genealogy tree nodes, anywhere
+        // a theme or other plugin calls get_avatar() /
+        // get_avatar_url()) goes through WP core, which only knows
+        // the user's email address and falls back to Gravatar — so
+        // the upload appears to "succeed but not show" anywhere
+        // outside the profile page itself. pre_get_avatar_data fires
+        // for both get_avatar() and get_avatar_url(), so a single
+        // hook covers every surface without per-call branching.
+        add_filter('pre_get_avatar_data', [$this, 'filter_avatar_data'], 10, 2);
+    }
+
+    /**
+     * pre_get_avatar_data filter: redirect WP's avatar pipeline to
+     * the user's uploaded matrix_avatar_url when one exists.
+     *
+     * $id_or_email can be a numeric user ID, a WP_User, a comment
+     * object, a post object (with post_author), or a raw email
+     * string — handle each shape so the filter is robust regardless
+     * of where in the codebase get_avatar*() is called from.
+     */
+    public function filter_avatar_data($args, $id_or_email) {
+        $user_id = 0;
+
+        if (is_numeric($id_or_email)) {
+            $user_id = (int) $id_or_email;
+        } elseif ($id_or_email instanceof WP_User) {
+            $user_id = (int) $id_or_email->ID;
+        } elseif (is_object($id_or_email)) {
+            if (!empty($id_or_email->user_id)) {
+                $user_id = (int) $id_or_email->user_id;
+            } elseif (!empty($id_or_email->ID)) {
+                $user_id = (int) $id_or_email->ID;
+            } elseif (!empty($id_or_email->comment_author_email)) {
+                $u = get_user_by('email', $id_or_email->comment_author_email);
+                if ($u) {
+                    $user_id = (int) $u->ID;
+                }
+            }
+        } elseif (is_string($id_or_email) && is_email($id_or_email)) {
+            $u = get_user_by('email', $id_or_email);
+            if ($u) {
+                $user_id = (int) $u->ID;
+            }
+        }
+
+        if ($user_id <= 0) {
+            return $args;
+        }
+
+        $url = get_user_meta($user_id, 'matrix_avatar_url', true);
+        if (is_string($url) && $url !== '') {
+            $args['url']          = $url;
+            $args['found_avatar'] = true;
+        }
+
+        return $args;
     }
 
     public function enqueue_public_assets() {
