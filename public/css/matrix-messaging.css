@@ -667,3 +667,70 @@
 .matrix-messaging__react-picker-btn:hover {
     background: #f6f7f7;
 }
+
+
+/* -----------------------------------------------------------------
+ * Members panel + self-leave (DB 1.0.22)
+ *
+ * The panel reuses the .matrix-messaging__menu base so it inherits
+ * the absolute-positioning, z-index, and hidden-attribute toggling.
+ * It just widens the box and stacks a header (Leave button) above
+ * a scrollable roster list.
+ *
+ * Width is capped at 280px so a long display name doesn't push the
+ * panel off the right edge of the pane on narrow viewports.
+ * Vertical max-height keeps a 50-member team room scrollable
+ * without overflowing into the message area below.
+ * ----------------------------------------------------------------- */
+
+.matrix-messaging__members-panel {
+    width: 280px;
+    max-height: 360px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+}
+.matrix-messaging__members-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 10px;
+    border-bottom: 1px solid #dcdcde;
+    background: #f6f7f7;
+}
+.matrix-messaging__members-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    flex: 1 1 auto;
+}
+.matrix-messaging__members-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    border-bottom: 1px solid #f0f0f1;
+}
+.matrix-messaging__members-row:last-child { border-bottom: 0; }
+.matrix-messaging__members-name { flex: 1 1 auto; }
+.matrix-messaging__members-role {
+    font-size: 11px;
+    color: #646970;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+.matrix-messaging__members-self {
+    font-size: 11px;
+    color: #2271b1;
+}
+.matrix-messaging__members-empty {
+    padding: 12px;
+    color: #646970;
+    font-size: 12px;
+    text-align: center;
+}
+.matrix-messaging__members-label {
+    margin-left: 4px;
+}

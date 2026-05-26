@@ -120,6 +120,19 @@ class Matrix_MLM_User_Messaging {
                 'unblock_user'     => __('Unblock user', 'matrix-mlm'),
                 'confirm_block'    => __('Block this user? They will no longer be able to message you and you will not be able to message them.', 'matrix-mlm'),
                 'block_failed'     => __('Could not change block state.', 'matrix-mlm'),
+                // Members panel + self-leave (DB 1.0.22).
+                'members_button'      => __('Members', 'matrix-mlm'),
+                'members_panel_title' => __('Members', 'matrix-mlm'),
+                'members_loading'     => __('Loading members…', 'matrix-mlm'),
+                'members_load_failed' => __('Could not load members.', 'matrix-mlm'),
+                'members_role_owner'  => __('owner', 'matrix-mlm'),
+                'members_role_member' => __('member', 'matrix-mlm'),
+                'members_you'         => __('you', 'matrix-mlm'),
+                /* translators: %d: number of active members in the team room. */
+                'members_count'       => __('%d members', 'matrix-mlm'),
+                'leave_thread'        => __('Leave thread', 'matrix-mlm'),
+                'confirm_leave'       => __('Leave this team room? You will stop receiving messages here. Your sponsor will not be able to add you back automatically — you would have to be re-invited.', 'matrix-mlm'),
+                'leave_failed'        => __('Could not leave the thread.', 'matrix-mlm'),
             ],
         ]);
         ?>
