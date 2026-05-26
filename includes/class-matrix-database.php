@@ -113,6 +113,10 @@ class Matrix_MLM_Database {
         //                                  at model layer — see
         //                                  Matrix_MLM_Messaging::is_blocked_either_way)
         //   - matrix_message_reports:      admin moderation queue rows
+        //   - matrix_message_reactions:    emoji reactions on individual
+        //                                  messages (DB 1.0.21). Toggleable
+        //                                  per (message, user, emoji)
+        //                                  via UNIQUE constraint.
         // Created by self::create_tables(); listed here so the schema
         // status probe and the "Repair Database Schema" admin tool
         // surface drift on these tables the same way they do for the
@@ -122,6 +126,7 @@ class Matrix_MLM_Database {
         'matrix_messages',
         'matrix_message_blocks',
         'matrix_message_reports',
+        'matrix_message_reactions',
     ];
 
     /**
@@ -1685,6 +1690,28 @@ class Matrix_MLM_Database {
         ) $charset_collate;";
         dbDelta($sql_message_reports);
 
+        // Message reactions (DB 1.0.21). One row per (message, user,
+        // emoji) — the UNIQUE constraint enforces toggle semantics
+        // at the storage layer so the model's react_to_message()
+        // can do an "INSERT IGNORE then count affected" check
+        // instead of a SELECT-then-INSERT race. emoji is varchar(16)
+        // because emoji are multi-byte (a thumbs-up is 4 bytes
+        // UTF-8, a skin-toned emoji can be 8+ bytes via ZWJ
+        // sequence) and we cap at a small UI palette anyway.
+        $table_message_reactions = $wpdb->prefix . 'matrix_message_reactions';
+        $sql_message_reactions = "CREATE TABLE $table_message_reactions (
+            id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            message_id bigint(20) UNSIGNED NOT NULL,
+            user_id bigint(20) UNSIGNED NOT NULL,
+            emoji varchar(16) NOT NULL,
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY message_user_emoji (message_id, user_id, emoji),
+            KEY message_id (message_id),
+            KEY user_id (user_id)
+        ) $charset_collate;";
+        dbDelta($sql_message_reactions);
+
         update_option('matrix_mlm_db_version', MATRIX_MLM_DB_VERSION);
     }
 
@@ -1718,6 +1745,7 @@ class Matrix_MLM_Database {
             'matrix_messages',
             'matrix_message_blocks',
             'matrix_message_reports',
+            'matrix_message_reactions',
         ];
 
         foreach ($tables as $table) {

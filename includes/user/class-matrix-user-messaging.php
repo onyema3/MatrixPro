@@ -57,6 +57,11 @@ class Matrix_MLM_User_Messaging {
             'currentUserId'     => (int) $user_id,
             'pollingIntervalMs' => (int) $settings['polling_interval_ms'],
             'allowAttachments'  => !empty($settings['allow_attachments']),
+            // Reaction palette (DB 1.0.21). Mirrors the server's
+            // Matrix_MLM_Messaging::ALLOWED_REACTION_EMOJIS so the
+            // picker stays in sync if an operator filters the
+            // palette via matrix_messaging_allowed_reactions.
+            'reactionPalette'   => Matrix_MLM_Messaging::ALLOWED_REACTION_EMOJIS,
             'i18n'              => [
                 'new_dm_prompt' => __('Username or referral code:', 'matrix-mlm'),
                 'send'          => __('Send', 'matrix-mlm'),
@@ -93,6 +98,10 @@ class Matrix_MLM_User_Messaging {
                 'message_deleted'  => __('(message deleted)', 'matrix-mlm'),
                 'flag_edited'      => __('(edited)', 'matrix-mlm'),
                 'flag_stripped'    => __('stripped', 'matrix-mlm'),
+                // Reactions (DB 1.0.21).
+                'add_reaction'     => __('Add reaction', 'matrix-mlm'),
+                'reaction_add'     => __('Add this reaction', 'matrix-mlm'),
+                'reaction_remove'  => __('Remove your reaction', 'matrix-mlm'),
                 'attach'           => __('Attach image', 'matrix-mlm'),
                 // Older-message pagination.
                 'load_older'       => __('Load older messages', 'matrix-mlm'),

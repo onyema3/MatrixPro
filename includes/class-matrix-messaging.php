@@ -196,6 +196,10 @@ class Matrix_MLM_Messaging {
         add_action('wp_ajax_matrix_messaging_unblock',       [__CLASS__, 'ajax_unblock']);
         add_action('wp_ajax_matrix_messaging_mute',          [__CLASS__, 'ajax_mute']);
         add_action('wp_ajax_matrix_messaging_report',        [__CLASS__, 'ajax_report']);
+        // Toggle an emoji reaction on a message (DB 1.0.21).
+        // POST shape so the nonce / login gate matches every
+        // other messaging endpoint.
+        add_action('wp_ajax_matrix_messaging_react',         [__CLASS__, 'ajax_react']);
         // Cross-thread search across the messages a user can see.
         // Kept POST-shaped (via ajax_guard) so the nonce / login
         // gates apply identically to every other messaging
@@ -1313,6 +1317,177 @@ class Matrix_MLM_Messaging {
         return (int) $wpdb->insert_id;
     }
 
+    // ---------------------------------------------------------------
+    // Emoji reactions on individual messages (DB 1.0.21)
+    //
+    // One row in matrix_message_reactions per (message, user, emoji).
+    // The UNIQUE constraint enforces toggle semantics at the storage
+    // layer so react_to_message() can do a delete-then-insert without
+    // a SELECT-and-race window.
+    //
+    // Reaction palette is intentionally tiny — six common emojis
+    // (see ALLOWED_REACTION_EMOJIS) — to dodge the "should we ship a
+    // 1500-emoji picker" question for a v1 feature, and to bound
+    // moderator overhead (no need for a filter rule to ban an
+    // offensive ZWJ-sequence emoji that smuggled past the picker).
+    // Operators can grow the palette by filtering matrix_messaging_allowed_reactions.
+    // ---------------------------------------------------------------
+
+    /**
+     * Whitelisted emoji palette. Kept ASCII-friendly in the source by
+     * using the actual emoji literals — modern PHP with mbstring
+     * handles them fine, and reading "👍" in code is more obvious
+     * than reading "\u{1F44D}".
+     */
+    const ALLOWED_REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+    /**
+     * Toggle a reaction. If the (message, user, emoji) row already
+     * exists, delete it; otherwise insert it.
+     *
+     * Returns ['action' => 'added'|'removed', 'count' => N] on
+     * success so the caller can update its UI in one round-trip
+     * without a follow-up GET. Returns WP_Error on policy failure.
+     */
+    public static function react_to_message($message_id, $user_id, $emoji) {
+        global $wpdb;
+        $message_id = (int) $message_id;
+        $user_id    = (int) $user_id;
+        $emoji      = (string) $emoji;
+
+        if ($message_id <= 0 || $user_id <= 0) {
+            return new WP_Error('matrix_messaging_bad_args', __('Invalid arguments.', 'matrix-mlm'));
+        }
+
+        // Whitelist + filter for operator extension. The filter
+        // runs only when the default whitelist would refuse the
+        // emoji, so the common case (matches ALLOWED) stays a
+        // single in_array lookup.
+        $allowed = self::ALLOWED_REACTION_EMOJIS;
+        if (!in_array($emoji, $allowed, true)) {
+            $allowed = (array) apply_filters('matrix_messaging_allowed_reactions', $allowed);
+            if (!in_array($emoji, $allowed, true)) {
+                return new WP_Error('matrix_messaging_invalid_emoji', __('Reaction not allowed.', 'matrix-mlm'));
+            }
+        }
+
+        // Visibility gate: reacting to a message implies seeing it.
+        // Cheap check via thread participation.
+        $thread_id = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT thread_id FROM {$wpdb->prefix}matrix_messages WHERE id = %d AND deleted_at IS NULL",
+            $message_id
+        ));
+        if (!$thread_id || !self::user_can_view_thread($thread_id, $user_id)) {
+            return new WP_Error('matrix_messaging_forbidden', __('Cannot react to this message.', 'matrix-mlm'));
+        }
+
+        $reactions_t = $wpdb->prefix . 'matrix_message_reactions';
+
+        // Toggle. INSERT IGNORE means "add if absent"; the affected
+        // rows count tells us whether we added or hit the unique
+        // constraint. If we added, return; if not, delete (the
+        // emoji was already there for this user — the click means
+        // remove).
+        $inserted = $wpdb->query($wpdb->prepare(
+            "INSERT IGNORE INTO $reactions_t (message_id, user_id, emoji, created_at)
+             VALUES (%d, %d, %s, %s)",
+            $message_id, $user_id, $emoji, current_time('mysql', true)
+        ));
+
+        if ($inserted === 1) {
+            $action = 'added';
+        } else {
+            $wpdb->delete($reactions_t, [
+                'message_id' => $message_id,
+                'user_id'    => $user_id,
+                'emoji'      => $emoji,
+            ], ['%d', '%d', '%s']);
+            $action = 'removed';
+        }
+
+        $count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $reactions_t WHERE message_id = %d AND emoji = %s",
+            $message_id, $emoji
+        ));
+
+        return ['action' => $action, 'emoji' => $emoji, 'count' => $count];
+    }
+
+    /**
+     * Compute reactions for the recent message window of a thread.
+     *
+     * Returns a map keyed by message_id whose values are
+     * [emoji => ['count' => N, 'mine' => 0|1]] so the JS can
+     * render in one pass. Bounded by RECEIPT_LOOKBACK to keep
+     * the response from ballooning on long threads — older
+     * messages drop their reactions UI from view (the rows
+     * themselves stay; this is purely a render-cost cap).
+     *
+     * Two queries: (a) recent message ids in the thread, (b)
+     * reactions joined to those ids. PHP-side group-by keeps
+     * the response shape compact for the wire.
+     */
+    public static function compute_thread_reactions($thread_id, $user_id) {
+        global $wpdb;
+        $thread_id = (int) $thread_id;
+        $user_id   = (int) $user_id;
+        if ($thread_id <= 0 || $user_id <= 0) {
+            return new \stdClass(); // empty object so JS sees {}, not []
+        }
+
+        $messages_t  = $wpdb->prefix . 'matrix_messages';
+        $reactions_t = $wpdb->prefix . 'matrix_message_reactions';
+
+        // Same lookback window as receipts so the two maps
+        // describe the same set of messages — keeps the
+        // client's per-message rendering loop simple.
+        $ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT id FROM $messages_t
+              WHERE thread_id = %d AND deleted_at IS NULL
+              ORDER BY id DESC
+              LIMIT %d",
+            $thread_id, self::RECEIPT_LOOKBACK
+        ));
+        if (empty($ids)) {
+            return new \stdClass();
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '%d'));
+        $args         = array_map('intval', $ids);
+        $args[]       = $user_id;
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT message_id, emoji, user_id
+               FROM $reactions_t
+              WHERE message_id IN ($placeholders)",
+            array_map('intval', $ids)
+        ));
+
+        $out = [];
+        foreach ($rows as $r) {
+            $mid = (int) $r->message_id;
+            if (!isset($out[$mid])) {
+                $out[$mid] = [];
+            }
+            if (!isset($out[$mid][$r->emoji])) {
+                $out[$mid][$r->emoji] = ['count' => 0, 'mine' => 0];
+            }
+            $out[$mid][$r->emoji]['count']++;
+            if ((int) $r->user_id === $user_id) {
+                $out[$mid][$r->emoji]['mine'] = 1;
+            }
+        }
+        // Cast to objects so empty stays {} not [] on the wire.
+        $obj = new \stdClass();
+        foreach ($out as $mid => $emojis) {
+            $emoji_obj = new \stdClass();
+            foreach ($emojis as $e => $payload) {
+                $emoji_obj->$e = $payload;
+            }
+            $obj->$mid = $emoji_obj;
+        }
+        return $obj;
+    }
+
     /**
      * Off-platform contact stripping. Replaces email addresses, phone
      * numbers, and external URLs with [contact removed]. Conservative
@@ -2005,6 +2180,12 @@ class Matrix_MLM_Messaging {
             'messages'    => $rows,
             'thread_type' => $thread_type,
             'receipts'    => self::compute_thread_read_receipts($thread_id, $uid),
+            // Reactions map (DB 1.0.21). Same lookback window as
+            // receipts so the JS can iterate one render loop and
+            // apply both. Empty object {} when no reactions exist
+            // anywhere in the recent window — keeps the wire shape
+            // stable.
+            'reactions'   => self::compute_thread_reactions($thread_id, $uid),
             // Edit-window seconds the client uses to hide
             // edit/delete affordances after the in-memory clock
             // ticks past created_at + window. Pulled from the
@@ -2191,6 +2372,25 @@ class Matrix_MLM_Messaging {
             wp_send_json_error(['message' => $r->get_error_message()]);
         }
         wp_send_json_success(['report_id' => $r]);
+    }
+
+    /**
+     * POST action=matrix_messaging_react with message_id + emoji.
+     *
+     * Toggles the reaction. Returns the new count for that emoji
+     * on the message and whether the action added or removed —
+     * lets the JS canonicalise its in-memory copy in one round-
+     * trip instead of waiting for the next poll.
+     */
+    public static function ajax_react() {
+        $uid = self::ajax_guard();
+        $message_id = (int) ($_POST['message_id'] ?? 0);
+        $emoji      = isset($_POST['emoji']) ? wp_unslash((string) $_POST['emoji']) : '';
+        $result = self::react_to_message($message_id, $uid, $emoji);
+        if (is_wp_error($result)) {
+            wp_send_json_error(['message' => $result->get_error_message()]);
+        }
+        wp_send_json_success($result);
     }
 
     /**

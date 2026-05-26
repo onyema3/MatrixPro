@@ -268,7 +268,17 @@
             // via the receipts map; we leave it empty initially
             // (no flicker between optimistic add and the first
             // poll's authoritative state).
-            (own && !deleted ? '<div class="matrix-messaging__message-receipt" data-receipt-for="' + parseInt(msg.id, 10) + '"></div>' : '');
+            (own && !deleted ? '<div class="matrix-messaging__message-receipt" data-receipt-for="' + parseInt(msg.id, 10) + '"></div>' : '') +
+            // Reactions slot (DB 1.0.21). Always present on
+            // non-deleted rows so applyReactions() can write
+            // into it without re-rendering the bubble. Hidden
+            // (display:none via empty content) until the next
+            // poll tick lands a non-empty map.
+            (!deleted ? '<div class="matrix-messaging__message-reactions" data-reactions-for="' + parseInt(msg.id, 10) + '"></div>' : '') +
+            // React-button trigger. On hover the bubble surfaces
+            // it (CSS); clicking pops the picker via the global
+            // delegate further down. Suppressed on deleted rows.
+            (!deleted ? '<button type="button" class="matrix-messaging__msg-react-trigger" data-msg-react="' + parseInt(msg.id, 10) + '" title="' + escapeHtml(cfg.i18n.add_reaction || 'Add reaction') + '" aria-label="' + escapeHtml(cfg.i18n.add_reaction || 'Add reaction') + '">+&#x1F642;</button>' : '');
     }
 
     /**
@@ -364,6 +374,7 @@
 
             (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
             applyReceipts(data.receipts, activeThreadType);
+            applyReactions(data.reactions);
             applyThreadState(data.thread_state);
             // hasMoreOlder defaults to true; the first
             // fetch_older click resolves it. If the initial
@@ -406,6 +417,7 @@
                 var $msgs = $('#matrix-messaging-messages');
                 (data.messages || []).forEach(function (m) { renderMessage($msgs, m, false); });
                 applyReceipts(data.receipts, activeThreadType);
+                applyReactions(data.reactions);
                 applyThreadState(data.thread_state);
             });
         }, Math.max(2000, parseInt(cfg.pollingIntervalMs, 10) || 10000));
@@ -509,6 +521,47 @@
             }
 
             $slot.text(label).toggle(label !== '');
+        });
+    }
+
+    /**
+     * Apply the reactions map (DB 1.0.21) from a fetch_thread
+     * response to every message bubble in the recent window.
+     *
+     * Wire shape: { message_id: { emoji: { count, mine } } }.
+     * We render a chip per emoji with its count, and toggle a
+     * .is-mine class when the current user is among the
+     * reactors so the chip can self-highlight without an extra
+     * SELECT. Empty messages get the slot cleared so a removed
+     * reaction collapses cleanly.
+     */
+    function applyReactions(reactions) {
+        if (!reactions || typeof reactions !== 'object') { return; }
+        // Clear every reactions slot first, so a message whose
+        // last reaction just got removed by another tab loses
+        // the chips on the next tick. Cheap — at most 50
+        // (RECEIPT_LOOKBACK) elements on the page.
+        $('.matrix-messaging__message-reactions').empty();
+
+        Object.keys(reactions).forEach(function (mid) {
+            var emojis = reactions[mid] || {};
+            var $slot  = $('.matrix-messaging__message-reactions[data-reactions-for="' + parseInt(mid, 10) + '"]');
+            if (!$slot.length) { return; }
+            Object.keys(emojis).forEach(function (e) {
+                var info = emojis[e] || {};
+                var count = parseInt(info.count, 10) || 0;
+                if (count <= 0) { return; }
+                var mine = parseInt(info.mine, 10) === 1;
+                var $chip = $('<button type="button" class="matrix-messaging__reaction-chip"></button>')
+                    .toggleClass('is-mine', mine)
+                    .attr('data-msg-id', parseInt(mid, 10))
+                    .attr('data-emoji', e)
+                    .attr('title', mine
+                        ? (cfg.i18n.reaction_remove || 'Remove your reaction')
+                        : (cfg.i18n.reaction_add || 'Add this reaction'))
+                    .append(document.createTextNode(e + ' ' + count));
+                $slot.append($chip);
+            });
         });
     }
 
@@ -729,6 +782,74 @@
     });
 
     // --- Older-message pagination ---
+
+    // Reaction picker (DB 1.0.21). Hover-on-bubble surfaces the
+    // "+🙂" trigger; clicking it pops a small fixed palette of
+    // emoji buttons. The palette mirrors the server's
+    // ALLOWED_REACTION_EMOJIS — kept synced via wp_localize_script
+    // (cfg.reactionPalette) so a future operator filter that
+    // grows the palette server-side propagates to the client
+    // without an editor round-trip. We close the picker on
+    // outside click / Escape so it never sticks open behind the
+    // user's actual conversation.
+    var $reactPicker = null;
+    function closeReactPicker() {
+        if ($reactPicker) {
+            $reactPicker.remove();
+            $reactPicker = null;
+        }
+    }
+    $pane.on('click', '.matrix-messaging__msg-react-trigger', function (e) {
+        e.stopPropagation();
+        var msgId = parseInt($(this).attr('data-msg-react'), 10);
+        if (!msgId) { return; }
+        closeReactPicker();
+        var palette = (cfg.reactionPalette && cfg.reactionPalette.length)
+            ? cfg.reactionPalette
+            : ['\u{1F44D}', '\u2764\uFE0F', '\u{1F602}', '\u{1F62E}', '\u{1F622}', '\u{1F64F}'];
+        var $picker = $('<div class="matrix-messaging__react-picker"></div>')
+            .attr('data-msg-id', msgId);
+        palette.forEach(function (e) {
+            $('<button type="button" class="matrix-messaging__react-picker-btn"></button>')
+                .text(e)
+                .attr('data-emoji', e)
+                .appendTo($picker);
+        });
+        // Position adjacent to the trigger using offset so we don't
+        // need to track per-bubble heights.
+        var off = $(this).offset();
+        $picker.css({ position: 'absolute', top: off.top - 40, left: off.left });
+        $('body').append($picker);
+        $reactPicker = $picker;
+    });
+    $(document).on('click', '.matrix-messaging__react-picker-btn', function (e) {
+        e.stopPropagation();
+        var $picker = $(this).closest('.matrix-messaging__react-picker');
+        var msgId   = parseInt($picker.attr('data-msg-id'), 10);
+        var emoji   = $(this).attr('data-emoji');
+        closeReactPicker();
+        if (!msgId || !emoji) { return; }
+        api('react', { message_id: msgId, emoji: emoji }).done(function () {
+            // Optimistic update is skipped; the next poll tick
+            // (default 10s) re-applies the canonical reactions
+            // map. Operators who set polling_interval_ms low
+            // get near-instant feedback; high-cadence sites get
+            // eventual-consistency feedback. Either way, no
+            // duplicated state to reconcile if the server
+            // result disagrees with our local guess.
+        });
+    });
+    $pane.on('click', '.matrix-messaging__reaction-chip', function (e) {
+        e.stopPropagation();
+        var msgId = parseInt($(this).attr('data-msg-id'), 10);
+        var emoji = $(this).attr('data-emoji');
+        if (!msgId || !emoji) { return; }
+        api('react', { message_id: msgId, emoji: emoji });
+    });
+    $(document).on('click.matrixReactPickerOutside', function () { closeReactPicker(); });
+    $(document).on('keydown.matrixReactPicker', function (e) {
+        if (e.key === 'Escape') { closeReactPicker(); }
+    });
 
     $pane.on('click', '#matrix-messaging-load-older', function () {
         if (!activeThreadId || olderFetchInFlight || !hasMoreOlder || oldestId === 0) { return; }
