@@ -144,7 +144,11 @@ class Matrix_MLM_User_Zebra_Payout {
             $banks_result  = $fintava->is_active() ? $fintava->get_banks() : null;
             if (is_wp_error($banks_result)) {
                 $banks_list            = Matrix_MLM_Fintava::get_static_banks_fallback();
-                $banks_fallback_reason = $banks_result->get_error_message();
+                // Same translator call the Fintava bank-payout form
+                // uses — pulls the clean user_message attached by
+                // get_banks() instead of the raw per-host curl
+                // breakdown.
+                $banks_fallback_reason = Matrix_MLM_Fintava::user_facing_error_message($banks_result);
             } elseif (is_array($banks_result)) {
                 $banks_list = $banks_result;
             } else {

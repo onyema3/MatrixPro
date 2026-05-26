@@ -752,6 +752,16 @@ class Matrix_MLM_Fintava {
         // Every host failed. Build a single WP_Error that names every
         // host we tried and what each one returned, so the dropdown
         // fallback note shows the per-host breakdown verbatim.
+        //
+        // Same dual-form contract as make_request(): the verbose
+        // per-host string lives on the message slot for operator
+        // diagnostics (admin Gateways page diagnostic, error_log
+        // greps), and a clean user_message rides on the data dict
+        // so user-facing surfaces routed through
+        // user_facing_error_message() show a readable note instead
+        // of "https://live.fintavapay.com/api/dev: cURL error 28: …
+        // | https://api.fintavapay.com/api/v1: cURL error 28: …"
+        // under the bank dropdown.
         $parts = [];
         foreach ($errors_per_base as $base => $msg) {
             $parts[] = sprintf('%s: %s', $base, $msg);
@@ -762,7 +772,10 @@ class Matrix_MLM_Fintava {
                 /* translators: %s: per-host failure breakdown ("base: message | base: message") */
                 __('Fintava /banks failed on every host tried. %s', 'matrix-mlm'),
                 implode(' | ', $parts)
-            )
+            ),
+            [
+                'user_message' => __('Live bank list is temporarily unavailable; using the built-in Nigerian banks list.', 'matrix-mlm'),
+            ]
         );
     }
 
@@ -1875,7 +1888,7 @@ class Matrix_MLM_Fintava {
             // account name to the operator and lets the actual transfer
             // arbitrate correctness.
             $payload = [
-                'message'              => $resolved->get_error_message(),
+                'message'              => self::user_facing_error_message($resolved),
                 'allow_manual_override' => true,
             ];
 
@@ -3091,7 +3104,17 @@ class Matrix_MLM_Fintava {
 
         $balance = $this->get_merchant_balance();
         if (is_wp_error($balance)) {
-            wp_send_json_error(['message' => $balance->get_error_message()]);
+            // Capability-gated to manage_matrix_mlm so this surface
+            // is admin-only, but route through the same translator
+            // we use everywhere else for consistency. The WP_Error
+            // from get_merchant_balance() propagates from
+            // make_request(), which now attaches a user_message on
+            // both transport and HTTP-error branches; the helper
+            // pulls that clean copy and falls through to the
+            // verbose form when no user_message exists (e.g. errors
+            // raised by older callsites that haven't been routed
+            // through make_request yet).
+            wp_send_json_error(['message' => self::user_facing_error_message($balance)]);
         }
 
         wp_send_json_success(['balance' => $balance]);
@@ -6372,10 +6395,10 @@ class Matrix_MLM_Fintava {
                     'message' => sprintf(
                         /* translators: %s: support contact / admin instructions */
                         __('We detected an existing Fintava record for this email or phone, but could not recover the wallet automatically. Please contact an administrator to use Migration -> Link to attach the existing wallet to your account. (Reason: %s)', 'matrix-mlm'),
-                        $recovered->get_error_message()
+                        self::user_facing_error_message($recovered)
                     ),
                     'recovery_error_code' => $recovered->get_error_code(),
-                    'duplicate_signal'    => $customer->get_error_message(),
+                    'duplicate_signal'    => self::user_facing_error_message($customer),
                 ]);
                 return;
             }
@@ -6482,7 +6505,7 @@ class Matrix_MLM_Fintava {
                     'message' => sprintf(
                         /* translators: %s: upstream Fintava error message */
                         __('Could not create your Fintava virtual wallet: %s. Please try again. If the problem persists, contact an administrator.', 'matrix-mlm'),
-                        $customer->get_error_message()
+                        self::user_facing_error_message($customer)
                     ),
                 ]);
                 return;
@@ -6628,7 +6651,7 @@ class Matrix_MLM_Fintava {
                 wp_send_json_error([
                     'message' => sprintf(
                         __('Wallet ID is missing and could not be resolved automatically: %s', 'matrix-mlm'),
-                        is_array($resolved->get_error_message()) ? implode(' ', $resolved->get_error_message()) : $resolved->get_error_message()
+                        self::user_facing_error_message($resolved)
                     ),
                     'needs_wallet_id' => true,
                 ]);
@@ -7092,14 +7115,41 @@ class Matrix_MLM_Fintava {
             // Decorate transport errors (DNS, TLS, timeout) with the URL we
             // were trying to hit so callers can tell whether the WordPress
             // host has outbound connectivity to Fintava at all.
+            //
+            // Two parallel forms, both intentional:
+            //
+            //   - $error_message keeps the verbose "<curl err> (url=…)"
+            //     shape because it's the value that ends up in
+            //     matrix_fintava_payouts.failure_reason, in error_log
+            //     diagnostics, and on admin-facing screens (Manual
+            //     Refund on Bill History, payout retry pages) where the
+            //     URL is the primary triage signal — "did the WP host
+            //     reach Fintava at all?"
+            //
+            //   - $user_message is the clean copy member-facing surfaces
+            //     pull via user_facing_error_message(). The bank-account
+            //     card on the consolidated Wallet page used to render
+            //     `cURL error 28: Connection timed out (url=https://api.
+            //     fintavapay.com/...)` whenever the upstream was slow or
+            //     unreachable; with this attached, the card now reads
+            //     "Wallet balance is temporarily unavailable. Please
+            //     refresh in a moment." while the operator-facing audit
+            //     trail keeps the curl detail.
+            $transport_msg = (string) $response->get_error_message();
+            $verbose_msg   = sprintf(
+                /* translators: 1: original transport error, 2: target URL */
+                __('%1$s (url=%2$s)', 'matrix-mlm'),
+                $transport_msg,
+                $url
+            );
             return new WP_Error(
                 $response->get_error_code(),
-                sprintf(
-                    /* translators: 1: original transport error, 2: target URL */
-                    __('%1$s (url=%2$s)', 'matrix-mlm'),
-                    $response->get_error_message(),
-                    $url
-                )
+                $verbose_msg,
+                [
+                    'user_message' => __('We could not reach the payments service right now. Please try again in a moment.', 'matrix-mlm'),
+                    'transport'    => true,
+                    'url'          => $url,
+                ]
             );
         }
 
@@ -7328,6 +7378,109 @@ class Matrix_MLM_Fintava {
             return (string) $data['user_message'];
         }
         return (string) $error->get_error_message();
+    }
+
+    /**
+     * Translate a stored matrix_fintava_payouts.failure_reason audit
+     * string into clean member-facing copy.
+     *
+     * The audit column carries the verbose form make_request() builds
+     * for triage:
+     *
+     *     "API Error (HTTP 500) calling /bank/credit: An unexpected
+     *      error occurred [body=…] [sent_keys=amount,account_number,…]"
+     *
+     * That shape is exactly what an operator wants on the admin payout
+     * retry page or in error_log greps, but member-facing surfaces
+     * (the bank-payout history table, the unified wallet history)
+     * read it as developer noise wrapped around the upstream sentence
+     * the user could actually act on.
+     *
+     * By the time these strings live in the DB the WP_Error is gone,
+     * so user_facing_error_message() can't help. This helper parses
+     * the same shape make_request() emits and strips the diagnostic
+     * decoration so members see a readable copy:
+     *
+     *   "An unexpected error occurred."
+     *   "Insufficient balance for this transaction."
+     *   "Invalid account number."
+     *
+     * The transport-error branch of make_request() — and the
+     * "(url=…)" decoration that landed there before user_message was
+     * threaded in — is also handled, so legacy rows written before
+     * that fix still render cleanly without a backfill.
+     *
+     * Stripped tokens (in order):
+     *   1. Leading "API Error (HTTP NNN) calling /endpoint" prefix,
+     *      with optional ": " separator before the upstream sentence.
+     *   2. Trailing diagnostic tags: [errors=…], [error=…],
+     *      [details=…], [detail=…], [body=…], [sent_keys=…].
+     *   3. Trailing "(url=https://…)" decoration from the legacy
+     *      transport-error branch.
+     *   4. Leading "cURL error N: " prefix (members don't need to
+     *      know the call was made via cURL).
+     *   5. Trailing " [refund failed]" annotation matrix→virtual
+     *      flows append for the rare double-failure case — kept on
+     *      the audit row, dropped from member copy.
+     *
+     * Empty result after stripping (e.g. the row only ever held the
+     * verbose prefix) falls through to $fallback so the column never
+     * renders blank. Default fallback is a generic "transfer could
+     * not be completed" sentence — operators who want a different
+     * default can pass one in.
+     *
+     * @param mixed  $raw      Raw failure_reason value from the DB.
+     *                         Non-string inputs return $fallback.
+     * @param string $fallback Member-facing string when $raw yields
+     *                         nothing useful after stripping.
+     * @return string
+     */
+    public static function friendly_failure_reason($raw, $fallback = '') {
+        if (!is_string($raw) || $raw === '') {
+            return (string) $fallback;
+        }
+        $msg = $raw;
+
+        // Drop the "API Error (HTTP NNN) calling /endpoint" prefix.
+        // The endpoint token is anchored to the next whitespace OR
+        // the optional ": " that introduces the upstream sentence,
+        // so both shapes ("…/endpoint: insufficient balance" and
+        // "…/endpoint [errors=…]") are stripped correctly.
+        $msg = preg_replace(
+            '/^API Error \(HTTP \d+\) calling \S+?(?:: )?/',
+            '',
+            (string) $msg
+        );
+
+        // Drop trailing diagnostic tags. Order doesn't matter — every
+        // tag matches the same "[key=value]" shape, all stripped in
+        // one pass.
+        $msg = preg_replace(
+            '/\s*\[(?:errors?|details?|body|sent_keys)=[^\]]*\]/',
+            '',
+            (string) $msg
+        );
+
+        // Drop the legacy "(url=https://…)" decoration the older
+        // transport-error branch appended before user_message was
+        // attached. New rows don't carry this; older rows still do.
+        $msg = preg_replace('/\s*\(url=[^)]+\)\s*$/', '', (string) $msg);
+
+        // Drop the "cURL error N: " prefix.
+        $msg = preg_replace('/^cURL error \d+:\s*/', '', (string) $msg);
+
+        // Drop the matrix→virtual " [refund failed]" annotation.
+        $msg = preg_replace('/\s*\[refund failed\]\s*$/', '', (string) $msg);
+
+        $msg = trim((string) $msg);
+
+        if ($msg === '') {
+            return $fallback !== ''
+                ? (string) $fallback
+                : __('The transfer could not be completed. Please try again, or contact support if the problem persists.', 'matrix-mlm');
+        }
+
+        return $msg;
     }
 
     private function generate_reference() {
