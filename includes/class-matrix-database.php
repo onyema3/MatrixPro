@@ -740,12 +740,54 @@ class Matrix_MLM_Database {
                 message_id bigint(20) UNSIGNED NOT NULL,
                 attachment_id bigint(20) UNSIGNED NOT NULL,
                 position tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+                kind varchar(16) NOT NULL DEFAULT 'image',
+                duration_ms int(10) UNSIGNED DEFAULT NULL,
+                waveform_peaks_json text DEFAULT NULL,
                 created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (id),
                 UNIQUE KEY message_position (message_id, position),
                 KEY message_id (message_id),
-                KEY attachment_id (attachment_id)
+                KEY attachment_id (attachment_id),
+                KEY kind (kind)
             ) {$charset};");
+        } else {
+            // 1.0.25 — voice-note columns on an existing
+            // matrix_message_attachments table. Three idempotent
+            // ADD COLUMN probes plus the kind index. Same lazy-
+            // migration shape as the e-pin / 2FA / transaction-pin
+            // ALTERs above. dbDelta in create_tables() handles a
+            // fresh install; this block handles the upgrade path
+            // for installs that landed the 1.0.23 shape.
+            $voice_columns = [
+                'kind' => "ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'image' AFTER position",
+                'duration_ms' => "ADD COLUMN duration_ms INT(10) UNSIGNED DEFAULT NULL AFTER kind",
+                'waveform_peaks_json' => "ADD COLUMN waveform_peaks_json TEXT DEFAULT NULL AFTER duration_ms",
+            ];
+            foreach ($voice_columns as $col_name => $add_clause) {
+                $col_exists = (int) $wpdb->get_var($wpdb->prepare(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                      WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                        AND COLUMN_NAME = %s",
+                    DB_NAME, $message_attachments_table, $col_name
+                ));
+                if ($col_exists === 0) {
+                    $wpdb->query("ALTER TABLE {$message_attachments_table} {$add_clause}");
+                }
+            }
+            // Companion KEY on `kind` so the moderation queue
+            // and the per-thread voice-only filters in
+            // hydrate_message_rows have an index to lean on.
+            // INFORMATION_SCHEMA.STATISTICS lists one row per
+            // index-column pair; we probe by the index name.
+            $kind_index_exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+                  WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    AND INDEX_NAME = 'kind'",
+                DB_NAME, $message_attachments_table
+            ));
+            if ($kind_index_exists === 0) {
+                $wpdb->query("ALTER TABLE {$message_attachments_table} ADD KEY kind (kind)");
+            }
         }
 
         // 1.0.24 — widen matrix_message_threads.type ENUM to include
@@ -1848,17 +1890,33 @@ class Matrix_MLM_Database {
         // so the JS can render thumbnails in the order the sender
         // attached them. UNIQUE(message_id, position) catches
         // accidental duplicate inserts at the storage layer.
+        // 1.0.25 — voice-note columns. `kind` discriminates the
+        // attachment family ('image' vs 'voice') so render code
+        // can pick the right widget without re-reading the WP
+        // attachment's mime type per row. `duration_ms` and
+        // `waveform_peaks_json` are voice-only metadata and stay
+        // NULL on image rows. Voice files are also delivered via
+        // Matrix_MLM_Attachment_Signer (not raw /uploads/ URLs),
+        // gated by per-thread participant authorisation rather
+        // than the manage_matrix_mlm capability the signer
+        // started life on. See Matrix_MLM_Messaging::send_message
+        // for write-side semantics and ::hydrate_message_rows
+        // for read-side.
         $table_message_attachments = $wpdb->prefix . 'matrix_message_attachments';
         $sql_message_attachments = "CREATE TABLE $table_message_attachments (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             message_id bigint(20) UNSIGNED NOT NULL,
             attachment_id bigint(20) UNSIGNED NOT NULL,
             position tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+            kind varchar(16) NOT NULL DEFAULT 'image',
+            duration_ms int(10) UNSIGNED DEFAULT NULL,
+            waveform_peaks_json text DEFAULT NULL,
             created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
             UNIQUE KEY message_position (message_id, position),
             KEY message_id (message_id),
-            KEY attachment_id (attachment_id)
+            KEY attachment_id (attachment_id),
+            KEY kind (kind)
         ) $charset_collate;";
         dbDelta($sql_message_attachments);
 

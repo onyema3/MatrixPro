@@ -172,6 +172,76 @@ class Matrix_MLM_Messaging {
     const MAX_ATTACHMENTS_PER_MESSAGE_HARD    = 8;
 
     /**
+     * Voice-note constants (DB 1.0.25).
+     *
+     * Voice notes ride on top of the same matrix_message_attachments
+     * row that images use, with `kind = 'voice'` discriminating the
+     * render path. The intentionally short MIME whitelist below
+     * covers what real browsers' MediaRecorder emits — Opus in
+     * WebM (Chrome/Firefox/Edge), Opus in Ogg (legacy Firefox),
+     * AAC in MP4 (Safari iOS+macOS), and MP3 as a defensive catch
+     * for some Android browsers. We deliberately do NOT accept
+     * audio/wav: at speech bitrates it's 10x the size of Opus for
+     * no perceptual quality gain and would trivially exhaust the
+     * byte cap, taking the operator-tunable cap from "useful
+     * brake" to "always-tripped error".
+     *
+     * `voice_allowed_mime()` runs this through wp_get_mime_types()
+     * so an operator filter can never widen WP's own upload
+     * allow-list (a defensive belt + braces against a typo in a
+     * matrix_messaging_voice_allowed_mime hook).
+     */
+    const VOICE_ALLOWED_MIME = [
+        'audio/webm',
+        'audio/ogg',
+        'audio/mp4',
+        'audio/mpeg',
+    ];
+
+    /**
+     * Default 2 minutes; hard ceiling 5. The duration cap exists
+     * to keep voice notes voicemail-shaped (the "I'm running late,
+     * call you back" usecase) rather than podcast-shaped. A 30-min
+     * "voice note" is a podcast and should ride a different
+     * surface. Operators can lower the default via the settings
+     * UI; the hard ceiling cannot be raised at runtime, so a
+     * misconfigured filter cannot turn the feature into a
+     * podcast host.
+     */
+    const VOICE_MAX_DURATION_SECONDS_DEFAULT = 120;
+    const VOICE_MAX_DURATION_SECONDS_HARD    = 300;
+
+    /**
+     * Default 2 MB. Large enough for ~10 minutes of speech-bitrate
+     * Opus; small enough that a malicious client cannot exhaust
+     * the upload cap with a single voice note. Hard ceiling is
+     * pinned to the existing per-attachment max_attachment_bytes
+     * — voice notes can never be larger than the image cap.
+     */
+    const VOICE_MAX_BYTES_DEFAULT = 2097152; // 2 * 1024 * 1024
+
+    /**
+     * Documented client-side waveform target. The recorder UI in
+     * PR 2 will downsample the recorded PCM into this many
+     * amplitude buckets and ship them as a JSON array on the new
+     * waveform_peaks_json column. Server-side render code does
+     * not recompute peaks; it renders whatever the client sent
+     * (or a flat bar if the column is NULL).
+     *
+     * Kept as a class constant so the JS payload can read it
+     * via wp_localize_script and the two ends never drift.
+     */
+    const VOICE_WAVEFORM_PEAKS = 64;
+
+    /**
+     * Subdirectory (relative to wp_upload_dir basedir) under
+     * which voice attachments live. The leading + trailing slashes
+     * are part of the contract — Matrix_MLM_Attachment_Signer's
+     * ALLOWED_SUBTREES list expects strings of this exact shape.
+     */
+    const VOICE_UPLOAD_SUBTREE = '/matrix-messaging-voice/';
+
+    /**
      * Typing-indicator timing (DB 1.0.23 — no schema, transient-backed).
      *
      * TYPING_TTL_SECONDS — how long a typing beacon counts as
@@ -237,6 +307,12 @@ class Matrix_MLM_Messaging {
             'strip_off_platform_contacts'   => 1,
             'allow_attachments'             => 1,
             'max_attachment_bytes'          => 5 * 1024 * 1024,
+            // Voice notes (DB 1.0.25). See VOICE_* constants above
+            // for the rationale on each default and the hard
+            // ceilings runtime resolvers clamp to.
+            'allow_voice_notes'             => 1,
+            'voice_max_duration_seconds'    => self::VOICE_MAX_DURATION_SECONDS_DEFAULT,
+            'voice_max_bytes'               => self::VOICE_MAX_BYTES_DEFAULT,
             // Multi-attachment cap (DB 1.0.23). See
             // MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT for rationale.
             'max_attachments_per_message'   => self::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
@@ -789,8 +865,16 @@ class Matrix_MLM_Messaging {
      * one-element array. The first validated id is also written
      * to matrix_messages.attachment_id so legacy readers keep
      * working without a backfill.
+     *
+     * Voice notes (DB 1.0.25): $attachment_meta is an optional
+     * keyed array shaped [attachment_id => ['peaks' => [...]]]
+     * that the recorder UI uses to ship pre-computed waveform
+     * peaks. Server-side does NOT trust client-supplied
+     * duration; it re-probes via wp_read_audio_metadata. Any
+     * unrecognised attachment_meta keys are ignored, so older
+     * callers that pass [] (or omit the argument) keep working.
      */
-    public static function send_message($thread_id, $sender_id, $body, $attachment_ids = null) {
+    public static function send_message($thread_id, $sender_id, $body, $attachment_ids = null, $attachment_meta = []) {
         global $wpdb;
         $thread_id  = (int) $thread_id;
         $sender_id  = (int) $sender_id;
@@ -870,8 +954,25 @@ class Matrix_MLM_Messaging {
         // Cap the array length BEFORE validation so a payload of
         // 1000 ids doesn't fan into 1000 get_post() calls before
         // we refuse.
+        //
+        // 1.0.25 — voice classification. classify_attachment()
+        // returns 'image' or 'voice' for accepted ids and
+        // WP_Error otherwise. Image-or-voice acceptance means
+        // pre-1.0.25 image-only callers see no behaviour change;
+        // voice attachments additionally run the duration probe
+        // and the per-attachment relocate-to-private-subtree
+        // step. A voice attachment that fails the duration cap
+        // is REJECTED (return WP_Error) rather than silently
+        // skipped — the recorder UI in PR 2 wants a useful
+        // error code to surface to the sender, and a "your
+        // 6-minute voice note silently became a 0-attachment
+        // text message" UX is worse than a 400.
         $max_attachments = self::get_max_attachments_per_message();
         $validated_attachment_ids = [];
+        $validated_attachment_meta = []; // attachment_id => ['kind', 'duration_ms', 'peaks']
+        $voice_max_duration_ms = self::get_voice_max_duration_seconds() * 1000;
+        $voice_max_bytes       = self::get_voice_max_bytes();
+        $voice_enabled         = self::is_voice_enabled();
         if (!empty($attachment_ids) && !empty($settings['allow_attachments'])) {
             // Normalize, dedupe, drop zeroes.
             $normalized = [];
@@ -887,6 +988,14 @@ class Matrix_MLM_Messaging {
             if (count($normalized) > $cap) {
                 $normalized = array_slice($normalized, 0, $cap);
             }
+            // Optional voice meta (waveform peaks) handed in by
+            // the recorder UI. Shape: [attachment_id => peaks[]].
+            // Sender-supplied peaks are advisory — the duration
+            // is re-probed server-side regardless. Out-of-shape
+            // entries are dropped silently.
+            $client_voice_meta = isset($attachment_meta) && is_array($attachment_meta)
+                ? $attachment_meta
+                : [];
             foreach ($normalized as $aid) {
                 $att_post = get_post($aid);
                 if (!$att_post || $att_post->post_type !== 'attachment') {
@@ -895,7 +1004,111 @@ class Matrix_MLM_Messaging {
                 if ((int) $att_post->post_author !== $sender_id) {
                     continue;
                 }
+                $classification = self::classify_attachment($aid);
+                if (is_wp_error($classification)) {
+                    // Voice-shaped failure (415) is loud — the
+                    // sender explicitly recorded audio, the file
+                    // arrived through the upload pipeline, and
+                    // we refuse to send it. Image-or-other
+                    // failures stay silent for backward compat.
+                    if ($classification->get_error_code() === 'matrix_messaging_voice_unsupported_mime') {
+                        return $classification;
+                    }
+                    continue;
+                }
+                $kind = $classification['kind'];
+                $meta = [
+                    'kind'        => $kind,
+                    'duration_ms' => null,
+                    'peaks'       => null,
+                ];
+                if ($kind === 'voice') {
+                    if (!$voice_enabled) {
+                        return new WP_Error(
+                            'matrix_messaging_voice_disabled',
+                            __('Voice notes are currently disabled on this site.', 'matrix-mlm'),
+                            ['status' => 403]
+                        );
+                    }
+                    // Byte cap (server-side authority — the JS
+                    // pre-flights this too but a hand-crafted
+                    // POST has no UI between it and us).
+                    $abs = get_attached_file($aid);
+                    $bytes = $abs && file_exists($abs) ? (int) filesize($abs) : 0;
+                    if ($bytes <= 0 || $bytes > $voice_max_bytes) {
+                        // Unlink the file: it is no longer
+                        // referenced by any matrix_messages row
+                        // and leaving it on disk would leak
+                        // member audio for nothing in return.
+                        if ($abs && file_exists($abs)) {
+                            @unlink($abs);
+                        }
+                        wp_delete_attachment($aid, true);
+                        return new WP_Error(
+                            'matrix_messaging_voice_too_large',
+                            sprintf(
+                                /* translators: %d: byte cap in MB. */
+                                __('Voice note too large. Limit is %d MB.', 'matrix-mlm'),
+                                (int) ceil($voice_max_bytes / (1024 * 1024))
+                            ),
+                            ['status' => 413]
+                        );
+                    }
+                    $duration_ms = self::probe_voice_duration_ms($aid);
+                    if ($duration_ms <= 0 || $duration_ms > $voice_max_duration_ms) {
+                        if ($abs && file_exists($abs)) {
+                            @unlink($abs);
+                        }
+                        wp_delete_attachment($aid, true);
+                        return new WP_Error(
+                            'matrix_messaging_voice_too_long',
+                            sprintf(
+                                /* translators: %d: duration cap in seconds. */
+                                __('Voice note too long. Limit is %d seconds.', 'matrix-mlm'),
+                                (int) self::get_voice_max_duration_seconds()
+                            ),
+                            ['status' => 413]
+                        );
+                    }
+                    $meta['duration_ms'] = $duration_ms;
+                    // Relocate into the private voice-notes
+                    // subtree before we point a message row at
+                    // it. If relocate fails we refuse the send
+                    // rather than letting a voice file land in
+                    // the public year/month uploads dir.
+                    if (!self::relocate_voice_attachment($aid)) {
+                        wp_delete_attachment($aid, true);
+                        return new WP_Error(
+                            'matrix_messaging_voice_storage_error',
+                            __('Could not stage voice note. Please try again.', 'matrix-mlm'),
+                            ['status' => 500]
+                        );
+                    }
+                    // Sanitise client-supplied waveform peaks:
+                    // numeric array, length-bounded, normalised
+                    // to [0..1] floats. Anything malformed is
+                    // dropped (renders as a flat bar).
+                    if (isset($client_voice_meta[$aid]['peaks'])
+                        && is_array($client_voice_meta[$aid]['peaks'])) {
+                        $peaks_in = $client_voice_meta[$aid]['peaks'];
+                        $peaks_out = [];
+                        $cap_peaks = self::VOICE_WAVEFORM_PEAKS;
+                        foreach ($peaks_in as $p) {
+                            $f = (float) $p;
+                            if ($f < 0) { $f = 0.0; }
+                            if ($f > 1) { $f = 1.0; }
+                            $peaks_out[] = round($f, 4);
+                            if (count($peaks_out) >= $cap_peaks) {
+                                break;
+                            }
+                        }
+                        if (!empty($peaks_out)) {
+                            $meta['peaks'] = $peaks_out;
+                        }
+                    }
+                }
                 $validated_attachment_ids[] = $aid;
+                $validated_attachment_meta[$aid] = $meta;
             }
         }
 
@@ -938,13 +1151,24 @@ class Matrix_MLM_Messaging {
         // hydrate_message_rows on a single code path: read the
         // new table; only fall back to the legacy column for
         // pre-1.0.23 messages that have no rows here.
+        //
+        // 1.0.25 — kind/duration_ms/waveform_peaks_json carry the
+        // voice-note metadata. Image rows leave duration and
+        // peaks NULL; voice rows have both.
         foreach ($validated_attachment_ids as $position => $aid) {
-            $wpdb->insert($attachments_t, [
+            $att_meta = isset($validated_attachment_meta[$aid])
+                ? $validated_attachment_meta[$aid]
+                : ['kind' => 'image', 'duration_ms' => null, 'peaks' => null];
+            $row = [
                 'message_id'    => $message_id,
                 'attachment_id' => (int) $aid,
                 'position'      => (int) $position,
+                'kind'          => (string) $att_meta['kind'],
+                'duration_ms'   => isset($att_meta['duration_ms']) ? (int) $att_meta['duration_ms'] : null,
+                'waveform_peaks_json' => !empty($att_meta['peaks']) ? wp_json_encode($att_meta['peaks']) : null,
                 'created_at'    => $now,
-            ]);
+            ];
+            $wpdb->insert($attachments_t, $row);
         }
 
         $wpdb->update($threads_t, ['last_message_at' => $now], ['id' => $thread_id]);
@@ -1008,6 +1232,416 @@ class Matrix_MLM_Messaging {
             $filtered = self::MAX_ATTACHMENTS_PER_MESSAGE_HARD;
         }
         return $filtered;
+    }
+
+    // ---------------------------------------------------------------
+    // Voice-note resolvers (DB 1.0.25)
+    // ---------------------------------------------------------------
+
+    /**
+     * Are voice notes enabled on this install?
+     *
+     * Distinct from `is_messaging_enabled()` — voice can be turned
+     * off without disabling text + image messaging. Operators
+     * needing a quick-disable during a moderation incident set
+     * this without uninstalling anything.
+     */
+    public static function is_voice_enabled() {
+        $s = self::get_settings();
+        return !empty($s['allow_voice_notes']);
+    }
+
+    /**
+     * The audio MIME types we accept for voice notes.
+     *
+     * Two layers of defence:
+     *   1. The static VOICE_ALLOWED_MIME constant is the
+     *      operator-visible default (kept in code so it travels
+     *      with the plugin, not buried in an option row).
+     *   2. The matrix_messaging_voice_allowed_mime filter lets a
+     *      regional install accept an extra codec that the
+     *      base whitelist doesn't list — but the resolver
+     *      intersects with wp_get_mime_types() so a typo'd
+     *      filter cannot widen WP's own upload allow-list.
+     */
+    public static function voice_allowed_mime() {
+        $defaults = self::VOICE_ALLOWED_MIME;
+        $filtered = apply_filters('matrix_messaging_voice_allowed_mime', $defaults);
+        if (!is_array($filtered) || empty($filtered)) {
+            $filtered = $defaults;
+        }
+        // Intersect with WP's own mime allow-list. wp_get_mime_types
+        // returns ext-pattern => mime; we project to the unique set
+        // of mime values for the membership check.
+        $wp_mimes = function_exists('wp_get_mime_types') ? array_values(wp_get_mime_types()) : [];
+        $out = [];
+        foreach ($filtered as $mime) {
+            $mime = strtolower(trim((string) $mime));
+            if ($mime === '' || strpos($mime, 'audio/') !== 0) {
+                continue;
+            }
+            if (!empty($wp_mimes) && !in_array($mime, $wp_mimes, true)) {
+                // Filter tried to add a mime WP itself does not
+                // accept on upload — silently drop it. Belt &
+                // braces against a typo'd or hostile add_filter.
+                continue;
+            }
+            if (!in_array($mime, $out, true)) {
+                $out[] = $mime;
+            }
+        }
+        // Safety net: if intersection ate every entry (e.g. WP's
+        // wp_get_mime_types is filtered to an empty list elsewhere
+        // in the install), return the static defaults — the
+        // intersection is defence-in-depth, not the only gate.
+        return empty($out) ? $defaults : $out;
+    }
+
+    /**
+     * Effective voice-note duration cap in seconds. Same
+     * floor/ceiling shape as get_max_attachments_per_message.
+     */
+    public static function get_voice_max_duration_seconds() {
+        $s = self::get_settings();
+        $val = isset($s['voice_max_duration_seconds'])
+            ? (int) $s['voice_max_duration_seconds']
+            : self::VOICE_MAX_DURATION_SECONDS_DEFAULT;
+        if ($val < 5) {
+            $val = 5; // Floor — recording for less than 5s is functionally pointless.
+        }
+        if ($val > self::VOICE_MAX_DURATION_SECONDS_HARD) {
+            $val = self::VOICE_MAX_DURATION_SECONDS_HARD;
+        }
+        $filtered = (int) apply_filters('matrix_messaging_voice_max_duration_seconds', $val);
+        if ($filtered < 5) {
+            $filtered = 5;
+        }
+        if ($filtered > self::VOICE_MAX_DURATION_SECONDS_HARD) {
+            $filtered = self::VOICE_MAX_DURATION_SECONDS_HARD;
+        }
+        return $filtered;
+    }
+
+    /**
+     * Effective voice-note byte cap. Hard ceiling is the existing
+     * `max_attachment_bytes` (per-attachment image cap) — voice
+     * cannot ever be larger than what a single image upload is
+     * allowed to be. This means the global per-attachment knob
+     * is the absolute upper bound and the voice knob can only
+     * tighten it.
+     */
+    public static function get_voice_max_bytes() {
+        $s = self::get_settings();
+        $hard = isset($s['max_attachment_bytes'])
+            ? (int) $s['max_attachment_bytes']
+            : 5 * 1024 * 1024;
+        if ($hard < 1) {
+            $hard = 5 * 1024 * 1024;
+        }
+        $val = isset($s['voice_max_bytes'])
+            ? (int) $s['voice_max_bytes']
+            : self::VOICE_MAX_BYTES_DEFAULT;
+        if ($val < 1) {
+            $val = self::VOICE_MAX_BYTES_DEFAULT;
+        }
+        if ($val > $hard) {
+            $val = $hard;
+        }
+        $filtered = (int) apply_filters('matrix_messaging_voice_max_bytes', $val);
+        if ($filtered < 1) {
+            $filtered = self::VOICE_MAX_BYTES_DEFAULT;
+        }
+        if ($filtered > $hard) {
+            $filtered = $hard;
+        }
+        return $filtered;
+    }
+
+    /**
+     * Classify a WP attachment for messaging purposes.
+     *
+     * Returns:
+     *   ['kind' => 'image'|'voice', 'mime' => '<mime>']      on accept
+     *   WP_Error                                              on reject
+     *
+     * Only callers who want a hard reject on a non-image,
+     * non-voice attachment branch on the WP_Error path; the
+     * existing send loop in send_message() drops silently for
+     * legacy compatibility (an attachment that doesn't classify
+     * as image OR voice is just skipped, mirroring the
+     * pre-1.0.25 behaviour for unsupported attachments).
+     */
+    public static function classify_attachment($attachment_id) {
+        $attachment_id = (int) $attachment_id;
+        if ($attachment_id <= 0) {
+            return new WP_Error(
+                'matrix_messaging_attachment_invalid',
+                __('Invalid attachment.', 'matrix-mlm')
+            );
+        }
+        $mime = (string) get_post_mime_type($attachment_id);
+        if ($mime === '') {
+            return new WP_Error(
+                'matrix_messaging_attachment_unknown',
+                __('Attachment has no detectable type.', 'matrix-mlm')
+            );
+        }
+        $mime = strtolower($mime);
+        if (strpos($mime, 'image/') === 0) {
+            return ['kind' => 'image', 'mime' => $mime];
+        }
+        if (in_array($mime, self::voice_allowed_mime(), true)) {
+            return ['kind' => 'voice', 'mime' => $mime];
+        }
+        return new WP_Error(
+            'matrix_messaging_voice_unsupported_mime',
+            __('Unsupported voice-note format.', 'matrix-mlm'),
+            ['status' => 415, 'mime' => $mime]
+        );
+    }
+
+    /**
+     * Probe an audio attachment's duration in milliseconds.
+     *
+     * Cached in postmeta on first probe so re-renders never re-
+     * read the file from disk. Returns 0 on probe failure — the
+     * caller treats 0 as "duration unknown, refuse the send"
+     * because a duration we cannot measure is a duration we
+     * cannot cap.
+     */
+    public static function probe_voice_duration_ms($attachment_id) {
+        $attachment_id = (int) $attachment_id;
+        if ($attachment_id <= 0) {
+            return 0;
+        }
+        $cached = (int) get_post_meta($attachment_id, '_matrix_messaging_voice_duration_ms', true);
+        if ($cached > 0) {
+            return $cached;
+        }
+        $path = get_attached_file($attachment_id);
+        if (!$path || !file_exists($path)) {
+            return 0;
+        }
+        if (!function_exists('wp_read_audio_metadata')) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+        }
+        if (!function_exists('wp_read_audio_metadata')) {
+            // Some lean WP installs do not load wp-admin/media.php
+            // outside the admin context. Falling back to 0 is the
+            // safe choice — the caller refuses the send rather
+            // than admitting an unmeasurable file.
+            return 0;
+        }
+        $meta = wp_read_audio_metadata($path);
+        if (!is_array($meta) || empty($meta['length'])) {
+            return 0;
+        }
+        $ms = (int) round((float) $meta['length'] * 1000);
+        if ($ms > 0) {
+            update_post_meta($attachment_id, '_matrix_messaging_voice_duration_ms', $ms);
+        }
+        return $ms;
+    }
+
+    /**
+     * Move a freshly-uploaded voice attachment into the private
+     * voice-notes subtree if it isn't already there. Idempotent.
+     *
+     * Why move-on-classify instead of upload_dir-on-upload:
+     * voice files are uploaded through the standard WP media
+     * pipeline (async-upload.php → wp_handle_upload) which
+     * doesn't expose a per-call upload_dir filter the way the
+     * loan-uploads code path does (loans wrap their own
+     * wp_handle_upload call, voice does not). Doing the move
+     * here, at message-send time, keeps the model layer
+     * authoritative on subtree placement and means a hand-
+     * crafted send AJAX with a stray-uploaded audio file lands
+     * the file in the right place anyway.
+     *
+     * The move:
+     *   1. Resolves on-disk source path + url from the WP
+     *      attachment meta.
+     *   2. Computes a destination under
+     *      uploads/matrix-messaging-voice/<year>/<month>/.
+     *   3. Renames on disk, updates _wp_attached_file, updates
+     *      the GUID via wp_update_post.
+     *   4. Drops .htaccess + web.config deny rules on first
+     *      creation of the subtree (mirrors the loan-uploads
+     *      pattern from Matrix_MLM_User_Loan::ensure_upload_guards).
+     *
+     * Returns true on success or no-op (already in the subtree),
+     * false on a fixable failure (e.g. permission denied — the
+     * caller rejects the send), so the send path can decide
+     * whether to admit the message or 500 on the upload.
+     */
+    public static function relocate_voice_attachment($attachment_id) {
+        $attachment_id = (int) $attachment_id;
+        if ($attachment_id <= 0) {
+            return false;
+        }
+        $source_abs = get_attached_file($attachment_id);
+        if (!$source_abs || !file_exists($source_abs)) {
+            return false;
+        }
+
+        $upload = wp_upload_dir();
+        if (!is_array($upload) || empty($upload['basedir']) || empty($upload['baseurl'])) {
+            return false;
+        }
+        $basedir = (string) $upload['basedir'];
+        $baseurl = (string) $upload['baseurl'];
+
+        // Already in the subtree? Idempotent no-op. We compare on
+        // the relative path so a basedir with a trailing slash or
+        // a symlinked uploads dir doesn't trip us up.
+        $relative_attached = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
+        if ($relative_attached !== ''
+            && strpos('/' . ltrim($relative_attached, '/'), self::VOICE_UPLOAD_SUBTREE) === 0) {
+            // Still ensure the deny guards exist — first-time
+            // operators may have a leftover folder from a
+            // pre-PR test that needs the guards backfilled.
+            self::ensure_voice_upload_guards(dirname($source_abs));
+            return true;
+        }
+
+        // Compute target path:
+        //   <basedir>/matrix-messaging-voice/<year>/<month>/<filename>
+        $year   = date('Y');
+        $month  = date('m');
+        $sub    = rtrim(self::VOICE_UPLOAD_SUBTREE, '/') . '/' . $year . '/' . $month;
+        $dest_dir_abs = $basedir . $sub;
+        if (!wp_mkdir_p($dest_dir_abs)) {
+            return false;
+        }
+
+        $filename     = wp_basename($source_abs);
+        $dest_abs     = trailingslashit($dest_dir_abs) . $filename;
+        $dest_relative = ltrim($sub . '/' . $filename, '/');
+
+        // Avoid clobbering an existing file at the destination —
+        // use wp_unique_filename to disambiguate.
+        if (file_exists($dest_abs)) {
+            $unique   = wp_unique_filename($dest_dir_abs, $filename);
+            $dest_abs = trailingslashit($dest_dir_abs) . $unique;
+            $dest_relative = ltrim($sub . '/' . $unique, '/');
+        }
+
+        if (!@rename($source_abs, $dest_abs)) {
+            // Cross-filesystem rename can fail; fall back to
+            // copy+unlink. wp_filesystem would be the textbook
+            // move here, but it requires wp_admin/file.php and
+            // a credential probe that does not run on a regular
+            // member request. Direct PHP filesystem calls match
+            // the rest of this plugin's upload path.
+            if (!@copy($source_abs, $dest_abs)) {
+                return false;
+            }
+            @unlink($source_abs);
+        }
+
+        // Update the attachment meta + guid so wp_get_attachment_url
+        // and downstream signed URLs resolve to the new path.
+        update_post_meta($attachment_id, '_wp_attached_file', $dest_relative);
+        $new_url = trailingslashit($baseurl) . $dest_relative;
+        wp_update_post([
+            'ID'   => $attachment_id,
+            'guid' => $new_url,
+        ]);
+
+        // Drop the deny guards on the destination dir on first
+        // creation. Idempotent — the helper only writes if the
+        // marker is absent.
+        self::ensure_voice_upload_guards($dest_dir_abs);
+
+        return true;
+    }
+
+    /**
+     * Drop deny-direct-access config files in the voice-notes
+     * upload subtree on first creation. Mirrors the v2 guards
+     * Matrix_MLM_User_Loan plants in /matrix-loan-files/ — the
+     * shape and marker are kept identical so an audit can grep
+     * the tree for a single sentinel and find every protected
+     * subdirectory.
+     *
+     * On Apache and IIS these files take effect automatically.
+     * On Nginx the operator has to splice an equivalent
+     * `location ~ ^/wp-content/uploads/matrix-messaging-voice/` deny
+     * block into their server config; the README + steering
+     * note (PR 4) document this.
+     */
+    private static function ensure_voice_upload_guards($dir) {
+        if (!is_string($dir) || $dir === '' || !is_dir($dir)) {
+            return;
+        }
+        $marker = 'MatrixPro guard v2';
+
+        $htaccess = trailingslashit($dir) . '.htaccess';
+        $needs_write = !file_exists($htaccess);
+        if (!$needs_write) {
+            $existing = @file_get_contents($htaccess);
+            if (!is_string($existing) || strpos($existing, $marker) === false) {
+                $needs_write = true;
+            }
+        }
+        if ($needs_write) {
+            $rules = "# {$marker}\n"
+                   . "# Messaging voice notes. Direct HTTP access is denied —\n"
+                   . "# member voice files are streamed via the signed-URL\n"
+                   . "# endpoint at /wp-json/matrix-mlm/v1/attachment which\n"
+                   . "# validates HMAC + expiry + per-thread participation\n"
+                   . "# before serving the audio. The deny-PHP-execution\n"
+                   . "# rule is kept as defense-in-depth in case a future\n"
+                   . "# config change re-enables direct access.\n"
+                   . "<FilesMatch \"\\.(php|phtml|php3|php4|php5|php6|php7|phar|pht)$\">\n"
+                   . "    Require all denied\n"
+                   . "</FilesMatch>\n"
+                   . "<IfModule mod_php.c>\n"
+                   . "    php_flag engine off\n"
+                   . "</IfModule>\n"
+                   . "RemoveHandler .php .phtml .phar\n"
+                   . "RemoveType .php .phtml .phar\n"
+                   . "<IfModule mod_authz_core.c>\n"
+                   . "    Require all denied\n"
+                   . "</IfModule>\n"
+                   . "<IfModule !mod_authz_core.c>\n"
+                   . "    Order deny,allow\n"
+                   . "    Deny from all\n"
+                   . "</IfModule>\n";
+            @file_put_contents($htaccess, $rules);
+        }
+
+        $webconfig = trailingslashit($dir) . 'web.config';
+        $needs_write_wc = !file_exists($webconfig);
+        if (!$needs_write_wc) {
+            $existing_wc = @file_get_contents($webconfig);
+            if (!is_string($existing_wc) || strpos($existing_wc, $marker) === false) {
+                $needs_write_wc = true;
+            }
+        }
+        if ($needs_write_wc) {
+            $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                 . "<!-- {$marker} -->\n"
+                 . "<configuration>\n"
+                 . "  <system.webServer>\n"
+                 . "    <handlers accessPolicy=\"Read\" />\n"
+                 . "    <security>\n"
+                 . "      <requestFiltering>\n"
+                 . "        <fileExtensions allowUnlisted=\"true\">\n"
+                 . "          <add fileExtension=\".php\" allowed=\"false\" />\n"
+                 . "          <add fileExtension=\".phtml\" allowed=\"false\" />\n"
+                 . "          <add fileExtension=\".phar\" allowed=\"false\" />\n"
+                 . "        </fileExtensions>\n"
+                 . "      </requestFiltering>\n"
+                 . "      <authorization>\n"
+                 . "        <remove users=\"*\" roles=\"\" verbs=\"\" />\n"
+                 . "        <deny users=\"*\" />\n"
+                 . "      </authorization>\n"
+                 . "    </security>\n"
+                 . "  </system.webServer>\n"
+                 . "</configuration>\n";
+            @file_put_contents($webconfig, $xml);
+        }
     }
 
     public static function get_thread($thread_id) {
@@ -1155,8 +1789,13 @@ class Matrix_MLM_Messaging {
         $attachments_by_message = [];
         if (!empty($message_ids)) {
             $placeholders = implode(',', array_fill(0, count($message_ids), '%d'));
+            // 1.0.25 — pull the new voice metadata columns
+            // alongside id/position. Older rows have NULL on
+            // duration_ms / waveform_peaks_json, kind defaults
+            // to 'image' (column NOT NULL DEFAULT 'image'), so
+            // legacy reads land in the same shape.
             $att_rows = $wpdb->get_results($wpdb->prepare(
-                "SELECT message_id, attachment_id, position
+                "SELECT message_id, attachment_id, position, kind, duration_ms, waveform_peaks_json
                    FROM {$wpdb->prefix}matrix_message_attachments
                   WHERE message_id IN ($placeholders)
                   ORDER BY message_id ASC, position ASC",
@@ -1167,7 +1806,16 @@ class Matrix_MLM_Messaging {
                 if (!isset($attachments_by_message[$mid])) {
                     $attachments_by_message[$mid] = [];
                 }
-                $attachments_by_message[$mid][] = (int) $ar->attachment_id;
+                $kind = isset($ar->kind) ? (string) $ar->kind : 'image';
+                if ($kind !== 'voice') {
+                    $kind = 'image';
+                }
+                $attachments_by_message[$mid][] = [
+                    'attachment_id' => (int) $ar->attachment_id,
+                    'kind'          => $kind,
+                    'duration_ms'   => isset($ar->duration_ms) ? (int) $ar->duration_ms : null,
+                    'peaks_json'    => isset($ar->waveform_peaks_json) ? (string) $ar->waveform_peaks_json : null,
+                ];
             }
         }
 
@@ -1176,26 +1824,90 @@ class Matrix_MLM_Messaging {
             // the new-table list when present (covers messages
             // sent on or after DB 1.0.23). Otherwise fall back to
             // the legacy single attachment_id column. Either path
-            // produces an ordered list of {id, url} objects so the
-            // client doesn't branch on storage version.
+            // produces an ordered list of {id, url, kind, ...}
+            // objects so the client doesn't branch on storage
+            // version.
             $atts_out = [];
-            $att_ids  = [];
+            $att_records = [];
             $mid_int  = (int) $r->id;
             if (!empty($attachments_by_message[$mid_int])) {
-                $att_ids = $attachments_by_message[$mid_int];
+                $att_records = $attachments_by_message[$mid_int];
             } elseif (!empty($r->attachment_id)) {
-                $att_ids = [(int) $r->attachment_id];
+                // Legacy single-column path. Pre-1.0.25 only had
+                // image attachments, so we synthesize an image
+                // record here. (If somehow a voice attachment
+                // ended up referenced via the legacy column,
+                // its render falls through to the signer-aware
+                // branch below via classify_attachment.)
+                $att_records = [[
+                    'attachment_id' => (int) $r->attachment_id,
+                    'kind'          => 'image',
+                    'duration_ms'   => null,
+                    'peaks_json'    => null,
+                ]];
             }
 
-            if (!empty($att_ids) && empty($r->deleted_at)) {
-                foreach ($att_ids as $aid) {
+            if (!empty($att_records) && empty($r->deleted_at)) {
+                foreach ($att_records as $rec) {
+                    $aid = (int) $rec['attachment_id'];
+                    if ($aid <= 0) {
+                        continue;
+                    }
+                    $kind = $rec['kind'] === 'voice' ? 'voice' : 'image';
+                    if ($kind === 'voice') {
+                        // Voice files are gated behind the
+                        // attachment-signer. We never link the
+                        // raw /uploads/ URL on the wire — the
+                        // moderation surface and the recipient
+                        // surface both consume the signed URL.
+                        // Empty signer return means the file
+                        // does not sit under an allowed subtree
+                        // (legacy data only); skip it rather
+                        // than fall through to the public URL.
+                        $public = wp_get_attachment_url($aid);
+                        $signed = '';
+                        if ($public && class_exists('Matrix_MLM_Attachment_Signer')) {
+                            $signed = Matrix_MLM_Attachment_Signer::sign_url_from_public($public);
+                        }
+                        if (!$signed || $signed === $public) {
+                            // Fall-through to public URL would
+                            // leak — refuse to render the
+                            // attachment instead. The bubble
+                            // will look attachment-less to the
+                            // client, which is preferable to
+                            // shipping an unsigned URL to a
+                            // member's voice file.
+                            continue;
+                        }
+                        $peaks = null;
+                        if (!empty($rec['peaks_json'])) {
+                            $decoded = json_decode($rec['peaks_json'], true);
+                            if (is_array($decoded)) {
+                                $peaks = $decoded;
+                            }
+                        }
+                        $atts_out[] = (object) [
+                            'id'          => $aid,
+                            'kind'        => 'voice',
+                            'url'         => $signed,
+                            // No thumb for audio — the JS
+                            // renders a waveform widget keyed
+                            // off `kind`, not off thumb_url.
+                            'thumb_url'   => null,
+                            'duration_ms' => isset($rec['duration_ms']) ? (int) $rec['duration_ms'] : null,
+                            'peaks'       => $peaks,
+                        ];
+                        continue;
+                    }
+                    // Image branch — unchanged from 1.0.23.
                     $url = wp_get_attachment_url($aid);
                     if (!$url) {
                         continue;
                     }
                     $thumb = wp_get_attachment_image_url($aid, 'medium');
                     $atts_out[] = (object) [
-                        'id'        => (int) $aid,
+                        'id'        => $aid,
+                        'kind'      => 'image',
                         'url'       => $url,
                         'thumb_url' => $thumb ?: $url,
                     ];
@@ -1206,8 +1918,18 @@ class Matrix_MLM_Messaging {
             // Legacy single-attachment field. Kept on the wire so
             // any cached / older client copy still renders the
             // first attachment without code changes; new clients
-            // read the attachments[] array and ignore this.
-            $r->attachment_url = !empty($atts_out) ? $atts_out[0]->thumb_url : null;
+            // read the attachments[] array and ignore this. Voice-
+            // first messages set this to NULL — old clients that
+            // would have rendered a thumb shouldn't be linking to
+            // a voice file at all.
+            $first_image = null;
+            foreach ($atts_out as $a) {
+                if (isset($a->kind) && $a->kind === 'image' && !empty($a->thumb_url)) {
+                    $first_image = $a->thumb_url;
+                    break;
+                }
+            }
+            $r->attachment_url = $first_image;
             $r->is_deleted = !empty($r->deleted_at) ? 1 : 0;
             $r->is_edited  = !empty($r->edited_at) ? 1 : 0;
 
@@ -3369,7 +4091,31 @@ class Matrix_MLM_Messaging {
             $attachment_ids = $aid > 0 ? [$aid] : [];
         }
 
-        $result = self::send_message($thread_id, $uid, $body, $attachment_ids);
+        // Voice-note metadata (DB 1.0.25). Optional. Shape:
+        //   attachment_meta[<attachment_id>][peaks][] = float
+        // Sanitised on the model side; here we just normalise
+        // the wp_unslash-and-array-of-arrays layout that PHP
+        // produces from the multipart POST body. Anything
+        // out-of-shape gets dropped silently (model defaults to
+        // a flat-bar render when peaks are missing).
+        $attachment_meta = [];
+        if (isset($_POST['attachment_meta']) && is_array($_POST['attachment_meta'])) {
+            foreach ($_POST['attachment_meta'] as $aid => $meta) {
+                $aid_int = (int) $aid;
+                if ($aid_int <= 0 || !is_array($meta)) {
+                    continue;
+                }
+                $entry = [];
+                if (isset($meta['peaks']) && is_array($meta['peaks'])) {
+                    $entry['peaks'] = array_map('floatval', $meta['peaks']);
+                }
+                if (!empty($entry)) {
+                    $attachment_meta[$aid_int] = $entry;
+                }
+            }
+        }
+
+        $result = self::send_message($thread_id, $uid, $body, $attachment_ids, $attachment_meta);
         if (is_wp_error($result)) {
             wp_send_json_error(['message' => $result->get_error_message()]);
         }
