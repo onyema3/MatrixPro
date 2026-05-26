@@ -347,6 +347,100 @@ class Matrix_MLM_Notifications {
     }
 
     /**
+     * Send a Matrix Wallet → Virtual Account transfer confirmation
+     * to the user. Fired from
+     * Matrix_MLM_Fintava::ajax_transfer_matrix_to_virtual() right
+     * after Fintava confirms the wallet-to-wallet credit landed and
+     * the local matrix_fintava_payouts row has been flipped to
+     * 'completed'.
+     *
+     * Distinct from the admin-facing send_admin_notification
+     * ('matrix_to_virtual_transfer', ...) that has always been part
+     * of that flow: admin keeps getting the operational alert, and
+     * now the user also gets a clear receipt with amount / charge /
+     * total / destination / reference. The user-side gap was the
+     * source of the "I'm not getting email alerts for matrix wallet
+     * to fintava transactions" report — every other money-moving
+     * surface in the plugin (deposits, withdrawals, user-to-user
+     * Matrix transfers, commissions) emails the user; this one was
+     * the only flow that didn't, so it read to members like the
+     * transfer hadn't actually happened.
+     *
+     * @param int    $user_id        Recipient.
+     * @param float  $amount         Money landed in the virtual account
+     *                               (excludes the charge).
+     * @param float  $charge         Service charge debited alongside.
+     * @param string $reference      Fintava CustomerReference / payout ref.
+     * @param string $account_number User's own virtual NUBAN — included
+     *                               in the body so a member with multiple
+     *                               accounts on file can tell which one
+     *                               this credit landed on.
+     * @return void
+     */
+    public static function send_matrix_to_virtual_transfer_notification($user_id, $amount, $charge, $reference, $account_number) {
+        $user = get_userdata((int) $user_id);
+        if (!$user) return;
+
+        $currency    = get_option('matrix_mlm_currency_symbol', '₦');
+        $amount_str  = $currency . number_format((float) $amount, 2);
+        $charge_str  = $currency . number_format((float) $charge, 2);
+        $total_str   = $currency . number_format((float) $amount + (float) $charge, 2);
+
+        $subject = sprintf(
+            /* translators: 1: site name, 2: amount transferred */
+            __('[%1$s] Matrix → Virtual transfer of %2$s confirmed', 'matrix-mlm'),
+            get_bloginfo('name'),
+            $amount_str
+        );
+
+        $dashboard_url = home_url('/matrix-dashboard/wallet/');
+
+        $message = self::get_email_template('matrix-to-virtual', [
+            'username'       => $user->user_login,
+            'amount'         => $amount_str,
+            'charge'         => $charge_str,
+            'total_debit'    => $total_str,
+            'account_number' => (string) $account_number,
+            'reference'      => (string) $reference,
+            'site_name'      => get_bloginfo('name'),
+            'dashboard_url'  => $dashboard_url,
+        ]);
+
+        self::send_email($user->user_email, $subject, $message);
+
+        // In-app notification (1.0.15). Surfaces the same receipt in
+        // the bell dropdown alongside the email so a member who
+        // doesn't reload the wallet page still sees the activity in
+        // the navigation chrome.
+        if (class_exists('Matrix_MLM_In_App_Notifications')) {
+            Matrix_MLM_In_App_Notifications::enqueue(
+                (int) $user_id,
+                'matrix_to_virtual_transfer',
+                sprintf(
+                    /* translators: %s: amount transferred */
+                    __('Transfer to Virtual account: %s', 'matrix-mlm'),
+                    $amount_str
+                ),
+                sprintf(
+                    /* translators: 1: amount, 2: total debit (amount + charge), 3: account number */
+                    __('%1$s landed in your Virtual account (%3$s). %2$s was debited from your Matrix wallet.', 'matrix-mlm'),
+                    $amount_str,
+                    $total_str,
+                    (string) $account_number
+                ),
+                '/matrix-dashboard/wallet/',
+                [
+                    'amount'         => (float) $amount,
+                    'charge'         => (float) $charge,
+                    'total_debit'    => (float) $amount + (float) $charge,
+                    'account_number' => (string) $account_number,
+                    'reference'      => (string) $reference,
+                ]
+            );
+        }
+    }
+
+    /**
      * Send withdrawal notification
      */
     public static function send_withdrawal_notification($user_id, $amount, $status) {
@@ -1274,6 +1368,39 @@ class Matrix_MLM_Notifications {
             case 'withdrawal':
                 $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
                 $content .= '<p>' . sprintf(__('Your withdrawal of %s has been %s.', 'matrix-mlm'), $vars['amount'], strtolower($vars['status'])) . '</p>';
+                break;
+            case 'matrix-to-virtual':
+                // Inline fallback for installs without a dedicated
+                // public/templates/emails/matrix-to-virtual.php on
+                // disk. Mirrors the deposit-fallback shape: short
+                // confirmation paragraph, then a Reference line so
+                // support can correlate against the
+                // matrix_fintava_payouts row when a member writes in.
+                $content .= '<p>' . sprintf(__('Hello %s,', 'matrix-mlm'), $vars['username']) . '</p>';
+                $content .= '<p>' . sprintf(
+                    /* translators: 1: amount, 2: account number */
+                    __('Your transfer of <strong>%1$s</strong> from your Matrix wallet to your Virtual account (<code>%2$s</code>) has been completed.', 'matrix-mlm'),
+                    esc_html($vars['amount'] ?? ''),
+                    esc_html($vars['account_number'] ?? '')
+                ) . '</p>';
+                if (!empty($vars['charge'])) {
+                    $content .= '<p>' . sprintf(
+                        /* translators: 1: service charge, 2: total debit */
+                        __('Service charge: %1$s. Total debit from your Matrix wallet: <strong>%2$s</strong>.', 'matrix-mlm'),
+                        esc_html($vars['charge']),
+                        esc_html($vars['total_debit'] ?? '')
+                    ) . '</p>';
+                }
+                if (!empty($vars['reference'])) {
+                    $content .= '<p style="font-size:12px;color:#6b7280;margin-top:16px;">' . sprintf(
+                        /* translators: %s: Fintava reference / payout reference */
+                        __('Reference: %s', 'matrix-mlm'),
+                        '<code>' . esc_html($vars['reference']) . '</code>'
+                    ) . '</p>';
+                }
+                if (!empty($vars['dashboard_url'])) {
+                    $content .= '<p style="text-align: center; margin-top: 20px;"><a href="' . esc_url($vars['dashboard_url']) . '" style="background: #4f46e5; color: #fff; padding: 12px 30px; border-radius: 6px; text-decoration: none; display: inline-block;">' . __('View Wallet', 'matrix-mlm') . '</a></p>';
+                }
                 break;
             case 'loan':
                 // Inline fallback so installs without the dedicated

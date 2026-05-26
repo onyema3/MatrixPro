@@ -2956,6 +2956,24 @@ class Matrix_MLM_Fintava {
             )
         );
 
+        // User-side email + in-app notification. Was missing in the
+        // original handler, which is why members reported "I'm not
+        // getting email alerts for matrix wallet to fintava
+        // transactions" while every other money-moving flow on the
+        // platform (deposits, withdrawals, user-to-user Matrix
+        // transfers, commissions) emails the user. The helper itself
+        // is a no-op when the user row can't be resolved, so this
+        // can't fail the request — the AJAX response below is
+        // unaffected. The admin alert above stays in place; this is
+        // a strict addition, not a replacement.
+        Matrix_MLM_Notifications::send_matrix_to_virtual_transfer_notification(
+            $user_id,
+            $amount,
+            $charge,
+            $reference,
+            $user_wallet->account_number
+        );
+
         wp_send_json_success([
             'message' => sprintf(
                 __('Transfer of %s%s to your Virtual wallet (%s) was successful.', 'matrix-mlm'),
