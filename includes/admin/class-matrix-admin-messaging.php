@@ -582,6 +582,68 @@ class Matrix_MLM_Admin_Messaging {
                 $new['presence_window_seconds']        = max(30, min(3600, (int) ($_POST['presence_window_seconds'] ?? $defaults['presence_window_seconds'])));
                 $new['offline_email_enabled']          = !empty($_POST['offline_email_enabled']) ? 1 : 0;
                 $new['offline_email_cooldown_seconds'] = max(0, min(86400, (int) ($_POST['offline_email_cooldown_seconds'] ?? $defaults['offline_email_cooldown_seconds'])));
+
+                // Voice notes (DB 1.0.25). Three operator knobs
+                // mirror the resolvers in Matrix_MLM_Messaging:
+                //
+                //   - allow_voice_notes is the master toggle. When
+                //     OFF, Matrix_MLM_Messaging::is_voice_enabled()
+                //     returns false, the composer hides its mic
+                //     button, and the model layer rejects any
+                //     voice attachment with HTTP 403. Existing
+                //     voice rows still play — the toggle is "no
+                //     new voice notes", not "moderate-out the
+                //     ones already on the floor".
+                //
+                //   - voice_max_duration_seconds is the per-message
+                //     ceiling, clamped 1..VOICE_MAX_DURATION_SECONDS_HARD
+                //     so the form agrees with
+                //     get_voice_max_duration_seconds(). The recorder
+                //     reads this via the localized config and auto-
+                //     stops on hit, so an operator who tightens
+                //     this setting takes effect on the next page
+                //     load — no JS bundle cache-bust needed.
+                //
+                //   - voice_max_bytes is the per-file size ceiling.
+                //     Capped at the existing max_attachment_bytes
+                //     (the image cap) on save so a future operator
+                //     who lowers max_attachment_bytes to e.g. 1 MB
+                //     doesn't accidentally leave voice on a higher
+                //     ceiling. The form posts MB; we round to bytes
+                //     the same way the image attachment block does.
+                $new['allow_voice_notes'] = !empty($_POST['allow_voice_notes']) ? 1 : 0;
+                $new['voice_max_duration_seconds'] = max(
+                    1,
+                    min(
+                        Matrix_MLM_Messaging::VOICE_MAX_DURATION_SECONDS_HARD,
+                        (int) ($_POST['voice_max_duration_seconds']
+                            ?? $defaults['voice_max_duration_seconds'])
+                    )
+                );
+                if (isset($_POST['voice_max_mb']) && $_POST['voice_max_mb'] !== '') {
+                    $vmb = (float) $_POST['voice_max_mb'];
+                    if ($vmb < 0.1) { $vmb = 0.1; }
+                    // Hard floor at 100 KB so a typo'd 0 doesn't
+                    // disable voice via the byte cap (the
+                    // allow_voice_notes toggle is the explicit
+                    // disable knob). The image-cap ceiling is
+                    // applied in the next step.
+                    $new['voice_max_bytes'] = (int) round($vmb * 1024 * 1024);
+                } else {
+                    $new['voice_max_bytes'] = max(102400, (int) ($_POST['voice_max_bytes'] ?? $defaults['voice_max_bytes']));
+                }
+                // Cap voice byte ceiling at the image attachment
+                // ceiling. Without this clamp an operator could
+                // raise voice to 50 MB after lowering images to
+                // 5 MB and produce a confusing config where voice
+                // is the heavyweight surface. The runtime resolver
+                // already does this clamp; we mirror it here so
+                // the saved value matches what the resolver will
+                // serve, instead of the form-layer accepting a
+                // value the runtime will silently lower.
+                if (!empty($new['max_attachment_bytes']) && $new['voice_max_bytes'] > $new['max_attachment_bytes']) {
+                    $new['voice_max_bytes'] = (int) $new['max_attachment_bytes'];
+                }
                 update_option(Matrix_MLM_Messaging::SETTINGS_OPTION, $new);
                 /**
                  * Fires after the messaging settings option has been
@@ -1394,6 +1456,74 @@ class Matrix_MLM_Admin_Messaging {
                                 esc_html__('How many image attachments a member can include in a single message. Range 1–%2$d. Default %1$d. Operators can raise the ceiling beyond %2$d in code via the matrix_messaging_max_attachments_per_message filter, but values typed here are clamped to the documented range.', 'matrix-mlm'),
                                 (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_DEFAULT,
                                 (int) Matrix_MLM_Messaging::MAX_ATTACHMENTS_PER_MESSAGE_HARD
+                            );
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+            </table>
+
+            <h2 class="title" style="margin-top:30px;"><?php esc_html_e('Voice Notes', 'matrix-mlm'); ?></h2>
+            <p class="description" style="max-width:780px;">
+                <?php esc_html_e('Members can record short voice notes from the messaging composer (DB 1.0.25). Recording happens entirely in-browser via MediaRecorder; the recorded blob uploads through the same endpoint that handles image attachments. Voice files are stored in a private uploads subtree, served only via signed REST URLs, and hard-deleted (file + WP attachment post) 30 days after a message is soft-deleted.', 'matrix-mlm'); ?>
+            </p>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th scope="row"><?php esc_html_e('Allow voice notes', 'matrix-mlm'); ?></th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="allow_voice_notes" value="1" <?php checked(!empty($s['allow_voice_notes'])); ?>>
+                            <?php esc_html_e('Show the microphone button in the composer and accept voice attachments at the model layer', 'matrix-mlm'); ?>
+                        </label>
+                        <p class="description">
+                            <?php esc_html_e('When unchecked, the recorder UI is hidden in the composer and any voice attachment posted via DevTools or a custom client is rejected with HTTP 403. Voice notes already on the floor remain playable — turning this off is "no new voice notes", not "moderate-out the existing ones". Use the moderation queue to retire individual recordings.', 'matrix-mlm'); ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="matrix-msg-voice-duration"><?php esc_html_e('Max duration', 'matrix-mlm'); ?></label>
+                    </th>
+                    <td>
+                        <input type="number" id="matrix-msg-voice-duration" name="voice_max_duration_seconds"
+                               min="1"
+                               max="<?php echo (int) Matrix_MLM_Messaging::VOICE_MAX_DURATION_SECONDS_HARD; ?>"
+                               value="<?php echo (int) $s['voice_max_duration_seconds']; ?>"> <?php esc_html_e('seconds', 'matrix-mlm'); ?>
+                        <p class="description">
+                            <?php
+                            printf(
+                                /* translators: 1: default in seconds, 2: hard ceiling in seconds. */
+                                esc_html__('Per-recording ceiling. The recorder auto-stops on hit, so a tighter value here lets members trim voice content without typing a stop themselves. Range 1–%2$d seconds. Default %1$ds. Operators can override at code level via the matrix_messaging_voice_max_duration_seconds filter.', 'matrix-mlm'),
+                                (int) Matrix_MLM_Messaging::VOICE_MAX_DURATION_SECONDS_DEFAULT,
+                                (int) Matrix_MLM_Messaging::VOICE_MAX_DURATION_SECONDS_HARD
+                            );
+                            ?>
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">
+                        <label for="matrix-msg-voice-mb"><?php esc_html_e('Max file size', 'matrix-mlm'); ?></label>
+                    </th>
+                    <td>
+                        <?php
+                        // Default voice cap is stored as bytes; render the
+                        // form as decimal MB to match the image attachment
+                        // field's UX. Same conversion + precision (two
+                        // decimals).
+                        $voice_max_mb = round(((int) $s['voice_max_bytes']) / (1024 * 1024), 2);
+                        $image_max_mb = round(((int) $s['max_attachment_bytes']) / (1024 * 1024), 2);
+                        ?>
+                        <input type="number" id="matrix-msg-voice-mb" name="voice_max_mb"
+                               min="0.1" max="<?php echo esc_attr((string) $image_max_mb); ?>" step="0.1"
+                               value="<?php echo esc_attr((string) $voice_max_mb); ?>"> <?php esc_html_e('MB', 'matrix-mlm'); ?>
+                        <p class="description">
+                            <?php
+                            printf(
+                                /* translators: 1: current cap in bytes, 2: image attachment cap in MB used as the ceiling. */
+                                esc_html__('Per-recording byte ceiling. Recorder auto-stops if the rolling encoded size crosses this value, so a too-tight setting here may truncate a long recording before the duration cap fires. Capped on save at the image attachment ceiling (currently %2$s MB) — voice cannot be the heaviest surface on the platform. Currently %1$s bytes.', 'matrix-mlm'),
+                                '<code>' . esc_html(number_format_i18n((int) $s['voice_max_bytes'])) . '</code>',
+                                '<code>' . esc_html((string) $image_max_mb) . '</code>'
                             );
                             ?>
                         </p>
