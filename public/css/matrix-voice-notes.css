@@ -1,0 +1,315 @@
+/* Matrix Messaging — voice-notes UI.
+ *
+ * Two surfaces:
+ *   1. The composer recorder (mic button, recording indicator, level
+ *      meter, send/cancel) that swaps in over the textarea while a
+ *      recording is active.
+ *   2. The <matrix-voice-player> custom element that renders incoming
+ *      voice attachments inside message bubbles.
+ *
+ * Colour tokens are exposed via CSS custom properties so a future dark-
+ * mode toggle (or operator skin) can recolour both surfaces without
+ * touching this file. All defaults match the existing messaging chrome
+ * in matrix-messaging.css.
+ */
+
+:root {
+    --matrix-voice-accent:        #2563eb;
+    --matrix-voice-accent-hover:  #1d4ed8;
+    --matrix-voice-recording:     #dc2626;
+    --matrix-voice-recording-bg:  #fef2f2;
+    --matrix-voice-bar-idle:      #cbd5e1;
+    --matrix-voice-bar-played:    #2563eb;
+    --matrix-voice-surface:       #f3f4f6;
+    --matrix-voice-surface-text:  #1f2937;
+    --matrix-voice-error:         #b91c1c;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer mic button (resting state).                                */
+/* ------------------------------------------------------------------ */
+
+/* Sits flush against the existing .matrix-messaging__attach-btn so
+   the two affordances read as a pair. Same chrome metrics as that
+   button to keep the composer row visually balanced.                  */
+.matrix-messaging__voice-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background: #f9fafb;
+    color: #6b7280;
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 0;
+}
+.matrix-messaging__voice-btn:hover {
+    background: #e5e7eb;
+    color: #374151;
+}
+.matrix-messaging__voice-btn:focus-visible {
+    outline: 2px solid var(--matrix-voice-accent);
+    outline-offset: 2px;
+}
+.matrix-messaging__voice-btn[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.matrix-messaging__voice-btn .dashicons {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Composer recorder strip (visible while recording).                  */
+/* ------------------------------------------------------------------ */
+
+/* Replaces the textarea + send button in the composer row when the
+   user starts a recording. Same overall row height so the chat list
+   above doesn't reflow on enter/exit.                                 */
+.matrix-messaging__voice-recorder {
+    display: none;
+    flex: 1;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    background: var(--matrix-voice-recording-bg);
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    min-height: 40px;
+}
+.matrix-messaging__voice-recorder.is-recording {
+    display: flex;
+}
+
+/* Pulsing red dot — animation is decorative; respects
+   prefers-reduced-motion to drop the pulse for users who've asked the
+   OS to suppress motion effects.                                      */
+.matrix-messaging__voice-recorder-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--matrix-voice-recording);
+    flex-shrink: 0;
+    animation: matrix-voice-pulse 1.2s ease-in-out infinite;
+}
+@keyframes matrix-voice-pulse {
+    0%   { opacity: 1;   transform: scale(1);   }
+    50%  { opacity: 0.4; transform: scale(0.8); }
+    100% { opacity: 1;   transform: scale(1);   }
+}
+@media (prefers-reduced-motion: reduce) {
+    .matrix-messaging__voice-recorder-dot { animation: none; }
+}
+
+.matrix-messaging__voice-recorder-time {
+    font-variant-numeric: tabular-nums;
+    color: var(--matrix-voice-recording);
+    font-weight: 600;
+    min-width: 3.5em;
+}
+
+/* Live level meter — the recorder ticks a 0..1 RMS value into the
+   width of this bar's inner fill. Outer container is fixed-width so
+   the recorder strip doesn't reflow as level oscillates.              */
+.matrix-messaging__voice-recorder-meter {
+    flex: 1;
+    height: 8px;
+    background: rgba(220, 38, 38, 0.15);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.matrix-messaging__voice-recorder-meter-fill {
+    height: 100%;
+    width: 0;
+    background: var(--matrix-voice-recording);
+    transition: width 0.05s linear;
+}
+
+/* Cap-progress bar that tracks elapsed-ms / max-ms. Useful UX cue
+   when the operator has set a tight max_duration and the user is
+   close to the cap; sits below the level meter so it doesn't fight
+   for attention while sound levels jump around.                      */
+.matrix-messaging__voice-recorder-progress {
+    height: 2px;
+    background: rgba(220, 38, 38, 0.2);
+    border-radius: 1px;
+    overflow: hidden;
+    flex-basis: 100%;
+    margin-top: 4px;
+}
+.matrix-messaging__voice-recorder-progress-fill {
+    height: 100%;
+    width: 0;
+    background: var(--matrix-voice-recording);
+    transition: width 0.25s linear;
+}
+
+.matrix-messaging__voice-recorder-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.matrix-messaging__voice-recorder-cancel,
+.matrix-messaging__voice-recorder-stop {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+}
+.matrix-messaging__voice-recorder-cancel {
+    background: #e5e7eb;
+    color: #4b5563;
+}
+.matrix-messaging__voice-recorder-cancel:hover { background: #d1d5db; }
+.matrix-messaging__voice-recorder-stop {
+    background: var(--matrix-voice-accent);
+    color: #fff;
+}
+.matrix-messaging__voice-recorder-stop:hover  { background: var(--matrix-voice-accent-hover); }
+.matrix-messaging__voice-recorder-cancel .dashicons,
+.matrix-messaging__voice-recorder-stop .dashicons {
+    font-size: 16px; width: 16px; height: 16px;
+}
+
+/* When the composer is in recording mode we hide the textarea and
+   the legacy send button. A single class on the form swaps state so
+   we don't have to touch every child node from JS.                    */
+.matrix-messaging__composer.is-recording-voice .matrix-messaging__composer-row textarea,
+.matrix-messaging__composer.is-recording-voice .matrix-messaging__composer-row > .matrix-btn,
+.matrix-messaging__composer.is-recording-voice .matrix-messaging__attach-btn,
+.matrix-messaging__composer.is-recording-voice .matrix-messaging__voice-btn {
+    display: none !important;
+}
+
+/* Tile that shows the just-recorded voice note in the composer's
+   preview strip before it's sent. Reuses the existing preview-strip
+   chrome so the layout sits next to image previews when the user
+   has both queued.                                                    */
+.matrix-messaging__preview-tile--voice {
+    width: auto;
+    min-width: 200px;
+    padding: 6px 10px;
+    background: var(--matrix-voice-surface);
+    color: var(--matrix-voice-surface-text);
+}
+.matrix-messaging__preview-tile--voice matrix-voice-player {
+    display: flex;
+    width: 100%;
+}
+
+/* ------------------------------------------------------------------ */
+/* Voice attachment inside a message bubble.                           */
+/* ------------------------------------------------------------------ */
+
+.matrix-messaging__message-attachments--voice {
+    display: block;
+    margin-bottom: 6px;
+}
+.matrix-messaging__message-attachments--voice matrix-voice-player {
+    display: flex;
+    width: 280px;
+    max-width: 100%;
+}
+
+/* Re-record affordance shown on own voice messages within the edit
+   window. Lives where the pencil icon lives for image/text messages,
+   but uses a microphone glyph + "Re-record" tooltip so the user
+   knows the action is "delete this and record again", not "edit
+   transcription".                                                     */
+.matrix-messaging__msg-action--voice-rerecord .dashicons-microphone {
+    color: var(--matrix-voice-recording);
+}
+
+/* ------------------------------------------------------------------ */
+/* <matrix-voice-player> custom element.                               */
+/* ------------------------------------------------------------------ */
+
+.matrix-voice-player {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--matrix-voice-surface);
+    color: var(--matrix-voice-surface-text);
+    border-radius: 16px;
+    box-sizing: border-box;
+    /* Keep the component focusable by the keyboard handler in the JS
+       without the default focus halo doubling up on the inner
+       button's halo. The button has its own focus-visible style.       */
+    outline: none;
+}
+.matrix-voice-player:focus-visible {
+    box-shadow: 0 0 0 2px var(--matrix-voice-accent);
+}
+
+.matrix-voice-player__btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    background: var(--matrix-voice-accent);
+    color: #fff;
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 0;
+}
+.matrix-voice-player__btn:hover { background: var(--matrix-voice-accent-hover); }
+.matrix-voice-player__btn[disabled] {
+    background: #9ca3af;
+    cursor: not-allowed;
+}
+.matrix-voice-player__btn:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px var(--matrix-voice-accent);
+}
+.matrix-voice-player__btn-icon svg {
+    fill: currentColor;
+    pointer-events: none;
+}
+
+.matrix-voice-player__waveform {
+    flex: 1;
+    height: 32px;
+    cursor: pointer;
+    /* The canvas itself is a fixed-pixel-grid drawing surface; the
+       JS resizes width/height to match getBoundingClientRect * dpr
+       on every redraw. CSS just controls the layout box.              */
+    width: 100%;
+    display: block;
+}
+
+.matrix-voice-player__time {
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: #6b7280;
+    flex-shrink: 0;
+    min-width: 5em;
+    text-align: right;
+}
+
+/* Failure state — the audio element fired an error (signed URL
+   expired, file removed by moderation, or codec unsupported on this
+   browser). Visually flag it without removing the affordance, so the
+   user can click the bubble's Re-record button without thinking the
+   chat itself is broken.                                              */
+.matrix-voice-player--error {
+    background: #fef2f2;
+    color: var(--matrix-voice-error);
+}
+.matrix-voice-player--error .matrix-voice-player__btn {
+    background: var(--matrix-voice-error);
+}
