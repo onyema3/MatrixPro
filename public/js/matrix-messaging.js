@@ -118,6 +118,12 @@
                 '<div class="matrix-messaging__message-meta">' +
                     escapeHtml(msg.created_at || '') + strippedFlag +
                 '</div>' +
+                // Read-receipt slot, only on own messages. The
+                // server populates it on the next fetch_thread tick
+                // via the receipts map; we leave it empty initially
+                // (no flicker between optimistic add and the first
+                // poll's authoritative state).
+                (own && !deleted ? '<div class="matrix-messaging__message-receipt" data-receipt-for="' + parseInt(msg.id, 10) + '"></div>' : '') +
             '</div>'
         );
 
@@ -137,6 +143,7 @@
         api('fetch_thread', { thread_id: threadId, after_id: 0 }).done(function (resp) {
             if (!resp || !resp.success) { return; }
             (resp.data.messages || []).forEach(function (m) { renderMessage($msgs, m); });
+            applyReceipts(resp.data.receipts, resp.data.thread_type);
             startPolling();
 
             // Scroll to and flash a search-jumped message, if one
@@ -163,12 +170,104 @@
                 if (!resp || !resp.success) { return; }
                 var $msgs = $('#matrix-messaging-messages');
                 (resp.data.messages || []).forEach(function (m) { renderMessage($msgs, m); });
+                applyReceipts(resp.data.receipts, resp.data.thread_type);
             });
         }, Math.max(2000, parseInt(cfg.pollingIntervalMs, 10) || 10000));
     }
 
     function stopPolling() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    /**
+     * Render the receipts map onto already-rendered own messages.
+     *
+     * Called after every fetch_thread response. Receipts are
+     * server-computed for the most recent N own messages; missing
+     * entries (older messages outside the lookback window) leave
+     * the slot empty.
+     *
+     * Threading model:
+     *   - DM (recipient_count == 1): "Sent" if not yet read, "Seen
+     *     <human-time>" once the other party has read up to or
+     *     past this message.
+     *   - team_room: "Read by N / M" while partial, just "Read"
+     *     when everyone has caught up. Hidden when read_count is
+     *     zero so the chrome stays quiet for a freshly-sent
+     *     message in a quiet room.
+     *
+     * Idempotent: re-running with the same receipts is a no-op
+     * (.text() is set to the same string).
+     */
+    function applyReceipts(receipts, threadType) {
+        if (!receipts || typeof receipts !== 'object') { return; }
+        var isDm = threadType === 'dm';
+        Object.keys(receipts).forEach(function (mid) {
+            var info = receipts[mid] || {};
+            var $slot = $('.matrix-messaging__message-receipt[data-receipt-for="' + parseInt(mid, 10) + '"]');
+            if (!$slot.length) { return; }
+            var rc = parseInt(info.read_count, 10) || 0;
+            var total = parseInt(info.recipient_count, 10) || 0;
+            var label = '';
+
+            if (isDm) {
+                // Single recipient. "Sent" pre-read, "Seen" post-read.
+                if (rc >= 1) {
+                    label = info.last_read_at
+                        ? formatString(cfg.i18n.receipt_seen_at || 'Seen %s', formatReadTime(info.last_read_at))
+                        : (cfg.i18n.receipt_seen || 'Seen');
+                } else if (total > 0) {
+                    label = cfg.i18n.receipt_sent || 'Sent';
+                }
+            } else {
+                // Team room. Stay quiet while no one has read it,
+                // pluralise once partial, collapse to "Read" once
+                // everyone has caught up.
+                if (total === 0) {
+                    label = '';
+                } else if (rc === 0) {
+                    label = cfg.i18n.receipt_sent || 'Sent';
+                } else if (rc >= total) {
+                    label = cfg.i18n.receipt_read_all || 'Read';
+                } else {
+                    label = formatString(cfg.i18n.receipt_read_partial || 'Read by %1$s / %2$s', rc, total);
+                }
+            }
+
+            $slot.text(label).toggle(label !== '');
+        });
+    }
+
+    /**
+     * Lightweight printf-ish helper. We can't pull in
+     * sprintf-js, and template strings would lose IE11 — keep
+     * it ASCII-tier simple.
+     */
+    function formatString(template, a, b) {
+        return String(template)
+            .replace('%1$s', a)
+            .replace('%2$s', b)
+            .replace('%s', a);
+    }
+
+    /**
+     * Render a server-side UTC datetime string ("2026-05-26 14:32:01")
+     * as a short relative form. Falls back to the raw string if the
+     * Date constructor doesn't recognise it.
+     */
+    function formatReadTime(serverDt) {
+        if (!serverDt) { return ''; }
+        // Server returns mysql GMT format; coerce by appending Z so
+        // browsers interpret as UTC. Avoids a 1-minute "in the future"
+        // glitch on clients with a mildly-skewed clock.
+        var iso = String(serverDt).replace(' ', 'T') + 'Z';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) { return serverDt; }
+        var diffSec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+        if (diffSec < 60) { return cfg.i18n.receipt_just_now || 'just now'; }
+        if (diffSec < 3600) { return Math.floor(diffSec / 60) + 'm'; }
+        if (diffSec < 86400) { return Math.floor(diffSec / 3600) + 'h'; }
+        return d.toLocaleDateString();
     }
 
     // --- Wire up ---
