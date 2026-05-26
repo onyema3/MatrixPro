@@ -3,7 +3,7 @@
  * Plugin Name: Matrix MLM Pro
  * Plugin URI: https://fortsolutions.net
  * Description: A comprehensive Matrix MLM plugin with multiple plan structures, payment gateways (Paystack, Flutterwave, Fintava, Zebra Wallet), user dashboards, admin management, 2FA security, multi-language support, and more.
- * Version: 2.0.0
+ * Version: 2.0.2
  * Author: Fort Solutions Ltd
  * Author URI: https://fortsolutions.net
  * License: GPL v2 or later
@@ -19,7 +19,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin Constants
-define('MATRIX_MLM_VERSION', '2.0.1');
+define('MATRIX_MLM_VERSION', '2.0.2');
 define('MATRIX_MLM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MATRIX_MLM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MATRIX_MLM_PLUGIN_FILE', __FILE__);

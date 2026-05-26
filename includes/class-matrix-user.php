@@ -79,7 +79,7 @@ class Matrix_MLM_User {
      */
     public static function get_referral_link($user_id) {
         $code = self::get_referral_code($user_id);
-        return home_url('/matrix/?ref=' . $code);
+        return home_url('/signup/?ref=' . $code);
     }
 
     /**

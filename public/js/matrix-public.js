@@ -186,7 +186,13 @@
             //    they see after clicking through.
             if (data && data.verify_pending) {
                 showNotification(data.message || 'Account created. Check your email to verify.', 'success');
-                window.location.href = '/matrix-login?registered=1';
+                // Use matrixMLM.siteUrl (the localized home_url())
+                // so subdirectory WordPress installs (e.g. site at
+                // example.com/blog/) get /blog/matrix instead of
+                // /matrix. Falls back to the relative path on the
+                // off chance matrixMLM didn't bind for any reason.
+                var siteBase = (typeof matrixMLM !== 'undefined' && matrixMLM.siteUrl) ? matrixMLM.siteUrl.replace(/\/$/, '') : '';
+                window.location.href = siteBase + '/matrix?registered=1';
                 return;
             }
             showNotification(data && data.message ? data.message : 'Registration successful!', 'success');

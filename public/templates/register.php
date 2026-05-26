@@ -52,7 +52,7 @@ $referral_code = isset($_GET['ref']) ? sanitize_text_field($_GET['ref']) : '';
             <button type="submit" class="matrix-btn matrix-btn-primary matrix-btn-block"><?php _e('Create Account', 'matrix-mlm'); ?></button>
         </form>
         <div class="matrix-auth-footer">
-            <p><?php _e('Already have an account?', 'matrix-mlm'); ?> <a href="<?php echo home_url('/matrix-login'); ?>"><?php _e('Login', 'matrix-mlm'); ?></a></p>
+            <p><?php _e('Already have an account?', 'matrix-mlm'); ?> <a href="<?php echo home_url('/matrix'); ?>"><?php _e('Login', 'matrix-mlm'); ?></a></p>
         </div>
     </div>
 </div>

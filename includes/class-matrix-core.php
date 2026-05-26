@@ -155,17 +155,26 @@ class Matrix_MLM_Core {
         add_action('init', [$this, 'add_rewrite_rules']);
         add_filter('query_vars', [$this, 'add_query_vars']);
 
-        // Backward-compat 301 from /matrix-register/?ref=X to
-        // /matrix/?ref=X. The public page slug for the registration
-        // form was renamed in 2026 (see
-        // Matrix_MLM_Activator::migrate_register_page_slug() for the
-        // server-side rename) so referral links members shared on
-        // social media, in emails, on flyers, on business cards
-        // before the rename keep working — a 404 there would
-        // silently erase the conversion path for every prior
-        // promotion campaign, which for an MLM is the entire
-        // business model.
-        add_action('template_redirect', [$this, 'redirect_legacy_register_url']);
+        // Backward-compat 301s for the auth-page slug history:
+        //
+        //   - /matrix-register/?ref=X   -> /signup/?ref=X
+        //     (the original pre-PR #339 register URL)
+        //
+        //   - /matrix-login/             -> /matrix/
+        //     (the pre-this-rename login URL)
+        //
+        //   - /matrix/?ref=X (logged-out) -> /signup/?ref=X
+        //     (referral links members shared during the ~24h window
+        //     between PR #339 and this rename, when /matrix/ was
+        //     the registration URL — without this branch every one
+        //     of those referrals would land on the new login page
+        //     and the prospect couldn't progress past it)
+        //
+        // See redirect_legacy_auth_urls() for the matching logic.
+        // Hooked on template_redirect (not init) so the regex check
+        // only fires on real page-render requests, not on every API
+        // call, AJAX request, REST hit, or admin-bar render.
+        add_action('template_redirect', [$this, 'redirect_legacy_auth_urls']);
 
         // Email verification handler
         add_action('init', [$this, 'handle_email_verification']);
@@ -177,8 +186,8 @@ class Matrix_MLM_Core {
         // from the WP admin bar, an expired-session redirect to
         // wp-login.php?action=logout, or any third-party plugin
         // that calls wp_logout(). Registering this filter ensures
-        // every logout path lands on /matrix-login so users never
-        // get dropped onto the default wp-login.php?loggedout=true
+        // every logout path lands on /matrix so users never get
+        // dropped onto the default wp-login.php?loggedout=true
         // screen, which doesn't match the plugin's branded UI.
         add_filter('logout_redirect', [$this, 'filter_logout_redirect'], 10, 3);
 
@@ -243,20 +252,20 @@ class Matrix_MLM_Core {
         // we fan out.
         add_action('init', [$this, 'maybe_purge_caches_after_upgrade'], 99);
 
-        // Self-heal the /matrix/ registration page on installs that
-        // upgraded past PR #339 (the matrix-register → matrix slug
-        // rename) without reactivating the plugin. See
-        // maybe_self_heal_register_page() for the full rationale —
-        // short version: the in-place slug rename only runs on
+        // Self-heal the auth-page layout on installs that upgraded
+        // past PR #339 (the matrix-register → matrix slug rename)
+        // OR the subsequent rename to /matrix/ (login) + /signup/
+        // (register) without reactivating the plugin. See
+        // maybe_self_heal_auth_pages() for the full rationale —
+        // short version: the in-place slug renames only run on
         // Matrix_MLM_Activator::activate(), and operators who
         // deploy by `git pull` or via the GitHub auto-update
-        // checker (PR #326) never trigger that hook, so /matrix/
-        // never lands on disk and every internal "Register" link
-        // in the plugin (login footer, plans page, referral links
-        // from get_referral_link()) 404s. Same `init` priority 99
-        // as the cache purge above so the textdomain bootstrap
-        // has already run.
-        add_action('init', [$this, 'maybe_self_heal_register_page'], 99);
+        // checker (PR #326) never trigger that hook, so the new
+        // slugs never land on disk and every internal "Login"
+        // and "Register" link in the plugin 404s. Same `init`
+        // priority 99 as the cache purge above so the textdomain
+        // bootstrap has already run.
+        add_action('init', [$this, 'maybe_self_heal_auth_pages'], 99);
     }
 
     public function enqueue_public_assets() {
@@ -722,7 +731,101 @@ class Matrix_MLM_Core {
      * spill into wp-admin/admin-header.php redirects on the first
      * post-upgrade page load.
      */
-    public function maybe_self_heal_register_page() {
+    /**
+     * Self-heal the auth-page slug layout on installs that upgraded
+     * past PR #339, or this current rename, without reactivating
+     * the plugin.
+     *
+     * Why this is needed
+     * ------------------
+     *
+     * The auth page slugs have shifted twice in close succession:
+     *
+     *   - Original (pre-PR #339):
+     *       /matrix-login/    -> [matrix_login]
+     *       /matrix-register/ -> [matrix_register]
+     *
+     *   - Post-PR #339 (~24h window):
+     *       /matrix-login/    -> [matrix_login]
+     *       /matrix/          -> [matrix_register]
+     *
+     *   - Current (this rename):
+     *       /matrix/          -> [matrix_login]
+     *       /signup/          -> [matrix_register]
+     *
+     * Both the seed (Matrix_MLM_Activator::create_pages) and the
+     * in-place migrations (migrate_auth_page_slugs) live on the
+     * activator, which fires exclusively from the WP
+     * `register_activation_hook`. That hook runs ONLY when an
+     * admin clicks Activate on the Plugins screen. Operators who
+     * deploy by `git pull` (or via the GitHub auto-update checker
+     * introduced in PR #326) never trigger it, so the new slugs
+     * never land on disk for them.
+     *
+     * The downstream symptom on those installs:
+     *
+     *   - The legacy pages (/matrix-login/, /matrix-register/, or
+     *     post-PR #339 /matrix/) still exist in wp_posts untouched
+     *     by the upgrade.
+     *
+     *   - But every internal link the plugin emits now points at
+     *     the new slugs — see Matrix_MLM_User::get_referral_link()
+     *     (/signup/?ref=…), templates/login.php and
+     *     templates/register.php (cross-linked footers), and
+     *     Matrix_MLM_Admin_Frontend's Page Setup tool. All 404
+     *     because no page lives at those slugs on disk.
+     *
+     *   - The legacy-URL redirects in redirect_legacy_auth_urls()
+     *     send /matrix-login/ to /matrix/ and /matrix-register/
+     *     to /signup/ — both of which then 404 too, and so the
+     *     entire login + register flow is broken end-to-end on
+     *     git-pull installs.
+     *
+     * What this method does
+     * ---------------------
+     *
+     * Same three-state matrix as the activator's
+     * migrate_auth_page_slugs(), reused via that helper. The
+     * activator runs it inside register_activation_hook; this
+     * runs it on every page load until the version stamp
+     * matches. The helper is idempotent so re-running on the
+     * same install state is a safe no-op.
+     *
+     * After the migration finishes we backfill any missing slug
+     * with a fresh insert. Three things can drive a missing
+     * slug here:
+     *
+     *   1. Operator deleted the page by hand.
+     *   2. Operator hand-created a /matrix-2/ collision earlier
+     *      that blocked the migration's gate.
+     *   3. The install never had the page in the first place
+     *      (e.g. someone deactivated before activate() finished).
+     *
+     * The backfill mirrors the matrix / signup entries in
+     * Matrix_MLM_Activator::create_pages exactly, so a healed
+     * install ends up identical to a freshly-activated one.
+     *
+     * Stamp pattern
+     * -------------
+     *
+     * Mirrors maybe_purge_caches_after_upgrade exactly: write the
+     * stamp BEFORE doing any work, so a fatal in wp_update_post or
+     * wp_insert_post (e.g. a misbehaving filter on `wp_insert_post_data`
+     * from another plugin) doesn't cause the heal to retry on
+     * every subsequent request and re-trigger the same fault. The
+     * autoload=false flag keeps the option out of the alloptions
+     * cache.
+     *
+     * The stamp is keyed by MATRIX_MLM_VERSION rather than a
+     * boolean, so each forward version movement re-runs the heal
+     * exactly once. That gives us a recovery path if a future
+     * release ships a bug that wipes a page — operators need only
+     * bump the constant to trigger another heal pass. The option
+     * key is reused from PR #347's earlier register-page heal so
+     * existing installs that already stamped under that name get
+     * the new heal on this version's bump.
+     */
+    public function maybe_self_heal_auth_pages() {
         $last_run = (string) get_option('matrix_mlm_register_page_self_heal_version', '0.0.0');
         if (!version_compare($last_run, MATRIX_MLM_VERSION, '<')) {
             return;
@@ -733,36 +836,83 @@ class Matrix_MLM_Core {
         // cause the heal to retry on every page load forever.
         update_option('matrix_mlm_register_page_self_heal_version', MATRIX_MLM_VERSION, false);
 
-        // Branch 1: the canonical page already exists. The most
-        // common case on every install that ran activate() under
-        // the new code OR was self-healed on an earlier release.
-        $new = get_page_by_path('matrix', OBJECT, 'page');
-        if ($new) {
-            return;
+        // Re-use the activator's migration helper. Idempotent:
+        // each step gates on (source exists) AND (target does
+        // NOT exist), so re-running on an already-migrated
+        // install is a safe no-op.
+        if (class_exists('Matrix_MLM_Activator') && method_exists('Matrix_MLM_Activator', 'activate')) {
+            // The migrator is private on the activator class; expose
+            // it via a thin public wrapper. Direct call avoids running
+            // the full activate() (which would re-create database
+            // tables, re-set capabilities, re-flush rewrite rules,
+            // etc.) on every plugin upgrade.
+            if (method_exists('Matrix_MLM_Activator', 'self_heal_auth_pages')) {
+                Matrix_MLM_Activator::self_heal_auth_pages();
+                return;
+            }
         }
 
-        // Branch 2: legacy slug exists, new slug does not. In-place
-        // rename so post ID, content, and operator customisations
-        // all survive. Mirrors Matrix_MLM_Activator::migrate_register_page_slug.
-        $legacy = get_page_by_path('matrix-register', OBJECT, 'page');
-        if ($legacy) {
-            wp_update_post([
-                'ID'        => $legacy->ID,
-                'post_name' => 'matrix',
+        // Fallback: inline the migration. Should not normally fire
+        // because the activator class is loaded before init priority
+        // 99, but we guard against a bootstrap failure that leaves
+        // the class unavailable so the heal still runs.
+        $this->inline_heal_auth_pages();
+    }
+
+    /**
+     * Inline copy of the auth-page migration + backfill, used as a
+     * fallback when Matrix_MLM_Activator isn't loaded for any reason.
+     * See maybe_self_heal_auth_pages() and
+     * Matrix_MLM_Activator::migrate_auth_page_slugs() for the
+     * authoritative state machine.
+     */
+    private function inline_heal_auth_pages() {
+        // Step 1a — pre-PR #339: /matrix-register/ → /signup/.
+        $signup = get_page_by_path('signup', OBJECT, 'page');
+        if (!$signup) {
+            $pre339 = get_page_by_path('matrix-register', OBJECT, 'page');
+            if ($pre339) {
+                wp_update_post(['ID' => $pre339->ID, 'post_name' => 'signup']);
+                $signup = get_post($pre339->ID);
+            }
+        }
+
+        // Step 1b — post-PR #339: /matrix/ holds register content → /signup/.
+        if (!$signup) {
+            $matrix = get_page_by_path('matrix', OBJECT, 'page');
+            if ($matrix && strpos((string) $matrix->post_content, '[matrix_register]') !== false) {
+                wp_update_post(['ID' => $matrix->ID, 'post_name' => 'signup']);
+            }
+        }
+
+        // Step 2 — /matrix-login/ → /matrix/.
+        $matrix_after = get_page_by_path('matrix', OBJECT, 'page');
+        if (!$matrix_after) {
+            $login = get_page_by_path('matrix-login', OBJECT, 'page');
+            if ($login) {
+                wp_update_post(['ID' => $login->ID, 'post_name' => 'matrix']);
+            }
+        }
+
+        // Backfill: ensure both auth pages exist.
+        if (!get_page_by_path('matrix', OBJECT, 'page')) {
+            wp_insert_post([
+                'post_title'   => 'Login',
+                'post_content' => '[matrix_login]',
+                'post_status'  => 'publish',
+                'post_type'    => 'page',
+                'post_name'    => 'matrix',
             ]);
-            return;
         }
-
-        // Branch 3: neither page exists. Create a fresh /matrix/
-        // page with the registration shortcode. Mirrors the
-        // 'matrix' entry in Matrix_MLM_Activator::create_pages().
-        wp_insert_post([
-            'post_title'   => 'Register',
-            'post_content' => '[matrix_register]',
-            'post_status'  => 'publish',
-            'post_type'    => 'page',
-            'post_name'    => 'matrix',
-        ]);
+        if (!get_page_by_path('signup', OBJECT, 'page')) {
+            wp_insert_post([
+                'post_title'   => 'Register',
+                'post_content' => '[matrix_register]',
+                'post_status'  => 'publish',
+                'post_type'    => 'page',
+                'post_name'    => 'signup',
+            ]);
+        }
     }
 
     /**
@@ -771,13 +921,13 @@ class Matrix_MLM_Core {
      * If a `redirect_to` was already supplied (e.g. from
      * wp_logout_url() in the dashboard nav) and points at our own
      * site, honour it so callers can override per-link. Otherwise
-     * fall back to /matrix-login. Off-site redirects are dropped
-     * for safety so a malicious open-redirect query string can't
+     * fall back to /matrix. Off-site redirects are dropped for
+     * safety so a malicious open-redirect query string can't
      * bounce a freshly-logged-out user to an attacker-controlled
      * domain.
      */
     public function filter_logout_redirect($redirect_to, $requested_redirect_to, $user) {
-        $login_url = home_url('/matrix-login');
+        $login_url = home_url('/matrix');
 
         if (!empty($requested_redirect_to)) {
             $safe = wp_validate_redirect($requested_redirect_to, '');
@@ -4108,7 +4258,7 @@ class Matrix_MLM_Core {
         Matrix_MLM_Notifications::send_welcome_email($user_id);
 
         // Redirect to login with success message
-        $redirect_url = add_query_arg('verified', '1', home_url('/matrix-login'));
+        $redirect_url = add_query_arg('verified', '1', home_url('/matrix'));
         wp_redirect($redirect_url);
         exit;
     }
@@ -4144,54 +4294,83 @@ class Matrix_MLM_Core {
     }
 
     /**
-     * 301 redirect from the legacy /matrix-register/ URL to the
-     * current /matrix/ URL, preserving any query string.
+     * 301-redirect three classes of legacy auth-page URLs onto the
+     * current layout, preserving query strings throughout.
      *
-     * The page slug was renamed in 2026 — see
-     * Matrix_MLM_Activator::migrate_register_page_slug() for the
-     * in-place wp_posts rename that runs on activation. After the
-     * rename the legacy slug 404s on installs where the migration
-     * succeeded, which would silently erase the conversion path
-     * for every referral link members shared on social media, in
-     * emails, on flyers, etc. before the rename. This redirect
-     * catches those requests and forwards them to the new URL with
-     * `?ref=X` intact, so old links keep crediting the right
-     * referrer.
+     * Layout history
+     * --------------
      *
-     * Implementation notes:
+     *   - Original (pre-PR #339):
+     *       /matrix-login/    -> [matrix_login]
+     *       /matrix-register/ -> [matrix_register]
+     *
+     *   - Post-PR #339 (~24h window):
+     *       /matrix-login/    -> [matrix_login]
+     *       /matrix/          -> [matrix_register]
+     *
+     *   - Current:
+     *       /matrix/          -> [matrix_login]
+     *       /signup/          -> [matrix_register]
+     *
+     * What this method redirects
+     * --------------------------
+     *
+     *   1. /matrix-register/[?...]   ->  /signup/[?...]
+     *      Catches the original register URL members shared on
+     *      social media, in emails, on flyers, on business cards
+     *      before either rename. A 404 there would erase the
+     *      conversion path for every prior promotion campaign,
+     *      which for an MLM is the entire business model.
+     *
+     *   2. /matrix-login/[?...]      ->  /matrix/[?...]
+     *      Catches the original login URL bookmarked by existing
+     *      members and embedded in operator-shared docs / tutorials.
+     *
+     *   3. /matrix/?ref=CODE (logged-out only) -> /signup/?ref=CODE
+     *      Catches the brief window when /matrix/ was the register
+     *      page (post-PR #339, pre-this-rename) and members were
+     *      already sharing referral links of the form
+     *      /matrix/?ref=XYZ. After this rename /matrix/ is the
+     *      LOGIN page; without this branch every shared referral
+     *      from that 24h window would land prospects on the login
+     *      screen they can't progress past, and the ref code would
+     *      be silently lost. Gated to logged-out visitors so an
+     *      existing member visiting /matrix/?ref=… (e.g. from
+     *      their own WhatsApp history) still reaches the login
+     *      page rather than getting bounced to /signup/.
+     *
+     * Implementation notes
+     * --------------------
      *
      *   - Hooked on `template_redirect` (not `init`) so this runs
      *     after WordPress has finished routing the request and we
-     *     know the request really is for the legacy slug, not for
-     *     a different post that happens to live in a similar URL
-     *     space. Running this on `init` would force every request
-     *     on the entire site through the regex check; gating it on
+     *     know the request really is for one of the legacy paths,
+     *     not for a different post in a similar URL space. Running
+     *     this on `init` would force every request on the entire
+     *     site through the regex checks; gating it on
      *     `template_redirect` fires it only on real page-render
      *     requests where the cost is negligible.
      *
-     *   - The match path is parsed from REQUEST_URI rather than
-     *     read from $wp_query->query because on a clean install
-     *     where /matrix-register/ no longer exists in wp_posts,
-     *     WordPress routes the URL straight to its 404 handler
-     *     and there's no usable WP_Query state to inspect. Using
-     *     parse_url(REQUEST_URI) sidesteps that by working at the
-     *     raw HTTP layer.
+     *   - Match paths are parsed from REQUEST_URI rather than read
+     *     from $wp_query->query because on a clean install where
+     *     /matrix-login/ or /matrix-register/ no longer exists in
+     *     wp_posts, WordPress routes the URL straight to its 404
+     *     handler and there's no usable WP_Query state to inspect.
+     *     Using parse_url(REQUEST_URI) sidesteps that by working
+     *     at the raw HTTP layer.
      *
-     *   - The trailing-slash variants (/matrix-register and
-     *     /matrix-register/) are both matched; rtrim normalises
-     *     them before comparison so we don't have to maintain two
-     *     branches.
+     *   - Trailing-slash variants are both matched; rtrim
+     *     normalises them before comparison so we don't have to
+     *     maintain two branches.
      *
-     *   - Whole-path comparison against home_url('/matrix-register')
-     *     handles WordPress installs in subdirectories correctly
-     *     (e.g. site at example.com/blog/, the legacy URL is
-     *     /blog/matrix-register/ and home_url returns
-     *     https://example.com/blog/matrix-register). A naive
-     *     substring check would also catch unrelated paths like
-     *     /admin/matrix-register/ on operator-customised sites,
-     *     so the strict equality is the right call.
+     *   - Whole-path comparison against home_url('/<slug>') handles
+     *     WordPress installs in subdirectories correctly (e.g.
+     *     example.com/blog/, where the legacy paths live under
+     *     /blog/). A naive substring check would also catch
+     *     unrelated paths like /admin/matrix-register/ on
+     *     operator-customised sites, so strict equality is right.
      *
-     *   - The query string is preserved verbatim. A link like
+     *   - Query strings are preserved verbatim. A link like
      *     /matrix-register/?ref=ABC123&utm_source=whatsapp keeps
      *     both the ref code (which the registration handler in
      *     handle_registration() reads from $_POST['referral_code']
@@ -4203,16 +4382,14 @@ class Matrix_MLM_Core {
      *     consumers (Facebook scraper, WhatsApp link preview,
      *     Twitter card crawler) update their cached resolution to
      *     the new URL on the next refresh. A 302 here would leave
-     *     them re-resolving the legacy URL forever.
+     *     them re-resolving the legacy URLs forever.
      *
-     *   - Idempotent: if /matrix-register/ never existed on this
-     *     install (fresh activation post-rename), the redirect
-     *     never fires because no request ever reaches it (the URL
-     *     is 404 at WP routing time, but the 404 still routes
-     *     through template_redirect, which is exactly when we
-     *     intercept).
+     *   - Idempotent: if any of the legacy slugs never existed on
+     *     this install (fresh activation post-rename), the
+     *     corresponding redirect simply never fires because no
+     *     request ever reaches it.
      */
-    public function redirect_legacy_register_url() {
+    public function redirect_legacy_auth_urls() {
         $request_uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
         if ($request_uri === '') {
             return;
@@ -4222,26 +4399,43 @@ class Matrix_MLM_Core {
         if (!is_string($request_path) || $request_path === '') {
             return;
         }
-
-        // Build the canonical legacy path including any subdirectory
-        // prefix WordPress is installed under, then compare with the
-        // request path after both have been rtrim'd of any trailing
-        // slash (so /matrix-register and /matrix-register/ both
-        // match the same comparison target).
-        $expected_path = parse_url(home_url('/matrix-register'), PHP_URL_PATH);
-        if (!is_string($expected_path) || $expected_path === '') {
-            return;
-        }
-
-        if (rtrim($request_path, '/') !== rtrim($expected_path, '/')) {
-            return;
-        }
+        $request_path_normalised = rtrim($request_path, '/');
 
         $query = parse_url($request_uri, PHP_URL_QUERY);
-        $target = home_url('/matrix/' . (is_string($query) && $query !== '' ? '?' . $query : ''));
+        $query_suffix = (is_string($query) && $query !== '') ? ('?' . $query) : '';
 
-        wp_safe_redirect($target, 301);
-        exit;
+        // Branch 1 — /matrix-register/ -> /signup/.
+        $register_path = parse_url(home_url('/matrix-register'), PHP_URL_PATH);
+        if (is_string($register_path) && $register_path !== ''
+            && $request_path_normalised === rtrim($register_path, '/')) {
+            wp_safe_redirect(home_url('/signup/' . $query_suffix), 301);
+            exit;
+        }
+
+        // Branch 2 — /matrix-login/ -> /matrix/.
+        $login_path = parse_url(home_url('/matrix-login'), PHP_URL_PATH);
+        if (is_string($login_path) && $login_path !== ''
+            && $request_path_normalised === rtrim($login_path, '/')) {
+            wp_safe_redirect(home_url('/matrix/' . $query_suffix), 301);
+            exit;
+        }
+
+        // Branch 3 — /matrix/?ref=CODE for logged-out visitors only.
+        // The current /matrix/ slug is the login page; an existing
+        // member loading it should reach login, not be bounced. We
+        // gate on (a) request path equals /matrix/, (b) a `ref`
+        // query param is present, and (c) the visitor is logged
+        // out. Logged-in members who somehow click an old
+        // /matrix/?ref=… link (e.g. from their own WhatsApp
+        // history) keep going to the login page as expected.
+        $matrix_path = parse_url(home_url('/matrix'), PHP_URL_PATH);
+        if (is_string($matrix_path) && $matrix_path !== ''
+            && $request_path_normalised === rtrim($matrix_path, '/')
+            && isset($_GET['ref']) && $_GET['ref'] !== ''
+            && !is_user_logged_in()) {
+            wp_safe_redirect(home_url('/signup/' . $query_suffix), 301);
+            exit;
+        }
     }
 
     public function daily_cron() {

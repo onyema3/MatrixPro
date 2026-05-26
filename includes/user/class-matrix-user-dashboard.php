@@ -244,7 +244,7 @@ class Matrix_MLM_User_Dashboard {
 
     public function render_dashboard($atts) {
         if (!is_user_logged_in()) {
-            return '<script>window.location.href="' . home_url('/matrix-login') . '";</script>';
+            return '<script>window.location.href="' . home_url('/matrix') . '";</script>';
         }
 
         $user_id = get_current_user_id();
@@ -371,7 +371,7 @@ class Matrix_MLM_User_Dashboard {
                     }
                     ?>
                     <?php echo $this->build_notification_bell($user_id); ?>
-                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix-login'))); ?>" class="matrix-nav-logout"><?php echo Matrix_MLM_Icons::svg('exit'); ?> <?php _e('Logout', 'matrix-mlm'); ?></a>
+                    <a href="<?php echo esc_url(wp_logout_url(home_url('/matrix'))); ?>" class="matrix-nav-logout"><?php echo Matrix_MLM_Icons::svg('exit'); ?> <?php _e('Logout', 'matrix-mlm'); ?></a>
                 </div><!-- /.matrix-dashboard-nav (was <nav>; demoted to <div role="navigation"> to escape theme `nav a` cascade — see open tag above) -->
             </div>
             <div class="matrix-dashboard-content">
@@ -451,7 +451,7 @@ class Matrix_MLM_User_Dashboard {
         $currency = (string) get_option('matrix_mlm_currency_symbol', '₦');
         $period   = date_i18n('F Y');
         $can_pay  = $balance >= $amount;
-        $logout   = wp_logout_url(home_url('/matrix-login'));
+        $logout   = wp_logout_url(home_url('/matrix'));
 
         ob_start();
         ?>
