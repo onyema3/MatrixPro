@@ -26,6 +26,14 @@ class Matrix_MLM_User_Messaging {
         // Lazy team-room self-heal (skeleton: cheap idempotent walk).
         Matrix_MLM_Messaging::self_heal_membership($user_id);
 
+        // Initial presence pulse — render() runs on every messages-tab
+        // load so this seeds last_seen before any AJAX has fired,
+        // which means a user who lands on the page and immediately
+        // walks away still counts as "online" for the next two
+        // minutes (preventing a false-positive offline email for a
+        // message that arrives mid-render).
+        Matrix_MLM_Messaging::update_presence($user_id);
+
         $threads = Matrix_MLM_Messaging::list_threads_for_user($user_id);
         $settings = Matrix_MLM_Messaging::get_settings();
 
@@ -55,6 +63,12 @@ class Matrix_MLM_User_Messaging {
                 'reply_placeholder' => __('Write a message...', 'matrix-mlm'),
                 'no_threads'    => __('No conversations yet. Start one with the New Message button.', 'matrix-mlm'),
                 'select_thread' => __('Select a conversation, or start a new one.', 'matrix-mlm'),
+                'search_min_chars'  => __('Type at least 2 characters to search.', 'matrix-mlm'),
+                'search_searching'  => __('Searching…', 'matrix-mlm'),
+                'search_no_results' => __('No messages match your search.', 'matrix-mlm'),
+                'search_result_count' => __('%d match', 'matrix-mlm'),
+                'search_result_count_plural' => __('%d matches', 'matrix-mlm'),
+                'search_failed'     => __('Search failed. Please try again.', 'matrix-mlm'),
             ],
         ]);
         ?>
@@ -66,6 +80,21 @@ class Matrix_MLM_User_Messaging {
                     <button type="button" class="matrix-btn matrix-btn-primary matrix-btn-sm" id="matrix-messaging-new-dm">
                         <?php esc_html_e('New Message', 'matrix-mlm'); ?>
                     </button>
+                    <div class="matrix-messaging__search">
+                        <input
+                            type="search"
+                            id="matrix-messaging-search-input"
+                            class="matrix-messaging__search-input"
+                            placeholder="<?php esc_attr_e('Search messages…', 'matrix-mlm'); ?>"
+                            autocomplete="off"
+                            aria-label="<?php esc_attr_e('Search messages across all conversations', 'matrix-mlm'); ?>">
+                        <button
+                            type="button"
+                            id="matrix-messaging-search-clear"
+                            class="matrix-messaging__search-clear"
+                            aria-label="<?php esc_attr_e('Clear search', 'matrix-mlm'); ?>"
+                            style="display:none;">&times;</button>
+                    </div>
                 </div>
                 <ul class="matrix-messaging__threads" id="matrix-messaging-threads">
                     <?php if (empty($threads)): ?>
@@ -91,6 +120,7 @@ class Matrix_MLM_User_Messaging {
                         </li>
                     <?php endforeach; endif; ?>
                 </ul>
+                <ul class="matrix-messaging__search-results" id="matrix-messaging-search-results" style="display:none;" aria-live="polite"></ul>
             </aside>
 
             <section class="matrix-messaging__pane" id="matrix-messaging-pane">

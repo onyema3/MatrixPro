@@ -136,6 +136,18 @@ class Matrix_MLM_Admin_Messaging {
                 $new['max_attachment_bytes']        = max(0, (int) ($_POST['max_attachment_bytes'] ?? $defaults['max_attachment_bytes']));
                 $new['team_rooms_auto_create']      = !empty($_POST['team_rooms_auto_create']) ? 1 : 0;
                 $new['polling_interval_ms']        = max(2000, min(120000, (int) ($_POST['polling_interval_ms'] ?? $defaults['polling_interval_ms'])));
+                // Push delivery for offline recipients.
+                // - presence_window_seconds is clamped to 30..3600s
+                //   (anything below 30s would race the bell-poll
+                //   cadence; anything above an hour drains the
+                //   email path of usefulness).
+                // - offline_email_cooldown_seconds is clamped to
+                //   0..86400s. Zero = "send for every message"
+                //   (loud), one day = "at most one email per
+                //   thread per day" (quiet).
+                $new['presence_window_seconds']        = max(30, min(3600, (int) ($_POST['presence_window_seconds'] ?? $defaults['presence_window_seconds'])));
+                $new['offline_email_enabled']          = !empty($_POST['offline_email_enabled']) ? 1 : 0;
+                $new['offline_email_cooldown_seconds'] = max(0, min(86400, (int) ($_POST['offline_email_cooldown_seconds'] ?? $defaults['offline_email_cooldown_seconds'])));
                 update_option(Matrix_MLM_Messaging::SETTINGS_OPTION, $new);
                 add_settings_error('matrix_messaging', 'saved', __('Settings saved.', 'matrix-mlm'), 'updated');
                 break;
@@ -283,6 +295,24 @@ class Matrix_MLM_Admin_Messaging {
                     <td><label><input type="checkbox" name="team_rooms_auto_create" value="1" <?php checked(!empty($s['team_rooms_auto_create'])); ?>> <?php esc_html_e('Auto-create a team room per sponsor with their direct referrals', 'matrix-mlm'); ?></label></td></tr>
                 <tr><th><?php esc_html_e('Polling interval (ms)', 'matrix-mlm'); ?></th>
                     <td><input type="number" name="polling_interval_ms" min="2000" max="120000" value="<?php echo (int) $s['polling_interval_ms']; ?>"></td></tr>
+            </table>
+            <h2 style="margin-top:30px;"><?php esc_html_e('Push Delivery (Offline Recipients)', 'matrix-mlm'); ?></h2>
+            <p class="description">
+                <?php esc_html_e('When a recipient is not currently on the dashboard, push the message via email (and SMS when SMS notifications are enabled). Online recipients always receive an in-app bell badge update on the next poll, regardless of these settings.', 'matrix-mlm'); ?>
+            </p>
+            <table class="form-table">
+                <tr><th><?php esc_html_e('Presence window (seconds)', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="number" name="presence_window_seconds" min="30" max="3600" value="<?php echo (int) $s['presence_window_seconds']; ?>">
+                        <p class="description"><?php esc_html_e('A user is considered online if they have hit any messaging or notifications endpoint within this window. Default 120 seconds.', 'matrix-mlm'); ?></p>
+                    </td></tr>
+                <tr><th><?php esc_html_e('Email offline recipients', 'matrix-mlm'); ?></th>
+                    <td><label><input type="checkbox" name="offline_email_enabled" value="1" <?php checked(!empty($s['offline_email_enabled'])); ?>> <?php esc_html_e('Send a "new message" email (and SMS, if enabled) when the recipient is not currently online', 'matrix-mlm'); ?></label></td></tr>
+                <tr><th><?php esc_html_e('Email cooldown per thread (seconds)', 'matrix-mlm'); ?></th>
+                    <td>
+                        <input type="number" name="offline_email_cooldown_seconds" min="0" max="86400" value="<?php echo (int) $s['offline_email_cooldown_seconds']; ?>">
+                        <p class="description"><?php esc_html_e('Suppress repeat emails for the same thread within this window so a burst of messages from one sender does not generate one email per message. Set to 0 to email every message. Default 600 seconds (10 minutes).', 'matrix-mlm'); ?></p>
+                    </td></tr>
             </table>
             <p><button type="submit" class="button button-primary"><?php esc_html_e('Save Settings', 'matrix-mlm'); ?></button></p>
         </form>

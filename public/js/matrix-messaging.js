@@ -25,11 +25,22 @@
     var $threadsList = $('#matrix-messaging-threads');
     var $pane = $('#matrix-messaging-pane');
     var $newDmBtn = $('#matrix-messaging-new-dm');
+    var $searchInput = $('#matrix-messaging-search-input');
+    var $searchClear = $('#matrix-messaging-search-clear');
+    var $searchResults = $('#matrix-messaging-search-results');
 
     var activeThreadId = null;
     var renderedIds = Object.create(null);
     var lastId = 0;
     var pollTimer = null;
+
+    // Search state. searchSeq is incremented on each new query so a
+    // late-arriving response from a stale request can't overwrite a
+    // newer result set; debounceTimer collapses fast typing into a
+    // single request burst.
+    var searchSeq = 0;
+    var searchDebounceTimer = null;
+    var pendingHighlightMessageId = null;
 
     function api(action, data, method) {
         method = method || 'POST';
@@ -127,6 +138,20 @@
             if (!resp || !resp.success) { return; }
             (resp.data.messages || []).forEach(function (m) { renderMessage($msgs, m); });
             startPolling();
+
+            // Scroll to and flash a search-jumped message, if one
+            // was queued by handleSearchResultClick. Done after the
+            // initial fetch completes so the row exists in the DOM.
+            if (pendingHighlightMessageId) {
+                var targetId = pendingHighlightMessageId;
+                pendingHighlightMessageId = null;
+                var $target = $msgs.find('.matrix-messaging__message[data-id="' + targetId + '"]');
+                if ($target.length) {
+                    $target[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    $target.addClass('matrix-messaging__message--flash');
+                    setTimeout(function () { $target.removeClass('matrix-messaging__message--flash'); }, 2400);
+                }
+            }
         });
     }
 
@@ -240,6 +265,171 @@
                 alert((resp && resp.data && resp.data.message) || 'Could not start conversation.');
             }
         });
+    });
+
+    // --- Cross-thread search ---
+    //
+    // Behavior:
+    //   - Debounced 250ms on every keystroke.
+    //   - Two-character minimum (server enforces same floor).
+    //   - searchSeq stamping discards stale responses that lose
+    //     the race after the user has typed something newer.
+    //   - Result click loads the matching thread and queues a
+    //     highlight on the matched message id, which loadThread
+    //     consumes after its initial fetch resolves.
+    //
+    // While search results are visible we hide the threads list
+    // (the same panel real estate hosts both) and surface a clear
+    // button so the user can return to the thread list with a
+    // single click rather than having to wipe the input by hand.
+
+    function renderSearchPlaceholder(message) {
+        $searchResults
+            .show()
+            .html('<li class="matrix-messaging__search-empty">' + escapeHtml(message) + '</li>');
+    }
+
+    function highlightMatch(text, q) {
+        // Case-insensitive single-pass highlight. We escape the HTML
+        // first, then match against the escaped form using an
+        // escaped regex of the query — which keeps the snippet safe
+        // against injection while still highlighting the match.
+        var escaped = escapeHtml(text || '');
+        if (!q) { return escaped; }
+        var re;
+        try {
+            re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+        } catch (e) {
+            return escaped;
+        }
+        return escaped.replace(re, '<mark class="matrix-messaging__search-mark">$1</mark>');
+    }
+
+    function renderSearchResults(query, results) {
+        if (!results || results.length === 0) {
+            renderSearchPlaceholder(cfg.i18n.search_no_results);
+            return;
+        }
+        var countTpl = results.length === 1
+            ? (cfg.i18n.search_result_count || '%d match')
+            : (cfg.i18n.search_result_count_plural || '%d matches');
+        var header = '<li class="matrix-messaging__search-header">' +
+            escapeHtml(countTpl.replace('%d', String(results.length))) +
+            '</li>';
+
+        var items = results.map(function (row) {
+            var threadLabel = escapeHtml(row.thread_label || '');
+            var senderLabel = escapeHtml(row.sender_label || '');
+            var snippet = highlightMatch(row.snippet || row.body || '', query);
+            var when = escapeHtml(row.created_at || '');
+            return '<li class="matrix-messaging__search-result"' +
+                ' data-thread-id="' + parseInt(row.thread_id, 10) + '"' +
+                ' data-message-id="' + parseInt(row.id, 10) + '"' +
+                ' data-thread-label="' + threadLabel + '">' +
+                '<div class="matrix-messaging__search-result-head">' +
+                    '<strong>' + threadLabel + '</strong>' +
+                    '<span class="matrix-messaging__search-result-when">' + when + '</span>' +
+                '</div>' +
+                '<div class="matrix-messaging__search-result-sender">' + senderLabel + '</div>' +
+                '<div class="matrix-messaging__search-result-snippet">' + snippet + '</div>' +
+            '</li>';
+        }).join('');
+
+        $searchResults.show().html(header + items);
+    }
+
+    function showThreadsList() {
+        $searchResults.hide().empty();
+        $threadsList.show();
+    }
+
+    function showSearchPanel() {
+        $threadsList.hide();
+        $searchResults.show();
+    }
+
+    function runSearch(query) {
+        var seq = ++searchSeq;
+        if (!query || query.length < 2) {
+            // Too short — surface guidance instead of firing a
+            // request the server would reject anyway.
+            showSearchPanel();
+            renderSearchPlaceholder(cfg.i18n.search_min_chars);
+            return;
+        }
+        showSearchPanel();
+        renderSearchPlaceholder(cfg.i18n.search_searching);
+
+        api('search', { q: query }).done(function (resp) {
+            // Drop late-arriving responses that lost the race.
+            if (seq !== searchSeq) { return; }
+            if (!resp || !resp.success) {
+                renderSearchPlaceholder(cfg.i18n.search_failed);
+                return;
+            }
+            renderSearchResults(query, (resp.data && resp.data.results) || []);
+        }).fail(function () {
+            if (seq !== searchSeq) { return; }
+            renderSearchPlaceholder(cfg.i18n.search_failed);
+        });
+    }
+
+    $searchInput.on('input', function () {
+        var v = (this.value || '').trim();
+        $searchClear.toggle(v.length > 0);
+        if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); }
+        if (v === '') {
+            searchSeq++; // invalidate any in-flight response
+            showThreadsList();
+            return;
+        }
+        searchDebounceTimer = setTimeout(function () { runSearch(v); }, 250);
+    });
+
+    // Submit (Enter) collapses the debounce so a deliberate Enter
+    // doesn't wait the extra 250ms.
+    $searchInput.on('keydown', function (e) {
+        if (e.key === 'Enter' || e.keyCode === 13) {
+            e.preventDefault();
+            if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); }
+            var v = (this.value || '').trim();
+            if (v.length >= 2) { runSearch(v); }
+        } else if (e.key === 'Escape' || e.keyCode === 27) {
+            $searchInput.val('');
+            $searchClear.hide();
+            searchSeq++;
+            showThreadsList();
+        }
+    });
+
+    $searchClear.on('click', function () {
+        $searchInput.val('').focus();
+        $searchClear.hide();
+        searchSeq++;
+        showThreadsList();
+    });
+
+    $searchResults.on('click', '.matrix-messaging__search-result', function () {
+        var $row = $(this);
+        var threadId = parseInt($row.data('thread-id'), 10);
+        var messageId = parseInt($row.data('message-id'), 10);
+        var label = $row.data('thread-label') || '';
+        if (!threadId) { return; }
+
+        // Remember which message to scroll to after the thread
+        // loads, then route through the same loadThread path that
+        // the sidebar click uses so the polling lifecycle and
+        // active-state visuals stay consistent. Also hide the
+        // search panel so the user lands on the conversation.
+        pendingHighlightMessageId = messageId || null;
+        showThreadsList();
+        $threadsList.find('.matrix-messaging__thread').removeClass('is-active');
+        var $li = $threadsList.find('.matrix-messaging__thread[data-thread-id="' + threadId + '"]');
+        if ($li.length) {
+            $li.addClass('is-active');
+            $li.find('.matrix-badge').remove();
+        }
+        loadThread(threadId, label);
     });
 
     // Auto-open ?open=<id> after redirect from new DM.
